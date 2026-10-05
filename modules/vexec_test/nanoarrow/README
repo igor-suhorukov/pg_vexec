@@ -1,0 +1,17 @@
+nanoarrow 0.7.0-SNAPSHOT, Apache License 2.0, vendored for vexec's tests only
+(pg_vector_executor.md §5, V0's export check); vexec itself never links it.
+
+  nanoarrow.h, nanoarrow.c   apache/arrow-nanoarrow at
+                             8c4e869cc8e4920737a513bc3012780050016bc5, its
+                             bundled source as sedona-db vendors it
+                             (oss_databases/sedona-db, c/sedona-geoarrow-c/
+                             src/nanoarrow, last changed there in da53f0015b1),
+                             unmodified; compiled with
+                             NANOARROW_NAMESPACE=VexecTest.
+
+  sha256  31cf28444d1b0b8f938d6b6a1e9f8e3e0aa2357513d48f33662b7da6796409c1  nanoarrow.c
+          2dfbff5753a7a9a7cc23e001601ea70bc8c8a0db686ede11bfe95ca4d61560f0  nanoarrow.h
+
+Its FULL validation checks offsets, union type ids, run ends and list views,
+and not view structs, UTF-8 or dictionary indices; vexec_test.c checks views
+and UTF-8 itself.

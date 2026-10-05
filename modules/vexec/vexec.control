@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# vexec: a vectorized planner and executor for PostgreSQL 19 (pg_accel)
+comment = 'A vectorized planner and executor, on the hooks PostgreSQL 19 has'
+default_version = '1.0'
+module_pathname = '$libdir/vexec'
+relocatable = false
+schema = vexec
+superuser = true

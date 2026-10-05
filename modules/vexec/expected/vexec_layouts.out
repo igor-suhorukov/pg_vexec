@@ -1,0 +1,486 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- The batch layer (pg_vector_executor.md §3.4, §5 V0): batches of every
+-- type of the layouts' corpus (§6.2) convert between every pair of layouts
+-- and back unchanged, out through a slot in both formats, and compacted;
+-- and both formats' exports pass the export check.  vexec_test, a module of
+-- the tests alone, runs them; vexec_corpus_setup made the corpus.
+\i sql/vexec_corpus_setup.sql
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- The layouts' semantics corpus (pg_vector_executor.md §6.2, "Layouts"): a
+-- table of every kind of type vexec holds, with the values at each layout's
+-- edges, over 2,600 rows -- three batches, the last short -- with NULLs at
+-- the edges of the bitmaps' words and of the batches.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+CREATE EXTENSION IF NOT EXISTS vexec_test;
+RESET client_min_messages;
+CREATE TABLE corpus (
+	id int4,
+	b bool, i2 int2, i4 int4, i8 int8, f4 float4, f8 float8,
+	o oid, m money, ch "char",
+	d date, t time, ts timestamp, tstz timestamptz, iv interval, tz timetz,
+	n numeric, n10_2 numeric(10,2), n18_0 numeric(18,0), n38_5 numeric(38,5),
+	n5_m2 numeric(5,-2), n3_10 numeric(3,10), n40_2 numeric(40,2),
+	tx text, vc varchar(200), bp char(5), bt bytea, js json, jb jsonb,
+	u uuid, nm name, mac macaddr, mac8 macaddr8, ip inet, pt point,
+	a4 int4[], at text[], k int4, big text
+);
+-- big's long values are stored out of line, uncompressed
+ALTER TABLE corpus ALTER COLUMN big SET STORAGE EXTERNAL;
+-- a row's value is NULL where its id is at a word's edge, or every 7th
+CREATE FUNCTION corpus_null(id int4, col int4) RETURNS bool
+LANGUAGE sql IMMUTABLE AS
+$$ SELECT (id - 1) % 64 IN (0, 63) OR (id + col) % 7 = 0 OR id IN (1024, 1025, 2048) $$;
+INSERT INTO corpus
+SELECT g,
+	CASE WHEN corpus_null(g, 1) THEN NULL ELSE g % 3 = 0 END,
+	CASE WHEN corpus_null(g, 2) THEN NULL
+		 WHEN g % 50 = 1 THEN 32767 WHEN g % 50 = 2 THEN -32768 ELSE (g * 7) % 30000 - 15000 END,
+	CASE WHEN corpus_null(g, 3) THEN NULL
+		 WHEN g % 50 = 3 THEN 2147483647 WHEN g % 50 = 4 THEN -2147483648 ELSE (g::int8 * 1000003 % 1000000007)::int4 END,
+	CASE WHEN corpus_null(g, 4) THEN NULL
+		 WHEN g % 50 = 5 THEN 9223372036854775807 WHEN g % 50 = 6 THEN -9223372036854775808
+		 ELSE g::int8 * 1000000007 * 97 END,
+	CASE WHEN corpus_null(g, 5) THEN NULL
+		 WHEN g % 50 = 7 THEN 'NaN' WHEN g % 50 = 8 THEN '-0' WHEN g % 50 = 9 THEN '-Infinity'
+		 ELSE g / 7.0 END,
+	CASE WHEN corpus_null(g, 6) THEN NULL
+		 WHEN g % 50 = 10 THEN 'NaN' WHEN g % 50 = 11 THEN '-0' WHEN g % 50 = 12 THEN 'Infinity'
+		 WHEN g % 50 = 13 THEN 1e308 ELSE g / 3.0 END,
+	CASE WHEN corpus_null(g, 7) THEN NULL WHEN g % 50 = 14 THEN 4294967295 ELSE g END,
+	CASE WHEN corpus_null(g, 8) THEN NULL ELSE (g * 1.25)::money END,
+	CASE WHEN corpus_null(g, 9) THEN NULL ELSE chr(33 + g % 90)::"char" END,
+	-- dates: the infinities, PostgreSQL's limits
+	CASE WHEN corpus_null(g, 10) THEN NULL
+		 WHEN g % 50 = 15 THEN 'infinity' WHEN g % 50 = 16 THEN '-infinity'
+		 WHEN g % 50 = 17 THEN '4714-11-24 BC' WHEN g % 50 = 18 THEN '5874897-12-31'
+		 ELSE '2000-01-01'::date + (g * 37 - 40000) END,
+	-- time, 24:00:00 included
+	CASE WHEN corpus_null(g, 11) THEN NULL WHEN g % 50 = 19 THEN '24:00:00'
+		 ELSE '00:00:00'::time + g * interval '17 seconds' END,
+	-- timestamps: the infinities, the limits, and from 294247-01-10 on
+	CASE WHEN corpus_null(g, 12) THEN NULL
+		 WHEN g % 50 = 20 THEN 'infinity' WHEN g % 50 = 21 THEN '-infinity'
+		 WHEN g % 50 = 22 THEN '4714-11-24 00:00:00 BC'
+		 WHEN g % 50 = 23 AND g > 2000 THEN '294276-12-31 23:59:59.999999'
+		 WHEN g % 50 = 24 AND g > 2000 THEN '294247-01-10 04:00:54.775808'
+		 WHEN g % 50 = 25 THEN '294247-01-10 04:00:54.775807'
+		 ELSE '2000-01-01'::timestamp + g * interval '1 day 3 hours 7 minutes 11.123456 seconds' END,
+	CASE WHEN corpus_null(g, 13) THEN NULL
+		 WHEN g % 50 = 20 THEN 'infinity' WHEN g % 50 = 21 THEN '-infinity'
+		 WHEN g % 50 = 23 AND g > 2000 THEN '294276-12-30 23:59:59.999999+00'
+		 ELSE '1999-12-31 00:00:00+00'::timestamptz - g * interval '13 days 5 hours 0.5 seconds' END,
+	-- intervals: the infinities, and time parts on both sides of 292 years in ns
+	CASE WHEN corpus_null(g, 14) THEN NULL
+		 WHEN g % 50 = 26 THEN 'infinity' WHEN g % 50 = 27 AND g > 2000 THEN '-infinity'
+		 WHEN g % 50 = 28 AND g > 1000 THEN '2562048 hours'
+		 WHEN g % 50 = 29 THEN '2562047 hours 47 minutes 16.854775 seconds'
+		 ELSE make_interval(months => g % 13, days => g % 31, secs => g * 1.000001) END,
+	CASE WHEN corpus_null(g, 15) THEN NULL ELSE ('10:11:12.13'::time + g * interval '1 second')::timetz END,
+	-- numerics: NaN and the infinities, and each typmod's edges
+	CASE WHEN corpus_null(g, 16) THEN NULL
+		 WHEN g % 50 = 30 THEN 'NaN' WHEN g % 50 = 31 THEN 'Infinity' WHEN g % 50 = 32 THEN '-Infinity'
+		 WHEN g % 50 = 33 THEN 1.000 ELSE g / 7.0::numeric END,
+	CASE WHEN corpus_null(g, 17) THEN NULL
+		 WHEN g % 50 = 34 THEN 99999999.99 WHEN g % 50 = 35 THEN -99999999.99 WHEN g % 50 = 36 THEN 0
+		 ELSE g * 1.07 - 1000 END,
+	CASE WHEN corpus_null(g, 18) THEN NULL
+		 WHEN g % 50 = 34 THEN 999999999999999999 WHEN g % 50 = 35 THEN -999999999999999999
+		 ELSE g::int8 * 123456789 END,
+	CASE WHEN corpus_null(g, 19) THEN NULL
+		 WHEN g % 50 = 34 THEN 999999999999999999999999999999999.99999
+		 WHEN g % 50 = 35 THEN -999999999999999999999999999999999.99999
+		 WHEN g % 50 = 36 AND g > 1000 THEN 'NaN'
+		 ELSE g * 1234567890123456789.12345 END,
+	CASE WHEN corpus_null(g, 20) THEN NULL WHEN g % 50 = 34 THEN 9999900 ELSE g * 100 END,
+	CASE WHEN corpus_null(g, 21) THEN NULL ELSE g * 0.0000000001 / 1000 END,
+	CASE WHEN corpus_null(g, 22) THEN NULL ELSE g * 1.5 END,
+	-- strings: 12 and 13 bytes (a view's inline edge), 126 and 127 (the short
+	-- header's), compressed inline, and external
+	CASE WHEN corpus_null(g, 23) THEN NULL
+		 WHEN g % 50 = 37 THEN repeat('x', 12) WHEN g % 50 = 38 THEN repeat('y', 13)
+		 WHEN g % 50 = 39 THEN repeat('z', 126) WHEN g % 50 = 40 THEN repeat('w', 127)
+		 WHEN g % 50 = 41 THEN repeat('compressible ', 400)
+		 WHEN g % 50 = 42 THEN (SELECT string_agg(md5((g * 1000 + s)::text), '') FROM generate_series(1, 300) s)
+		 WHEN g % 50 = 43 THEN '' WHEN g % 50 = 44 THEN 'äöü €'
+		 ELSE 'row ' || g END,
+	CASE WHEN corpus_null(g, 24) THEN NULL ELSE repeat(chr(97 + g % 26), g % 200) END,
+	CASE WHEN corpus_null(g, 25) THEN NULL WHEN g % 50 = 45 THEN '' ELSE substr('abcdefgh', 1 + g % 5, g % 4) END,
+	CASE WHEN corpus_null(g, 26) THEN NULL
+		 WHEN g % 50 = 46 THEN '\x00ff00'::bytea WHEN g % 50 = 47 THEN decode(repeat('ab', 70), 'hex')
+		 ELSE int4send(g) END,
+	CASE WHEN corpus_null(g, 27) THEN NULL ELSE ('{"g": ' || g || ', "s": "' || repeat('j', g % 20) || '"}')::json END,
+	CASE WHEN corpus_null(g, 28) THEN NULL ELSE ('{"g": ' || g || ', "a": [1, 2, ' || g % 10 || ']}')::jsonb END,
+	CASE WHEN corpus_null(g, 29) THEN NULL ELSE md5(g::text)::uuid END,
+	CASE WHEN corpus_null(g, 30) THEN NULL ELSE ('name_' || g)::name END,
+	CASE WHEN corpus_null(g, 31) THEN NULL ELSE ('08:00:2b:01:02:' || lpad(to_hex(g % 256), 2, '0'))::macaddr END,
+	CASE WHEN corpus_null(g, 32) THEN NULL ELSE ('08:00:2b:01:02:03:04:' || lpad(to_hex(g % 256), 2, '0'))::macaddr8 END,
+	CASE WHEN corpus_null(g, 33) THEN NULL ELSE ('10.' || g % 256 || '.' || g / 256 % 256 || '.1/24')::inet END,
+	CASE WHEN corpus_null(g, 34) THEN NULL ELSE point(g, -g / 3.0) END,
+	CASE WHEN corpus_null(g, 35) THEN NULL ELSE ARRAY[g, g + 1, NULL, g % 5] END,
+	CASE WHEN corpus_null(g, 36) THEN NULL ELSE ARRAY['a' || g, NULL, repeat('t', g % 30)] END,
+	42,
+	CASE WHEN corpus_null(g, 37) THEN NULL WHEN g % 10 = 1 THEN repeat('external ' || g, 400)
+		 ELSE 'short ' || g END
+FROM generate_series(1, 2600) g;
+ANALYZE corpus;
+-- every column of three batches through every shape and back
+SELECT * FROM vexec_test.roundtrip('SELECT * FROM corpus ORDER BY id');
+ col |            type             | layouts | pairs | kept | dictionaries | constants | rows | batches 
+-----+-----------------------------+---------+-------+------+--------------+-----------+------+---------
+   1 | integer                     |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+   2 | boolean                     |       2 |    12 |    0 |            6 |         0 | 2600 |       3
+   3 | smallint                    |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+   4 | integer                     |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+   5 | bigint                      |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+   6 | real                        |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+   7 | double precision            |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+   8 | oid                         |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+   9 | money                       |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+  10 | "char"                      |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+  11 | date                        |       2 |    12 |    0 |            6 |         0 | 2600 |       3
+  12 | time without time zone      |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+  13 | timestamp without time zone |       2 |     3 |    6 |            3 |         0 | 2600 |       3
+  14 | timestamp with time zone    |       2 |     6 |    4 |            4 |         0 | 2600 |       3
+  15 | interval                    |       2 |     3 |    6 |            3 |         0 | 2600 |       3
+  16 | time with time zone         |       2 |    12 |    0 |            6 |         0 | 2600 |       3
+  17 | numeric                     |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  18 | numeric(10,2)               |       4 |    48 |    0 |           12 |         0 | 2600 |       3
+  19 | numeric(18,0)               |       4 |    48 |    0 |           12 |         0 | 2600 |       3
+  20 | numeric(38,5)               |       4 |    34 |    8 |           10 |         0 | 2600 |       3
+  21 | numeric(5,-2)               |       4 |    48 |    0 |           12 |         0 | 2600 |       3
+  22 | numeric(3,10)               |       4 |    48 |    0 |           12 |         0 | 2600 |       3
+  23 | numeric(40,2)               |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  24 | text                        |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  25 | character varying(200)      |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  26 | character(5)                |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  27 | bytea                       |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  28 | json                        |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  29 | jsonb                       |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  30 | uuid                        |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+  31 | name                        |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+  32 | macaddr                     |       2 |    12 |    0 |            6 |         0 | 2600 |       3
+  33 | macaddr8                    |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+  34 | inet                        |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  35 | point                       |       1 |     3 |    0 |            3 |         0 | 2600 |       3
+  36 | integer[]                   |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  37 | text[]                      |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+  38 | integer                     |       1 |     3 |    0 |            3 |         3 | 2600 |       3
+  39 | text                        |       3 |    27 |    0 |            9 |         0 | 2600 |       3
+(39 rows)
+
+-- the export check in each format: nanoarrow's full validation, vexec's
+-- own check of views and of UTF-8, and every value read back
+SELECT * FROM vexec_test.export('SELECT * FROM corpus ORDER BY id', 'postgres');
+ col |            type             |       layout        |   arrow    |       extension        | rows | nulls 
+-----+-----------------------------+---------------------+------------+------------------------+------+-------
+   1 | integer                     | fixed(4)            | i          |                        | 2600 |     0
+   2 | boolean                     | byte                | c          | arrow.bool8            | 2600 |   441
+   3 | smallint                    | fixed(2)            | s          |                        | 2600 |   440
+   4 | integer                     | fixed(4)            | i          |                        | 2600 |   440
+   5 | bigint                      | fixed(8)            | l          |                        | 2600 |   441
+   6 | real                        | fixed(4)            | f          |                        | 2600 |   441
+   7 | double precision            | fixed(8)            | g          |                        | 2600 |   441
+   8 | oid                         | fixed(4)            | I          |                        | 2600 |   442
+   9 | money                       | fixed(8)            | l          | postgresql.money       | 2600 |   441
+  10 | "char"                      | fixed(1)            | c          | postgresql.char        | 2600 |   440
+  11 | date                        | fixed(4,postgres)   | i          | postgresql.date        | 2600 |   440
+  12 | time without time zone      | fixed(8)            | l          | postgresql.time        | 2600 |   441
+  13 | timestamp without time zone | fixed(8,postgres)   | l          | postgresql.timestamp   | 2600 |   441
+  14 | timestamp with time zone    | fixed(8,postgres)   | l          | postgresql.timestamptz | 2600 |   441
+  15 | interval                    | fixed(16,postgres)  | w:16       | postgresql.interval    | 2600 |   442
+  16 | time with time zone         | fixed(12/16)        | w:12       | postgresql.timetz      | 2600 |   441
+  17 | numeric                     | datum               | vz         | postgresql.numeric     | 2600 |   440
+  18 | numeric(10,2)               | scaled(8,2)         | d:10,2,64  |                        | 2600 |   440
+  19 | numeric(18,0)               | scaled(8,0)         | d:18,0,64  |                        | 2600 |   441
+  20 | numeric(38,5)               | scaled(16,5), datum | d:38,5; vz | postgresql.numeric     | 2600 |   441
+  21 | numeric(5,-2)               | scaled(8,0)         | d:7,0,64   |                        | 2600 |   441
+  22 | numeric(3,10)               | scaled(8,10)        | d:3,10,64  |                        | 2600 |   442
+  23 | numeric(40,2)               | datum               | vz         | postgresql.numeric     | 2600 |   441
+  24 | text                        | datum               | vu         |                        | 2600 |   440
+  25 | character varying(200)      | datum               | vu         |                        | 2600 |   440
+  26 | character(5)                | datum               | vu         |                        | 2600 |   441
+  27 | bytea                       | datum               | vz         |                        | 2600 |   441
+  28 | json                        | datum               | vu         | arrow.json             | 2600 |   441
+  29 | jsonb                       | datum               | vz         | postgresql.jsonb       | 2600 |   442
+  30 | uuid                        | fixed(16)           | w:16       | arrow.uuid             | 2600 |   441
+  31 | name                        | fixed(64)           | w:64       | postgresql.name        | 2600 |   440
+  32 | macaddr                     | fixed(6/8)          | w:6        | postgresql.macaddr     | 2600 |   440
+  33 | macaddr8                    | fixed(8)            | w:8        | postgresql.macaddr8    | 2600 |   441
+  34 | inet                        | datum               | vz         | postgresql.inet        | 2600 |   441
+  35 | point                       | fixed(16)           | w:16       | postgresql.point       | 2600 |   441
+  36 | integer[]                   | datum               | vz         | postgresql._int4       | 2600 |   442
+  37 | text[]                      | datum               | vz         | postgresql._text       | 2600 |   441
+  38 | integer                     | fixed(4)            | i          |                        | 2600 |     0
+  39 | text                        | datum               | vu         |                        | 2600 |   440
+(39 rows)
+
+SELECT * FROM vexec_test.export('SELECT * FROM corpus ORDER BY id', 'arrow');
+ col |            type             |              layout               |   arrow    |       extension        | rows | nulls 
+-----+-----------------------------+-----------------------------------+------------+------------------------+------+-------
+   1 | integer                     | fixed(4)                          | i          |                        | 2600 |     0
+   2 | boolean                     | bit                               | b          |                        | 2600 |   441
+   3 | smallint                    | fixed(2)                          | s          |                        | 2600 |   440
+   4 | integer                     | fixed(4)                          | i          |                        | 2600 |   440
+   5 | bigint                      | fixed(8)                          | l          |                        | 2600 |   441
+   6 | real                        | fixed(4)                          | f          |                        | 2600 |   441
+   7 | double precision            | fixed(8)                          | g          |                        | 2600 |   441
+   8 | oid                         | fixed(4)                          | I          |                        | 2600 |   442
+   9 | money                       | fixed(8)                          | l          | postgresql.money       | 2600 |   441
+  10 | "char"                      | fixed(1)                          | c          | postgresql.char        | 2600 |   440
+  11 | date                        | fixed(4,arrow)                    | i          | postgresql.date        | 2600 |   440
+  12 | time without time zone      | fixed(8)                          | l          | postgresql.time        | 2600 |   441
+  13 | timestamp without time zone | fixed(8,postgres)                 | l          | postgresql.timestamp   | 2600 |   441
+  14 | timestamp with time zone    | fixed(8,arrow), fixed(8,postgres) | l          | postgresql.timestamptz | 2600 |   441
+  15 | interval                    | fixed(16,postgres)                | w:16       | postgresql.interval    | 2600 |   442
+  16 | time with time zone         | fixed(12)                         | w:12       | postgresql.timetz      | 2600 |   441
+  17 | numeric                     | view                              | vz         | postgresql.numeric     | 2600 |   440
+  18 | numeric(10,2)               | scaled(8,2)                       | d:10,2,64  |                        | 2600 |   440
+  19 | numeric(18,0)               | scaled(8,0)                       | d:18,0,64  |                        | 2600 |   441
+  20 | numeric(38,5)               | scaled(16,5), view                | d:38,5; vz | postgresql.numeric     | 2600 |   441
+  21 | numeric(5,-2)               | scaled(8,0)                       | d:7,0,64   |                        | 2600 |   441
+  22 | numeric(3,10)               | scaled(8,10)                      | d:3,10,64  |                        | 2600 |   442
+  23 | numeric(40,2)               | view                              | vz         | postgresql.numeric     | 2600 |   441
+  24 | text                        | view                              | vu         |                        | 2600 |   440
+  25 | character varying(200)      | view                              | vu         |                        | 2600 |   440
+  26 | character(5)                | view                              | vu         |                        | 2600 |   441
+  27 | bytea                       | view                              | vz         |                        | 2600 |   441
+  28 | json                        | view                              | vu         | arrow.json             | 2600 |   441
+  29 | jsonb                       | view                              | vz         | postgresql.jsonb       | 2600 |   442
+  30 | uuid                        | fixed(16)                         | w:16       | arrow.uuid             | 2600 |   441
+  31 | name                        | fixed(64)                         | w:64       | postgresql.name        | 2600 |   440
+  32 | macaddr                     | fixed(6)                          | w:6        | postgresql.macaddr     | 2600 |   440
+  33 | macaddr8                    | fixed(8)                          | w:8        | postgresql.macaddr8    | 2600 |   441
+  34 | inet                        | view                              | vz         | postgresql.inet        | 2600 |   441
+  35 | point                       | fixed(16)                         | w:16       | postgresql.point       | 2600 |   441
+  36 | integer[]                   | view                              | vz         | postgresql._int4       | 2600 |   442
+  37 | text[]                      | view                              | vz         | postgresql._text       | 2600 |   441
+  38 | integer                     | fixed(4)                          | i          |                        | 2600 |     0
+  39 | text                        | view                              | vu         |                        | 2600 |   440
+(39 rows)
+
+-- without the values Arrow's types cannot mean -- the infinities, time's
+-- 24:00:00, timestamps past the Unix epoch's int64 -- the Arrow format
+-- exports Arrow's own date32, timestamp[us], time64[us] and month_day_nano
+SELECT col, type, layout, arrow, extension FROM vexec_test.export(
+	'SELECT d, t, ts, tstz, iv FROM corpus WHERE id % 50 NOT BETWEEN 15 AND 29 ORDER BY id', 'arrow');
+ col |            type             |     layout      |  arrow  | extension 
+-----+-----------------------------+-----------------+---------+-----------
+   1 | date                        | fixed(4,arrow)  | tdD     | 
+   2 | time without time zone      | fixed(8)        | ttu     | 
+   3 | timestamp without time zone | fixed(8,arrow)  | tsu:    | 
+   4 | timestamp with time zone    | fixed(8,arrow)  | tsu:UTC | 
+   5 | interval                    | fixed(16,arrow) | tin     | 
+(5 rows)
+
+SELECT col, type, layout, arrow, extension FROM vexec_test.export(
+	'SELECT d, t, ts, tstz, iv FROM corpus WHERE id % 50 NOT BETWEEN 15 AND 29 ORDER BY id', 'postgres');
+ col |            type             |       layout       | arrow |       extension        
+-----+-----------------------------+--------------------+-------+------------------------
+   1 | date                        | fixed(4,postgres)  | i     | postgresql.date
+   2 | time without time zone      | fixed(8)           | ttu   | 
+   3 | timestamp without time zone | fixed(8,postgres)  | l     | postgresql.timestamp
+   4 | timestamp with time zone    | fixed(8,postgres)  | l     | postgresql.timestamptz
+   5 | interval                    | fixed(16,postgres) | w:16  | postgresql.interval
+(5 rows)
+
+-- and with the per-structure settings changed one at a time, and with
+-- every column dictionary-encoded
+SELECT v.varlena, b.bool, t.temporal, n.numeric, d.dict,
+       count(*) AS columns, sum(e.nulls) AS nulls, min(e.rows) AS rows
+FROM (VALUES ('format'), ('datum'), ('view'), ('offsets')) v(varlena),
+     (VALUES ('format'), ('byte'), ('bit')) b(bool),
+     (VALUES ('format'), ('postgres'), ('arrow')) t(temporal),
+     (VALUES ('format'), ('scaled'), ('varlena')) n(numeric),
+     (VALUES (false), (true)) d(dict),
+     LATERAL vexec_test.export('SELECT * FROM corpus ORDER BY id', 'arrow',
+                               v.varlena, b.bool, t.temporal, n.numeric, d.dict) e
+WHERE (v.varlena = 'format')::int + (b.bool = 'format')::int +
+      (t.temporal = 'format')::int + (n.numeric = 'format')::int >= 3
+GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5;
+ varlena |  bool  | temporal | numeric | dict | columns | nulls | rows 
+---------+--------+----------+---------+------+---------+-------+------
+ datum   | format | format   | format  | f    |      39 | 16311 | 2600
+ datum   | format | format   | format  | t    |      39 | 16311 | 2600
+ format  | bit    | format   | format  | f    |      39 | 16311 | 2600
+ format  | bit    | format   | format  | t    |      39 | 16311 | 2600
+ format  | byte   | format   | format  | f    |      39 | 16311 | 2600
+ format  | byte   | format   | format  | t    |      39 | 16311 | 2600
+ format  | format | arrow    | format  | f    |      39 | 16311 | 2600
+ format  | format | arrow    | format  | t    |      39 | 16311 | 2600
+ format  | format | format   | format  | f    |      39 | 16311 | 2600
+ format  | format | format   | format  | t    |      39 | 16311 | 2600
+ format  | format | format   | scaled  | f    |      39 | 16311 | 2600
+ format  | format | format   | scaled  | t    |      39 | 16311 | 2600
+ format  | format | format   | varlena | f    |      39 | 16311 | 2600
+ format  | format | format   | varlena | t    |      39 | 16311 | 2600
+ format  | format | postgres | format  | f    |      39 | 16311 | 2600
+ format  | format | postgres | format  | t    |      39 | 16311 | 2600
+ offsets | format | format   | format  | f    |      39 | 16311 | 2600
+ offsets | format | format   | format  | t    |      39 | 16311 | 2600
+ view    | format | format   | format  | f    |      39 | 16311 | 2600
+ view    | format | format   | format  | t    |      39 | 16311 | 2600
+(20 rows)
+
+-- the batch's row count at its edges: 1,023, 1,024 and 1,025 rows
+SELECT n, (SELECT string_agg(DISTINCT batches::text || ' batches of ' || rows::text || ' rows', '; ')
+           FROM vexec_test.roundtrip(format('SELECT * FROM corpus WHERE id <= %s ORDER BY id', n)))
+FROM unnest(ARRAY[1, 63, 64, 65, 1023, 1024, 1025, 2048, 2049]) n;
+  n   |       string_agg       
+------+------------------------
+    1 | 1 batches of 1 rows
+   63 | 1 batches of 63 rows
+   64 | 1 batches of 64 rows
+   65 | 1 batches of 65 rows
+ 1023 | 1 batches of 1023 rows
+ 1024 | 1 batches of 1024 rows
+ 1025 | 2 batches of 1025 rows
+ 2048 | 2 batches of 2048 rows
+ 2049 | 3 batches of 2049 rows
+(9 rows)
+
+SELECT * FROM vexec_test.roundtrip('SELECT * FROM corpus WHERE false');
+ col |            type             | layouts | pairs | kept | dictionaries | constants | rows | batches 
+-----+-----------------------------+---------+-------+------+--------------+-----------+------+---------
+   1 | integer                     |       1 |     0 |    0 |            0 |         0 |    0 |       0
+   2 | boolean                     |       2 |     0 |    0 |            0 |         0 |    0 |       0
+   3 | smallint                    |       1 |     0 |    0 |            0 |         0 |    0 |       0
+   4 | integer                     |       1 |     0 |    0 |            0 |         0 |    0 |       0
+   5 | bigint                      |       1 |     0 |    0 |            0 |         0 |    0 |       0
+   6 | real                        |       1 |     0 |    0 |            0 |         0 |    0 |       0
+   7 | double precision            |       1 |     0 |    0 |            0 |         0 |    0 |       0
+   8 | oid                         |       1 |     0 |    0 |            0 |         0 |    0 |       0
+   9 | money                       |       1 |     0 |    0 |            0 |         0 |    0 |       0
+  10 | "char"                      |       1 |     0 |    0 |            0 |         0 |    0 |       0
+  11 | date                        |       2 |     0 |    0 |            0 |         0 |    0 |       0
+  12 | time without time zone      |       1 |     0 |    0 |            0 |         0 |    0 |       0
+  13 | timestamp without time zone |       2 |     0 |    0 |            0 |         0 |    0 |       0
+  14 | timestamp with time zone    |       2 |     0 |    0 |            0 |         0 |    0 |       0
+  15 | interval                    |       2 |     0 |    0 |            0 |         0 |    0 |       0
+  16 | time with time zone         |       2 |     0 |    0 |            0 |         0 |    0 |       0
+  17 | numeric                     |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  18 | numeric(10,2)               |       4 |     0 |    0 |            0 |         0 |    0 |       0
+  19 | numeric(18,0)               |       4 |     0 |    0 |            0 |         0 |    0 |       0
+  20 | numeric(38,5)               |       4 |     0 |    0 |            0 |         0 |    0 |       0
+  21 | numeric(5,-2)               |       4 |     0 |    0 |            0 |         0 |    0 |       0
+  22 | numeric(3,10)               |       4 |     0 |    0 |            0 |         0 |    0 |       0
+  23 | numeric(40,2)               |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  24 | text                        |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  25 | character varying(200)      |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  26 | character(5)                |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  27 | bytea                       |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  28 | json                        |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  29 | jsonb                       |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  30 | uuid                        |       1 |     0 |    0 |            0 |         0 |    0 |       0
+  31 | name                        |       1 |     0 |    0 |            0 |         0 |    0 |       0
+  32 | macaddr                     |       2 |     0 |    0 |            0 |         0 |    0 |       0
+  33 | macaddr8                    |       1 |     0 |    0 |            0 |         0 |    0 |       0
+  34 | inet                        |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  35 | point                       |       1 |     0 |    0 |            0 |         0 |    0 |       0
+  36 | integer[]                   |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  37 | text[]                      |       3 |     0 |    0 |            0 |         0 |    0 |       0
+  38 | integer                     |       1 |     0 |    0 |            0 |         0 |    0 |       0
+  39 | text                        |       3 |     0 |    0 |            0 |         0 |    0 |       0
+(39 rows)
+
+-- numeric's scaled form at its edges: 18 and 38 digits, a value of another
+-- display scale, NaN and the infinities, and zero of any scale
+SELECT v, s, w, vexec_test.scaled(v, s, w)
+FROM (VALUES (999999999999999999::numeric, 0, 8), (-999999999999999999, 0, 8),
+             (9999999999999999999, 0, 8), (9223372036854775807, 0, 16),
+             (99999999999999999999999999999999999999, 0, 16),
+             (-99999999999999999999999999999999999999, 0, 16),
+             (999999999999999999999999999999999999999, 0, 16),
+             (0.00000000000000000000000000000000000001, 38, 16),
+             (999999999999999999999999999999999.99999, 5, 16),
+             (123.45, 2, 8), (123.4, 2, 8), (123.450, 3, 8), (123.45, 3, 8),
+             (0.0001, 4, 8), (0.00010, 5, 8), (-0.5, 1, 8), (0.000, 3, 8), (0, 0, 8),
+             (12300, 0, 8), (1e20, 0, 16), ('NaN', 0, 16), ('Infinity', 0, 16),
+             ('-Infinity', 0, 16)) x(v, s, w);
+                    v                     | s  | w  |                                       scaled                                       
+------------------------------------------+----+----+------------------------------------------------------------------------------------
+                       999999999999999999 |  0 |  8 | 999999999999999999 -> 999999999999999999
+                      -999999999999999999 |  0 |  8 | -999999999999999999 -> -999999999999999999
+                      9999999999999999999 |  0 |  8 | none
+                      9223372036854775807 |  0 | 16 | 9223372036854775807 -> 9223372036854775807
+   99999999999999999999999999999999999999 |  0 | 16 | 99999999999999999999999999999999999999 -> 99999999999999999999999999999999999999
+  -99999999999999999999999999999999999999 |  0 | 16 | -99999999999999999999999999999999999999 -> -99999999999999999999999999999999999999
+  999999999999999999999999999999999999999 |  0 | 16 | none
+ 0.00000000000000000000000000000000000001 | 38 | 16 | 1 -> 0.00000000000000000000000000000000000001
+  999999999999999999999999999999999.99999 |  5 | 16 | 99999999999999999999999999999999999999 -> 999999999999999999999999999999999.99999
+                                   123.45 |  2 |  8 | 12345 -> 123.45
+                                    123.4 |  2 |  8 | none
+                                  123.450 |  3 |  8 | 123450 -> 123.450
+                                   123.45 |  3 |  8 | none
+                                   0.0001 |  4 |  8 | 1 -> 0.0001
+                                  0.00010 |  5 |  8 | 10 -> 0.00010
+                                     -0.5 |  1 |  8 | -5 -> -0.5
+                                    0.000 |  3 |  8 | 0 -> 0.000
+                                        0 |  0 |  8 | 0 -> 0
+                                    12300 |  0 |  8 | 12300 -> 12300
+                    100000000000000000000 |  0 | 16 | 100000000000000000000 -> 100000000000000000000
+                                      NaN |  0 | 16 | none
+                                 Infinity |  0 | 16 | none
+                                -Infinity |  0 | 16 | none
+(23 rows)
+
+-- a scale past the scaled layout's 38 has no scaled form, zero's included
+SELECT vexec_test.scaled(round(0::numeric, 2000), 2000) AS zero_at_2000,
+       vexec_test.scaled(round(0.5, 39), 39) AS half_at_39;
+ zero_at_2000 | half_at_39 
+--------------+------------
+ none         | none
+(1 row)
+
+-- a numeric of another display scale than its column's typmod, as a table
+-- access method storing Datums could hold: the scaled layout refuses it,
+-- and the column keeps PostgreSQL's
+SELECT col, type, layouts, pairs, kept FROM vexec_test.roundtrip(
+	'SELECT x FROM (VALUES (1.50), (1.505), (2.5), (NULL)) v(x)',
+	ARRAY[(SELECT atttypmod FROM pg_attribute WHERE attrelid = 'corpus'::regclass AND attname = 'n10_2')]);
+ col |     type      | layouts | pairs | kept 
+-----+---------------+---------+-------+------
+   1 | numeric(10,2) |       4 |     9 |    4
+(1 row)
+
+SELECT col, type, layout, arrow FROM vexec_test.export(
+	'SELECT x::numeric(10,2) FROM (VALUES (1.50), (1.505), (NULL)) v(x)', 'arrow');
+ col |     type      |   layout    |   arrow   
+-----+---------------+-------------+-----------
+   1 | numeric(10,2) | scaled(8,2) | d:10,2,64
+(1 row)
+
+-- text in a database whose encoding is not UTF8: Arrow's binary, not utf8
+SELECT current_database() AS suite_db \gset
+CREATE DATABASE vexec_latin1 TEMPLATE template0 ENCODING 'LATIN1' LOCALE 'C';
+\c vexec_latin1
+SET client_min_messages = warning;
+CREATE EXTENSION vexec;
+CREATE EXTENSION vexec_test;
+RESET client_min_messages;
+SELECT col, type, layout, arrow, extension, rows FROM vexec_test.export(
+	$$SELECT convert_from('\xe4f6fc'::bytea, 'LATIN1') AS t, 'x'::varchar AS v,
+	         '{"a": 1}'::json AS j, repeat('l', 20) AS long$$, 'arrow');
+ col |       type        | layout | arrow |     extension      | rows 
+-----+-------------------+--------+-------+--------------------+------
+   1 | text              | view   | vz    | postgresql.text    |    1
+   2 | character varying | view   | vz    | postgresql.varchar |    1
+   3 | json              | view   | vz    | postgresql.json    |    1
+   4 | text              | view   | vz    | postgresql.text    |    1
+(4 rows)
+
+SELECT col, type, layout, arrow, extension, rows FROM vexec_test.export(
+	$$SELECT convert_from('\xe4f6fc'::bytea, 'LATIN1') AS t, repeat('l', 20) AS long$$,
+	'arrow', 'offsets');
+ col | type | layout  | arrow |    extension    | rows 
+-----+------+---------+-------+-----------------+------
+   1 | text | offsets | z     | postgresql.text |    1
+   2 | text | offsets | z     | postgresql.text |    1
+(2 rows)
+
+\c :suite_db
+DROP DATABASE vexec_latin1;
+DROP TABLE corpus;
+DROP FUNCTION corpus_null(int4, int4);

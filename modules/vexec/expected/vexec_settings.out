@@ -1,0 +1,153 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- vexec's settings (pg_vector_executor.md §3.12): every one, its default and
+-- its context; the values each takes; the prefix reserved; and the
+-- planner's among those EXPLAIN (SETTINGS) shows.  GPU execution is off at
+-- every level by default (§3.11).
+SELECT name,
+       CASE WHEN name = 'vexec.debug_check_plans' THEN '(on where assertions are)' ELSE setting END AS setting,
+       unit, context, vartype, min_val, max_val, enumvals,
+       (pg_settings_get_flags(name) @> ARRAY['EXPLAIN']) AS explain
+FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
+            name             |          setting          | unit |  context   | vartype | min_val |   max_val    |          enumvals           | explain 
+-----------------------------+---------------------------+------+------------+---------+---------+--------------+-----------------------------+---------
+ vexec.batch_bool_layout     | format                    |      | user       | enum    |         |              | {format,byte,bit}           | t
+ vexec.batch_dictionary      | off                       |      | user       | bool    |         |              |                             | f
+ vexec.batch_format          | postgres                  |      | user       | enum    |         |              | {postgres,arrow}            | t
+ vexec.batch_numeric_layout  | format                    |      | user       | enum    |         |              | {format,scaled,varlena}     | t
+ vexec.batch_setup_cost      | 1                         |      | user       | real    | 0       | 1.79769e+308 |                             | t
+ vexec.batch_temporal_layout | format                    |      | user       | enum    |         |              | {format,postgres,arrow}     | t
+ vexec.batch_varlena_layout  | format                    |      | user       | enum    |         |              | {format,datum,view,offsets} | t
+ vexec.compact_threshold     | 0.25                      |      | user       | real    | 0       | 1            |                             | f
+ vexec.convert_cost          | 0.001                     |      | user       | real    | 0       | 1.79769e+308 |                             | t
+ vexec.cpu_operator_factor   | 0.35                      |      | user       | real    | 0       | 100          |                             | t
+ vexec.cpu_tuple_factor      | 0.35                      |      | user       | real    | 0       | 100          |                             | t
+ vexec.debug_check_plans     | (on where assertions are) |      | superuser  | bool    |         |              |                             | f
+ vexec.debug_layout_seed     | 0                         |      | superuser  | integer | 0       | 2147483647   |                             | f
+ vexec.debug_require_vector  | off                       |      | superuser  | bool    |         |              |                             | f
+ vexec.enable_agg            | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_hashjoin       | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_insert         | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_scan           | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_sort           | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_window         | on                        |      | user       | bool    |         |              |                             | t
+ vexec.gpu                   | off                       |      | user       | enum    |         |              | {off,auto,force}            | t
+ vexec.gpu_arena_mb          | 256                       | MB   | postmaster | integer | 1       | 1073741823   |                             | f
+ vexec.gpu_devices           |                           |      | postmaster | string  |         |              |                             | f
+ vexec.gpu_memory_limit_mb   | 0                         | MB   | postmaster | integer | 0       | 1073741823   |                             | f
+ vexec.gpu_operator_factor   | 0.0625                    |      | user       | real    | 0       | 100          |                             | t
+ vexec.gpu_segments          | off                       |      | sighup     | bool    |         |              |                             | f
+ vexec.gpu_setup_cost        | 100                       |      | user       | real    | 0       | 1.79769e+308 |                             | t
+ vexec.gpu_transfer_cost     | 1e-05                     |      | user       | real    | 0       | 1.79769e+308 |                             | t
+ vexec.min_rows              | 10000                     |      | user       | integer | 0       | 2147483647   |                             | t
+ vexec.mode                  | off                       |      | user       | enum    |         |              | {off,explain,auto,force}    | t
+ vexec.orca                  | on                        |      | user       | bool    |         |              |                             | t
+(31 rows)
+
+-- the modes
+SET vexec.mode = explain;
+SHOW vexec.mode;
+ vexec.mode 
+------------
+ explain
+(1 row)
+
+SET vexec.mode = auto;
+SET vexec.mode = force;
+SET vexec.mode = bogus;
+ERROR:  invalid value for parameter "vexec.mode": "bogus"
+HINT:  Available values: off, explain, auto, force.
+RESET vexec.mode;
+SHOW vexec.mode;
+ vexec.mode 
+------------
+ off
+(1 row)
+
+-- the formats, and one structure at a time
+SET vexec.batch_format = arrow;
+SET vexec.batch_varlena_layout = offsets;
+SET vexec.batch_bool_layout = byte;
+SET vexec.batch_temporal_layout = postgres;
+SET vexec.batch_numeric_layout = varlena;
+SELECT current_setting('vexec.batch_format') AS format,
+       current_setting('vexec.batch_varlena_layout') AS varlena,
+       current_setting('vexec.batch_bool_layout') AS bool,
+       current_setting('vexec.batch_temporal_layout') AS temporal,
+       current_setting('vexec.batch_numeric_layout') AS numeric;
+ format | varlena | bool | temporal | numeric 
+--------+---------+------+----------+---------
+ arrow  | offsets | byte | postgres | varlena
+(1 row)
+
+SET vexec.batch_varlena_layout = arrow;
+ERROR:  invalid value for parameter "vexec.batch_varlena_layout": "arrow"
+HINT:  Available values: format, datum, view, offsets.
+SET vexec.batch_bool_layout = view;
+ERROR:  invalid value for parameter "vexec.batch_bool_layout": "view"
+HINT:  Available values: format, byte, bit.
+RESET ALL;
+-- factors, and their bounds
+SET vexec.cpu_tuple_factor = 0.5;
+SET vexec.cpu_operator_factor = -1;
+ERROR:  -1 is outside the valid range for parameter "vexec.cpu_operator_factor" (0 .. 100)
+SET vexec.compact_threshold = 1.5;
+ERROR:  1.5 is outside the valid range for parameter "vexec.compact_threshold" (0 .. 1)
+RESET ALL;
+-- the prefix is vexec's: a name it does not define is refused
+SET vexec.no_such_setting = 1;
+ERROR:  invalid configuration parameter name "vexec.no_such_setting"
+DETAIL:  "vexec" is a reserved prefix.
+-- the GPU: off by default; a server's devices are its own
+SHOW vexec.gpu;
+ vexec.gpu 
+-----------
+ off
+(1 row)
+
+SHOW vexec.gpu_devices;
+ vexec.gpu_devices 
+-------------------
+ 
+(1 row)
+
+SET vexec.gpu = auto;
+RESET vexec.gpu;
+SET vexec.gpu_devices = '0';
+ERROR:  parameter "vexec.gpu_devices" cannot be changed without restarting the server
+SET vexec.gpu_segments = on;
+ERROR:  parameter "vexec.gpu_segments" cannot be changed now
+-- the debug settings are a superuser's
+SET vexec.debug_check_plans = on;
+SET vexec.debug_require_vector = off;
+CREATE ROLE regress_vexec_settings;
+SET ROLE regress_vexec_settings;
+SET vexec.debug_check_plans = on;
+ERROR:  permission denied to set parameter "vexec.debug_check_plans"
+SET vexec.mode = explain;
+RESET ROLE;
+DROP ROLE regress_vexec_settings;
+RESET ALL;
+-- EXPLAIN (SETTINGS) shows the planner's settings that differ from their
+-- defaults, as it shows enable_*
+CREATE FUNCTION explain_lines(query text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	line text;
+BEGIN
+	FOR line IN EXECUTE query LOOP
+		RETURN NEXT line;
+	END LOOP;
+END
+$$;
+SET vexec.mode = explain;
+SET vexec.batch_format = arrow;
+SELECT l FROM explain_lines('EXPLAIN (SETTINGS, COSTS OFF) SELECT 1') l
+WHERE l LIKE 'Settings:%';
+                               l                                
+----------------------------------------------------------------
+ Settings: vexec.mode = 'explain', vexec.batch_format = 'arrow'
+(1 row)
+
+RESET ALL;
+DROP FUNCTION explain_lines(text);

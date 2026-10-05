@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# vexec_test: vexec's batch layer, tested from SQL (pg_accel's tests only)
+comment = 'Tests of vexec''s batch layer: layouts, conversions and Arrow export'
+default_version = '1.0'
+module_pathname = '$libdir/vexec_test'
+relocatable = false
+schema = vexec_test
+superuser = true
+requires = 'vexec'

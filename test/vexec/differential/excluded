@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The tests of PostgreSQL's parallel_schedule the differential runner leaves
+# out (pg_vector_executor.md §6.1), each with its reason: the tests that list
+# catalog objects or the server's settings, which differ between sessions for
+# reasons that are not vexec's answers, as TimescaleDB's and the pg_arrow
+# plan's copies leave them out (timescaledb/test/pgtest/CMakeLists.txt:17-45).
+#
+#   test            reason

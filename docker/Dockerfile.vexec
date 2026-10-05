@@ -1,0 +1,55 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: Apache-2.0
+#
+# vexec's images (pg_vector_executor.md §3.2, §6.4): a server image with a C
+# toolchain on it, in which vexec is built by PGXS, installed into the
+# server's own tree, and its suites run.  The tree is not copied in: the
+# suites bind-mount it and build from it (test/vexec/run.sh).
+#
+#   BASE_IMAGE=cloudberry/pg19-vanilla:latest   the vanilla leg: REL_19_STABLE
+#                                                as it is, the port's own build
+#   BASE_IMAGE=pg_accel/cb-ext:<commit>          the port: the patched server
+#                                                and the port's modules
+#
+# Both are Debian trixie with the server in /usr/local/pgsql, so one
+# definition serves both.  PostgreSQL's own regression suite comes from the
+# commit the server was built from, read out of PostgreSQL's checkout (the
+# "pgsrc" build context), so that the tests cannot be of another commit than
+# the binaries under them -- as the port's cb-ext image takes it
+# (pg19/docker/Dockerfile.cbext).
+
+ARG BASE_IMAGE=cloudberry/pg19-vanilla:latest
+
+FROM ${BASE_IMAGE}
+USER root
+
+# gcc and make for PGXS; gdb for cores; perl and diffutils for pg_regress;
+# python3 for the differential runner; procps for the suites' waits.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential gdb perl diffutils python3 procps git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# PostgreSQL's regression suite at the server's commit, with its C module
+# built against the installed server as an extension is (Dockerfile.cbext
+# does the same for the port).  The cb-ext image has it already, in
+# /cb/pgregress; the vanilla image does not.
+RUN --mount=type=bind,from=pgsrc,target=/pgsrc,ro \
+    if [ ! -f /cb/pgregress/regress.so ]; then \
+        mkdir -p /cb/pgregress \
+     && git -C /pgsrc archive "$(cat /usr/local/pgsql/.pg_ref_commit)" src/test/regress \
+            | tar -x -C /cb/pgregress --strip-components=3 \
+     && cd /cb/pgregress \
+     && printf '%s\n' 'MODULES = regress' 'PG_CONFIG = /usr/local/pgsql/bin/pg_config' \
+            'PGXS := $(shell $(PG_CONFIG) --pgxs)' 'include $(PGXS)' > Makefile.pgxs \
+     && make -f Makefile.pgxs > /dev/null \
+     && cp "$(pg_config --pkglibdir)/autoinc.so" "$(pg_config --pkglibdir)/refint.so" . \
+     && cp /usr/local/pgsql/.pg_ref_commit /cb/pgregress/.pg_ref_commit; \
+    fi
+
+# vexec is installed into the server's tree by the suites, as postgres.
+RUN chown -R postgres:postgres /usr/local/pgsql /cb/pgregress
+
+ENV PATH=/usr/local/pgsql/bin:$PATH \
+    TMPDIR=/tmp
+USER postgres
+WORKDIR /home/postgres

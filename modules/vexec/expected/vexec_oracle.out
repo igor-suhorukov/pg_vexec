@@ -1,0 +1,93 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- The capability oracle for types (pg_vector_executor.md §3.3.2, §3.4):
+-- every type has a layout in each format, and every layout it can be held
+-- in is one the conversions take it between.  And the batch-source
+-- registry (§3.5.1), which no storage module fills before V1.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+RESET client_min_messages;
+SELECT t AS type, (vexec.type_layouts(t)).*
+FROM unnest(ARRAY[
+	'bool', '"char"', 'int2', 'int4', 'int8', 'oid', 'float4', 'float8', 'money',
+	'time', 'date', 'timestamp', 'timestamptz', 'interval',
+	'numeric', 'numeric(10,2)', 'numeric(18,0)', 'numeric(19,0)', 'numeric(38,5)',
+	'numeric(39,0)', 'numeric(5,-2)', 'numeric(17,-2)', 'numeric(3,10)', 'numeric(2,40)',
+	'text', 'varchar(20)', 'char(5)', 'bytea', 'json', 'jsonb', 'xml', 'cstring',
+	'uuid', 'name', 'tid', 'point', 'macaddr', 'macaddr8', 'timetz', 'inet',
+	'int4[]', 'text[]', 'int4range', 'regclass', 'pg_lsn', 'xid8', 'oid8'
+]) t;
+      type      |    class     |      postgres      |      arrow      |                 layouts                  
+----------------+--------------+--------------------+-----------------+------------------------------------------
+ bool           | bool         | byte               | bit             | {byte,bit}
+ "char"         | by-value     | fixed(1)           | fixed(1)        | {fixed(1)}
+ int2           | by-value     | fixed(2)           | fixed(2)        | {fixed(2)}
+ int4           | by-value     | fixed(4)           | fixed(4)        | {fixed(4)}
+ int8           | by-value     | fixed(8)           | fixed(8)        | {fixed(8)}
+ oid            | by-value     | fixed(4)           | fixed(4)        | {fixed(4)}
+ float4         | by-value     | fixed(4)           | fixed(4)        | {fixed(4)}
+ float8         | by-value     | fixed(8)           | fixed(8)        | {fixed(8)}
+ money          | by-value     | fixed(8)           | fixed(8)        | {fixed(8)}
+ time           | by-value     | fixed(8)           | fixed(8)        | {fixed(8)}
+ date           | date         | fixed(4,postgres)  | fixed(4,arrow)  | {"fixed(4,postgres)","fixed(4,arrow)"}
+ timestamp      | timestamp    | fixed(8,postgres)  | fixed(8,arrow)  | {"fixed(8,postgres)","fixed(8,arrow)"}
+ timestamptz    | timestamp    | fixed(8,postgres)  | fixed(8,arrow)  | {"fixed(8,postgres)","fixed(8,arrow)"}
+ interval       | interval     | fixed(16,postgres) | fixed(16,arrow) | {"fixed(16,postgres)","fixed(16,arrow)"}
+ numeric        | numeric      | datum              | view            | {datum,view,offsets}
+ numeric(10,2)  | numeric      | scaled(8,2)        | scaled(8,2)     | {"scaled(8,2)",datum,view,offsets}
+ numeric(18,0)  | numeric      | scaled(8,0)        | scaled(8,0)     | {"scaled(8,0)",datum,view,offsets}
+ numeric(19,0)  | numeric      | scaled(16,0)       | scaled(16,0)    | {"scaled(16,0)",datum,view,offsets}
+ numeric(38,5)  | numeric      | scaled(16,5)       | scaled(16,5)    | {"scaled(16,5)",datum,view,offsets}
+ numeric(39,0)  | numeric      | datum              | view            | {datum,view,offsets}
+ numeric(5,-2)  | numeric      | scaled(8,0)        | scaled(8,0)     | {"scaled(8,0)",datum,view,offsets}
+ numeric(17,-2) | numeric      | scaled(16,0)       | scaled(16,0)    | {"scaled(16,0)",datum,view,offsets}
+ numeric(3,10)  | numeric      | scaled(8,10)       | scaled(8,10)    | {"scaled(8,10)",datum,view,offsets}
+ numeric(2,40)  | numeric      | datum              | view            | {datum,view,offsets}
+ text           | varlena      | datum              | view            | {datum,view,offsets}
+ varchar(20)    | varlena      | datum              | view            | {datum,view,offsets}
+ char(5)        | varlena      | datum              | view            | {datum,view,offsets}
+ bytea          | varlena      | datum              | view            | {datum,view,offsets}
+ json           | varlena      | datum              | view            | {datum,view,offsets}
+ jsonb          | varlena      | datum              | view            | {datum,view,offsets}
+ xml            | varlena      | datum              | view            | {datum,view,offsets}
+ cstring        | cstring      | datum              | view            | {datum,view,offsets}
+ uuid           | by-reference | fixed(16)          | fixed(16)       | {fixed(16)}
+ name           | by-reference | fixed(64)          | fixed(64)       | {fixed(64)}
+ tid            | by-reference | fixed(6)           | fixed(6)        | {fixed(6)}
+ point          | by-reference | fixed(16)          | fixed(16)       | {fixed(16)}
+ macaddr        | by-reference | fixed(6/8)         | fixed(6)        | {fixed(6/8),fixed(6)}
+ macaddr8       | by-reference | fixed(8)           | fixed(8)        | {fixed(8)}
+ timetz         | by-reference | fixed(12/16)       | fixed(12)       | {fixed(12/16),fixed(12)}
+ inet           | varlena      | datum              | view            | {datum,view,offsets}
+ int4[]         | varlena      | datum              | view            | {datum,view,offsets}
+ text[]         | varlena      | datum              | view            | {datum,view,offsets}
+ int4range      | varlena      | datum              | view            | {datum,view,offsets}
+ regclass       | by-value     | fixed(4)           | fixed(4)        | {fixed(4)}
+ pg_lsn         | by-value     | fixed(8)           | fixed(8)        | {fixed(8)}
+ xid8           | by-value     | fixed(8)           | fixed(8)        | {fixed(8)}
+ oid8           | by-value     | fixed(8)           | fixed(8)        | {fixed(8)}
+(47 rows)
+
+-- a domain is held as its base type
+CREATE DOMAIN vexec_price AS numeric(12,2) CHECK (VALUE >= 0);
+CREATE TYPE vexec_mood AS ENUM ('sad', 'ok', 'happy');
+CREATE TYPE vexec_pair AS (a int4, b text);
+SELECT t AS type, (vexec.type_layouts(t)).*
+FROM unnest(ARRAY['vexec_price', 'vexec_mood', 'vexec_pair', 'vexec_pair[]']) t;
+     type     |  class   |  postgres   |    arrow    |              layouts               
+--------------+----------+-------------+-------------+------------------------------------
+ vexec_price  | numeric  | scaled(8,2) | scaled(8,2) | {"scaled(8,2)",datum,view,offsets}
+ vexec_mood   | by-value | fixed(4)    | fixed(4)    | {fixed(4)}
+ vexec_pair   | varlena  | datum       | view        | {datum,view,offsets}
+ vexec_pair[] | varlena  | datum       | view        | {datum,view,offsets}
+(4 rows)
+
+DROP TYPE vexec_pair;
+DROP TYPE vexec_mood;
+DROP DOMAIN vexec_price;
+-- the sources storage modules registered: none in this build
+SELECT * FROM vexec.sources();
+ source | access_method | minor | estimates 
+--------+---------------+-------+-----------
+(0 rows)
+

@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# vexec's own tests that every session of the differential runner must
+# answer alike (pg_vector_executor.md §6.1).  vexec_settings, vexec_oracle
+# and vexec_explain show the settings and the planner's records, which are
+# the sessions' own, and are not here.
+test: vexec_layouts

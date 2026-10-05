@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# vexec's Compose project: the images vexec is built and tested in, and the
+# containers its suites run in (test/vexec/run.sh drives it).  Nothing is
+# installed on the host.
+#
+#   vexec-dev-vanilla   the vanilla leg (pg_vector_executor.md §6.4): the
+#                       port's build of REL_19_STABLE, cloudberry/pg19-vanilla,
+#                       with a C toolchain and PostgreSQL's regression suite
+#   vexec-dev-port      the port: pg_accel/cb-ext at CB_COMMIT, VB's build of
+#                       the port's modules on the patched server, with a C
+#                       toolchain
+#
+# The checkouts are build contexts: PG_SRC (github/postgres), for the
+# regression suite at the server's own commit.
+
+name: pg_accel_vexec
+
+x-dev: &dev
+  context: .
+  dockerfile: Dockerfile.vexec
+  additional_contexts:
+    pgsrc: ${PG_SRC:-../../postgres}
+
+# A suite's container: the tree read-only, and a scratch directory of its
+# own for the builds and the servers.  Within the port's tests' memory cap
+# (§6.7), without swap; /dev/shm for parallel query.  VEXEC_CPUS bounds the
+# CPUs it may use, so that a suite run beside a timed one stays out of its
+# way.
+x-run: &run
+  user: postgres
+  # The servers listen on sockets in their own directories only; no network.
+  network_mode: none
+  shm_size: 2gb
+  mem_limit: ${CB_TESTS_MEM:-40g}
+  memswap_limit: ${CB_TESTS_MEM:-40g}
+  cpus: ${VEXEC_CPUS:-0}
+  tmpfs:
+    - /tmp:exec
+  volumes:
+    - ..:/src:ro
+    - ${VEXEC_WORK:-/nonexistent}:/work
+  environment:
+    VEXEC_SRC: /src
+    VEXEC_WORK: /work
+    CB_SRC_MOUNT: ${CB_SRC_MOUNT:-}
+
+services:
+  vexec-dev-vanilla:
+    image: pg_accel/vexec-dev:vanilla
+    build:
+      <<: *dev
+      args:
+        BASE_IMAGE: ${PG_VANILLA_IMAGE:-cloudberry/pg19-vanilla:latest}
+    profiles: ["build"]
+
+  vexec-dev-port:
+    image: pg_accel/vexec-dev:port-${CB_COMMIT:-unset}
+    build:
+      <<: *dev
+      args:
+        BASE_IMAGE: pg_accel/cb-ext:${CB_COMMIT:-unset}
+    profiles: ["build"]
+
+  vanilla:
+    <<: *run
+    image: pg_accel/vexec-dev:vanilla
+    profiles: ["run"]
+
+  port:
+    <<: *run
+    image: pg_accel/vexec-dev:port-${CB_COMMIT:-unset}
+    profiles: ["run"]
+
+  # The port's full run with vexec on every node (test/vexec/fullrun.sh), as
+  # the port's own tests service runs its suites (pg19/docker/compose.yml):
+  # privileged and as root for the resource group suite's cgroups, /tmp a
+  # tmpfs, within the tests' memory cap, and a disk for that suite's
+  # clusters.
+  #
+  # On a project's network, as the tests service is.  This host has no
+  # address pool left for a network of this project's own, so it joins
+  # pg_accel_default, VB's (compose.yml), made when VB's containers first
+  # ran.  Not Docker's default bridge: there the container's resolver is the
+  # host's router, and a name that does not exist fails as "No address
+  # associated with hostname", which the port's external_table test does
+  # not expect; Docker's own resolver on a project's network fails it as
+  # the test expects.
+  fullrun:
+    image: pg_accel/vexec-dev:port-${CB_COMMIT:-unset}
+    user: root
+    privileged: true
+    entrypoint: ["/src/test/vexec/fullrun.sh"]
+    networks: [pg_accel]
+    shm_size: 4gb
+    tmpfs:
+      - /tmp
+    mem_limit: ${CB_TESTS_MEM:-40g}
+    memswap_limit: ${CB_TESTS_MEM:-40g}
+    volumes:
+      - /var/lib/cbdisk
+      - ..:/src:ro
+      - ${VEXEC_WORK:-/nonexistent}:/work
+    environment:
+      VEXEC_FULLRUN_PRELOAD: ${VEXEC_FULLRUN_PRELOAD:-1}
+      RESULTS_DIR: /work/fullrun-${VEXEC_FULLRUN_PRELOAD:-1}
+    profiles: ["run"]
+
+networks:
+  pg_accel:
+    external: true
+    name: pg_accel_default

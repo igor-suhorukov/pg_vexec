@@ -1,0 +1,153 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# vexec's tests on the host (pg_vector_executor.md §5 V0, §6): the images,
+# and each leg in a container of its own (docker/vexec.yml), its results in
+# a run of the cache.  Nothing is installed on the host; it needs docker,
+# git and python3.
+#
+#   run.sh images                the dev images: the vanilla leg's, from the
+#                                port's cloudberry/pg19-vanilla; the port's,
+#                                from VB's pg_accel/cb-ext at CB_COMMIT
+#   run.sh checks                the header copies, the notices, the tree
+#                                (on the host)
+#   run.sh suite [leg]           vexec's own regression suite
+#   run.sh states [leg]          vexec's states of §1.2: installed and not
+#                                preloaded, its objects without its library,
+#                                its library removed
+#   run.sh pgregress [leg]       PostgreSQL's regression suite, unchanged,
+#                                with vexec installed, preloaded off, and
+#                                preloaded in explain mode
+#   run.sh differential [leg]    the differential runner's four sessions
+#   run.sh cluster               the cluster leg, four segments of the port
+#   run.sh tpc [storage...]      the tpc suite on four segments (CB_TPC=check)
+#                                in each storage: heap ao_column pax
+#                                pax_porc_vec, vexec preloaded in off mode
+#   run.sh fullrun [suite...]    the port's full run with vexec on every
+#                                node, and without it, compared: each
+#                                run's latest of VEXEC_FULLRUN_RUNS
+#   run.sh v0                    V0's "done when": checks; the suite, the
+#                                states, pgregress and differential on both
+#                                legs; the cluster leg
+#
+# A leg is vanilla (REL_19_STABLE as it is, vexec built by PGXS) or port (the
+# patched server with the port's modules); both when not given.
+#
+# Settings, from the environment:
+#   VEXEC_CACHE   the runs: ~/.cache/pg_accel/vexec
+#   CB_SRC, PG_SRC the port's and PostgreSQL's checkouts: ../../cloudberry,
+#                 ../../postgres
+#   CB_COMMIT     the port's build: the newest pg_accel/cb-ext image's
+#   VEXEC_CPUS    each container's CPUs: 0, as many as there are; 1 beside a
+#                 timed run
+#   CB_TESTS_MEM  each container's memory: 40g
+#   VEXEC_FULLRUN_RUNS  the full runs to make: "0 1", without vexec and
+#                 with it; "1" compares a new run with vexec with the
+#                 latest run without it
+#
+# Timed runs measure the host: ClickBench's time mode (test/clickbench) asks
+# for nothing else to run.  Beside one, give VEXEC_CPUS=1, and leave tpc and
+# fullrun, which want the whole machine, for after it.
+#
+# A leg's outcome is its container's exit status, through tee (pipefail).
+set -u -o pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$here/../.." && pwd)"
+COMPOSE="$ROOT/docker/vexec.yml"
+export VEXEC_CACHE="${VEXEC_CACHE:-$HOME/.cache/pg_accel/vexec}"
+export CB_SRC="${CB_SRC:-$(cd "$ROOT/.." && pwd)/cloudberry}"
+export PG_SRC="${PG_SRC:-$(cd "$ROOT/.." && pwd)/postgres}"
+export VEXEC_CPUS="${VEXEC_CPUS:-0}"
+
+if [ -z "${CB_COMMIT:-}" ]; then
+	CB_COMMIT="$(docker images pg_accel/cb-ext --format '{{.CreatedAt}} {{.Tag}}' 2> /dev/null | sort -r | awk 'NR == 1 {print $NF}')"
+fi
+export CB_COMMIT
+
+die() { echo "run.sh: $*" >&2; exit 1; }
+
+new_run() {					# new_run <name>: a directory of the cache
+	local run="$VEXEC_CACHE/runs/$(date +%Y%m%dT%H%M%S)-$1"
+	mkdir -p "$run" || die "cannot make $run"
+	echo "$run"
+}
+
+in_leg() {					# in_leg <leg> <run dir> <command>: RESULTS_DIR, the run, for every command of it
+	local leg="$1" run="$2" cmd="$3"
+	[ "$leg" = port ] && [ -z "$CB_COMMIT" ] && die "no pg_accel/cb-ext image: run test/clickbench/run.sh images"
+	VEXEC_WORK="$run" docker compose -f "$COMPOSE" --profile run run --rm -T "$leg" \
+		bash -c "export RESULTS_DIR=/work; $cmd" 2>&1 | grep -v -E '^ (Container|Network) '
+	return "${PIPESTATUS[0]}"
+}
+
+legs() { [ $# -gt 0 ] && echo "$@" || echo "vanilla port"; }
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+	images)
+		docker compose -f "$COMPOSE" --profile build build vexec-dev-vanilla || exit 1
+		[ -n "$CB_COMMIT" ] || die "no pg_accel/cb-ext image: run test/clickbench/run.sh images"
+		docker compose -f "$COMPOSE" --profile build build vexec-dev-port
+		;;
+	checks)
+		rc=0
+		"$here/checks/headers.sh" || rc=1
+		"$here/checks/notices.sh" || rc=1
+		"$here/checks/tree.sh" || rc=1
+		exit $rc
+		;;
+	suite|states|pgregress|differential)
+		rc=0
+		for leg in $(legs "$@"); do
+			run="$(new_run "$leg-$cmd")"
+			echo "== $cmd on the $leg leg: $run"
+			in_leg "$leg" "$run" "/src/test/vexec/$cmd.sh" | tee "$run/output" || rc=1
+		done
+		exit $rc
+		;;
+	cluster)
+		run="$(new_run cluster)"
+		echo "== the cluster leg: $run"
+		in_leg port "$run" "/src/test/vexec/cluster.sh" | tee "$run/output"
+		exit "${PIPESTATUS[0]}"
+		;;
+	tpc)
+		rc=0
+		for storage in ${*:-heap ao_column pax pax_porc_vec}; do
+			run="$(new_run "tpc-$storage")"
+			echo "== tpc on $storage: $run"
+			in_leg port "$run" "/src/test/vexec/build.sh > /dev/null && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage /src/test/tpc/run.sh" \
+				| tee "$run/output" || rc=1
+		done
+		exit $rc
+		;;
+	fullrun)
+		rc=0
+		for preload in ${VEXEC_FULLRUN_RUNS:-0 1}; do
+			run="$(new_run "fullrun-$preload")"
+			echo "== the port's full run, vexec $( [ $preload = 1 ] && echo "on every node" || echo "not loaded"): $run"
+			VEXEC_WORK="$run" VEXEC_FULLRUN_PRELOAD=$preload docker compose -f "$COMPOSE" --profile run \
+				run --rm -T fullrun "$@" 2>&1 | grep -v -E '^ (Container|Network) ' | tee "$run/output"
+		done
+		python3 "$here/fullrun_compare.py" "$(ls -d "$VEXEC_CACHE"/runs/*-fullrun-0 | tail -1)/output" \
+			"$(ls -d "$VEXEC_CACHE"/runs/*-fullrun-1 | tail -1)/output" || rc=1
+		exit $rc
+		;;
+	v0)
+		rc=0
+		"$0" checks || rc=1
+		for c in suite states pgregress differential; do
+			"$0" "$c" || rc=1
+		done
+		"$0" cluster || rc=1
+		echo
+		echo "V0: $([ $rc -eq 0 ] && echo "every leg passed" || echo "a leg FAILED")"
+		exit $rc
+		;;
+	*)
+		sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
+		exit 2
+		;;
+esac
