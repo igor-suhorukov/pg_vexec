@@ -1,0 +1,134 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# pg_accel's Compose project: the images ClickBench's suite runs on, and the
+# containers it runs in.  test/clickbench/run.sh drives it; nothing is
+# installed on the host.
+#
+# The servers are the port's builds (github/cloudberry, branch
+# extension_postgresql_19), made from the port's own Dockerfiles in its
+# checkout and tagged here by the commits they are built from, so that a
+# baseline names exactly what it ran and the port's own cloudberry/* tags are
+# left as they are:
+#
+#   pg19-patched, pg19-patched-noassert   PostgreSQL 19 with the port's core
+#                                          series (REL_19_STABLE_CLOUDBERRY),
+#                                          with assertions and without
+#   cb-ext, cb-ext-noassert               the port's modules on each: ORCA,
+#                                          gp_ao, PAX, and DuckDB in /opt/duckdb
+#   clickbench-vanilla                    the vanilla leg (pg_vector_executor.md
+#                                          §6.4): the port's two builds of
+#                                          REL_19_STABLE, cloudberry/pg19-vanilla
+#                                          and -noassert, in /pg/vanilla and
+#                                          /pg/vanilla-noassert, with DuckDB
+#
+# The checkouts are build contexts; their paths are all there is to change if
+# they live elsewhere: CB_SRC (github/cloudberry), PG_SRC (github/postgres).
+# run.sh sets the commits (PG_PATCHED_COMMIT, CB_COMMIT) and the run's paths.
+
+name: pg_accel
+
+x-port-pg: &port-pg
+  context: ${CB_SRC:-../../cloudberry}/pg19/docker
+  dockerfile: Dockerfile.pg
+  additional_contexts:
+    pgsrc: ${PG_SRC:-../../postgres}
+
+x-port-ext: &port-ext
+  context: ${CB_SRC:-../../cloudberry}/pg19/docker
+  dockerfile: Dockerfile.cbext
+  additional_contexts:
+    cbsrc: ${CB_SRC:-../../cloudberry}
+    pgsrc: ${PG_SRC:-../../postgres}
+
+# A run's container: the suite read-only, ClickBench's checkout read-only, the
+# data cache, the servers' data directories on disk (a cold run reads them from
+# the disk), and the run's results.  Within the port's tests' memory cap
+# (pg_vector_executor.md §6.7), without swap; /dev/shm for parallel query's
+# dynamic shared memory.
+x-run: &run
+  user: postgres
+  entrypoint: ["/clickbench/bench.sh"]
+  shm_size: 8gb
+  mem_limit: ${CB_TESTS_MEM:-40g}
+  memswap_limit: ${CB_TESTS_MEM:-40g}
+  tmpfs:
+    - /tmp
+  volumes:
+    - ../test/clickbench:/clickbench:ro
+    - ${CLICKBENCH_SRC:-../../../ClickBench}:/clickbench-src:ro
+    - ${CLICKBENCH_CACHE:-/nonexistent}:/cache
+    - ${CLICKBENCH_WORK:-/nonexistent}:/work
+    - ${CLICKBENCH_RUNS:-/nonexistent}:/runs
+  environment:
+    CLICKBENCH_HOST: ${CLICKBENCH_HOST:-}
+
+services:
+  pg19-patched:
+    image: pg_accel/pg19-patched:${PG_PATCHED_COMMIT:-unset}
+    build:
+      <<: *port-pg
+      args:
+        PG_REF: ${PG_PATCHED_COMMIT:-unset}
+      labels:
+        org.pg_accel.pg_commit: ${PG_PATCHED_COMMIT:-unset}
+    profiles: ["build"]
+
+  pg19-patched-noassert:
+    image: pg_accel/pg19-patched-noassert:${PG_PATCHED_COMMIT:-unset}
+    build:
+      <<: *port-pg
+      args:
+        PG_REF: ${PG_PATCHED_COMMIT:-unset}
+        PG_CASSERT: "false"
+      labels:
+        org.pg_accel.pg_commit: ${PG_PATCHED_COMMIT:-unset}
+    profiles: ["build"]
+
+  cb-ext:
+    image: pg_accel/cb-ext:${CB_COMMIT:-unset}
+    build:
+      <<: *port-ext
+      args:
+        PG_IMAGE: pg_accel/pg19-patched:${PG_PATCHED_COMMIT:-unset}
+        CB_REF: ${CB_COMMIT:-unset}
+      labels:
+        org.pg_accel.pg_commit: ${PG_PATCHED_COMMIT:-unset}
+        org.pg_accel.cb_commit: ${CB_COMMIT:-unset}
+    profiles: ["build"]
+
+  cb-ext-noassert:
+    image: pg_accel/cb-ext-noassert:${CB_COMMIT:-unset}
+    build:
+      <<: *port-ext
+      args:
+        PG_IMAGE: pg_accel/pg19-patched-noassert:${PG_PATCHED_COMMIT:-unset}
+        CB_REF: ${CB_COMMIT:-unset}
+      labels:
+        org.pg_accel.pg_commit: ${PG_PATCHED_COMMIT:-unset}
+        org.pg_accel.cb_commit: ${CB_COMMIT:-unset}
+    profiles: ["build"]
+
+  clickbench-vanilla:
+    image: pg_accel/clickbench-vanilla:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.clickbench
+      args:
+        PG_VANILLA_IMAGE: ${PG_VANILLA_IMAGE:-cloudberry/pg19-vanilla:latest}
+        PG_VANILLA_NOASSERT_IMAGE: ${PG_VANILLA_NOASSERT_IMAGE:-cloudberry/pg19-vanilla-noassert:latest}
+    profiles: ["build"]
+
+  # The vanilla route, and DuckDB's side of the suite: the subsets, the
+  # references, and the reports.
+  vanilla:
+    <<: *run
+    image: pg_accel/clickbench-vanilla:latest
+    profiles: ["run"]
+
+  # The ORCA route: the port, a coordinator and its segments in one container.
+  # ORCA_IMAGE is cb-ext's, with assertions, for check mode, and
+  # cb-ext-noassert's for time mode.
+  orca:
+    <<: *run
+    image: ${ORCA_IMAGE:-unset}
+    profiles: ["run"]

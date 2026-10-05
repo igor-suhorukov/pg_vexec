@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: Apache-2.0
+#
+# The vanilla leg of pg_vector_executor.md §6.4 for ClickBench's suite: the
+# port's two builds of vanilla PostgreSQL 19 (REL_19_STABLE), with assertions
+# for check mode and without them for time mode, in one image as the port's
+# compare image has them (pg19/docker/Dockerfile.compare); and DuckDB, pinned
+# as the port's tpc suite pins it, which gives the suite its reference answers.
+
+ARG PG_VANILLA_IMAGE=cloudberry/pg19-vanilla:latest
+ARG PG_VANILLA_NOASSERT_IMAGE=cloudberry/pg19-vanilla-noassert:latest
+
+FROM ${PG_VANILLA_IMAGE} AS vanilla
+FROM ${PG_VANILLA_NOASSERT_IMAGE} AS vanilla-noassert
+
+FROM debian:trixie-slim
+USER root
+# The servers' libraries, as the port's runtime images have them; Python for
+# the suite, and its venv for DuckDB; pigz to read the dataset.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libreadline8t64 zlib1g libicu76 libssl3t64 liblz4-1 libzstd1 libxml2 libxslt1.1 \
+        libpython3.13 libldap2 ca-certificates locales tzdata procps \
+        python3 python3-venv pigz mawk \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 -s /bin/bash postgres
+
+ARG DUCKDB_VERSION=1.5.5
+RUN python3 -m venv /opt/duckdb \
+    && /opt/duckdb/bin/pip install --no-cache-dir "duckdb==${DUCKDB_VERSION}" \
+    && chmod -R a+rX /opt/duckdb
+
+COPY --from=vanilla /usr/local/pgsql /pg/vanilla
+COPY --from=vanilla-noassert /usr/local/pgsql /pg/vanilla-noassert
+
+ENV TMPDIR=/tmp
+USER postgres
+WORKDIR /home/postgres
