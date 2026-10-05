@@ -1,10 +1,11 @@
 -- SPDX-License-Identifier: Apache-2.0
 --
--- The vectorized planner in V0 (pg_vector_executor.md §3.3, §5): its hooks
--- in place, which in off mode build nothing and in explain mode only cost
--- and record the vector alternatives; EXPLAIN's vexec option, which prints
--- them; the statement's gates; the oracle's refusals; and plans that stay
--- PostgreSQL's in every mode, since no vector node exists before V1.
+-- The vectorized planner (pg_vector_executor.md §3.3, §5 V0 and V1): its
+-- hooks, which in off mode build nothing and in explain mode only cost and
+-- record the vector alternatives; EXPLAIN's vexec option, which prints them
+-- and what became of each; the statement's gates; the oracle's refusals;
+-- plans that stay PostgreSQL's in off and explain mode; and from V1 the
+-- VecScan paths auto and force mode add.
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vexec;
@@ -85,8 +86,8 @@ EXPLAIN (VEXEC, COSTS OFF)
 WITH c AS MATERIALIZED (SELECT vt.a FROM vt JOIN vu USING (a))
 SELECT * FROM vt JOIN vu USING (a) JOIN c USING (a);
 
--- auto and force: no vector node exists yet, so the plan is PostgreSQL's,
--- and EXPLAIN (VEXEC) says why
+-- auto and force: the VecScan path is added -- in force mode as the
+-- relation's scan -- and the other nodes come in V2 to V4
 SET vexec.mode = auto;
 EXPLAIN (VEXEC, COSTS OFF) SELECT b, count(*) FROM vt GROUP BY b;
 SET vexec.mode = force;
@@ -96,9 +97,17 @@ SET vexec.batch_format = arrow;
 EXPLAIN (VEXEC, COSTS OFF) SELECT count(*) FROM vt;
 RESET vexec.batch_format;
 
--- a test that needs a vector node fails where none was built
+-- a test that needs a vector node fails where one was possible and none
+-- was built: here the cost model prices the vector scan above the row scan
 SET vexec.debug_require_vector = on;
 SELECT count(*) FROM vt;
+SET vexec.mode = auto;
+SET vexec.cpu_tuple_factor = 100;
+SELECT count(*) FROM vt;
+RESET vexec.cpu_tuple_factor;
+-- and a statement with no table a vector node could scan requires none
+SELECT 1 AS one;
+SET vexec.mode = force;
 RESET vexec.debug_require_vector;
 
 -- in explain mode it requires nothing
@@ -137,7 +146,8 @@ FROM (SELECT l::json->0 AS plan FROM explain_lines('EXPLAIN (VEXEC, FORMAT JSON)
      json_array_elements(p.plan->'Vexec'->'Alternatives') alt;
 RESET vexec.convert_cost;
 
--- plans are PostgreSQL's in every mode, costs and all
+-- plans are PostgreSQL's in off and explain mode, costs and all; auto and
+-- force differ where a VecScan is chosen
 CREATE TABLE vexec_plans (mode text, query int4, plan text);
 DO $$
 DECLARE
@@ -161,7 +171,10 @@ BEGIN
 	END LOOP;
 END
 $$;
-SELECT query, count(DISTINCT plan) AS plans FROM vexec_plans GROUP BY query ORDER BY query;
+SELECT query, count(DISTINCT plan) AS plans FROM vexec_plans
+WHERE mode IN ('off', 'explain') GROUP BY query ORDER BY query;
+SELECT query, bool_or(plan LIKE '%Vec Seq Scan%') AS vector_in_force FROM vexec_plans
+WHERE mode = 'force' GROUP BY query ORDER BY query;
 
 -- the plan check walks every plan, subplans included
 SET vexec.debug_check_plans = on;

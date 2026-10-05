@@ -84,12 +84,22 @@ vexec_alt_refuse(VexecPlanState *ps, VexecAlt *alt, const char *reason)
 /*
  * It was possible, at this cost, as the detail describes it.  A join
  * relation keeps the cheapest of its alternatives, with that one's detail.
- * Why it was not chosen follows from the mode: in V0 there is no vector
- * node to choose.
+ * What became of it follows from the mode and the node:
+ *
+ *	explain mode	not chosen: alternatives are costed and recorded, never
+ *					chosen
+ *	VecScan			added, as a path that competes in add_path by cost
+ *					(auto), or that is the relation's scan (force); in
+ *					ORCA's plans built, or not chosen where vexec's cost
+ *					model prices it above ORCA's row scan
+ *	VecResult		built, in ORCA's plans
+ *	the others		not built: their nodes come in V2 to V4
  */
 void
 vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const char *detail)
 {
+	bool		scan_or_result;
+
 	if (alt == NULL)
 		return;
 	if (alt->possible && alt->cost.total >= 0 && alt->cost.total <= cost->total)
@@ -97,8 +107,37 @@ vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const
 	alt->possible = true;
 	alt->cost = *cost;
 	alt->detail = detail ? MemoryContextStrdup(ps->mcxt, detail) : NULL;
-	alt->reason = ps->mode == VEXEC_MODE_EXPLAIN ?
-		"explain mode" : "no vector node is built yet (V0)";
+	scan_or_result = strcmp(alt->node, "VecScan") == 0 || strcmp(alt->node, "VecResult") == 0;
+	if (ps->mode == VEXEC_MODE_EXPLAIN)
+	{
+		alt->status = "not chosen";
+		alt->reason = "explain mode";
+	}
+	else if (!scan_or_result)
+	{
+		alt->status = "not built";
+		alt->reason = strcmp(alt->node, "VecAgg") == 0 ? "VecAgg is built from V2" :
+			strcmp(alt->node, "VecHashJoin") == 0 ? "VecHashJoin is built from V3" :
+			"VecSort is built from V4";
+	}
+	else if (alt->root != NULL)
+	{
+		/* PostgreSQL's planner: a path */
+		alt->status = "added";
+		alt->reason = ps->mode == VEXEC_MODE_FORCE ?
+			"forced: the relation's scan, beside its partial paths" : "to be chosen by cost";
+	}
+	else if (ps->mode == VEXEC_MODE_AUTO && cost->row_total > 0 && cost->total >= cost->row_total)
+	{
+		/* ORCA's plans: built or not, here */
+		alt->status = "not chosen";
+		alt->reason = "dearer than ORCA's row node, by vexec's cost model";
+	}
+	else
+	{
+		alt->status = "built";
+		alt->reason = ps->mode == VEXEC_MODE_FORCE ? "forced" : "cheaper";
+	}
 }
 
 /* The names of a set of base relations, as EXPLAIN calls them. */
@@ -171,6 +210,8 @@ vexec_reasons_node(VexecPlanState *ps)
 		a = lappend(a, item_string("node", alt->node));
 		a = lappend(a, item_string("target", alt->target));
 		a = lappend(a, makeDefElem(pstrdup("possible"), (Node *) makeBoolean(alt->possible), -1));
+		if (alt->possible)
+			a = lappend(a, item_string("status", alt->status ? alt->status : "?"));
 		a = lappend(a, item_string("reason", alt->reason ? alt->reason : "?"));
 		if (alt->detail)
 			a = lappend(a, item_string("detail", alt->detail));

@@ -20,10 +20,24 @@ OBJS = \
 	batch/numeric.o \
 	batch/rows.o \
 	batch/types.o \
+	exec/methods.o \
+	exec/node.o \
+	exec/vecresult.o \
+	exec/vecscan.o \
+	expr/compile.o \
+	expr/eval.o \
+	expr/k_arith.o \
+	expr/k_compare.o \
+	expr/k_datetime.o \
+	expr/k_numeric.o \
+	expr/k_text.o \
+	expr/kernels.o \
+	plan/build.o \
 	plan/check.o \
 	plan/cost.o \
 	plan/explain.o \
 	plan/oracle.o \
+	plan/orca.o \
 	plan/paths.o \
 	plan/reasons.o \
 	source/registry.o
@@ -36,7 +50,7 @@ DATA = vexec--1.0.sql
 # into the server's include directory, under extension/vexec/.
 HEADERS = ../../include/vexec_source.h
 
-REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts
+REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_scan
 
 PG_CPPFLAGS = -I$(srcdir) -I$(srcdir)/pgxs/include -I$(srcdir)/../../include
 

@@ -12,11 +12,10 @@
  *	- Plan node ids are unique over the tree and every subplan, which
  *	  EXPLAIN ANALYZE on a cluster and parallel query's DSM keys rely on.
  *	- A plan made in off or explain mode has no vector node.
- *	- From V1, every vector node's column map points at a child column of
- *	  the right type, and its expressions compile.
+ *	- Every vector node is in its canonical form (plan/build.c).
  *
  * It returns how many vector nodes the plan has, for
- * vexec.debug_require_vector.  V0 builds none.
+ * vexec.debug_require_vector.
  *
  *-------------------------------------------------------------------------
  */
@@ -26,6 +25,7 @@
 #include "nodes/plannodes.h"
 
 #include "vexec.h"
+#include "exec/exec.h"
 #include "plan/plan.h"
 
 typedef struct CheckContext
@@ -34,12 +34,26 @@ typedef struct CheckContext
 	int			vector_nodes;
 } CheckContext;
 
-/* Whether a CustomScan is one of vexec's vector nodes: none until V1. */
+/*
+ * Whether a CustomScan is one of vexec's vector nodes, and that it is in
+ * its canonical form (build.c): a VecScan scans a relation with no
+ * custom_scan_tlist; a VecResult has its child in lefttree and no
+ * relation.
+ */
 static bool
 is_vector_node(CustomScan *cscan)
 {
-	(void) cscan;
-	return false;
+	if (!vexec_is_vector_node((Plan *) cscan))
+		return false;
+	if (cscan->methods == vexec_scan_methods())
+	{
+		if (cscan->scan.scanrelid == 0 || cscan->custom_scan_tlist != NIL ||
+			cscan->scan.plan.lefttree != NULL)
+			elog(ERROR, "vexec plan check: a VecScan not in its canonical form");
+	}
+	else if (cscan->scan.scanrelid != 0 || cscan->scan.plan.lefttree == NULL)
+		elog(ERROR, "vexec plan check: a VecResult not in its canonical form");
+	return true;
 }
 
 static void

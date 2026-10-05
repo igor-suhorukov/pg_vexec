@@ -42,6 +42,7 @@
 
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
+#include "utils/rel.h"
 #include "utils/spccache.h"
 
 #include "vexec.h"
@@ -193,4 +194,39 @@ vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, VexecCost *cost)
 	cost->rowout = vexec_convert_cost * path_width_cols(rowpath) * rowpath->rows;
 	cost->startup = rowpath->startup_cost + vexec_batch_setup_cost + cost->convert_in;
 	cost->total = rowpath->total_cost + vexec_batch_setup_cost + cost->convert_in + cost->rowout;
+}
+
+/*
+ * A scan ORCA's translator built, priced as a row scan and as a vector scan
+ * in PostgreSQL's units: the table's pages, its tuples, and the oracle's
+ * counts of the quals' and the target's steps, at cpu_operator_cost a step.
+ * ORCA's own costs are in its units, and its choices in V1 are its own; in
+ * auto mode its scan becomes a vector scan where this prices it lower (V5's
+ * CCostModelVec prices vector operators inside ORCA's search).
+ */
+void
+vexec_cost_plan_scan(Relation rel, const VexecSteps *quals, const VexecSteps *target,
+					 int ncols_in, int ncols_out, double rows, VexecCost *cost)
+{
+	double		tuples = Max(rel->rd_rel->reltuples, rows);
+	double		pages = Max(rel->rd_rel->relpages, 0);
+	double		disk = seq_page_cost * pages;
+	double		qual_ops = quals->kernel + quals->fallback;
+	double		target_ops = target->kernel + target->fallback;
+	Cost		row_cpu;
+	Cost		cpu;
+
+	memset(cost, 0, sizeof(VexecCost));
+	row_cpu = (cpu_tuple_cost + cpu_operator_cost * qual_ops) * tuples +
+		cpu_operator_cost * target_ops * rows;
+	cpu = cpu_tuple_cost * vexec_cpu_tuple_factor * tuples +
+		cpu_operator_cost * (quals->kernel * vexec_cpu_operator_factor + quals->fallback) * tuples +
+		cpu_operator_cost * (target->kernel * vexec_cpu_operator_factor + target->fallback) * rows;
+	cost->rows = rows;
+	cost->row_startup = 0;
+	cost->row_total = disk + row_cpu;
+	cost->convert_in = vexec_convert_cost * ncols_in * tuples;
+	cost->rowout = vexec_convert_cost * ncols_out * rows;
+	cost->startup = vexec_batch_setup_cost;
+	cost->total = cost->startup + disk + cpu + cost->convert_in + cost->rowout;
 }

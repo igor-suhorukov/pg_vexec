@@ -31,6 +31,23 @@ if [ -n "$changed" ]; then
 	fail=1
 fi
 
+# the working trees of this work's worktrees, whose changes are not
+# committed yet (V1's: ../cloudberry-vexec/wt and the readers')
+git -C "$CB_SRC" worktree list --porcelain | awk '/^worktree /{w=$2} /^branch refs\/heads\/vexec/{print w}' |
+while read -r wt; do
+	changed=$(git -C "$wt" status --porcelain --untracked-files=all | cut -c4- | sed 's/.* -> //' | outside)
+	if [ -n "$changed" ]; then
+		echo "  $wt's working tree changes paths outside pg19/:"
+		echo "$changed" | sed 's/^/    /' | head -20
+		echo FAIL
+	else
+		echo "  ok $wt: $(git -C "$wt" status --porcelain --untracked-files=all | wc -l) paths changed in its working tree, all under pg19/"
+	fi
+done > "${TMPDIR:-/tmp}/vexec-tree-wt.$$"
+cat "${TMPDIR:-/tmp}/vexec-tree-wt.$$" | grep -v '^FAIL$'
+grep -q '^FAIL$' "${TMPDIR:-/tmp}/vexec-tree-wt.$$" && fail=1
+rm -f "${TMPDIR:-/tmp}/vexec-tree-wt.$$"
+
 branches="${CB_BRANCHES:-$( (git -C "$CB_SRC" branch --format='%(refname:short)' --list 'vexec*'; git -C "$CB_SRC" branch --show-current) | sort -u)}"
 for b in $branches; do
 	paths=$(git -C "$CB_SRC" diff --name-only "$BASE...$b" | outside)

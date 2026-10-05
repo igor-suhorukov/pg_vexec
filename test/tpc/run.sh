@@ -31,7 +31,8 @@
 #   TPC_VEXEC     vexec in every node's shared_preload_libraries, after the
 #                 port's modules: 1 (where it is installed), 0
 #   TPC_VEXEC_MODE  each query's vexec.mode: off; TPC_VEXEC_FORMAT its
-#                 vexec.batch_format: postgres
+#                 vexec.batch_format: postgres.  In force mode a query
+#                 planned without the vector nodes it could have fails
 #
 # and a cluster secret long enough for gp_core, which refuses one under 16
 # characters (pg19/modules/gp_core/gp_cluster.c:135): "tpc-" and three
@@ -115,6 +116,10 @@ if [ "${TPC_VEXEC:-1}" = 1 ] && [ -f "$("$BINDIR/pg_config" --pkglibdir)/vexec.s
 fi
 VEXEC_OPTIONS=""
 [ -n "$VEXEC_PRELOAD" ] && VEXEC_OPTIONS="-c vexec.mode=${TPC_VEXEC_MODE:-off} -c vexec.batch_format=${TPC_VEXEC_FORMAT:-postgres}"
+# in force mode, a statement planned without a vector node where one could
+# be built fails (vexec.debug_require_vector): every query's plan is then
+# known to carry its vector scans
+[ -n "$VEXEC_PRELOAD" ] && [ "${TPC_VEXEC_MODE:-off}" = force ] && VEXEC_OPTIONS="$VEXEC_OPTIONS -c vexec.debug_require_vector=on"
 SF="${TPC_SF:-1}"
 KINDS="${TPC_KINDS:-h ds}"
 SEGMENTS="${TPC_SEGMENTS:-4}"

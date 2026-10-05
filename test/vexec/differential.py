@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The differential runner's comparison (pg_vector_executor.md §6.1).
 
-  differential.py <corpus dir> <session>... [--kept <dir>]
+  differential.py <corpus dir> <session>... [--kept <dir>] [--keep <test>,...]
 
 Each session is a directory of pg_regress's results/ for one corpus, run
 with vexec in one configuration, beside its server's log.  The first
@@ -10,7 +10,8 @@ session is the reference -- vexec.mode = off, PostgreSQL's own executor --
 and every other is compared with it, test by test:
 
   - the rows of every result, sorted unless the statement orders them
-    (an ORDER BY in its text);
+    (an ORDER BY in its text outside parentheses: one in a subquery, a
+    CTE, a window or an aggregate orders nothing the statement returns);
   - EXPLAIN's output is dropped: plans are where the sessions are meant to
     differ;
   - the primary error messages, as psql prints them, in order;
@@ -21,6 +22,15 @@ and every other is compared with it, test by test:
 A difference a corpus keeps on purpose is a file <kept>/<session>/<test>.diff
 holding exactly the difference the comparison prints; any other difference
 fails the run.  Exits 1 when one does.
+
+--keep writes the named tests' differences, as this run finds them, into
+<kept>/<session>/, once they are reviewed: never a test that is not named.
+
+A corpus whose output varies from run to run of the same settings -- object
+ids, temporary schemas' numbers -- names what varies in <kept>/volatile: a
+regular expression a line, each match -- or each of its groups, when it has
+them -- replaced by "#" in every session's results before they are compared;
+"@<test> <expression>" for one test's results alone.
 """
 
 import collections
@@ -49,28 +59,65 @@ def logical_rows(lines):
     return rows
 
 
-def normalize(path):
+def orders_rows(text):
+    """Whether a statement orders its rows: an ORDER BY at its top level."""
+    text = re.sub(r'--[^\n]*', ' ', text)
+    text = re.sub(r"'(?:[^']|'')*'", "''", text)
+    inner = re.compile(r'\([^()]*\)')
+    while inner.search(text):
+        text = inner.sub(' ', text)
+    return bool(ORDER_BY.search(text))
+
+
+def is_table_header(line, sep):
+    """A result's header: a separator line as wide as the header, as psql
+    prints its aligned format.  A SQL comment of dashes alone ("--") after a
+    comment line is not one."""
+    if not line.strip() or not TABLE_SEP.match(sep) or TABLE_SEP.match(line):
+        return False
+    if len(sep) == len(line):
+        return True
+    # a header of characters wider than one column: psql pads by display width
+    return any(ord(c) > 127 for c in line) and len(sep) >= len(line.strip())
+
+
+def volatile_mark(m):
+    """A volatile match with "#" for it, or for each of its groups."""
+    if not m.re.groups:
+        return '#'
+    text, at = '', m.start()
+    for g in range(1, m.re.groups + 1):
+        if m.start(g) < 0:
+            continue
+        text += m.string[at:m.start(g)] + '#'
+        at = m.end(g)
+    return text + m.string[at:m.end()]
+
+
+def normalize(path, volatile=()):
     """A results file with plans dropped and unordered results sorted."""
     with open(path, encoding='utf-8', errors='replace') as f:
         lines = f.read().split('\n')
+    for v in volatile:
+        lines = [v.sub(volatile_mark, line) for line in lines]
     out = []
     query = []
     i = 0
     n = len(lines)
     while i < n:
         line = lines[i]
-        if i + 1 < n and TABLE_SEP.match(lines[i + 1]) and line.strip():
+        if i + 1 < n and is_table_header(line, lines[i + 1]):
             j = i + 2
             body = []
-            while j < n and not FOOTER.match(lines[j]):
+            while j < n and not FOOTER.match(lines[j]) and lines[j] != '':
                 body.append(lines[j])
                 j += 1
-            text = ' '.join(query)
+            text = '\n'.join(query)
             if 'QUERY PLAN' in line or EXPLAIN.search(text):
                 out.append('<plan>')
             else:
                 rows = logical_rows(body)
-                if not ORDER_BY.search(text):
+                if not orders_rows(text):
                     rows.sort()
                 out.append(line)
                 out.append(lines[i + 1])
@@ -102,7 +149,7 @@ def sqlstates(session_dir):
     return states
 
 
-def compare(reference, other):
+def compare(reference, other, volatile=()):
     """The differences of one session's results from the reference's."""
     diffs = {}
     ref_res = os.path.join(reference, 'results')
@@ -116,8 +163,9 @@ def compare(reference, other):
         if not os.path.exists(b_path):
             diffs[t] = 'no results in this session\n'
             continue
-        a = normalize(a_path)
-        b = normalize(b_path)
+        mine = [v for (test, v) in volatile if test in (None, t)]
+        a = normalize(a_path, mine)
+        b = normalize(b_path, mine)
         d = ''.join(difflib.unified_diff([x + '\n' for x in a], [x + '\n' for x in b],
                                          'reference', 'session', n=2))
         sa = sorted(ref_states.get(t, []))
@@ -132,22 +180,47 @@ def compare(reference, other):
 
 def main(argv):
     kept = None
+    keep = set()
     if '--kept' in argv:
         k = argv.index('--kept')
         kept = argv[k + 1]
         argv = argv[:k] + argv[k + 2:]
+    if '--keep' in argv:
+        k = argv.index('--keep')
+        keep = set(t for t in argv[k + 1].split(',') if t)
+        argv = argv[:k] + argv[k + 2:]
+        if kept is None:
+            print('--keep needs --kept')
+            return 2
     if len(argv) < 3:
         print(__doc__)
         return 2
     corpus, sessions = argv[0], argv[1:]
     reference = os.path.join(corpus, sessions[0])
+    volatile = []
+    vfile = os.path.join(kept, 'volatile') if kept else None
+    if vfile and os.path.exists(vfile):
+        with open(vfile) as f:
+            for l in f:
+                l = l.rstrip('\n')
+                if not l.strip() or l.startswith('#'):
+                    continue
+                test = None
+                if l.startswith('@'):
+                    test, l = l[1:].split(' ', 1)
+                volatile.append((test, re.compile(l)))
     failed = False
     for s in sessions[1:]:
-        diffs, tests = compare(reference, os.path.join(corpus, s))
+        diffs, tests = compare(reference, os.path.join(corpus, s), volatile)
         unexpected = {}
         kept_ok = 0
         for t, d in diffs.items():
             kfile = os.path.join(kept, s, t + '.diff') if kept else None
+            if t in keep:
+                os.makedirs(os.path.dirname(kfile), exist_ok=True)
+                with open(kfile, 'w') as f:
+                    f.write(d)
+                print('    %s: its difference kept in %s' % (t, kfile))
             if kfile and os.path.exists(kfile) and open(kfile).read() == d:
                 kept_ok += 1
             else:

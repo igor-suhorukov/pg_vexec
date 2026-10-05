@@ -7,8 +7,7 @@
  * vexec is the vectorized planner and executor of pg_vector_executor.md, as
  * one extension on the hooks PostgreSQL 19 already has.  Its parts are the
  * vectorized planner (plan/), the batch layer (batch/), the batch sources
- * (source/), and from V1 the executor's nodes (exec/) and expressions
- * (expr/).  This header holds the settings of §3.12 and the few things more
+ * (source/), the executor's nodes (exec/) and their expressions (expr/).  This header holds the settings of §3.12 and the few things more
  * than one part reads.
  *
  *-------------------------------------------------------------------------
@@ -18,7 +17,7 @@
 
 #include "utils/guc.h"
 
-#define VEXEC_VERSION	"0.1.0"
+#define VEXEC_VERSION	"0.2.0"
 
 /*
  * What vexec exports to other modules of its own repository's tests
@@ -130,5 +129,8 @@ extern void vexec_explain_install(void);
 
 /* source/registry.c */
 extern void vexec_source_registry_install(void);
+
+/* exec/methods.c: the vector nodes' methods, registered by name */
+extern void vexec_exec_install(void);
 
 #endif							/* VEXEC_H */

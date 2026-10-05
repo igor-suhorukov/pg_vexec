@@ -36,6 +36,15 @@
 #   CB_WORKERS   port: parallel workers per segment, 0 (as the tpc suite's
 #                TPC_WORKERS, gp.enable_parallel on above 0)
 #   CB_PAX_WITH  PAX's table options in place of the suite's
+#   CB_VEXEC     vexec's sessions, each one more configuration of each
+#                planner, "<planner>+<session>": force-postgres, force-arrow
+#                (vexec.mode = force in that format), auto-postgres,
+#                auto-arrow, and each with -serial, without parallel workers
+#                -- V1's vector scans have no partial path (V4 gives them
+#                one), so in force mode a parallel row scan still wins where
+#                workers are allowed.  vexec is then preloaded on every node,
+#                and the planners without a session run it in off mode.  The
+#                container starts through vexec-entry.sh, which installs it
 #   CB_OUT       the run's directory under /runs, which run.sh names
 #   KEEP         keep the servers' data directories
 #
@@ -69,6 +78,21 @@ case "$ROUTE:$STORAGE" in
 	port:aoco|port:porc|port:porc_vec) PLANNERS="${CB_PLANNERS:-orca planner}" ;;
 	*) die "CB_ROUTE and CB_STORAGE: vanilla with heap or heap_pk, port with aoco, porc or porc_vec" ;;
 esac
+VEXEC="${CB_VEXEC:-}"
+if [ -n "$VEXEC" ]; then
+	all=""
+	for p in $PLANNERS; do
+		all="$all $p"
+		for v in $VEXEC; do
+			case "$v" in force-postgres|force-arrow|auto-postgres|auto-arrow) ;;
+				force-postgres-serial|force-arrow-serial|auto-postgres-serial|auto-arrow-serial) ;;
+				*) die "no vexec session $v" ;;
+			esac
+			all="$all $p+$v"
+		done
+	done
+	PLANNERS="${all# }"
+fi
 case "$COLD" in evict|none) ;; *) die "CB_COLD is evict or none" ;; esac
 [ -n "$OUT" ] || die "CB_OUT is not set"
 [ "$MODE" = check ] && { REPS=1; TRIES=1; }
@@ -173,6 +197,7 @@ for n in $NODES; do
 		echo "port = $(port "$n")"
 		# the temporary files of EXPLAIN ANALYZE's queries, from the log
 		echo "log_temp_files = 0"
+		[ -n "$VEXEC" ] && [ "$ROUTE" = vanilla ] && echo "shared_preload_libraries = 'vexec'"
 		if [ "$ROUTE" = vanilla ]; then
 			# ClickBench's PostgreSQL settings (postgresql/install), the
 			# container's memory for the machine's
@@ -186,7 +211,7 @@ for n in $NODES; do
 			echo "work_mem = 64MB"
 		else
 			# the port's, as its tpc suite runs a cluster
-			echo "shared_preload_libraries = 'gp_core,gp_orca,gp_sql,gp_ao,pax'"
+			echo "shared_preload_libraries = 'gp_core,gp_orca,gp_sql,gp_ao,pax${VEXEC:+,vexec}'"
 			echo "gp.cluster_config = '$CONF'"
 			echo "gp.dbid = $((n + 1))"
 			echo "gp.cluster_secret = '$SECRET'"
@@ -311,7 +336,7 @@ q clickbench "SELECT json_build_object('version', version(),
 
 cat > "$OUT/config.json" <<EOF
 {"mode": "$MODE", "route": "$ROUTE", "storage": "$STORAGE", "segments": $([ "$ROUTE" = port ] && echo "$SEGMENTS" || echo 0),
- "planners": "$PLANNERS", "subset": "$SUBSET", "rows": $ROWS, "reps": $REPS, "tries": $TRIES,
+ "planners": "$PLANNERS", "vexec": "$VEXEC", "subset": "$SUBSET", "rows": $ROWS, "reps": $REPS, "tries": $TRIES,
  "timeout_s": $TIMEOUT, "cold": "$COLD", "stats": "${CB_STATS:-}", "workers": $WORKERS,
  "queries": [$(echo $QUERIES | tr ' ' ',')], "date": "$(date +%F)", "host": "${CLICKBENCH_HOST:-}",
  "table": $(printf '%s' "$(cat "$WORK/create.sql")" | "$PY" -c 'import json, sys; print(json.dumps(sys.stdin.read()))')}
@@ -320,14 +345,24 @@ EOF
 # --- the queries ---------------------------------------------------------------
 
 opts() {					# opts <planner> [timeout]: the session's settings
-	local o=""
+	local o="" base="${1%%+*}" v=""
+	[ "$1" != "$base" ] && v="${1#*+}"
 	[ -n "${2:-}" ] && o="-c statement_timeout=${2}s"
 	if [ "$ROUTE" = port ]; then
-		case "$1" in
+		case "$base" in
 			orca) o="$o -c gp.optimizer=on -c gp.optimizer_trace_fallback=on" ;;
 			planner) o="$o -c gp.optimizer=off" ;;
 		esac
 		[ "$WORKERS" -gt 0 ] && o="$o -c gp.enable_parallel=on -c max_parallel_workers_per_gather=$WORKERS"
+	fi
+	# vexec's session: its mode and format; off where the planner has none
+	if [ -n "$VEXEC" ]; then
+		case "$v" in
+			'') o="$o -c vexec.mode=off" ;;
+			*-serial) v="${v%-serial}"
+				o="$o -c vexec.mode=${v%%-*} -c vexec.batch_format=${v#*-} -c max_parallel_workers_per_gather=0" ;;
+			*) o="$o -c vexec.mode=${v%%-*} -c vexec.batch_format=${v#*-}" ;;
+		esac
 	fi
 	echo "$o"
 }

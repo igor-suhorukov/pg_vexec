@@ -1,0 +1,18 @@
+# What differs from run to run of the singlenode suite with the same settings
+# (differential.py): a regular expression a line, its groups replaced.
+#
+# a temporary schema's number: the backend's slot, as the parallel groups'
+# connections come and go
+pg_temp_(\d+)
+# a resource queue's object id, and an access method's, which the parallel
+# groups allocate in no fixed order
+resource queue id: (\d+)
+^ mpp5992\S*\s+\| (\d+) \|
+# the WAL an ANALYZE writes, and the buffers it reads: a sample is drawn
+# at random
+^WAL usage: (.*)$
+^buffer usage: (.*)$
+# whether VACUUM could drop an append-only table's old segment file: other
+# tests' snapshots decide (the tests themselves ignore this output)
+@brin_ao ^ +-1 \| +(\d+) \| +(\d+) \| +(\d+)$
+@brin_aocs ^ +-1 \| +(\d+) \| +(\d+) \| +(\d+)$

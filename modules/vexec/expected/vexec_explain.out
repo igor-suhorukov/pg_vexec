@@ -1,10 +1,11 @@
 -- SPDX-License-Identifier: Apache-2.0
 --
--- The vectorized planner in V0 (pg_vector_executor.md §3.3, §5): its hooks
--- in place, which in off mode build nothing and in explain mode only cost
--- and record the vector alternatives; EXPLAIN's vexec option, which prints
--- them; the statement's gates; the oracle's refusals; and plans that stay
--- PostgreSQL's in every mode, since no vector node exists before V1.
+-- The vectorized planner (pg_vector_executor.md §3.3, §5 V0 and V1): its
+-- hooks, which in off mode build nothing and in explain mode only cost and
+-- record the vector alternatives; EXPLAIN's vexec option, which prints them
+-- and what became of each; the statement's gates; the oracle's refusals;
+-- plans that stay PostgreSQL's in off and explain mode; and from V1 the
+-- VecScan paths auto and force mode add.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vexec;
 RESET client_min_messages;
@@ -62,7 +63,7 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT b, count(*), sum(d) FROM vt WHERE a > 10 GROUP
                Filter: (a > 10)
  Vexec: mode explain, format postgres
    VecScan on vt: not chosen (explain mode)
-     source: the slot path; quals: 0 kernel steps, 1 fallback step; target: 0 kernel steps, 0 fallback steps
+     source: the slot path; quals: 1 kernel step, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecAgg on GROUP BY: not chosen (explain mode)
      hashed, 1 grouping column, 2 aggregates; transitions through fmgr
    VecSort on ORDER BY: not chosen (explain mode)
@@ -82,9 +83,9 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT * FROM vt JOIN vu USING (a) WHERE vu.e > 1;
    VecScan on vt: not chosen (explain mode)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecScan on vu: not chosen (explain mode)
-     source: the slot path; quals: 0 kernel steps, 1 fallback step; target: 0 kernel steps, 0 fallback steps
+     source: the slot path; quals: 1 kernel step, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecHashJoin on vt, vu: not chosen (explain mode)
-     inner join, outer vt, inner vu; 1 hash clause, 0 with kernels
+     inner join, outer vt, inner vu; 1 hash clause, 1 with kernels
 (13 rows)
 
 EXPLAIN (VEXEC, COSTS OFF) SELECT * FROM vt LEFT JOIN vu ON vt.a = vu.a;
@@ -101,7 +102,7 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT * FROM vt LEFT JOIN vu ON vt.a = vu.a;
    VecScan on vu: not chosen (explain mode)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecHashJoin on vt, vu: not chosen (explain mode)
-     left join, outer vt, inner vu; 1 hash clause, 0 with kernels
+     left join, outer vt, inner vu; 1 hash clause, 1 with kernels
 (12 rows)
 
 EXPLAIN (VEXEC, COSTS OFF) SELECT * FROM vt WHERE EXISTS (SELECT 1 FROM vu WHERE vu.a = vt.a);
@@ -118,7 +119,7 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT * FROM vt WHERE EXISTS (SELECT 1 FROM vu WHERE
    VecScan on vu: not chosen (explain mode)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecHashJoin on vt, vu: not chosen (explain mode)
-     semi join, outer vt, inner vu; 1 hash clause, 0 with kernels
+     semi join, outer vt, inner vu; 1 hash clause, 1 with kernels
 (12 rows)
 
 EXPLAIN (VEXEC, COSTS OFF) SELECT * FROM vt FULL JOIN vu ON vt.a = vu.a;
@@ -363,15 +364,15 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT a FROM vt WHERE b < (SELECT max(e) FROM vu WHE
                  Filter: (a = vt.a)
  Vexec: mode explain, format postgres
    VecScan on vu (minmax_1): not chosen (explain mode)
-     source: the slot path; quals: 0 kernel steps, 1 fallback step; target: 0 kernel steps, 0 fallback steps
+     source: the slot path; quals: 1 kernel step, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecScan on vu (minmax_2): not chosen (explain mode)
-     source: the slot path; quals: 0 kernel steps, 1 fallback step; target: 0 kernel steps, 0 fallback steps
+     source: the slot path; quals: 1 kernel step, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecScan on vu (expr_1): not chosen (explain mode)
-     source: the slot path; quals: 0 kernel steps, 1 fallback step; target: 0 kernel steps, 0 fallback steps
+     source: the slot path; quals: 1 kernel step, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecAgg on aggregates (expr_1): not chosen (explain mode)
      plain, 0 grouping columns, 1 aggregate; transitions through fmgr
    VecScan on vt: not chosen (explain mode)
-     source: the slot path; quals: 0 kernel steps, 5 fallback steps; target: 0 kernel steps, 0 fallback steps
+     source: the slot path; quals: 3 kernel steps, 2 fallback steps; target: 0 kernel steps, 0 fallback steps
 (17 rows)
 
 -- each query level numbers its relations from 1: a CTE's join and the
@@ -402,34 +403,34 @@ SELECT * FROM vt JOIN vu USING (a) JOIN c USING (a);
    VecScan on vu (c): not chosen (explain mode)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecHashJoin on vt, vu (c): not chosen (explain mode)
-     inner join, outer vt (c), inner vu (c); 1 hash clause, 0 with kernels
+     inner join, outer vt (c), inner vu (c); 1 hash clause, 1 with kernels
    VecScan on vt: not chosen (explain mode)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecScan on vu: not chosen (explain mode)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecHashJoin on vt, vu: not chosen (explain mode)
-     inner join, outer vt, inner vu; 1 hash clause, 0 with kernels
+     inner join, outer vt, inner vu; 1 hash clause, 1 with kernels
    VecHashJoin on vt, c: not chosen (explain mode)
-     inner join, outer vt, inner c; 1 hash clause, 0 with kernels
+     inner join, outer vt, inner c; 1 hash clause, 1 with kernels
    VecHashJoin on vu, c: not chosen (explain mode)
-     inner join, outer vu, inner c; 1 hash clause, 0 with kernels
+     inner join, outer vu, inner c; 1 hash clause, 1 with kernels
    VecHashJoin on vt, vu, c: not chosen (explain mode)
-     inner join, outer vt, vu, inner c; 1 hash clause, 0 with kernels
+     inner join, outer vt, vu, inner c; 1 hash clause, 1 with kernels
 (34 rows)
 
--- auto and force: no vector node exists yet, so the plan is PostgreSQL's,
--- and EXPLAIN (VEXEC) says why
+-- auto and force: the VecScan path is added -- in force mode as the
+-- relation's scan -- and the other nodes come in V2 to V4
 SET vexec.mode = auto;
 EXPLAIN (VEXEC, COSTS OFF) SELECT b, count(*) FROM vt GROUP BY b;
                                                   QUERY PLAN                                                  
 --------------------------------------------------------------------------------------------------------------
  HashAggregate
    Group Key: b
-   ->  Seq Scan on vt
+   ->  Vec Seq Scan on vt
  Vexec: mode auto, format postgres
-   VecScan on vt: not chosen (no vector node is built yet (V0))
+   VecScan on vt: added (to be chosen by cost)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
-   VecAgg on GROUP BY: not chosen (no vector node is built yet (V0))
+   VecAgg on GROUP BY: not built (VecAgg is built from V2)
      hashed, 1 grouping column, 1 aggregate; transitions through fmgr
 (8 rows)
 
@@ -439,11 +440,11 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT b, count(*) FROM vt GROUP BY b;
 --------------------------------------------------------------------------------------------------------------
  HashAggregate
    Group Key: b
-   ->  Seq Scan on vt
+   ->  Vec Seq Scan on vt
  Vexec: mode force, format postgres
-   VecScan on vt: not chosen (no vector node is built yet (V0))
+   VecScan on vt: added (forced: the relation's scan, beside its partial paths)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
-   VecAgg on GROUP BY: not chosen (no vector node is built yet (V0))
+   VecAgg on GROUP BY: not built (VecAgg is built from V2)
      hashed, 1 grouping column, 1 aggregate; transitions through fmgr
 (8 rows)
 
@@ -453,21 +454,39 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT count(*) FROM vt;
                                                   QUERY PLAN                                                  
 --------------------------------------------------------------------------------------------------------------
  Aggregate
-   ->  Seq Scan on vt
+   ->  Vec Seq Scan on vt
  Vexec: mode force, format arrow
-   VecScan on vt: not chosen (no vector node is built yet (V0))
+   VecScan on vt: added (forced: the relation's scan, beside its partial paths)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
-   VecAgg on aggregates: not chosen (no vector node is built yet (V0))
+   VecAgg on aggregates: not built (VecAgg is built from V2)
      plain, 0 grouping columns, 1 aggregate; transitions through fmgr
 (7 rows)
 
 RESET vexec.batch_format;
--- a test that needs a vector node fails where none was built
+-- a test that needs a vector node fails where one was possible and none
+-- was built: here the cost model prices the vector scan above the row scan
 SET vexec.debug_require_vector = on;
+SELECT count(*) FROM vt;
+ count 
+-------
+  2000
+(1 row)
+
+SET vexec.mode = auto;
+SET vexec.cpu_tuple_factor = 100;
 SELECT count(*) FROM vt;
 ERROR:  the plan has no vector node
 DETAIL:  vexec.debug_require_vector is on.
 HINT:  EXPLAIN (VEXEC) shows each vector alternative, and why it was not taken.
+RESET vexec.cpu_tuple_factor;
+-- and a statement with no table a vector node could scan requires none
+SELECT 1 AS one;
+ one 
+-----
+   1
+(1 row)
+
+SET vexec.mode = force;
 RESET vexec.debug_require_vector;
 -- in explain mode it requires nothing
 SET vexec.mode = explain;
@@ -514,6 +533,7 @@ EXPLAIN (VEXEC, COSTS OFF, FORMAT JSON) SELECT b, count(*) FROM vt GROUP BY b;
            "Node": "VecScan",                                                                                                  +
            "Target": "vt",                                                                                                     +
            "Possible": true,                                                                                                   +
+           "Status": "not chosen",                                                                                             +
            "Reason": "explain mode",                                                                                           +
            "Detail": "source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps"+
          },                                                                                                                    +
@@ -521,6 +541,7 @@ EXPLAIN (VEXEC, COSTS OFF, FORMAT JSON) SELECT b, count(*) FROM vt GROUP BY b;
            "Node": "VecAgg",                                                                                                   +
            "Target": "GROUP BY",                                                                                               +
            "Possible": true,                                                                                                   +
+           "Status": "not chosen",                                                                                             +
            "Reason": "explain mode",                                                                                           +
            "Detail": "hashed, 1 grouping column, 1 aggregate; transitions through fmgr"                                        +
          }                                                                                                                     +
@@ -598,7 +619,8 @@ FROM (SELECT l::json->0 AS plan FROM explain_lines('EXPLAIN (VEXEC, FORMAT JSON)
 (1 row)
 
 RESET vexec.convert_cost;
--- plans are PostgreSQL's in every mode, costs and all
+-- plans are PostgreSQL's in off and explain mode, costs and all; auto and
+-- force differ where a VecScan is chosen
 CREATE TABLE vexec_plans (mode text, query int4, plan text);
 DO $$
 DECLARE
@@ -622,13 +644,24 @@ BEGIN
 	END LOOP;
 END
 $$;
-SELECT query, count(DISTINCT plan) AS plans FROM vexec_plans GROUP BY query ORDER BY query;
+SELECT query, count(DISTINCT plan) AS plans FROM vexec_plans
+WHERE mode IN ('off', 'explain') GROUP BY query ORDER BY query;
  query | plans 
 -------+-------
      1 |     1
      2 |     1
      3 |     1
      4 |     1
+(4 rows)
+
+SELECT query, bool_or(plan LIKE '%Vec Seq Scan%') AS vector_in_force FROM vexec_plans
+WHERE mode = 'force' GROUP BY query ORDER BY query;
+ query | vector_in_force 
+-------+-----------------
+     1 | t
+     2 | t
+     3 | f
+     4 | t
 (4 rows)
 
 -- the plan check walks every plan, subplans included

@@ -330,6 +330,15 @@ fixed_datum(VexecBatch *batch, const VexecVec *v, int row)
 				iv->month = months;
 				return PointerGetDatum(iv);
 			}
+			if (((uintptr_t) p) % ALIGNOF_DOUBLE != 0)
+			{
+				/* a source's interval, not aligned: a copy */
+				char	   *q = vexec_arena_alloc(&batch->arena, sizeof(Interval),
+												  ALIGNOF_DOUBLE, NULL, NULL);
+
+				memcpy(q, p, sizeof(Interval));
+				return PointerGetDatum(q);
+			}
 			return PointerGetDatum(p);
 		case VEXEC_TC_FIXED:
 			return fetch_att(p, true, type->typlen);
@@ -398,7 +407,7 @@ vexec_vec_datum(VexecBatch *batch, const VexecVec *v, int row, bool *isnull)
 				const char *p;
 				Size		len;
 
-				if (v->shape.layout == VEXEC_VIEW && v->datums != NULL)
+				if (v->datums != NULL)
 					return v->datums[row];
 				vexec_vec_value_bytes(v, row, &p, &len);
 				return bytes_as_datum(batch, v->type, p, len);

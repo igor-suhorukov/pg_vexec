@@ -382,6 +382,12 @@ vexec_vec_copy_value(VexecBatch *batch, VexecVec *dst, int j, const VexecVec *sr
 				}
 				memcpy(dst->buffers[0] + dofs[j], src->buffers[0] + so[i], len);
 				dofs[j + 1] = dofs[j] + len;
+				if (src->datums)
+				{
+					if (dst->datums == NULL)
+						dst->datums = vexec_batch_alloc0(batch, sizeof(Datum) * Max(dst->nvalues, 1));
+					dst->datums[j] = src->datums[i];
+				}
 				break;
 			}
 	}

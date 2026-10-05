@@ -1,0 +1,16 @@
+--- reference
++++ session
+@@ -196,5 +196,5 @@
+ ---------------------------------------------------------
+    Filter: (unique1 <> ALL ('{1,2,99,NULL}'::integer[]))
+- Seq Scan on tenk1  (cost=N..N rows=1 width=N)
++ Vec Seq Scan on tenk1  (cost=N..N rows=1 width=N)
+ (2 rows)
+ 
+@@ -208,5 +208,5 @@
+    Filter: (unique1 <> ALL (ARRAY[1, 2, 98, (InitPlan expr_1).col1, NULL::integer]))
+    InitPlan expr_1
+- Seq Scan on tenk1  (cost=N..N rows=1 width=N)
++ Vec Seq Scan on tenk1  (cost=N..N rows=1 width=N)
+ (4 rows)
+ 

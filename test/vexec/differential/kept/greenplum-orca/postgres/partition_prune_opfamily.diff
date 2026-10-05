@@ -1,0 +1,22 @@
+--- reference
++++ session
+@@ -221,9 +221,9 @@
+ --------
+   
+-                                  QUERY PLAN                                  
++                                    QUERY PLAN                                    
+                Filter: (b |=| 1)
+                Filter: (b |=| 1)
+-         ->  Seq Scan on t1_1_prt_p1 t1_2  (cost=0.00..431.00 rows=1 width=8)
+-         ->  Seq Scan on t1_1_prt_p2 t1_1  (cost=0.00..431.00 rows=1 width=8)
++         ->  Vec Seq Scan on t1_1_prt_p1 t1_2  (cost=0.00..431.00 rows=1 width=8)
++         ->  Vec Seq Scan on t1_1_prt_p2 t1_1  (cost=0.00..431.00 rows=1 width=8)
+          Number of partitions to scan: 2 (out of 2)
+    ->  Dynamic Seq Scan on t1  (cost=0.00..431.00 rows=1 width=8)
+@@ -264,5 +264,5 @@
+ -- gpdb
+ -- start_ignore
+-------------------------------------------------------------------------------
++----------------------------------------------------------------------------------
+ DROP TABLE t1;
+ DROP TABLE t2;

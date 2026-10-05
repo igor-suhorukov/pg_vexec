@@ -226,6 +226,42 @@ vexec_numeric_to_scaled(Datum num, int scale, int digits, int width, int128 *res
 }
 
 /*
+ * A numeric Datum's display scale, or -1 for NaN and the infinities.  Read
+ * from its header word, as vexec_numeric_to_scaled() reads it.
+ */
+int
+vexec_numeric_dscale(Datum num)
+{
+	varlena    *vl = (varlena *) DatumGetPointer(num);
+	const char *payload;
+	uint16		header;
+	int			result;
+	bool		copied = false;
+
+	if (VARATT_IS_EXTERNAL(vl) || VARATT_IS_COMPRESSED(vl))
+	{
+		vl = detoast_attr(vl);
+		copied = true;
+	}
+	if (VARSIZE_ANY_EXHDR(vl) < (int) sizeof(uint16))
+		result = -1;
+	else
+	{
+		payload = VARDATA_ANY(vl);
+		header = read_u16(payload);
+		if ((header & N_SIGN_MASK) == N_SPECIAL)
+			result = -1;
+		else if ((header & N_SIGN_MASK) == N_SHORT)
+			result = (header & N_SHORT_DSCALE_MASK) >> N_SHORT_DSCALE_SHIFT;
+		else
+			result = header & N_DSCALE_MASK;
+	}
+	if (copied)
+		pfree(vl);
+	return result;
+}
+
+/*
  * An integer at a scale as a numeric Datum, written into the batch's arena
  * with a 4-byte header: the form numeric's accessors take without a copy
  * (§3.4.2).  It is the numeric PostgreSQL's make_result() would make of the

@@ -1,0 +1,16 @@
+--- reference
++++ session
+@@ -211,5 +211,5 @@
+    Filter: (unique1 <> ALL ('{1,2,99,NULL}'::integer[]))
+  Optimizer: Postgres query optimizer
+- Seq Scan on tenk1  (cost=N..N rows=1 width=N)
++ Vec Seq Scan on tenk1  (cost=N..N rows=1 width=N)
+ (3 rows)
+ 
+@@ -224,5 +224,5 @@
+    InitPlan expr_1
+  Optimizer: Postgres query optimizer
+- Seq Scan on tenk1  (cost=N..N rows=1 width=N)
++ Vec Seq Scan on tenk1  (cost=N..N rows=1 width=N)
+ (5 rows)
+ 

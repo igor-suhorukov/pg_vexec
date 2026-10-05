@@ -8,7 +8,13 @@
 #
 #   run.sh images                the dev images: the vanilla leg's, from the
 #                                port's cloudberry/pg19-vanilla; the port's,
-#                                from VB's pg_accel/cb-ext at CB_COMMIT
+#                                from VB's pg_accel/cb-ext at CB_COMMIT, and
+#                                the port's build tools on it (portdev)
+#   run.sh portbuild             the port's modules built from VEXEC_PORT_SRC,
+#                                V1's worktree of the port, into
+#                                VEXEC_PORT_BUILD, and staged there: the port
+#                                leg's containers install the stage over
+#                                their image's modules (VEXEC_PORT_STAGE)
 #   run.sh checks                the header copies, the notices, the tree
 #                                (on the host)
 #   run.sh suite [leg]           vexec's own regression suite
@@ -19,10 +25,18 @@
 #                                with vexec installed, preloaded off, and
 #                                preloaded in explain mode
 #   run.sh differential [leg]    the differential runner's four sessions
+#   run.sh sources               the batch sources on a single node of the
+#                                port: heap, ao_row, ao_column, PAX porc and
+#                                porc_vec, each query off and in force mode
+#   run.sh portsuites            the port's singlenode and greenplum suites,
+#                                each pass, with vexec.mode = force in both
+#                                formats, against off (VEXEC_PORT_SUITES,
+#                                VEXEC_PORT_PASSES, VEXEC_PORT_SESSIONS)
 #   run.sh cluster               the cluster leg, four segments of the port
 #   run.sh tpc [storage...]      the tpc suite on four segments (CB_TPC=check)
 #                                in each storage: heap ao_column pax
-#                                pax_porc_vec, vexec preloaded in off mode
+#                                pax_porc_vec, vexec preloaded in
+#                                TPC_VEXEC_MODE (off) and TPC_VEXEC_FORMAT
 #   run.sh fullrun [suite...]    the port's full run with vexec on every
 #                                node, and without it, compared: each
 #                                run's latest of VEXEC_FULLRUN_RUNS
@@ -44,6 +58,12 @@
 #   VEXEC_FULLRUN_RUNS  the full runs to make: "0 1", without vexec and
 #                 with it; "1" compares a new run with vexec with the
 #                 latest run without it
+#   VEXEC_PORT_SRC  V1's worktree of the port: ../../cloudberry-vexec/wt
+#   VEXEC_PORT_BUILD  its build and stage: $VEXEC_CACHE/portbuild
+#   VEXEC_PORT_STAGE  the stage the port leg installs: VEXEC_PORT_BUILD's,
+#                 when it has one; "none" for the image's own modules
+#   VEXEC_PAX_CONTRIB  clones of PAX's two submodules at the commits the
+#                 tree pins: $VEXEC_CACHE/pax-contrib
 #
 # Timed runs measure the host: ClickBench's time mode (test/clickbench) asks
 # for nothing else to run.  Beside one, give VEXEC_CPUS=1, and leave tpc and
@@ -59,6 +79,14 @@ export VEXEC_CACHE="${VEXEC_CACHE:-$HOME/.cache/pg_accel/vexec}"
 export CB_SRC="${CB_SRC:-$(cd "$ROOT/.." && pwd)/cloudberry}"
 export PG_SRC="${PG_SRC:-$(cd "$ROOT/.." && pwd)/postgres}"
 export VEXEC_CPUS="${VEXEC_CPUS:-0}"
+export VEXEC_PORT_SRC="${VEXEC_PORT_SRC:-$(cd "$ROOT/.." && pwd)/cloudberry-vexec/wt}"
+export VEXEC_PORT_BUILD="${VEXEC_PORT_BUILD:-$VEXEC_CACHE/portbuild}"
+export VEXEC_PAX_CONTRIB="${VEXEC_PAX_CONTRIB:-$VEXEC_CACHE/pax-contrib}"
+if [ "${VEXEC_PORT_STAGE:-}" = none ]; then
+	unset VEXEC_PORT_STAGE
+elif [ -z "${VEXEC_PORT_STAGE:-}" ] && [ -d "$VEXEC_PORT_BUILD/stage/usr/local/pgsql" ]; then
+	export VEXEC_PORT_STAGE="$VEXEC_PORT_BUILD/stage"
+fi
 
 if [ -z "${CB_COMMIT:-}" ]; then
 	CB_COMMIT="$(docker images pg_accel/cb-ext --format '{{.CreatedAt}} {{.Tag}}' 2> /dev/null | sort -r | awk 'NR == 1 {print $NF}')"
@@ -89,7 +117,16 @@ case "$cmd" in
 	images)
 		docker compose -f "$COMPOSE" --profile build build vexec-dev-vanilla || exit 1
 		[ -n "$CB_COMMIT" ] || die "no pg_accel/cb-ext image: run test/clickbench/run.sh images"
-		docker compose -f "$COMPOSE" --profile build build vexec-dev-port
+		docker compose -f "$COMPOSE" --profile build build vexec-dev-port || exit 1
+		docker compose -f "$COMPOSE" --profile build build vexec-dev-portdev
+		;;
+	portbuild)
+		[ -n "$CB_COMMIT" ] || die "no pg_accel/cb-ext image: run test/clickbench/run.sh images"
+		[ -d "$VEXEC_PORT_SRC/pg19" ] || die "no worktree of the port at $VEXEC_PORT_SRC"
+		mkdir -p "$VEXEC_PORT_BUILD"
+		PORTBUILD_COMMIT="$(git -C "$VEXEC_PORT_SRC" rev-parse --short HEAD)$( [ -n "$(git -C "$VEXEC_PORT_SRC" status --porcelain -- pg19)" ] && echo +changes)" \
+			docker compose -f "$COMPOSE" --profile run run --rm -T portbuild 2>&1 | grep -v -E '^ (Container|Network) '
+		exit "${PIPESTATUS[0]}"
 		;;
 	checks)
 		rc=0
@@ -113,12 +150,24 @@ case "$cmd" in
 		in_leg port "$run" "/src/test/vexec/cluster.sh" | tee "$run/output"
 		exit "${PIPESTATUS[0]}"
 		;;
+	portsuites)
+		run="$(new_run portsuites)"
+		echo "== the port's suites, force against off: $run"
+		in_leg port "$run" "/src/test/vexec/portsuites.sh" | tee "$run/output"
+		exit "${PIPESTATUS[0]}"
+		;;
+	sources)
+		run="$(new_run sources)"
+		echo "== the batch sources on the port: $run"
+		in_leg port "$run" "/src/test/vexec/sources.sh" | tee "$run/output"
+		exit "${PIPESTATUS[0]}"
+		;;
 	tpc)
 		rc=0
 		for storage in ${*:-heap ao_column pax pax_porc_vec}; do
 			run="$(new_run "tpc-$storage")"
 			echo "== tpc on $storage: $run"
-			in_leg port "$run" "/src/test/vexec/build.sh > /dev/null && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage /src/test/tpc/run.sh" \
+			in_leg port "$run" "/src/test/vexec/build.sh > /dev/null && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} /src/test/tpc/run.sh" \
 				| tee "$run/output" || rc=1
 		done
 		exit $rc

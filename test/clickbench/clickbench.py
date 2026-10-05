@@ -739,9 +739,14 @@ def report(run, cache, src):
 
 
 def config_name(cfg, planner):
+    """A configuration's name: its route, planner and storage, and
+    vexec's session after a "+" (bench.sh's CB_VEXEC)."""
+    base, _, vexec = planner.partition('+')
     if cfg['route'] == 'vanilla':
-        return 'vanilla-%s' % cfg['storage']
-    return '%s-%s-s%d' % ('orca' if planner == 'orca' else 'planner', cfg['storage'], cfg['segments'])
+        name = 'vanilla-%s' % cfg['storage']
+    else:
+        name = '%s-%s-s%d' % ('orca' if base == 'orca' else 'planner', cfg['storage'], cfg['segments'])
+    return name + ('+' + vexec if vexec else '')
 
 
 def write_clickbench(run, cfg, name, per_q, load, size):

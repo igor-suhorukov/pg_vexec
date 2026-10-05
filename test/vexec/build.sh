@@ -20,6 +20,15 @@ rm -rf "$BUILD"
 mkdir -p "$BUILD"
 cp -a "$SRC/include" "$SRC/modules" "$BUILD/"
 
+# The port's modules built from V1's worktree (portbuild.sh), when a leg is
+# given their stage: installed over the image's own before vexec is built --
+# on the port's image alone, the vanilla leg's PostgreSQL staying as it is.
+if [ -d /cbstage/usr/local/pgsql ] && [ -d /cb/pg19 ] && [ ! -f /tmp/.vexec-port-staged ]; then
+	cp -a /cbstage/usr/local/pgsql/. "$(dirname "$("$PG_CONFIG" --bindir)")/"
+	touch /tmp/.vexec-port-staged
+	echo "the port's modules from the stage: $(cat /cbstage/COMMIT 2> /dev/null || echo '?')"
+fi
+
 echo "building against $("$PG_CONFIG" --version) at $(cat "$("$PG_CONFIG" --bindir)/../.pg_ref_commit" 2>/dev/null || echo '?')"
 for m in vexec vexec_test; do
 	[ -f "$BUILD/modules/$m/Makefile" ] || continue

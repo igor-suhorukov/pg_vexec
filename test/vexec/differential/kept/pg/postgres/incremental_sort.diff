@@ -1,0 +1,16 @@
+--- reference
++++ session
+@@ -452,5 +452,5 @@
+                                         explain_analyze_without_memory                                         
+ ---------------------------------------------------------------------------------------------------------------
+-               ->  Seq Scan on t (actual rows=1000.00 loops=1)
++               ->  Vec Seq Scan on t (actual rows=1000.00 loops=1)
+                Sort Key: t.a
+                Sort Method: quicksort  Memory: NNkB
+@@ -597,5 +597,5 @@
+                                          explain_analyze_without_memory                                         
+ ----------------------------------------------------------------------------------------------------------------
+-               ->  Seq Scan on t (actual rows=1000.00 loops=1)
++               ->  Vec Seq Scan on t (actual rows=1000.00 loops=1)
+                Sort Key: t.a
+                Sort Method: quicksort  Memory: NNkB

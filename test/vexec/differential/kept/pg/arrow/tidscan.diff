@@ -1,0 +1,9 @@
+--- reference
++++ session
+@@ -226,5 +226,5 @@
+  locktype |    mode    
+ ----------+------------
+- tuple    | SIReadLock
++ relation | SIReadLock
+ (1 row)
+ 

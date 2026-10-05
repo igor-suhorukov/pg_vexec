@@ -16,8 +16,11 @@
  * With vexec.mode = off, every hook calls the one it took the place of and
  * adds nothing, so plans are PostgreSQL's (§1.2).  In explain mode the
  * alternatives are costed and recorded but never added, so plans are
- * PostgreSQL's still.  In V0 there is no vector node yet, so auto and force
- * record the alternatives too, and add nothing.
+ * PostgreSQL's still.  In auto mode a VecScan path competes with the
+ * relation's other paths in add_path, by cost; in force mode it replaces
+ * them, wherever the oracle accepts it.  The join, aggregation and sort
+ * alternatives are still only costed and recorded: their nodes come in V2
+ * to V4.
  *
  * The scan hook works before it calls the hook it took the place of, so
  * that on a cluster's coordinator gp_core's hook, which empties the path
@@ -37,6 +40,7 @@
  */
 #include "postgres.h"
 
+#include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_class.h"
@@ -135,11 +139,13 @@ vexec_plan_state(PlannerInfo *root)
  *	  319-400), and which of a cursor's plans could be its target is not
  *	  known while it is planned.
  */
-static const char *
-statement_gate(Query *parse, int cursorOptions)
+const char *
+vexec_statement_gate(Query *parse, int cursorOptions)
 {
 	if (parse->rowMarks != NIL)
 		return "row marks: FOR UPDATE or FOR SHARE";
+	if (parse->hasModifyingCTE)
+		return "a data-modifying WITH, below whose ModifyTable EvalPlanQual runs";
 	switch (parse->commandType)
 	{
 		case CMD_UPDATE:
@@ -171,7 +177,7 @@ vexec_planner_setup(PlannerGlobal *glob, Query *parse, const char *query_string,
 
 		ps->mcxt = CurrentMemoryContext;
 		ps->mode = vexec_mode;
-		ps->gate_reason = statement_gate(parse, cursorOptions);
+		ps->gate_reason = vexec_statement_gate(parse, cursorOptions);
 		ps->gate_open = ps->gate_reason == NULL;
 		ps->record = vexec_mode == VEXEC_MODE_EXPLAIN || vexec_explain_requested(es);
 		ps->layout = vexec_layout_config();
@@ -197,7 +203,8 @@ vexec_planner_shutdown(PlannerGlobal *glob, Query *parse, const char *query_stri
 										 makeDefElem("vexec", vexec_reasons_node(ps), -1));
 
 	if (vexec_debug_require_vector && ps != NULL && ps->gate_open &&
-		(ps->mode == VEXEC_MODE_AUTO || ps->mode == VEXEC_MODE_FORCE) && nodes == 0)
+		(ps->mode == VEXEC_MODE_AUTO || ps->mode == VEXEC_MODE_FORCE) &&
+		ps->npossible > 0 && nodes == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("the plan has no vector node"),
@@ -209,8 +216,8 @@ vexec_planner_shutdown(PlannerGlobal *glob, Query *parse, const char *query_stri
 }
 
 /* The attribute numbers a relation's scan needs: its quals' and its target's. */
-static int
-needed_columns(RelOptInfo *rel)
+static Bitmapset *
+needed_attrs(RelOptInfo *rel)
 {
 	Bitmapset  *attrs = NULL;
 	ListCell   *lc;
@@ -218,20 +225,42 @@ needed_columns(RelOptInfo *rel)
 	pull_varattnos((Node *) rel->reltarget->exprs, rel->relid, &attrs);
 	foreach(lc, rel->baserestrictinfo)
 		pull_varattnos((Node *) ((RestrictInfo *) lfirst(lc))->clause, rel->relid, &attrs);
-	return bms_num_members(attrs);
+	return attrs;
+}
+
+/*
+ * A system column the scan cannot give: VecScan gives ctid, from each row's
+ * TID, and tableoid; xmin and its kind are heap's tuple header.
+ */
+static bool
+reads_other_system_column(Bitmapset *attrs)
+{
+	int			i = -1;
+
+	while ((i = bms_next_member(attrs, i)) >= 0)
+	{
+		AttrNumber	attno = i + FirstLowInvalidHeapAttributeNumber;
+
+		if (attno < 0 && attno != SelfItemPointerAttributeNumber &&
+			attno != TableOidAttributeNumber)
+			return true;
+	}
+	return false;
 }
 
 /*
  * A table's sequential scan, and its vector alternative (§3.3.3, Scans):
  * for a base relation or an appendrel child that is a table, whose access
  * method has a source or the slot path.  A partitioned parent gets none:
- * its paths are rebuilt from its children's, which get theirs.
+ * its paths are rebuilt from its children's, which get theirs.  In auto
+ * and force mode the VecScan path is added; in explain mode, and for
+ * EXPLAIN (VEXEC), it is recorded with its cost or its refusal.
  */
 static void
 consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 			  VexecPlanState *ps)
 {
-	VexecAlt   *alt;
+	VexecAlt   *alt = NULL;
 	Relation	relation;
 	const VexecSourceRoutine *src;
 	const char *how;
@@ -240,51 +269,41 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 	Path	   *rowpath;
 	VexecCost	cost;
 	double		source_bytes = -1;
+	Bitmapset  *attrs;
+	Relids		required_outer;
+	bool		add = ps->mode == VEXEC_MODE_AUTO || ps->mode == VEXEC_MODE_FORCE;
+	const char *refusal = NULL;
 
 	if (rte->rtekind != RTE_RELATION || rte->inh)
 		return;					/* not a table's own scan */
 	if (rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_OTHER_MEMBER_REL)
 		return;
+	if (IS_DUMMY_REL(rel))
+		return;					/* proved empty: nothing to scan */
 
-	alt = vexec_alt_record(ps, "VecScan", vexec_relids_names(root, rel->relids), root, NULL);
-	if (alt == NULL)
+	if (ps->record)
+		alt = vexec_alt_record(ps, "VecScan", vexec_relids_names(root, rel->relids), root, NULL);
+	if (alt == NULL && !add)
 		return;
 
+	attrs = needed_attrs(rel);
 	if (rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW)
+		refusal = rte->relkind == RELKIND_FOREIGN_TABLE ? "a foreign table" : "not a table";
+	else if (rte->tablesample != NULL)
+		refusal = "TABLESAMPLE";
+	else if (root->rowMarks != NIL)
+		refusal = "row marks at its query level: FOR UPDATE or FOR SHARE";
+	else if (!vexec_enable_scan)
+		refusal = "vexec.enable_scan is off";
+	else if ((rel->pgs_mask & PGS_SEQSCAN) == 0)
+		refusal = "sequential scans are disabled";
+	else if (ps->mode != VEXEC_MODE_FORCE && rel->tuples < vexec_min_rows)
+		refusal = psprintf("%.0f rows, fewer than vexec.min_rows", rel->tuples);
+	else if (reads_other_system_column(attrs))
+		refusal = "a system column other than ctid and tableoid";
+	if (refusal != NULL)
 	{
-		vexec_alt_refuse(ps, alt, rte->relkind == RELKIND_FOREIGN_TABLE ?
-						 "a foreign table" : "not a table");
-		return;
-	}
-	if (rte->tablesample != NULL)
-	{
-		vexec_alt_refuse(ps, alt, "TABLESAMPLE");
-		return;
-	}
-
-	/*
-	 * A relation with lateral references has only parameterized scans,
-	 * rescanned for each outer row; vector scans take no parameters before
-	 * V1 has rescans.
-	 */
-	if (!bms_is_empty(rel->lateral_relids))
-	{
-		vexec_alt_refuse(ps, alt, "lateral references");
-		return;
-	}
-	if (!vexec_enable_scan)
-	{
-		vexec_alt_refuse(ps, alt, "vexec.enable_scan is off");
-		return;
-	}
-	if ((rel->pgs_mask & PGS_SEQSCAN) == 0)
-	{
-		vexec_alt_refuse(ps, alt, "sequential scans are disabled");
-		return;
-	}
-	if (ps->mode != VEXEC_MODE_FORCE && rel->tuples < vexec_min_rows)
-	{
-		vexec_alt_refuse(ps, alt, psprintf("%.0f rows, fewer than vexec.min_rows", rel->tuples));
+		vexec_alt_refuse(ps, alt, refusal);
 		return;
 	}
 
@@ -300,16 +319,22 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 
 	relation = table_open(rte->relid, NoLock);
 	src = vexec_source_for(relation, &how);
-	if (src != NULL && VEXEC_SOURCE_HAS(src, estimate))
+	if (src == NULL && relation->rd_tableam == NULL)
 	{
-		/* the needed columns' bytes, after the source's pruning (V1) */
-		source_bytes = -1;
+		table_close(relation, NoLock);
+		vexec_alt_refuse(ps, alt, how);
+		return;
 	}
 	table_close(relation, NoLock);
 
-	rowpath = create_seqscan_path(root, rel, NULL, 0);
+	/*
+	 * A relation with lateral references has only paths parameterized by
+	 * them: a VecScan of it is rescanned for each outer row.
+	 */
+	required_outer = rel->lateral_relids;
+	rowpath = create_seqscan_path(root, rel, required_outer, 0);
 	vexec_cost_scan(root, rel, rowpath, &quals, &target,
-					needed_columns(rel), list_length(rel->reltarget->exprs),
+					bms_num_members(attrs), list_length(rel->reltarget->exprs),
 					source_bytes, &cost);
 	vexec_alt_costed(ps, alt, &cost,
 					 psprintf("source: %s; quals: %s, %s; target: %s, %s",
@@ -318,6 +343,21 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 							  count_of(quals.fallback, "fallback step", "fallback steps"),
 							  count_of(target.kernel, "kernel step", "kernel steps"),
 							  count_of(target.fallback, "fallback step", "fallback steps")));
+	if (add)
+	{
+		Path	   *path = vexec_scan_path(root, rel, rowpath, &cost);
+
+		/*
+		 * Force mode: wherever the oracle accepts it, the vector scan is the
+		 * relation's scan.  Its partial paths stay, since V1 has no
+		 * parallel-aware vector scan (V4): where the planner makes a
+		 * parallel plan, as the tests that force one ask, it keeps it.
+		 */
+		if (ps->mode == VEXEC_MODE_FORCE)
+			rel->pathlist = NIL;
+		add_path(rel, path);
+		ps->npossible++;
+	}
 }
 
 static void
@@ -325,7 +365,7 @@ vexec_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEn
 {
 	VexecPlanState *ps = vexec_plan_state(root);
 
-	if (ps != NULL && ps->record)
+	if (ps != NULL)
 		consider_scan(root, rel, rti, rte, ps);
 
 	if (prev_set_rel_pathlist)

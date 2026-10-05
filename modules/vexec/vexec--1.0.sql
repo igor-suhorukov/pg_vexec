@@ -22,3 +22,12 @@ CREATE FUNCTION type_layouts(type text, OUT class text, OUT postgres text,
 RETURNS record
 AS 'MODULE_PATHNAME', 'vexec_type_layouts'
 LANGUAGE C STRICT STABLE PARALLEL SAFE;
+
+-- The built-in functions vexec runs as kernels, bound by their OIDs
+-- (pg_vector_executor.md §3.7), with each kernel's family and whether it can
+-- mark a row PostgreSQL's evaluator must compute.
+CREATE FUNCTION kernels(OUT funcid oid, OUT function text, OUT family text,
+                        OUT can_fail bool)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_kernel_list'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;

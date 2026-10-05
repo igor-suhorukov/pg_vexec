@@ -1,0 +1,24 @@
+--- reference
++++ session
+@@ -450,7 +450,7 @@
+ -- Test EXPLAIN ANALYZE with only a fullsort group.
+ select explain_analyze_without_memory('select * from (select * from t order by a) s order by a, b limit 55');
+-             explain_analyze_without_memory              
+----------------------------------------------------------
+-         ->  Seq Scan on t (actual rows=1000.00 loops=1)
++               explain_analyze_without_memory                
++-------------------------------------------------------------
++         ->  Vec Seq Scan on t (actual rows=1000.00 loops=1)
+          Sort Key: t.a, t.b
+          Sort Method: top-N heapsort  Memory: NNkB
+@@ -592,7 +592,7 @@
+ -- Test EXPLAIN ANALYZE with both fullsort and presorted groups.
+ select explain_analyze_without_memory('select * from (select * from t order by a) s order by a, b limit 70');
+-             explain_analyze_without_memory              
+----------------------------------------------------------
+-         ->  Seq Scan on t (actual rows=1000.00 loops=1)
++               explain_analyze_without_memory                
++-------------------------------------------------------------
++         ->  Vec Seq Scan on t (actual rows=1000.00 loops=1)
+          Sort Key: t.a, t.b
+          Sort Method: top-N heapsort  Memory: NNkB

@@ -170,7 +170,8 @@ typedef struct VexecVec
 	char	  **buffers;		/* VIEW: data buffers; OFFSETS: one */
 	int64	   *buffer_sizes;
 	int			nbuffers;
-	Datum	   *datums;			/* VIEW: the Datums kept beside, or NULL */
+	Datum	   *datums;			/* VIEW, OFFSETS: the Datums kept beside, or
+								 * NULL */
 	int32	   *codes;			/* DICT */
 	struct VexecVec *dictionary;	/* DICT: FLAT values, never NULL */
 } VexecVec;
@@ -258,6 +259,7 @@ extern VEXEC_API void vexec_type_shape(const VexecType *type,
 extern VEXEC_API void vexec_type_build_shape(const VexecType *type, VexecShape *shape);
 extern VEXEC_API int vexec_type_shapes(const VexecType *type, VexecShape *shapes, int max);
 extern VEXEC_API bool vexec_shape_equal(const VexecShape *a, const VexecShape *b);
+extern VEXEC_API void vexec_shape_normalize(VexecShape *shape);
 extern VEXEC_API char *vexec_shape_name(const VexecType *type, const VexecShape *shape);
 extern VEXEC_API const char *vexec_layout_name(int layout);
 extern VEXEC_API const char *vexec_type_class_name(int tclass);
@@ -297,6 +299,7 @@ extern VEXEC_API bool vexec_batch_apply_config(VexecBatch *batch,
 extern VEXEC_API bool vexec_numeric_to_scaled(Datum num, int scale, int digits,
 												   int width, int128 *result);
 extern VEXEC_API Datum vexec_scaled_to_numeric(VexecBatch *batch, int128 value, int scale);
+extern VEXEC_API int vexec_numeric_dscale(Datum num);
 
 /* rows.c */
 extern VEXEC_API void vexec_batch_begin_rows(VexecBatch *batch);

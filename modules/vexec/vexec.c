@@ -28,6 +28,7 @@
 #include "utils/guc.h"
 
 #include "vexec.h"
+#include "plan/plan.h"
 
 PG_MODULE_MAGIC_EXT(
 					.name = "vexec",
@@ -156,7 +157,9 @@ _PG_init(void)
 	MarkGUCPrefixReserved("vexec");
 
 	vexec_source_registry_install();
+	vexec_exec_install();
 	vexec_planner_install();
+	vexec_orca_install();
 	vexec_explain_install();
 
 	/*
@@ -364,8 +367,9 @@ define_settings(void)
 							NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("vexec.debug_require_vector",
-							 "Fails a statement whose plan has no vector node.",
-							 "For tests that must see vectorization engage.",
+							 "Fails a statement whose plan has no vector node where one was possible.",
+							 "For tests that must see vectorization engage: in auto or force mode, a "
+							 "plan that the oracle accepted a vector node for and that has none.",
 							 &vexec_debug_require_vector, false,
 							 PGC_SUSET, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
 	DefineCustomIntVariable("vexec.debug_layout_seed",

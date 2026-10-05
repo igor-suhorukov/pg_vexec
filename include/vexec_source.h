@@ -89,6 +89,23 @@ typedef enum VexecEncoding
  * valid, as Arrow's and as a heap tuple's null bitmap; NULL when the column
  * has no NULLs.  A row the source has deleted is never NULL here: it is left
  * out of VexecSourceBatch.visible.
+ *
+ * What each layout reads, beside values:
+ *
+ *	FIXED	width and stride, and arrow_values for date, timestamp[tz] and
+ *			interval.  A by-value type at its width (stride = width); a
+ *			by-reference one of fixed length -- uuid, interval, name -- at
+ *			its width or PostgreSQL's array stride (its length aligned).
+ *	SCALED	width and scale: width 8 for a typmod of 18 digits or fewer
+ *			(precision, and -scale for a negative scale), 16 for up to 38,
+ *			stride = width.  Another width is converted, a value at a time.
+ *	OFFSETS	nvalues + 1 int32 offsets into buffers[0], whose size is
+ *			buffer_sizes[0]; they need not start at 0, and a NULL row's
+ *			pair must still lie in the buffer, as Arrow's does.
+ *	VIEW	the views, and buffers and buffer_sizes for the bytes past 12.
+ *
+ * vexec ignores the fields a layout does not read: a source may leave them
+ * as it likes.
  */
 typedef struct VexecColumn
 {
@@ -121,8 +138,8 @@ typedef struct VexecSourceSpec
 {
 	Size		size;			/* sizeof as the caller was built */
 	int			ncolumns;
-	const AttrNumber *attnums;	/* 1..natts, or SelfItemPointerAttributeNumber
-								 * for TIDs */
+	const AttrNumber *attnums;	/* 1..natts, ascending: a TID is asked for
+								 * with VEXEC_SRC_TIDS, never as a column */
 	const uint8 *layouts;		/* per column: the layout the batch format
 								 * asks for */
 	List	   *quals;			/* ANDed Exprs over the relation's own Vars:
@@ -149,7 +166,10 @@ typedef struct VexecSourceBatch
  * (table_beginscan, table_beginscan_parallel), so the access method keeps
  * the snapshot's registration, predicate locks, parallel units, rescan and
  * end; begin() is handed that scan.  Columns are named by attribute number,
- * never by a PlanState.
+ * never by a PlanState.  next() counts the visible rows it hands in the
+ * statistics, as the access method's getnextslot counts each row it
+ * returns (pgstat_count_heap_getnext), so that a table's figures do not
+ * depend on the executor that read it.
  */
 typedef struct VexecSourceRoutine
 {

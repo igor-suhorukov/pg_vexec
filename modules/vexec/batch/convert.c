@@ -370,8 +370,12 @@ view_set(VexecView *view, const char *p, Size len, int chunk, int32 offset)
 /*
  * Datums -> views over the same bytes.  The views point past each value's
  * header into the arena, which a batch's own values are in; a value
- * elsewhere is copied into it once.  The Datums are kept beside the views,
- * for fmgr, row parents and tuplesort (§3.4.2).
+ * elsewhere is copied into it once, and a compressed or external one is
+ * detoasted into it, since a view needs the bytes.  The Datums the column
+ * was built from are kept beside the views, for fmgr, row parents and
+ * tuplesort (§3.4.2): a compressed value and a TOAST pointer as they were
+ * stored, so that what reads the stored form -- pg_column_compression(),
+ * pg_column_toast_chunk_id() -- reads it as the row executor gives it.
  */
 static void
 datum_to_view(VexecBatch *batch, VexecVec *v, const VexecShape *to)
@@ -388,10 +392,17 @@ datum_to_view(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 		Size		len;
 		int			chunk = 0;
 		int32		offset = 0;
+		bool		stored_form = false;
 
 		if (!valid(v, i))
 			continue;
 		d = in[i];
+		if (v->type->typlen == -1)
+		{
+			varlena    *vl = (varlena *) DatumGetPointer(d);
+
+			stored_form = VARATT_IS_EXTERNAL(vl) || VARATT_IS_COMPRESSED(vl);
+		}
 		datum_payload(batch, v->type, &d, &p, &len);
 		if (len > PG_INT32_MAX)
 			elog(ERROR, "value too long for a view");
@@ -404,7 +415,7 @@ datum_to_view(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 				elog(ERROR, "a value copied into the batch is not in its arena");
 		}
 		view_set(&views[i], p, len, chunk, offset);
-		datums[i] = d;
+		datums[i] = stored_form ? in[i] : d;
 	}
 	v->values = views;
 	v->datums = datums;
@@ -419,7 +430,7 @@ bytes_to_datum(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 	Datum	   *out;
 	int			i;
 
-	if (v->shape.layout == VEXEC_VIEW && v->datums != NULL)
+	if (v->datums != NULL)
 		out = v->datums;
 	else
 	{
@@ -441,7 +452,11 @@ bytes_to_datum(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 	v->shape = *to;
 }
 
-/* Datums or views -> offsets: the payloads copied end to end */
+/*
+ * Datums or views -> offsets: the payloads copied end to end.  The Datums
+ * the column was built from, or those kept beside its views, are kept
+ * beside the offsets, as views keep them (datum_to_view).
+ */
 static bool
 to_offsets(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 {
@@ -449,12 +464,18 @@ to_offsets(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 	const char **ptrs = palloc(sizeof(char *) * Max(v->nvalues, 1));
 	Size	   *lens = palloc(sizeof(Size) * Max(v->nvalues, 1));
 	Datum	   *datums = NULL;
+	Datum	   *kept = NULL;
 	int64		total = 0;
 	char	   *data;
 	int			i;
 
 	if (v->shape.layout == VEXEC_DATUM)
 		datums = v->values;
+	if (datums != NULL || v->datums != NULL)
+	{
+		kept = vexec_batch_alloc0(batch, sizeof(Datum) * Max(v->nvalues, 1));
+		memcpy(kept, datums ? datums : v->datums, sizeof(Datum) * v->nvalues);
+	}
 	for (i = 0; i < v->nvalues; i++)
 	{
 		lens[i] = 0;
@@ -488,7 +509,7 @@ to_offsets(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 	pfree(lens);
 
 	v->values = offsets;
-	v->datums = NULL;
+	v->datums = kept;
 	v->nbuffers = 1;
 	v->buffers = vexec_batch_alloc0(batch, sizeof(char *));
 	v->buffer_sizes = vexec_batch_alloc0(batch, sizeof(int64));
@@ -521,7 +542,7 @@ offsets_to_view(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 	buffers[0] = v->buffers[0];
 	sizes[0] = off[v->nvalues];
 	v->values = views;
-	v->datums = NULL;
+	/* the Datums kept beside the offsets stay beside the views */
 	v->buffers = buffers;
 	v->buffer_sizes = sizes;
 	v->nbuffers = 1;

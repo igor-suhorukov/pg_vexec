@@ -1,0 +1,9 @@
+--- reference
++++ session
+@@ -217,5 +217,5 @@
+  ?column? | ?column? | ?column? | ?column? 
+ ----------+----------+----------+----------
+- t        | t        | t        | t
++ t        | t        | f        | f
+ (1 row)
+ 

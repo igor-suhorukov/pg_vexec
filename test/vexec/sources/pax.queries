@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# PAX's batch reader (pg_vector_executor.md §3.5.3): queries of sources.sh,
+# a line each, %t each storage's table.  The first lines make tables of
+# their own from %t, in its access method and with its options, once per
+# storage -- the first session makes them, the others find them -- so that
+# the reader meets what one load does not give it:
+#
+#   %t_pxg  PAX groups of 333 rows, odd and smaller than a batch, in
+#           several files, one INSERT a file; a file of groups all NULL but
+#           id; a group all deleted, a file all deleted, deletes across
+#           groups; columns added after the rows, of each type class, from
+#           their attmissing values; numeric NaN among scaled values;
+#           minmax and bloom filter statistics, which the sparse filter
+#           prunes files and groups by
+#   %t_pxh  groups of 1,500 rows, sliced into a batch and the rest, written
+#           in descending order, deletes inside groups, and a batch's rows
+#           of a group all deleted, the rest not
+#   %t_pxt  the type classes the base table lacks: fixed-length by-reference
+#           types whose stride is not their length -- macaddr, timetz,
+#           tid -- name, point, box, an enum, inet, varbit, money, time
+#   %t_pxl  values long enough to be PAX toasts: compressed, from 512 kB,
+#           and in the file's .toast, from 10 MB; no NULL comes before a
+#           toast in its group, which PAX's porc slot path misreads
+#
+# The names are this file's own: sources/*.queries all run on every
+# storage, in one database.
+#
+# Each query is then answered alike with vexec off and in force mode.
+DO $d$ DECLARE am text; opts text; w text := ''; BEGIN IF to_regclass('%t_pxg') IS NOT NULL THEN RETURN; END IF; SELECT a.amname, array_to_string(c.reloptions, ', ') INTO am, opts FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = '%t'::regclass; IF am = 'pax' THEN w := ' WITH (' || coalesce(opts || ', ', '') || 'minmax_columns=''id,i4,d,v'', bloomfilter_columns=''v,i8'')'; ELSIF opts IS NOT NULL THEN w := ' WITH (' || opts || ')'; END IF; PERFORM set_config('pax.max_tuples_per_group', '333', true); EXECUTE format('CREATE TABLE %t_pxg USING %I%s AS SELECT * FROM %t WHERE false', am, w); FOR i IN 0..5 LOOP EXECUTE format('INSERT INTO %t_pxg SELECT * FROM %t WHERE id %% 6 = %s ORDER BY id', i); END LOOP; INSERT INTO %t_pxg (id) SELECT 100000 + g FROM generate_series(1, 666) g; INSERT INTO %t_pxg (id, i4, b, t, n) SELECT 101000 + g, CASE WHEN g <= 333 THEN NULL ELSE g END, NULL, NULL, NULL FROM generate_series(1, 999) g; DELETE FROM %t_pxg WHERE id IN (SELECT id FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM %t WHERE id % 6 = 0) s WHERE rn BETWEEN 667 AND 999); DELETE FROM %t_pxg WHERE id % 6 = 5 AND id < 100000; DELETE FROM %t_pxg WHERE id IN (SELECT id FROM (SELECT id, row_number() OVER (ORDER BY id) AS rn FROM %t WHERE id % 6 = 1) s WHERE rn BETWEEN 300 AND 700); DELETE FROM %t_pxg WHERE id % 13 = 0; ALTER TABLE %t_pxg ADD COLUMN x_text text DEFAULT 'dflt', ADD COLUMN x_num numeric(10,2) DEFAULT 1.25, ADD COLUMN x_int int, ADD COLUMN x_bool bool DEFAULT true, ADD COLUMN x_uuid uuid DEFAULT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', ADD COLUMN x_ts timestamp DEFAULT '2021-01-01 10:00', ADD COLUMN x_iv interval DEFAULT '1 day 2 hours', ADD COLUMN x_ch "char" DEFAULT 'q'; INSERT INTO %t_pxg (id, i4, t, x_text, x_int, x_bool, x_num) SELECT 200000 + g, g, 'after ' || g, CASE WHEN g % 3 = 0 THEN NULL ELSE 'xt' || g END, g, g % 2 = 0, CASE WHEN g % 100 = 0 THEN 'NaN' ELSE g / 4.0 END FROM generate_series(1, 1000) g; ANALYZE %t_pxg; END $d$
+DO $d$ DECLARE am text; opts text; w text := ''; BEGIN IF to_regclass('%t_pxh') IS NOT NULL THEN RETURN; END IF; SELECT a.amname, array_to_string(c.reloptions, ', ') INTO am, opts FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = '%t'::regclass; IF opts IS NOT NULL THEN w := ' WITH (' || opts || ')'; END IF; PERFORM set_config('pax.max_tuples_per_group', '1500', true); EXECUTE format('CREATE TABLE %t_pxh USING %I%s AS SELECT * FROM %t WHERE false', am, w); INSERT INTO %t_pxh SELECT * FROM %t ORDER BY id DESC; DELETE FROM %t_pxh WHERE id % 1000 < 5 OR id BETWEEN 7000 AND 9100; DELETE FROM %t_pxh WHERE id IN (SELECT id FROM (SELECT id, row_number() OVER (ORDER BY id DESC) AS rn FROM %t) s WHERE rn BETWEEN 3001 AND 4100); ANALYZE %t_pxh; END $d$
+DO $d$ DECLARE am text; opts text; w text := ''; BEGIN IF to_regclass('%t_pxt') IS NOT NULL THEN RETURN; END IF; IF to_regtype('pax_vexec_mood') IS NULL THEN CREATE TYPE pax_vexec_mood AS ENUM ('sad', 'ok', 'happy'); END IF; SELECT a.amname, array_to_string(c.reloptions, ', ') INTO am, opts FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = '%t'::regclass; IF opts IS NOT NULL THEN w := ' WITH (' || opts || ')'; END IF; EXECUTE format('CREATE TABLE %t_pxt (id int, nm name, ma macaddr, tz timetz, pt point, ti tid, mo money, tm time, ip inet, vb varbit, c1 "char", f4 float4, i2 int2, by bytea, m8 macaddr8, bx box, md pax_vexec_mood, iv interval, u uuid, bp char(3)) USING %I%s', am, w); INSERT INTO %t_pxt SELECT g, CASE WHEN g % 17 = 0 THEN NULL ELSE ('n' || g)::name END, CASE WHEN g % 19 = 0 THEN NULL ELSE ('08:00:2b:01:02:' || lpad(to_hex(g % 256), 2, '0'))::macaddr END, CASE WHEN g % 23 = 0 THEN NULL ELSE ('10:' || (g % 60) || ':00+0' || (g % 9))::timetz END, point(g, -g), ('(' || g || ',' || (g % 7) || ')')::tid, (g * 1.25)::money, '00:00'::time + g * interval '17 second', ('10.0.' || (g % 256) || '.' || (g % 7))::inet, (g % 32)::bit(5)::varbit, (g % 26 + 65)::"char", (g / 3.0)::float4, (g % 1000)::int2, decode(md5(g::text), 'hex'), ('08:00:2b:01:02:03:04:' || lpad(to_hex(g % 256), 2, '0'))::macaddr8, box(point(g, g), point(g + 1, g + 2)), (ARRAY['sad', 'ok', 'happy'])[g % 3 + 1]::pax_vexec_mood, CASE WHEN g % 31 = 0 THEN NULL ELSE g * interval '1 minute' END, CASE WHEN g % 37 = 0 THEN NULL ELSE md5(g::text)::uuid END, CASE WHEN g % 29 = 0 THEN NULL ELSE (g % 1000)::text END FROM generate_series(1, 3000) g; DELETE FROM %t_pxt WHERE id % 50 = 3; END $d$
+DO $d$ DECLARE am text; opts text; w text := ''; BEGIN IF to_regclass('%t_pxl') IS NOT NULL THEN RETURN; END IF; SELECT a.amname, array_to_string(c.reloptions, ', ') INTO am, opts FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = '%t'::regclass; IF opts IS NOT NULL THEN w := ' WITH (' || opts || ')'; END IF; EXECUTE format('CREATE TABLE %t_pxl (id int, s text, b bytea, c char(6), j jsonb) USING %I%s', am, w); INSERT INTO %t_pxl SELECT g, CASE WHEN g = 2 THEN repeat('ab', 300000) WHEN g = 3 THEN repeat('xyz', 3600000) WHEN g = 5 THEN repeat(md5(g::text), 20000) ELSE 'v' || g END, CASE WHEN g = 4 THEN decode(repeat('00ff', 300000), 'hex') ELSE decode(md5(g::text), 'hex') END, 'c' || g, jsonb_build_object('k', g, 'pad', CASE WHEN g = 6 THEN repeat('q', 600000) ELSE 'p' END) FROM generate_series(1, 8) g; INSERT INTO %t_pxl (id) VALUES (9), (10); END $d$
+VACUUM %t_pxg
+# no column read: the rows of each group, less its deletes
+SELECT count(*) FROM %t
+SELECT count(*) FROM %t_pxg
+SELECT count(*) FROM %t_pxh
+# every value, each type class, and the columns from attmissing
+SELECT count(*), md5(string_agg(concat_ws(',', id, i2, i4, i8, f4, f8, n, nfree, t, v, bp, d, ts, tz, b, u, length(longt), md5(longt), ch, o, arr, j, iv, later, x_text, x_num, x_int, x_bool, x_uuid, x_ts, x_iv, x_ch), '|' ORDER BY id)) FROM %t_pxg
+SELECT md5(string_agg(concat_ws(',', id, i2, i4, i8, f4, f8, o, ch, d, ts, tz, iv, u), '|' ORDER BY id)) FROM %t_pxg
+SELECT md5(string_agg(concat_ws(',', id, t, v, bp, b, n, nfree, arr, j), '|' ORDER BY id)) FROM %t_pxg
+SELECT x_text, x_num, x_int, x_bool, x_uuid, x_ts, x_iv, x_ch, count(*) FROM %t_pxg GROUP BY 1, 2, 3, 4, 5, 6, 7, 8 ORDER BY 9 DESC, 1, 2, 3 LIMIT 6
+SELECT count(*), count(i4), count(t), count(b), count(n), count(x_text), count(x_int), count(x_num), count(later) FROM %t_pxg
+SELECT count(*), md5(string_agg(concat_ws(',', id, i2, i4, i8, f4, f8, n, nfree, t, v, bp, d, ts, tz, b, u, length(longt), ch, o, arr, j, iv, later), '|' ORDER BY id)) FROM %t_pxh
+# the sparse filter prunes files and groups by min/max and bloom filters
+SELECT count(*), sum(i4), min(t), max(t) FROM %t_pxg WHERE id BETWEEN 2000 AND 2400
+SELECT count(*), sum(i8) FROM %t_pxg WHERE i4 BETWEEN -2000 AND -1000 AND d < '2021-06-01'
+SELECT id, v, i8 FROM %t_pxg WHERE v = 'x777' OR v = 'x29999' ORDER BY id
+SELECT count(*) FROM %t_pxg WHERE i8 = 1000003::int8 * 4500 - 9000000000
+SELECT count(*), count(i4) FROM %t_pxg WHERE id > 100000 AND id < 100700
+SELECT count(*), count(id) FROM %t_pxg WHERE i4 IS NULL
+SELECT count(*) FROM %t_pxg WHERE t IS NOT NULL AND id >= 101000
+SELECT count(*) FROM %t_pxg WHERE d = '2020-02-01' AND id < 3000
+# quals over each layout
+SELECT count(*), sum(i2), sum(f8) FILTER (WHERE f8 <> 'NaN') FROM %t_pxg WHERE b AND n > 50 AND t LIKE 'name 1%'
+SELECT count(*) FROM %t_pxg WHERE u > 'f0000000-0000-0000-0000-000000000000' AND bp <> '1'
+SELECT count(*) FROM %t_pxg WHERE iv > '5 hours' AND ts > '2020-01-10' AND tz < '2020-01-01 05:00:00+00'
+SELECT count(*), sum(nfree), sum(n) FROM %t_pxg WHERE nfree BETWEEN 100 AND 1000 OR n < 1
+SELECT count(*), sum(x_num), sum(x_int) FROM %t_pxg WHERE x_bool AND x_text <> 'dflt' AND x_iv > '1 day'
+SELECT id, i4, t, x_text, x_num FROM %t_pxg WHERE id % 333 IN (0, 1, 332) AND id < 3000 ORDER BY id
+# each per-structure layout asked for in turn, whatever the session's format
+SET vexec.batch_varlena_layout = offsets; SET vexec.batch_bool_layout = bit; SET vexec.batch_numeric_layout = varlena; SET vexec.batch_temporal_layout = arrow; SELECT count(*), md5(string_agg(concat_ws(',', id, i2, i4, i8, f4, f8, n, nfree, t, v, bp, d, ts, tz, b, u, length(longt), md5(longt), ch, o, arr, j, iv, later, x_text, x_num, x_int, x_bool, x_uuid, x_ts, x_iv, x_ch), '|' ORDER BY id)) FROM %t_pxg
+SET vexec.batch_varlena_layout = view; SET vexec.batch_bool_layout = byte; SET vexec.batch_numeric_layout = scaled; SET vexec.batch_temporal_layout = postgres; SELECT count(*), md5(string_agg(concat_ws(',', id, i2, i4, i8, f4, f8, n, nfree, t, v, bp, d, ts, tz, b, u, length(longt), md5(longt), ch, o, arr, j, iv, later, x_text, x_num, x_int, x_bool, x_uuid, x_ts, x_iv, x_ch), '|' ORDER BY id)) FROM %t_pxg
+SET vexec.batch_varlena_layout = datum; SET vexec.batch_bool_layout = bit; SET vexec.batch_numeric_layout = varlena; SELECT count(*), sum(i4), count(*) FILTER (WHERE b), sum(n), sum(nfree), max(t), min(bp) FROM %t_pxg WHERE t > 'name 2' AND b IS NOT NULL OR nfree > 1000
+SET vexec.batch_varlena_layout = offsets; SET vexec.batch_numeric_layout = scaled; SELECT count(*), sum(i4), count(*) FILTER (WHERE b), sum(n), sum(nfree), max(t), min(bp) FROM %t_pxg WHERE t > 'name 2' AND b IS NOT NULL OR nfree > 1000
+SET vexec.batch_varlena_layout = view; SELECT id, length(s), md5(s), length(b), md5(b), c, length(j::text), j->>'k' FROM %t_pxl WHERE s > 'a' OR b IS NOT NULL ORDER BY id
+SET vexec.batch_varlena_layout = offsets; SELECT id, length(s), md5(s), length(b), md5(b), c, length(j::text), j->>'k' FROM %t_pxl WHERE s > 'a' OR b IS NOT NULL ORDER BY id
+SET vexec.batch_varlena_layout = offsets; SET vexec.batch_temporal_layout = arrow; SELECT count(*), md5(string_agg(concat_ws(',', id, nm, ma, tz, pt, ti, mo, tm, ip, vb, c1, f4, i2, by, m8, bx, md, iv, u, bp), '|' ORDER BY id)) FROM %t_pxt
+# TIDs: the table's layout, as the scan of each row gives it
+SELECT md5(string_agg(ctid::text, ',' ORDER BY id)) FROM %t_pxg WHERE id % 7 = 3
+SELECT md5(string_agg(ctid::text, ',' ORDER BY id)) FROM %t_pxh WHERE id % 3 = 0
+SELECT md5(string_agg(ctid::text, ',' ORDER BY id)) FROM %t WHERE id % 11 = 0
+SELECT a.id, a.t FROM %t_pxg a WHERE a.ctid = (SELECT ctid FROM %t_pxg WHERE id = 1234)
+SELECT count(*) FROM %t_pxg WHERE ctid IN (SELECT ctid FROM %t_pxg WHERE id % 50 = 1)
+# rescans: a parameterized scan, and an inner scan of a nested loop
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off; SELECT count(*), sum(s.c) FROM generate_series(1, 4) g, LATERAL (SELECT count(*) AS c FROM %t_pxg WHERE i4 > g * 10000) s
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_material = off; SELECT v.x, count(*) FROM (VALUES (1), (2), (3)) v(x) JOIN %t_pxh t ON t.id % 3 = v.x - 1 AND t.id < 3000 GROUP BY v.x ORDER BY v.x
+# the other type classes
+SELECT count(*), md5(string_agg(concat_ws(',', id, nm, ma, tz, pt, ti, mo, tm, ip, vb, c1, f4, i2, by, m8, bx, md, iv, u, bp), '|' ORDER BY id)) FROM %t_pxt
+SELECT count(*), min(nm), count(ma), max(tz), sum(mo), max(tm), max(ip), max(md), max(bp), max(iv), count(u) FROM %t_pxt WHERE nm > 'n5' OR tm > '10:00' OR md = 'ok' OR bp = '7'
+SELECT id, ti, pt, bx, ma, m8, c1, vb FROM %t_pxt WHERE id % 500 = 1 OR ma IS NULL AND id < 100 ORDER BY id
+# values PAX toasts
+SELECT id, length(s), md5(s), length(b), md5(b), c, length(j::text), j->>'k' FROM %t_pxl ORDER BY id
+SELECT id FROM %t_pxl WHERE s LIKE 'xyz%' OR c = 'c4' ORDER BY id
+SELECT count(*), sum(length(s)), sum(octet_length(b)) FROM %t_pxl WHERE length(s) > 1000 OR b IS NULL

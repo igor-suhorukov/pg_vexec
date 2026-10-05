@@ -379,11 +379,52 @@ vexec_type_shapes(const VexecType *type, VexecShape *shapes, int max)
 bool
 vexec_shape_equal(const VexecShape *a, const VexecShape *b)
 {
-	return a->layout == b->layout &&
-		a->arrow_values == b->arrow_values &&
-		a->width == b->width &&
-		a->stride == b->stride &&
-		a->scale == b->scale;
+	if (a->layout != b->layout)
+		return false;
+	switch (a->layout)
+	{
+		case VEXEC_FIXED:
+			return a->arrow_values == b->arrow_values &&
+				a->width == b->width && a->stride == b->stride;
+		case VEXEC_SCALED:
+			return a->width == b->width && a->stride == b->stride &&
+				a->scale == b->scale;
+		default:
+			/* the layout says it all: the other fields mean nothing here */
+			return true;
+	}
+}
+
+/*
+ * A shape's fields its layout leaves unused, as vexec's own shapes have
+ * them (vexec_type_shape): a source's column may leave them as it likes
+ * (vexec_source.h).
+ */
+void
+vexec_shape_normalize(VexecShape *shape)
+{
+	switch (shape->layout)
+	{
+		case VEXEC_FIXED:
+			shape->scale = 0;
+			break;
+		case VEXEC_SCALED:
+			shape->arrow_values = false;
+			break;
+		case VEXEC_BYTE_BOOL:
+		case VEXEC_BIT_BOOL:
+			shape->arrow_values = false;
+			shape->scale = 0;
+			shape->width = 1;
+			shape->stride = 1;
+			break;
+		default:
+			shape->arrow_values = false;
+			shape->scale = 0;
+			shape->width = 0;
+			shape->stride = 0;
+			break;
+	}
 }
 
 const char *

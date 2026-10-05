@@ -21,9 +21,9 @@
  *	  (PG19:src/backend/executor/execExpr.c:1096, 1110, 1162); WHERE CURRENT
  *	  OF.
  *
- * V0 binds no kernel: the tables of kernels are generated at build time
- * with the kernels themselves, from V1 (§3.7).  Every call is therefore a
- * fallback step in V0, priced at PostgreSQL's full cpu_operator_cost.
+ * The kernels are expr/'s, bound by function OID (expr/kernels.c); a call
+ * without one is a fallback step, priced at PostgreSQL's full
+ * cpu_operator_cost.
  *
  *-------------------------------------------------------------------------
  */
@@ -43,20 +43,19 @@
 #include "vexec.h"
 #include "batch/batch.h"
 #include "plan/plan.h"
+#include "expr/kernel.h"
 
 PG_FUNCTION_INFO_V1(vexec_type_layouts);
 
 /*
- * Whether a kernel is bound to a function for these inputs.  The kernel
- * tables come with the kernels (V1); until then, none.
+ * Whether a kernel is bound to a function for these inputs (expr/kernels.c):
+ * the planner's question, which the node's own binding answers again, with
+ * the call's constant arguments, when it begins.
  */
 bool
 vexec_kernel_bound(Oid funcid, Oid inputtype, Oid collation)
 {
-	(void) funcid;
-	(void) inputtype;
-	(void) collation;
-	return false;
+	return vexec_kernel_find(funcid, 1, &inputtype, collation) != NULL;
 }
 
 typedef struct OracleContext
@@ -79,7 +78,9 @@ oracle_call(OracleContext *ctx, Oid funcid, Node *node, List *args, Oid collatio
 	{
 		QualCost	qc = {0, 0};
 
-		add_function_cost(ctx->root, funcid, node, &qc);
+		/* without a PlannerInfo -- ORCA's plans -- the steps are only counted */
+		if (ctx->root != NULL)
+			add_function_cost(ctx->root, funcid, node, &qc);
 		ctx->steps->kernel++;
 		ctx->steps->kernel_cost += qc.per_tuple;
 	}
@@ -189,9 +190,12 @@ vexec_oracle_expr(PlannerInfo *root, Node *expr, VexecSteps *steps)
 	ctx.steps = &one;
 	(void) oracle_walker(expr, &ctx);
 
-	cost_qual_eval_node(&qc, expr, root);
-	one.fallback_cost = Max(qc.per_tuple - one.kernel_cost, 0);
-	one.startup = qc.startup;
+	if (root != NULL)
+	{
+		cost_qual_eval_node(&qc, expr, root);
+		one.fallback_cost = Max(qc.per_tuple - one.kernel_cost, 0);
+		one.startup = qc.startup;
+	}
 
 	steps->kernel += one.kernel;
 	steps->fallback += one.fallback;

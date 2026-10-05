@@ -112,6 +112,7 @@ print_alternative(List *a, ExplainState *es)
 	const char *target = item_str(a, "target");
 	const char *reason = item_str(a, "reason");
 	const char *detail = item_str(a, "detail");
+	const char *status = item_str(a, "status");
 	Node	   *possible_node = item(a, "possible");
 	bool		possible = possible_node && IsA(possible_node, Boolean) && boolVal(possible_node);
 	double		row_total = item_cost(a, "row_total");
@@ -121,7 +122,8 @@ print_alternative(List *a, ExplainState *es)
 	{
 		ExplainIndentText(es);
 		if (possible)
-			appendStringInfo(es->str, "%s on %s: not chosen (%s)\n", node, target, reason);
+			appendStringInfo(es->str, "%s on %s: %s (%s)\n", node, target,
+							 status ? status : "not chosen", reason);
 		else
 			appendStringInfo(es->str, "%s on %s: not possible (%s)\n", node, target, reason);
 		es->indent++;
@@ -151,6 +153,8 @@ print_alternative(List *a, ExplainState *es)
 	ExplainPropertyText("Node", node, es);
 	ExplainPropertyText("Target", target, es);
 	ExplainPropertyBool("Possible", possible, es);
+	if (possible)
+		ExplainPropertyText("Status", status ? status : "not chosen", es);
 	ExplainPropertyText("Reason", reason, es);
 	if (detail)
 		ExplainPropertyText("Detail", detail, es);

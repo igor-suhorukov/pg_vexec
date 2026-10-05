@@ -1,0 +1,980 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- VecScan's semantics (pg_vector_executor.md §3.7, §3.8, §6.2): each query
+-- is run with vexec.mode off, and in force mode in the PostgreSQL and the
+-- Arrow format, and vexec_check() prints PostgreSQL's answer -- its rows
+-- sorted, or its error's SQLSTATE and message -- when every run gives it,
+-- and which run differs otherwise.  So the expected output is PostgreSQL's
+-- answers, and a vector plan passes only where it gives them.
+--
+-- The cases: batch edges (1023, 1024 and 1025 rows; filters that keep 63,
+-- 64 and 65 rows of a word); NULLs, three-valued logic, IS DISTINCT FROM,
+-- ANY and ALL with NULLs; errors inside a batch and at its edge, and none
+-- from rows PostgreSQL never evaluates; floats' NaN, -0 and infinities;
+-- collations; bpchar; numerics at their layout's edges; dates and
+-- timestamps at their limits; LIKE; parameters and InitPlans; rescans;
+-- security quals; a volatile function's calls; the system columns.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+RESET client_min_messages;
+-- a query's answer in one configuration: its rows as text, sorted -- a
+-- long one as its count and md5 -- or its error
+CREATE FUNCTION vexec_run(q text, m text, f text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+	n int8;
+BEGIN
+	PERFORM set_config('vexec.mode', m, true);
+	PERFORM set_config('vexec.batch_format', f, true);
+	BEGIN
+		EXECUTE format('SELECT coalesce(string_agg(x::text, %L ORDER BY x::text COLLATE "C"), %L), count(*) FROM (%s) x',
+					   ' | ', '(none)', q) INTO r, n;
+		IF length(r) > 200 THEN
+			r := format('%s rows, md5 %s', n, md5(r));
+		END IF;
+	EXCEPTION WHEN OTHERS THEN
+		r := 'ERROR ' || SQLSTATE || ': ' || SQLERRM;
+	END;
+	RETURN r;
+END
+$$;
+-- PostgreSQL's answer, where force mode in both formats gives it
+CREATE FUNCTION vexec_check(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ref text := vexec_run(q, 'off', 'postgres');
+	got text;
+	f text;
+BEGIN
+	FOREACH f IN ARRAY ARRAY['postgres', 'arrow'] LOOP
+		got := vexec_run(q, 'force', f);
+		IF got IS DISTINCT FROM ref THEN
+			RETURN format('DIFFERS in the %s format: off gives [%s], force gives [%s]', f, ref, got);
+		END IF;
+	END LOOP;
+	RETURN ref;
+END
+$$;
+-- the tables: n rows each, every type class
+CREATE TABLE vs (
+	id int4, i2 int2, i4 int4, i8 int8, f4 float4, f8 float8,
+	n numeric(12,3), nb numeric(38,0), nf numeric, t text, v varchar(10), bp char(5),
+	d date, ts timestamp, tz timestamptz, b bool, u uuid, o oid, c "char", iv interval
+);
+INSERT INTO vs
+SELECT g, (g % 200 - 100)::int2, g * 37 % 1000 - 500, g::int8 * 1000000007,
+	   g / 8.0, g / 16.0, (g % 997) / 7.0, 10::numeric ^ 37 + g, g * 1.5,
+	   'text ' || (g % 101), 'v' || g % 17, (g % 5)::text,
+	   DATE '2001-01-01' + g, TIMESTAMP '2001-01-01' + g * interval '7 hours',
+	   TIMESTAMPTZ '2001-01-01 00:00:00+00' + g * interval '11 hours',
+	   g % 3 = 1, md5(g::text)::uuid, g, chr(65 + g % 26)::"char", g * interval '1 minute'
+FROM generate_series(1, 3000) g;
+UPDATE vs SET i2 = NULL, f8 = NULL, t = NULL, b = NULL WHERE id % 64 IN (0, 1, 63);
+UPDATE vs SET i4 = NULL, n = NULL, d = NULL WHERE id % 1024 IN (0, 1023);
+ANALYZE vs;
+CREATE TABLE edge1023 AS SELECT g AS a FROM generate_series(1, 1023) g;
+CREATE TABLE edge1024 AS SELECT g AS a FROM generate_series(1, 1024) g;
+CREATE TABLE edge1025 AS SELECT g AS a FROM generate_series(1, 1025) g;
+-- batch edges
+SELECT vexec_check('SELECT count(*), sum(a), min(a), max(a) FROM edge1023');
+     vexec_check      
+----------------------
+ (1023,523776,1,1023)
+(1 row)
+
+SELECT vexec_check('SELECT count(*), sum(a), min(a), max(a) FROM edge1024');
+     vexec_check      
+----------------------
+ (1024,524800,1,1024)
+(1 row)
+
+SELECT vexec_check('SELECT count(*), sum(a), min(a), max(a) FROM edge1025');
+     vexec_check      
+----------------------
+ (1025,525825,1,1025)
+(1 row)
+
+SELECT vexec_check('SELECT a FROM edge1025 WHERE a >= 1020');
+                     vexec_check                     
+-----------------------------------------------------
+ (1020) | (1021) | (1022) | (1023) | (1024) | (1025)
+(1 row)
+
+-- filters that keep 63, 64 and 65 rows of the first word
+SELECT vexec_check('SELECT count(*), sum(a) FROM edge1025 WHERE a <= 63');
+ vexec_check 
+-------------
+ (63,2016)
+(1 row)
+
+SELECT vexec_check('SELECT count(*), sum(a) FROM edge1025 WHERE a <= 64');
+ vexec_check 
+-------------
+ (64,2080)
+(1 row)
+
+SELECT vexec_check('SELECT count(*), sum(a) FROM edge1025 WHERE a <= 65');
+ vexec_check 
+-------------
+ (65,2145)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE id % 64 = 63');
+ vexec_check 
+-------------
+ (46)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs');
+ vexec_check 
+-------------
+ (3000)
+(1 row)
+
+-- NULLs to the row parent, three-valued logic, IS DISTINCT FROM
+SELECT vexec_check('SELECT id, i2, t FROM vs WHERE id IN (1, 2, 63, 64, 65, 128)');
+                          vexec_check                          
+---------------------------------------------------------------
+ (1,,) | (128,,) | (2,-98,"text 2") | (63,,) | (64,,) | (65,,)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i2 > 0 AND b');
+ vexec_check 
+-------------
+ (472)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i2 > 0 OR b');
+ vexec_check 
+-------------
+ (1896)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE NOT (i2 > 0 OR b)');
+ vexec_check 
+-------------
+ (965)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE (i2 > 0 AND b) IS NULL');
+ vexec_check 
+-------------
+ (139)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE b IS TRUE');
+ vexec_check 
+-------------
+ (953)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE b IS NOT FALSE');
+ vexec_check 
+-------------
+ (1092)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE b IS UNKNOWN');
+ vexec_check 
+-------------
+ (139)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i2 IS NULL');
+ vexec_check 
+-------------
+ (139)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i2 IS NOT NULL AND t IS NOT NULL');
+ vexec_check 
+-------------
+ (2861)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i2 IS DISTINCT FROM 5');
+ vexec_check 
+-------------
+ (2987)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i2 IS NOT DISTINCT FROM NULL');
+ vexec_check 
+-------------
+ (139)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t IS DISTINCT FROM ''text 7''');
+ vexec_check 
+-------------
+ (2972)
+(1 row)
+
+SELECT vexec_check('SELECT id, i2 > 0, b AND i2 > 0, b OR i2 > 0 FROM vs WHERE id <= 3 OR id = 64');
+               vexec_check                
+------------------------------------------
+ (1,,,) | (2,f,f,f) | (3,f,f,f) | (64,,,)
+(1 row)
+
+-- ANY and ALL, NULL elements, empty arrays
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 IN (1, 2, 3, NULL)');
+ vexec_check 
+-------------
+ (9)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 NOT IN (1, 2, 3, NULL)');
+ vexec_check 
+-------------
+ (0)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 NOT IN (1, 2, 3)');
+ vexec_check 
+-------------
+ (2987)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 = ANY (''{}''::int4[])');
+ vexec_check 
+-------------
+ (0)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 <> ALL (''{}''::int4[])');
+ vexec_check 
+-------------
+ (3000)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 > ALL (ARRAY[10, 20])');
+ vexec_check 
+-------------
+ (1433)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 < ANY (ARRAY[-100, NULL])');
+ vexec_check 
+-------------
+ (1200)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t IN (''text 1'', ''text 2'')');
+ vexec_check 
+-------------
+ (57)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 = ANY (NULL::int4[])');
+ vexec_check 
+-------------
+ (0)
+(1 row)
+
+-- errors: inside a batch, at its edge, and PostgreSQL's own
+SELECT vexec_check('SELECT i2 * i2 * i2 * i2 FROM vs WHERE id < 5');
+            vexec_check             
+------------------------------------
+ ERROR 22003: smallint out of range
+(1 row)
+
+SELECT vexec_check('SELECT i4 * 1000000 FROM vs');
+                   vexec_check                   
+-------------------------------------------------
+ 3000 rows, md5 0bc8455885b8d0e60d52d9835cdc4a75
+(1 row)
+
+SELECT vexec_check('SELECT a * 2147483 FROM edge1025 WHERE a > 1000');
+            vexec_check            
+-----------------------------------
+ ERROR 22003: integer out of range
+(1 row)
+
+SELECT vexec_check('SELECT 1000 / (a - 1024) FROM edge1025');
+          vexec_check          
+-------------------------------
+ ERROR 22012: division by zero
+(1 row)
+
+SELECT vexec_check('SELECT 1000 / (a - 1025) FROM edge1025');
+          vexec_check          
+-------------------------------
+ ERROR 22012: division by zero
+(1 row)
+
+SELECT vexec_check('SELECT (-2147483648)::int4 / (a - 1024 - 1) FROM edge1025 WHERE a = 1024');
+            vexec_check            
+-----------------------------------
+ ERROR 22003: integer out of range
+(1 row)
+
+SELECT vexec_check('SELECT a % (a - 7) FROM edge1023 WHERE a < 10');
+          vexec_check          
+-------------------------------
+ ERROR 22012: division by zero
+(1 row)
+
+SELECT vexec_check('SELECT (i8 * i8) FROM vs WHERE id = 3000');
+           vexec_check            
+----------------------------------
+ ERROR 22003: bigint out of range
+(1 row)
+
+SELECT vexec_check('SELECT i2::int4 * 400 FROM vs WHERE id < 4');
+       vexec_check        
+--------------------------
+ () | (-38800) | (-39200)
+(1 row)
+
+SELECT vexec_check('SELECT (i4 * 100)::int2 FROM vs WHERE id < 20');
+            vexec_check             
+------------------------------------
+ ERROR 22003: smallint out of range
+(1 row)
+
+SELECT vexec_check('SELECT f8 * 1e308 * 10 FROM vs WHERE id = 5');
+                vexec_check                
+-------------------------------------------
+ ERROR 22003: value out of range: overflow
+(1 row)
+
+SELECT vexec_check('SELECT f8 / 0 FROM vs WHERE id = 5');
+          vexec_check          
+-------------------------------
+ ERROR 22012: division by zero
+(1 row)
+
+SELECT vexec_check('SELECT f8 / 0 FROM vs WHERE id = 1');
+ vexec_check 
+-------------
+ ()
+(1 row)
+
+SELECT vexec_check('SELECT (f8 * 1e-320)::float4 FROM vs WHERE id = 5');
+                vexec_check                 
+--------------------------------------------
+ ERROR 22003: value out of range: underflow
+(1 row)
+
+-- and none from rows PostgreSQL never evaluates
+SELECT vexec_check('SELECT a FROM edge1025 WHERE a > 1020 AND 1000 / (a - 1) > 0');
+ vexec_check 
+-------------
+ (none)
+(1 row)
+
+SELECT vexec_check('SELECT a FROM edge1025 WHERE a = 1 OR 1000 / (a - 1) > 900');
+ vexec_check 
+-------------
+ (1) | (2)
+(1 row)
+
+SELECT vexec_check('SELECT CASE WHEN a = 1 THEN 0 ELSE 1000 / (a - 1) END FROM edge1023 WHERE a < 4');
+     vexec_check      
+----------------------
+ (0) | (1000) | (500)
+(1 row)
+
+SELECT vexec_check('SELECT 1000 / (a - 1025) FROM edge1025 LIMIT 3');
+   vexec_check   
+-----------------
+ (0) | (0) | (0)
+(1 row)
+
+SELECT vexec_check('SELECT 1000 / (a - 3) FROM edge1025 WHERE a <> 3');
+                   vexec_check                   
+-------------------------------------------------
+ 1024 rows, md5 528ccb0a1d75f6879210a856bed0f334
+(1 row)
+
+SELECT vexec_check('SELECT 1000 / i2 FROM vs WHERE i2 IS NULL OR i2 <> 0');
+                   vexec_check                   
+-------------------------------------------------
+ 2985 rows, md5 b8ce12b60bef861d5033aa05b6f3cae5
+(1 row)
+
+SELECT vexec_check('SELECT 1000 / NULLIF(i2, 0) FROM vs WHERE id < 5');
+        vexec_check         
+----------------------------
+ () | (-10) | (-10) | (-10)
+(1 row)
+
+-- the first error in row order, from the quals before the target list
+SELECT vexec_check('SELECT 1 / (a - 5) FROM edge1023 WHERE 1 / (a - 900) > -1');
+          vexec_check          
+-------------------------------
+ ERROR 22012: division by zero
+(1 row)
+
+-- floats: NaN, -0, the infinities
+CREATE TABLE vfl (x float8, y float4);
+INSERT INTO vfl VALUES ('NaN', 'NaN'), ('-0', '-0'), ('0', '0'), ('Infinity', 'Infinity'),
+	('-Infinity', '-Infinity'), (1.5, 1.5), (NULL, NULL);
+SELECT vexec_check('SELECT x FROM vfl WHERE x = ''NaN''');
+ vexec_check 
+-------------
+ NaN
+(1 row)
+
+SELECT vexec_check('SELECT x FROM vfl WHERE x > 1e300');
+  vexec_check   
+----------------
+ Infinity | NaN
+(1 row)
+
+SELECT vexec_check('SELECT x FROM vfl WHERE x < ''NaN''');
+             vexec_check             
+-------------------------------------
+ -0 | -Infinity | 0 | 1.5 | Infinity
+(1 row)
+
+SELECT vexec_check('SELECT x FROM vfl WHERE x = 0');
+ vexec_check 
+-------------
+ -0 | 0
+(1 row)
+
+SELECT vexec_check('SELECT x FROM vfl WHERE y >= x');
+                vexec_check                
+-------------------------------------------
+ -0 | -Infinity | 0 | 1.5 | Infinity | NaN
+(1 row)
+
+SELECT vexec_check('SELECT x + 1, x * 2, -x FROM vfl');
+                                                        vexec_check                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ (,,) | (-Infinity,-Infinity,Infinity) | (1,-0,0) | (1,0,-0) | (2.5,3,-1.5) | (Infinity,Infinity,-Infinity) | (NaN,NaN,NaN)
+(1 row)
+
+SELECT vexec_check('SELECT x - ''Infinity'' FROM vfl WHERE x = ''Infinity''');
+ vexec_check 
+-------------
+ (NaN)
+(1 row)
+
+-- collations: bytes, varstr_cmp, and a nondeterministic one left to fmgr
+CREATE COLLATION vexec_und (provider = icu, locale = 'und');
+CREATE COLLATION vexec_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+CREATE TABLE vco (s text);
+INSERT INTO vco VALUES ('a'), ('B'), ('b'), ('A'), ('ä'), ('ab'), (''), (NULL), ('Ab');
+SELECT vexec_check('SELECT s FROM vco WHERE s < ''b'' COLLATE "C"');
+             vexec_check              
+--------------------------------------
+ ("") | (A) | (Ab) | (B) | (a) | (ab)
+(1 row)
+
+SELECT vexec_check('SELECT s FROM vco WHERE s < ''b'' COLLATE "POSIX"');
+             vexec_check              
+--------------------------------------
+ ("") | (A) | (Ab) | (B) | (a) | (ab)
+(1 row)
+
+SELECT vexec_check('SELECT s FROM vco WHERE s < ''b'' COLLATE vexec_und');
+             vexec_check              
+--------------------------------------
+ ("") | (A) | (Ab) | (a) | (ab) | (ä)
+(1 row)
+
+SELECT vexec_check('SELECT s FROM vco WHERE s = ''a'' COLLATE vexec_und');
+ vexec_check 
+-------------
+ (a)
+(1 row)
+
+SELECT vexec_check('SELECT s FROM vco WHERE s = ''a'' COLLATE vexec_ci');
+ vexec_check 
+-------------
+ (A) | (a)
+(1 row)
+
+SELECT vexec_check('SELECT s FROM vco WHERE s >= ''A'' COLLATE vexec_ci');
+                vexec_check                
+-------------------------------------------
+ (A) | (Ab) | (B) | (a) | (ab) | (b) | (ä)
+(1 row)
+
+SELECT vexec_check('SELECT s FROM vco WHERE s LIKE ''a%'' COLLATE vexec_und');
+ vexec_check 
+-------------
+ (a) | (ab)
+(1 row)
+
+SELECT vexec_check('SELECT s FROM vco WHERE s <> ''''');
+                vexec_check                
+-------------------------------------------
+ (A) | (Ab) | (B) | (a) | (ab) | (b) | (ä)
+(1 row)
+
+-- bpchar's trailing blanks
+CREATE TABLE vbp (c char(6), v varchar(6));
+INSERT INTO vbp VALUES ('ab', 'ab'), ('ab  ', 'ab  '), ('ab c', 'ab c'), ('', ''), (NULL, NULL);
+SELECT vexec_check('SELECT c, v FROM vbp WHERE c = ''ab''');
+            vexec_check            
+-----------------------------------
+ ("ab    ","ab  ") | ("ab    ",ab)
+(1 row)
+
+SELECT vexec_check('SELECT c, v FROM vbp WHERE c = ''ab    ''');
+            vexec_check            
+-----------------------------------
+ ("ab    ","ab  ") | ("ab    ",ab)
+(1 row)
+
+SELECT vexec_check('SELECT c, v FROM vbp WHERE v = ''ab''');
+  vexec_check  
+---------------
+ ("ab    ",ab)
+(1 row)
+
+SELECT vexec_check('SELECT c, v FROM vbp WHERE c < ''ab c''');
+                    vexec_check                    
+---------------------------------------------------
+ ("      ","") | ("ab    ","ab  ") | ("ab    ",ab)
+(1 row)
+
+SELECT vexec_check('SELECT c, v FROM vbp WHERE c LIKE ''ab''');
+ vexec_check 
+-------------
+ (none)
+(1 row)
+
+SELECT vexec_check('SELECT c, v FROM vbp WHERE c LIKE ''ab%''');
+                      vexec_check                      
+-------------------------------------------------------
+ ("ab    ","ab  ") | ("ab    ",ab) | ("ab c  ","ab c")
+(1 row)
+
+SELECT vexec_check('SELECT c, v FROM vbp WHERE c LIKE ''%  ''');
+                              vexec_check                              
+-----------------------------------------------------------------------
+ ("      ","") | ("ab    ","ab  ") | ("ab    ",ab) | ("ab c  ","ab c")
+(1 row)
+
+-- LIKE: literal, prefix, suffix, substring, the general pattern, escapes
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''text 1''');
+ vexec_check 
+-------------
+ (28)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''text 1%''');
+ vexec_check 
+-------------
+ (341)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''%0''');
+ vexec_check 
+-------------
+ (314)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''%xt 9%''');
+ vexec_check 
+-------------
+ (304)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''t_xt _''');
+ vexec_check 
+-------------
+ (286)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t NOT LIKE ''%1%''');
+ vexec_check 
+-------------
+ (2295)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''%''');
+ vexec_check 
+-------------
+ (2861)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''%%%''');
+ vexec_check 
+-------------
+ (2861)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''text\_1'' ESCAPE ''\''');
+ vexec_check 
+-------------
+ (0)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''te#%%'' ESCAPE ''#''');
+ vexec_check 
+-------------
+ (0)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''text 1\''');
+                         vexec_check                          
+--------------------------------------------------------------
+ ERROR 22025: LIKE pattern must not end with escape character
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''xyz\''');
+ vexec_check 
+-------------
+ (0)
+(1 row)
+
+-- numerics: the scaled layout's edges, and what it cannot hold
+CREATE TABLE vnum (n numeric(18,0), m numeric(38,2), k numeric(10,4), f numeric);
+INSERT INTO vnum VALUES (999999999999999999, 999999999999999999999999999999999999.99, 123456.7891, 1.5),
+	(-999999999999999999, -1, 'NaN', 'NaN'), (0, 0.01, 0, '-Infinity'), (NULL, NULL, NULL, NULL);
+SELECT vexec_check('SELECT n, m, k, f FROM vnum WHERE n > 0 OR m < 1');
+                                                                  vexec_check                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------
+ (-999999999999999999,-1.00,NaN,NaN) | (0,0.01,0.0000,-Infinity) | (999999999999999999,999999999999999999999999999999999999.99,123456.7891,1.5)
+(1 row)
+
+SELECT vexec_check('SELECT n + 1, m * 2, k - 1 FROM vnum');
+                                                              vexec_check                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ (,,) | (-999999999999999998,-2.00,NaN) | (1,0.02,-1.0000) | (1000000000000000000,1999999999999999999999999999999999999.98,123455.7891)
+(1 row)
+
+SELECT vexec_check('SELECT n * n FROM vnum');
+                                        vexec_check                                         
+--------------------------------------------------------------------------------------------
+ () | (0) | (999999999999999998000000000000000001) | (999999999999999998000000000000000001)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vnum WHERE k = ''NaN'' OR k > 100');
+ vexec_check 
+-------------
+ (2)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vnum WHERE f > 1');
+ vexec_check 
+-------------
+ (2)
+(1 row)
+
+SELECT vexec_check('SELECT n = 999999999999999999.0, k = 123456.78910 FROM vnum');
+         vexec_check         
+-----------------------------
+ (,) | (f,f) | (f,f) | (t,t)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE n > 100.5 AND n <= 120.25');
+ vexec_check 
+-------------
+ (414)
+(1 row)
+
+SELECT vexec_check('SELECT sum(n * 2), sum(nb - 10::numeric ^ 37), sum(nf + i4) FROM vs');
+          vexec_check           
+--------------------------------
+ (425543.720,4501500,6740283.0)
+(1 row)
+
+SELECT vexec_check('SELECT i4::numeric, i8::numeric, i2::numeric FROM vs WHERE id < 3');
+                vexec_check                 
+--------------------------------------------
+ (-426,2000000014,-98) | (-463,1000000007,)
+(1 row)
+
+-- dates and timestamps: comparisons, their limits, and their fields
+CREATE TABLE vdt (d date, ts timestamp);
+INSERT INTO vdt VALUES ('infinity', 'infinity'), ('-infinity', '-infinity'),
+	('4713-11-24 BC', '4713-11-24 00:00:00 BC'), ('5874897-12-31', '294276-12-31 23:59:59.999999'),
+	('294247-01-10', '294247-01-10 04:00:54.775807'), ('2000-01-01', '2000-01-01'),
+	('1970-01-01', '1970-01-01'), (NULL, NULL);
+SELECT vexec_check('SELECT d, ts FROM vdt WHERE d > ''2000-01-01''');
+                                                          vexec_check                                                           
+--------------------------------------------------------------------------------------------------------------------------------
+ (01-10-294247,"Sun Jan 10 04:00:54.775807 294247") | (12-31-5874897,"Sun Dec 31 23:59:59.999999 294276") | (infinity,infinity)
+(1 row)
+
+SELECT vexec_check('SELECT d, ts FROM vdt WHERE ts < ''1999-12-31''');
+                                                    vexec_check                                                    
+-------------------------------------------------------------------------------------------------------------------
+ ("11-24-4713 BC","Wed Nov 24 00:00:00 4713 BC") | (-infinity,-infinity) | (01-01-1970,"Thu Jan 01 00:00:00 1970")
+(1 row)
+
+SELECT vexec_check('SELECT d FROM vdt WHERE d < ts');
+  vexec_check   
+----------------
+ (01-10-294247)
+(1 row)
+
+SELECT vexec_check('SELECT d FROM vdt WHERE d = ''2000-01-01''::timestamp');
+ vexec_check  
+--------------
+ (01-01-2000)
+(1 row)
+
+SELECT vexec_check('SELECT d::timestamp FROM vdt');
+                 vexec_check                  
+----------------------------------------------
+ ERROR 22008: date out of range for timestamp
+(1 row)
+
+SELECT vexec_check('SELECT ts::date FROM vdt');
+                                                    vexec_check                                                    
+-------------------------------------------------------------------------------------------------------------------
+ ("11-24-4713 BC") | () | (-infinity) | (01-01-1970) | (01-01-2000) | (01-10-294247) | (12-31-294276) | (infinity)
+(1 row)
+
+SELECT vexec_check('SELECT extract(year FROM d), extract(dow FROM d), extract(julian FROM d) FROM vdt');
+                                                                        vexec_check                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ (,,) | (-4713,3,366) | (-Infinity,,-Infinity) | (1970,4,2440588) | (2000,6,2451545) | (294247,0,109192579) | (5874897,2,2147483493) | (Infinity,,Infinity)
+(1 row)
+
+SELECT vexec_check('SELECT extract(year FROM ts), extract(second FROM ts), extract(epoch FROM ts) FROM vdt');
+                 vexec_check                  
+----------------------------------------------
+ 8 rows, md5 527a5d90b7f57627190e57f9bd9759a9
+(1 row)
+
+SELECT vexec_check('SELECT date_part(''month'', ts), date_part(''epoch'', ts), date_part(''decade'', ts) FROM vdt');
+                                                                               vexec_check                                                                               
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ (,,) | (,-Infinity,-Infinity) | (,Infinity,Infinity) | (1,0,197) | (1,9223372036854.775,29424) | (1,946684800,200) | (11,-210835180800,-472) | (12,9224318016000,29427)
+(1 row)
+
+SELECT vexec_check('SELECT extract(hour FROM d) FROM vdt');
+                     vexec_check                      
+------------------------------------------------------
+ ERROR 0A000: unit "hour" not supported for type date
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE d BETWEEN ''2002-01-01'' AND ''2003-01-01'' AND ts > ''2001-06-01''');
+ vexec_check 
+-------------
+ (213)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE tz < ''2002-01-01 00:00:00+00''');
+ vexec_check 
+-------------
+ (796)
+(1 row)
+
+SELECT vexec_check('SELECT extract(month FROM d), extract(doy FROM ts), extract(isodow FROM ts) FROM vs WHERE id IN (1, 500, 1024, 2999)');
+                vexec_check                 
+--------------------------------------------
+ (,299,5) | (1,1,1) | (3,145,7) | (5,146,6)
+(1 row)
+
+-- other types: bool, uuid, oid, "char", interval
+SELECT vexec_check('SELECT count(*) FROM vs WHERE b = true AND c > ''M''');
+ vexec_check 
+-------------
+ (476)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE u > ''80000000-0000-0000-0000-000000000000''');
+ vexec_check 
+-------------
+ (1522)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE o < 100 OR o >= 2990');
+ vexec_check 
+-------------
+ (110)
+(1 row)
+
+SELECT vexec_check('SELECT iv, b, u, c FROM vs WHERE id IN (1, 2, 63)');
+                                                                                vexec_check                                                                                
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ ("@ 1 hour 3 mins",,03afdbd6-6e79-29b1-25f8-597834fa83a4,L) | ("@ 1 min",,c4ca4238-a0b9-2382-0dcc-509a6f75849b,B) | ("@ 2 mins",f,c81e728d-9d4c-2f63-6f06-7f89cc14862c,C)
+(1 row)
+
+-- InitPlans, and an InitPlan no row reaches
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 > (SELECT avg(i4) FROM vs)');
+ vexec_check 
+-------------
+ (1496)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE id < 0 AND i4 > (SELECT 1 / (count(*) - count(*))::int4 FROM edge1023)');
+ vexec_check 
+-------------
+ (0)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vs WHERE id < 3 AND i4 > (SELECT 1 / (count(*) - count(*))::int4 FROM edge1023)');
+          vexec_check          
+-------------------------------
+ ERROR 22012: division by zero
+(1 row)
+
+SELECT vexec_check('SELECT id, (SELECT count(*) FROM edge1023 WHERE a < vs.id) FROM vs WHERE id < 4');
+      vexec_check      
+-----------------------
+ (1,0) | (2,1) | (3,2)
+(1 row)
+
+-- rescans: a lateral scan, rescanned for each outer row
+SELECT vexec_check('SELECT e.a, s.n FROM edge1023 e, LATERAL (SELECT count(*) AS n FROM vs WHERE vs.id < e.a) s WHERE e.a < 5');
+          vexec_check          
+-------------------------------
+ (1,0) | (2,1) | (3,2) | (4,3)
+(1 row)
+
+SELECT vexec_check('SELECT e.a FROM edge1023 e WHERE EXISTS (SELECT 1 FROM vs WHERE vs.id = e.a * 1000)');
+   vexec_check   
+-----------------
+ (1) | (2) | (3)
+(1 row)
+
+-- the system columns and a whole row
+SELECT vexec_check('SELECT ctid, tableoid::regclass FROM edge1023 WHERE a IN (1, 1023)');
+                vexec_check                
+-------------------------------------------
+ ("(0,1)",edge1023) | ("(4,119)",edge1023)
+(1 row)
+
+SELECT vexec_check('SELECT e FROM edge1023 e WHERE a < 3');
+    vexec_check    
+-------------------
+ ("(1)") | ("(2)")
+(1 row)
+
+SELECT vexec_check('SELECT row_to_json(r) FROM vbp r WHERE c IS NOT NULL');
+                                                                       vexec_check                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+ ("{""c"":""      "",""v"":""""}") | ("{""c"":""ab    "",""v"":""ab  ""}") | ("{""c"":""ab    "",""v"":""ab""}") | ("{""c"":""ab c  "",""v"":""ab c""}")
+(1 row)
+
+-- a volatile function: every call PostgreSQL makes, in its order, each of
+-- the three runs making as many: here the planner puts the cheap qual first
+CREATE SEQUENCE vseq;
+SELECT vexec_check('SELECT count(*) FROM edge1023 WHERE nextval(''vseq'') > 0 AND a < 10');
+ vexec_check 
+-------------
+ (9)
+(1 row)
+
+SELECT nextval('vseq') - 1 AS calls;
+ calls 
+-------
+    27
+(1 row)
+
+-- and here a dear one second, so that nextval() is called for every row
+CREATE FUNCTION vexec_dear(int4) RETURNS bool LANGUAGE plpgsql IMMUTABLE COST 1000 AS
+$$ BEGIN RETURN $1 < 10; END $$;
+SELECT vexec_check('SELECT count(*) FROM edge1023 WHERE nextval(''vseq'') > 0 AND vexec_dear(a)');
+ vexec_check 
+-------------
+ (9)
+(1 row)
+
+SELECT nextval('vseq') - 28 - 1 AS calls;
+ calls 
+-------
+  3069
+(1 row)
+
+-- security: a qual that would fail on a hidden row never sees it
+CREATE TABLE vsec (a int4, secret int4);
+INSERT INTO vsec SELECT g, g % 4 FROM generate_series(1, 2000) g;
+CREATE FUNCTION vexec_leak(int4) RETURNS bool LANGUAGE plpgsql COST 0.0000001 AS
+$$ BEGIN IF $1 = 0 THEN RAISE EXCEPTION 'saw a hidden row'; END IF; RETURN true; END $$;
+CREATE VIEW vsec_view WITH (security_barrier) AS SELECT * FROM vsec WHERE secret > 0;
+SELECT vexec_check('SELECT count(*) FROM vsec_view WHERE vexec_leak(secret)');
+ vexec_check 
+-------------
+ (1500)
+(1 row)
+
+ALTER TABLE vsec ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vsec FORCE ROW LEVEL SECURITY;
+CREATE POLICY vsec_p ON vsec USING (secret > 0);
+CREATE ROLE regress_vexec_rls;
+GRANT SELECT ON vsec TO regress_vexec_rls;
+GRANT EXECUTE ON FUNCTION vexec_check(text), vexec_run(text, text, text), vexec_leak(int4) TO regress_vexec_rls;
+SET ROLE regress_vexec_rls;
+SELECT vexec_check('SELECT count(*) FROM vsec WHERE vexec_leak(secret)');
+ vexec_check 
+-------------
+ (1500)
+(1 row)
+
+RESET ROLE;
+-- long and compressed values, and the functions that read their stored form
+CREATE TABLE vlong (id int4, s text);
+INSERT INTO vlong SELECT g, repeat(md5(g::text), 2000) FROM generate_series(1, 30) g;
+INSERT INTO vlong SELECT g, repeat('x', g) FROM generate_series(31, 40) g;
+SELECT vexec_check('SELECT id, length(s), pg_column_compression(s) IS NOT NULL FROM vlong WHERE s LIKE ''%a%'' OR id > 35');
+                  vexec_check                  
+-----------------------------------------------
+ 32 rows, md5 c408b7458a3a24911db13d476250dc36
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM vlong WHERE s = repeat(md5(''7''), 2000)');
+ vexec_check 
+-------------
+ (1)
+(1 row)
+
+-- dropped columns, and one added with a default
+ALTER TABLE vbp ADD COLUMN w int4 DEFAULT 7;
+ALTER TABLE vbp DROP COLUMN v;
+SELECT vexec_check('SELECT c, w FROM vbp WHERE w = 7');
+                           vexec_check                            
+------------------------------------------------------------------
+ ("      ",7) | ("ab    ",7) | ("ab    ",7) | ("ab c  ",7) | (,7)
+(1 row)
+
+-- a kernel's failure on a row the quals removed is no row of PostgreSQL's
+-- evaluator: EXPLAIN ANALYZE counts none sent to it
+CREATE FUNCTION vexec_sent(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+	r text := 'none sent';
+BEGIN
+	PERFORM set_config('vexec.mode', 'force', true);
+	FOR l IN EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF l LIKE '%Rows Sent to PostgreSQL%' THEN
+			r := btrim(l);
+		END IF;
+	END LOOP;
+	RETURN r;
+END
+$$;
+SELECT vexec_check('SELECT id, i2 + 32700::int2 FROM vs WHERE i2 < 50 AND id < 400');
+                  vexec_check                   
+------------------------------------------------
+ 286 rows, md5 74665b9b7735e314dba4040456ebe3e7
+(1 row)
+
+SELECT vexec_sent('SELECT id, i2 + 32700::int2 FROM vs WHERE i2 < 50 AND id < 400');
+ vexec_sent 
+------------
+ none sent
+(1 row)
+
+SELECT vexec_sent('SELECT id FROM vs WHERE i2 < 50 AND 1000 / (i2 - 70) > -100 AND id < 400');
+ vexec_sent 
+------------
+ none sent
+(1 row)
+
+DROP POLICY vsec_p ON vsec;
+REVOKE ALL ON vsec FROM regress_vexec_rls;
+REVOKE ALL ON FUNCTION vexec_check(text), vexec_run(text, text, text), vexec_leak(int4) FROM regress_vexec_rls;
+DROP ROLE regress_vexec_rls;
+DROP VIEW vsec_view;
+DROP TABLE vs, edge1023, edge1024, edge1025, vfl, vco, vbp, vnum, vdt, vsec, vlong;
+DROP COLLATION vexec_und;
+DROP COLLATION vexec_ci;
+DROP SEQUENCE vseq;
+DROP FUNCTION vexec_leak(int4);
+DROP FUNCTION vexec_dear(int4);
+DROP FUNCTION vexec_sent(text);
+DROP FUNCTION vexec_check(text);
+DROP FUNCTION vexec_run(text, text, text);

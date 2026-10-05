@@ -1,0 +1,435 @@
+--- reference
++++ session
+@@ -1138,173 +1138,146 @@
+ set enable_memoize = 0;
+ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(0, 0, 1)');
+-                                        explain_parallel_append                                         
+---------------------------------------------------------------------------------------------------------
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                           ->  Index Scan using ab_a1_b1_a_idx on ab_a1_b1 ab_1 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a1_b2_a_idx on ab_a1_b2 ab_2 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a1_b3_a_idx on ab_a1_b3 ab_3 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a2_b1_a_idx on ab_a2_b1 ab_4 (never executed)
+-                           ->  Index Scan using ab_a2_b2_a_idx on ab_a2_b2 ab_5 (never executed)
+-                           ->  Index Scan using ab_a2_b3_a_idx on ab_a2_b3 ab_6 (never executed)
+-                           ->  Index Scan using ab_a3_b1_a_idx on ab_a3_b1 ab_7 (never executed)
+-                           ->  Index Scan using ab_a3_b2_a_idx on ab_a3_b2 ab_8 (never executed)
+-                           ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
++                              explain_parallel_append                               
++------------------------------------------------------------------------------------
+                            Filter: (a = ANY ('{0,0,1}'::integer[]))
+-                     ->  Append (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
+-               ->  Nested Loop (actual rows=N loops=N)
+-         ->  Partial Aggregate (actual rows=N loops=N)
+-         Workers Launched: N
+-         Workers Planned: 1
+-   ->  Gather (actual rows=N loops=N)
+- Finalize Aggregate (actual rows=N loops=N)
+- Optimizer: Postgres query optimizer
+-(28 rows)
++                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on lprt_a a (never executed)
++                     Workers Launched: N
++                     Workers Planned: 1
++               ->  Gather (never executed)
++               ->  Parallel Append (actual rows=N loops=N)
++               Workers Launched: N
++               Workers Planned: 2
++         ->  Gather (actual rows=N loops=N)
++         ->  Materialize (never executed)
++         Join Filter: (ab.a = a.a)
++   ->  Nested Loop (actual rows=N loops=N)
++ Aggregate (actual rows=N loops=N)
++ Optimizer: Postgres query optimizer
++(23 rows)
+ 
+ -- Ensure the same partitions are pruned when we make the nested loop
+ -- parameter an Expr rather than a plain Param.
+ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a + 0 where a.a in(0, 0, 1)');
+-                                        explain_parallel_append                                         
+---------------------------------------------------------------------------------------------------------
+-                                 Index Cond: (a = (a.a + 0))
+-                                 Index Cond: (a = (a.a + 0))
+-                                 Index Cond: (a = (a.a + 0))
+-                                 Index Cond: (a = (a.a + 0))
+-                                 Index Cond: (a = (a.a + 0))
+-                                 Index Cond: (a = (a.a + 0))
+-                                 Index Cond: (a = (a.a + 0))
+-                                 Index Cond: (a = (a.a + 0))
+-                                 Index Cond: (a = (a.a + 0))
+-                           ->  Index Scan using ab_a1_b1_a_idx on ab_a1_b1 ab_1 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a1_b2_a_idx on ab_a1_b2 ab_2 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a1_b3_a_idx on ab_a1_b3 ab_3 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a2_b1_a_idx on ab_a2_b1 ab_4 (never executed)
+-                           ->  Index Scan using ab_a2_b2_a_idx on ab_a2_b2 ab_5 (never executed)
+-                           ->  Index Scan using ab_a2_b3_a_idx on ab_a2_b3 ab_6 (never executed)
+-                           ->  Index Scan using ab_a3_b1_a_idx on ab_a3_b1 ab_7 (never executed)
+-                           ->  Index Scan using ab_a3_b2_a_idx on ab_a3_b2 ab_8 (never executed)
+-                           ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
++                              explain_parallel_append                               
++------------------------------------------------------------------------------------
+                            Filter: (a = ANY ('{0,0,1}'::integer[]))
+-                     ->  Append (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
+-               ->  Nested Loop (actual rows=N loops=N)
+-         ->  Partial Aggregate (actual rows=N loops=N)
+-         Workers Launched: N
+-         Workers Planned: 1
+-   ->  Gather (actual rows=N loops=N)
+- Finalize Aggregate (actual rows=N loops=N)
+- Optimizer: Postgres query optimizer
+-(28 rows)
++                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on lprt_a a (never executed)
++                     Workers Launched: N
++                     Workers Planned: 1
++               ->  Gather (never executed)
++               ->  Parallel Append (actual rows=N loops=N)
++               Workers Launched: N
++               Workers Planned: 2
++         ->  Gather (actual rows=N loops=N)
++         ->  Materialize (never executed)
++         Join Filter: (ab.a = (a.a + 0))
++   ->  Nested Loop (actual rows=N loops=N)
++ Aggregate (actual rows=N loops=N)
++ Optimizer: Postgres query optimizer
++(23 rows)
+ 
+ insert into lprt_a values(3),(3);
+ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(1, 0, 3)');
+-                                        explain_parallel_append                                         
+---------------------------------------------------------------------------------------------------------
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                           ->  Index Scan using ab_a1_b1_a_idx on ab_a1_b1 ab_1 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a1_b2_a_idx on ab_a1_b2 ab_2 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a1_b3_a_idx on ab_a1_b3 ab_3 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a2_b1_a_idx on ab_a2_b1 ab_4 (never executed)
+-                           ->  Index Scan using ab_a2_b2_a_idx on ab_a2_b2 ab_5 (never executed)
+-                           ->  Index Scan using ab_a2_b3_a_idx on ab_a2_b3 ab_6 (never executed)
+-                           ->  Index Scan using ab_a3_b1_a_idx on ab_a3_b1 ab_7 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a3_b2_a_idx on ab_a3_b2 ab_8 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                              explain_parallel_append                               
++------------------------------------------------------------------------------------
+                            Filter: (a = ANY ('{1,0,3}'::integer[]))
+-                     ->  Append (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
+-               ->  Nested Loop (actual rows=N loops=N)
+-         ->  Partial Aggregate (actual rows=N loops=N)
+-         Workers Launched: N
+-         Workers Planned: 1
+-   ->  Gather (actual rows=N loops=N)
+- Finalize Aggregate (actual rows=N loops=N)
+- Optimizer: Postgres query optimizer
+-(28 rows)
++                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on lprt_a a (never executed)
++                     Workers Launched: N
++                     Workers Planned: 1
++               ->  Gather (never executed)
++               ->  Parallel Append (actual rows=N loops=N)
++               Workers Launched: N
++               Workers Planned: 2
++         ->  Gather (actual rows=N loops=N)
++         ->  Materialize (never executed)
++         Join Filter: (ab.a = a.a)
++   ->  Nested Loop (actual rows=N loops=N)
++ Aggregate (actual rows=N loops=N)
++ Optimizer: Postgres query optimizer
++(23 rows)
+ 
+ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(1, 0, 0)');
+-                                        explain_parallel_append                                         
+---------------------------------------------------------------------------------------------------------
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                           ->  Index Scan using ab_a1_b1_a_idx on ab_a1_b1 ab_1 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a1_b2_a_idx on ab_a1_b2 ab_2 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a1_b3_a_idx on ab_a1_b3 ab_3 (actual rows=N loops=N)
+-                           ->  Index Scan using ab_a2_b1_a_idx on ab_a2_b1 ab_4 (never executed)
+-                           ->  Index Scan using ab_a2_b2_a_idx on ab_a2_b2 ab_5 (never executed)
+-                           ->  Index Scan using ab_a2_b3_a_idx on ab_a2_b3 ab_6 (never executed)
+-                           ->  Index Scan using ab_a3_b1_a_idx on ab_a3_b1 ab_7 (never executed)
+-                           ->  Index Scan using ab_a3_b2_a_idx on ab_a3_b2 ab_8 (never executed)
+-                           ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
++                              explain_parallel_append                               
++------------------------------------------------------------------------------------
+                            Filter: (a = ANY ('{1,0,0}'::integer[]))
+-                           Rows Removed by Filter: N
+-                     ->  Append (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
+-               ->  Nested Loop (actual rows=N loops=N)
+-         ->  Partial Aggregate (actual rows=N loops=N)
+-         Workers Launched: N
+-         Workers Planned: 1
+-   ->  Gather (actual rows=N loops=N)
+- Finalize Aggregate (actual rows=N loops=N)
+- Optimizer: Postgres query optimizer
+-(29 rows)
++                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on lprt_a a (never executed)
++                     Workers Launched: N
++                     Workers Planned: 1
++               ->  Gather (never executed)
++               ->  Parallel Append (actual rows=N loops=N)
++               Workers Launched: N
++               Workers Planned: 2
++         ->  Gather (actual rows=N loops=N)
++         ->  Materialize (never executed)
++         Join Filter: (ab.a = a.a)
++   ->  Nested Loop (actual rows=N loops=N)
++ Aggregate (actual rows=N loops=N)
++ Optimizer: Postgres query optimizer
++(23 rows)
+ 
+ delete from lprt_a where a = 1;
+ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(1, 0, 0)');
+-                                     explain_parallel_append                                     
+--------------------------------------------------------------------------------------------------
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                                 Index Cond: (a = a.a)
+-                           ->  Index Scan using ab_a1_b1_a_idx on ab_a1_b1 ab_1 (never executed)
+-                           ->  Index Scan using ab_a1_b2_a_idx on ab_a1_b2 ab_2 (never executed)
+-                           ->  Index Scan using ab_a1_b3_a_idx on ab_a1_b3 ab_3 (never executed)
+-                           ->  Index Scan using ab_a2_b1_a_idx on ab_a2_b1 ab_4 (never executed)
+-                           ->  Index Scan using ab_a2_b2_a_idx on ab_a2_b2 ab_5 (never executed)
+-                           ->  Index Scan using ab_a2_b3_a_idx on ab_a2_b3 ab_6 (never executed)
+-                           ->  Index Scan using ab_a3_b1_a_idx on ab_a3_b1 ab_7 (never executed)
+-                           ->  Index Scan using ab_a3_b2_a_idx on ab_a3_b2 ab_8 (never executed)
+-                           ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
++                              explain_parallel_append                               
++------------------------------------------------------------------------------------
+                            Filter: (a = ANY ('{1,0,0}'::integer[]))
+-                           Rows Removed by Filter: N
+-                     ->  Append (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
+-               ->  Nested Loop (actual rows=N loops=N)
+-         ->  Partial Aggregate (actual rows=N loops=N)
+-         Workers Launched: N
+-         Workers Planned: 1
+-   ->  Gather (actual rows=N loops=N)
+- Finalize Aggregate (actual rows=N loops=N)
+- Optimizer: Postgres query optimizer
+-(29 rows)
++                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                     ->  Parallel Seq Scan on lprt_a a (never executed)
++                     Workers Launched: N
++                     Workers Planned: 1
++               ->  Gather (never executed)
++               ->  Parallel Append (actual rows=N loops=N)
++               Workers Launched: N
++               Workers Planned: 2
++         ->  Gather (actual rows=N loops=N)
++         ->  Materialize (never executed)
++         Join Filter: (ab.a = a.a)
++   ->  Nested Loop (actual rows=N loops=N)
++ Aggregate (actual rows=N loops=N)
++ Optimizer: Postgres query optimizer
++(23 rows)
+ 
+ reset enable_hashjoin;
+@@ -2078,10 +2051,10 @@
+ -- the plan as it's pulled in setref.c due to having just a single subnode).
+ select explain_parallel_append('select * from listp where a = (select 1);');
+-                       explain_parallel_append                        
+-----------------------------------------------------------------------
++                        explain_parallel_append                         
++------------------------------------------------------------------------
+                Filter: (a = (InitPlan expr_1).col1)
+                Filter: (a = (InitPlan expr_1).col1)
+-         ->  Parallel Seq Scan on listp_12_2 listp_2 (never executed)
+-         ->  Seq Scan on listp_12_1 listp_1 (actual rows=N loops=N)
++         ->  Vec Seq Scan on listp_12_1 listp_1 (actual rows=N loops=N)
++         ->  Vec Seq Scan on listp_12_2 listp_2 (never executed)
+      ->  Result (actual rows=N loops=N)
+    ->  Parallel Append (actual rows=N loops=N)
+@@ -2100,6 +2073,6 @@
+   union all
+ select * from listp where a = (select 2);');
+-                              explain_parallel_append                              
+------------------------------------------------------------------------------------
++                           explain_parallel_append                            
++------------------------------------------------------------------------------
+                      Filter: (a = (InitPlan expr_1).col1)
+                      Filter: (a = (InitPlan expr_1).col1)
+@@ -2108,8 +2081,8 @@
+                  ->  Result (actual rows=N loops=N)
+                  ->  Result (actual rows=N loops=N)
+-               ->  Parallel Seq Scan on listp_12_2 listp_2 (actual rows=N loops=N)
+-               ->  Parallel Seq Scan on listp_12_2 listp_5 (never executed)
+-               ->  Seq Scan on listp_12_1 listp_1 (never executed)
+-               ->  Seq Scan on listp_12_1 listp_4 (actual rows=N loops=N)
++               ->  Vec Seq Scan on listp_12_1 listp_1 (never executed)
++               ->  Vec Seq Scan on listp_12_1 listp_4 (actual rows=N loops=N)
++               ->  Vec Seq Scan on listp_12_2 listp_2 (actual rows=N loops=N)
++               ->  Vec Seq Scan on listp_12_2 listp_5 (never executed)
+                InitPlan expr_1
+                InitPlan expr_2
+@@ -2252,80 +2225,80 @@
+ \gexec
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a is null and b is null and c is null and d is null
+- Seq Scan on hp_prefix_test_p0 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p0 hp_prefix_test
+    Filter: ((a IS NULL) AND (b IS NULL) AND (c IS NULL) AND (d IS NULL))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a = 1 and b is null and c is null and d is null
+- Seq Scan on hp_prefix_test_p1 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p1 hp_prefix_test
+    Filter: ((b IS NULL) AND (c IS NULL) AND (d IS NULL) AND (a = 1))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a is null and b = 2 and c is null and d is null
+- Seq Scan on hp_prefix_test_p2 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p2 hp_prefix_test
+    Filter: ((a IS NULL) AND (c IS NULL) AND (d IS NULL) AND (b = 2))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a = 1 and b = 2 and c is null and d is null
+- Seq Scan on hp_prefix_test_p4 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p4 hp_prefix_test
+    Filter: ((c IS NULL) AND (d IS NULL) AND (a = 1) AND (b = 2))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a is null and b is null and c = 3 and d is null
+- Seq Scan on hp_prefix_test_p3 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p3 hp_prefix_test
+    Filter: ((a IS NULL) AND (b IS NULL) AND (d IS NULL) AND (c = 3))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a = 1 and b is null and c = 3 and d is null
+- Seq Scan on hp_prefix_test_p7 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p7 hp_prefix_test
+    Filter: ((b IS NULL) AND (d IS NULL) AND (a = 1) AND (c = 3))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a is null and b = 2 and c = 3 and d is null
+- Seq Scan on hp_prefix_test_p4 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p4 hp_prefix_test
+    Filter: ((a IS NULL) AND (d IS NULL) AND (b = 2) AND (c = 3))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a = 1 and b = 2 and c = 3 and d is null
+- Seq Scan on hp_prefix_test_p5 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p5 hp_prefix_test
+    Filter: ((d IS NULL) AND (a = 1) AND (b = 2) AND (c = 3))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a is null and b is null and c is null and d = 4
+- Seq Scan on hp_prefix_test_p4 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p4 hp_prefix_test
+    Filter: ((a IS NULL) AND (b IS NULL) AND (c IS NULL) AND (d = 4))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a = 1 and b is null and c is null and d = 4
+- Seq Scan on hp_prefix_test_p6 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p6 hp_prefix_test
+    Filter: ((b IS NULL) AND (c IS NULL) AND (a = 1) AND (d = 4))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a is null and b = 2 and c is null and d = 4
+- Seq Scan on hp_prefix_test_p5 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p5 hp_prefix_test
+    Filter: ((a IS NULL) AND (c IS NULL) AND (b = 2) AND (d = 4))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a = 1 and b = 2 and c is null and d = 4
+- Seq Scan on hp_prefix_test_p6 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p6 hp_prefix_test
+    Filter: ((c IS NULL) AND (a = 1) AND (b = 2) AND (d = 4))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a is null and b is null and c = 3 and d = 4
+- Seq Scan on hp_prefix_test_p4 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p4 hp_prefix_test
+    Filter: ((a IS NULL) AND (b IS NULL) AND (c = 3) AND (d = 4))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a = 1 and b is null and c = 3 and d = 4
+- Seq Scan on hp_prefix_test_p5 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p5 hp_prefix_test
+    Filter: ((b IS NULL) AND (a = 1) AND (c = 3) AND (d = 4))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a is null and b = 2 and c = 3 and d = 4
+- Seq Scan on hp_prefix_test_p6 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p6 hp_prefix_test
+    Filter: ((a IS NULL) AND (b = 2) AND (c = 3) AND (d = 4))
+  Optimizer: Postgres query optimizer
+ 
+ explain (costs off) select tableoid::regclass,* from hp_prefix_test where a = 1 and b = 2 and c = 3 and d = 4
+- Seq Scan on hp_prefix_test_p4 hp_prefix_test
++ Vec Seq Scan on hp_prefix_test_p4 hp_prefix_test
+    Filter: ((a = 1) AND (b = 2) AND (c = 3) AND (d = 4))
+  Optimizer: Postgres query optimizer

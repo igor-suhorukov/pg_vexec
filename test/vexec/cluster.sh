@@ -1,26 +1,29 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# The cluster leg (pg_vector_executor.md §5 V0, §6.1, §6.8): a coordinator
-# and VEXEC_SEGMENTS segments of the port in one container, as the port's
-# suites make one, with vexec in every node's shared_preload_libraries
-# beside the port's modules.  On it:
+# The cluster leg (pg_vector_executor.md §5 V0 and V1, §6.1, §6.8): a
+# coordinator and VEXEC_SEGMENTS segments of the port in one container, as
+# the port's suites make one, with vexec in every node's
+# shared_preload_libraries beside the port's modules.  On it:
 #
 #   - vexec loads on every node, and its settings are each node's;
-#   - a session's vexec settings and whether they reach the segments: not
-#     before V1, which adds vexec's names to gp_core's list of settings sent
-#     to them (§3.10), so this leg reports what a segment sees;
+#   - a session's vexec settings reach the segments: set only in the
+#     session on the coordinator, never in a segment's configuration, they
+#     are what a segment's session sees (gp_core's list, §3.10);
 #   - a workload over distributed tables of each storage -- heap, ao_column,
 #     PAX porc and porc_vec -- answers alike with vexec.mode off, explain,
-#     force in the PostgreSQL format and force in the Arrow format, under
+#     force in the PostgreSQL format, force in the Arrow format and force
+#     with the per-structure layouts drawn at random, under
 #     ORCA and under the planner's route;
-#   - EXPLAIN (VEXEC) on the coordinator: ORCA's plans reach no planner
-#     hook of vexec's (§2.1), and the planner's route records alternatives;
+#   - under ORCA, the fragments carry vector scans to every segment:
+#     EXPLAIN ANALYZE shows them executed below the Gather Motion, each with
+#     the rows the segments read, and EXPLAIN (VEXEC) the alternatives
+#     gp_orca's API offered (§3.3.4);
+#   - on the gather route, each segment plans its own SQL with vexec's path
+#     hooks: a statement a segment runs builds vector scans there, with the
+#     session's settings, as vexec.debug_require_vector proves;
 #   - the batch layer in a coordinator's backend over rows gathered from the
 #     segments: vexec_test's round trips and export check.
-#
-# In V0 no vector node exists, so every session must answer alike; from V1
-# the same leg checks vector nodes running on every segment.
 #
 #   VEXEC_SEGMENTS   4
 #   VEXEC_ROWS       rows of each table: 50000
@@ -112,9 +115,13 @@ for n in $NODES; do
 done
 check "the segments a query reaches have vexec" \
 	"$(cq 0 $DB "SELECT count(*) FROM gp.exec_on_segments('SELECT current_setting(''vexec.mode'')') WHERE result = 'off'")" "$SEGMENTS"
-# a session's setting on the coordinator, and what the segments see of it
-seen=$(cq 0 $DB "SET vexec.mode = explain; SELECT string_agg(DISTINCT result, ',') FROM gp.exec_on_segments('SELECT current_setting(''vexec.mode'')')")
-echo "  a session's SET vexec.mode = explain on the coordinator; the segments see: $seen (V1 sends vexec's settings to them)"
+# a session's settings on the coordinator reach the segments (§3.10)
+check "a session's SET vexec.mode = force reaches every segment" \
+	"$(cq 0 $DB "SET vexec.mode = force; SELECT count(*) FROM gp.exec_on_segments('SELECT current_setting(''vexec.mode'')') WHERE result = 'force'")" "$SEGMENTS"
+check "and SET vexec.batch_format = arrow" \
+	"$(cq 0 $DB "SET vexec.batch_format = arrow; SELECT count(*) FROM gp.exec_on_segments('SELECT current_setting(''vexec.batch_format'')') WHERE result = 'arrow'")" "$SEGMENTS"
+check "and a superuser's SET vexec.debug_require_vector = on" \
+	"$(cq 0 $DB "SET vexec.debug_require_vector = on; SELECT count(*) FROM gp.exec_on_segments('SELECT current_setting(''vexec.debug_require_vector'')') WHERE result = 'on'")" "$SEGMENTS"
 
 # the tables, in each storage, distributed
 cat > "$ROOT/tables.sql" <<SQL
@@ -146,13 +153,19 @@ QUERIES=(
 	"SELECT d, sum(v) OVER (PARTITION BY k ORDER BY id) FROM %t WHERE id % 1000 = 7"
 	"SELECT id, v FROM %t WHERE v > 99990 ORDER BY v, id LIMIT 20"
 )
-SESSIONS=("off" "explain" "force-postgres" "force-arrow")
+# force-random: the per-structure layouts drawn at random each time a node
+# reads them (§6.1), from a seed the coordinator's session sends the
+# segments with its other settings
+SEED="${VEXEC_SEED:-$(( (RANDOM << 15 | RANDOM) % 2147483646 + 1 ))}"
+echo "  random session's seed: $SEED (VEXEC_SEED=$SEED reruns it)"
+SESSIONS=("off" "explain" "force-postgres" "force-arrow" "force-random")
 session_sets() {
 	case "$1" in
 		off) echo "SET vexec.mode = off;" ;;
 		explain) echo "SET vexec.mode = explain;" ;;
 		force-postgres) echo "SET vexec.mode = force; SET vexec.batch_format = postgres;" ;;
 		force-arrow) echo "SET vexec.mode = force; SET vexec.batch_format = arrow;" ;;
+		force-random) echo "SET vexec.mode = force; SET vexec.debug_layout_seed = $SEED;" ;;
 	esac
 }
 nq=0
@@ -180,12 +193,55 @@ for optimizer in on off; do
 done
 echo "  $nq queries over the four storages, under ORCA and the planner: $nsame answered as in off mode"
 
-# EXPLAIN (VEXEC) on the coordinator
+# under ORCA: the fragments' vector scans, executed on every segment, each
+# reading through its storage's batch source
+for t in t_heap t_aoco t_porc t_porc_vec; do
+	case "$t" in
+		t_aoco) want="gp_ao" ;;
+		t_porc|t_porc_vec) want="pax" ;;
+		*) want="the slot path" ;;
+	esac
+	plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT k, v FROM $t WHERE v > 1000")
+	if echo "$plan" | grep -q "Gather Motion" && echo "$plan" | grep -q "Vec Seq Scan on public.$t (actual rows=[1-9]" \
+		&& echo "$plan" | grep -q "GPORCA" && echo "$plan" | grep -q "Source: $want"; then
+		echo "  ok ORCA's fragment runs a vector scan of $t on the segments, through $want"
+	else
+		echo "  FAILED ORCA's plan of $t has no vector scan executed below its Gather Motion:"
+		echo "$plan" | sed 's/^/    /'
+		fail=1
+	fi
+done
+# each segment ran its part of the vector scan, with rows of its own
+# (§6.8): EXPLAIN ANALYZE's per-segment figures, gp.enable_explain_allstat's
+# "allstat: seg_firststart_total_ntuples/seg0_<ms>_<ms>_<rows>/..."
+for t in t_heap t_aoco t_porc t_porc_vec; do
+	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.enable_explain_allstat = on;
+		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT k, v FROM $t WHERE v > 1000" |
+		awk -v t="$t" 'index($0, "Vec Seq Scan on " t) { found = 1 }
+			found && /allstat:/ { sub(/.*allstat: /, ""); n = split($0, e, "/"); c = 0
+				for (i = 2; i <= n; i++) { k = split(e[i], f, "_"); if (f[k] + 0 > 0) c++ }
+				print c; exit }')
+	check "each of the $SEGMENTS segments ran the vector scan of $t, with rows of its own" "$out" "$SEGMENTS"
+done
+seg_rows=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) SELECT k FROM t_heap WHERE v > 1000" | grep -c '"Custom Plan Provider": "VecScan"')
+[ "$seg_rows" -gt 0 ] && echo "  ok EXPLAIN ANALYZE's JSON names the VecScan the segments ran" \
+	|| { echo "  FAILED EXPLAIN ANALYZE's JSON names no VecScan"; fail=1; }
 explain=$(cq 0 $DB "SET gp.optimizer = on; SET gp.optimizer_trace_fallback = on; SET vexec.mode = explain; EXPLAIN (VEXEC, COSTS OFF) SELECT k, count(*) FROM t_aoco GROUP BY k")
-orca=$(echo "$explain" | grep '^Vexec')
-check "ORCA's plans reach no planner hook of vexec's" "$orca" "Vexec: no vector alternatives were considered"
-[ "$orca" = "Vexec: no vector alternatives were considered" ] || echo "$explain" | sed 's/^/    /'
+if echo "$explain" | grep -q "VecScan on t_aoco: not chosen (explain mode)" && ! echo "$explain" | grep -q "Vec Seq Scan"; then
+	echo "  ok ORCA's plans offer their scans to vexec through gp_orca's API, and explain mode builds none"
+else
+	echo "  FAILED ORCA's EXPLAIN (VEXEC) in explain mode:"
+	echo "$explain" | sed 's/^/    /'
+	fail=1
+fi
 
+# the gather route: each segment plans its own SQL with vexec's path hooks,
+# with the session's settings; a segment that built no vector node fails
+for t in t_heap t_aoco t_porc t_porc_vec; do
+	out=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = force; SET vexec.debug_require_vector = on;
+		SELECT count(*) FROM gp.exec_on_segments('SELECT count(*) FROM $t WHERE v > 1000') WHERE result::int8 > 0")
+	check "on the gather route, every segment scans $t with a vector scan" "$out" "$SEGMENTS"
+done
 planner=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = explain; EXPLAIN (VEXEC, COSTS OFF) SELECT k, count(*) FROM t_aoco GROUP BY k" | grep -c 'Vec')
 [ "$planner" -gt 0 ] && echo "  ok the planner's route records vector alternatives on the coordinator ($planner lines)" \
 	|| { echo "  FAILED the planner's route records nothing"; fail=1; }

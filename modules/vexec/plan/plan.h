@@ -12,8 +12,9 @@
  * planner's own search).  Every alternative not taken keeps its reason, for
  * EXPLAIN's vexec option.
  *
- * In V0 nothing is vectorized: no vector node exists yet, so in every mode
- * but off the hooks only cost and record the alternatives (§5, V0).
+ * In V1 the scan is vectorized: VecScan, and ORCA's Results over it as
+ * VecResult.  Joins, aggregations and sorts are still only costed and
+ * recorded (§5).
  *
  *-------------------------------------------------------------------------
  */
@@ -22,6 +23,7 @@
 
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
+#include "utils/relcache.h"
 
 #include "vexec.h"
 #include "batch/batch.h"
@@ -65,7 +67,9 @@ typedef struct VexecAlt
 								 * relids index */
 	Relids		relids;			/* joins: one record per join relation */
 	bool		possible;		/* the oracle accepted it */
-	char	   *reason;			/* why not possible, or why not chosen */
+	const char *status;			/* possible: "added", "built", "not chosen",
+								 * "not built" */
+	char	   *reason;			/* why not possible, or what became of it */
 	char	   *detail;			/* source, steps, layouts */
 	VexecCost	cost;
 } VexecAlt;
@@ -83,6 +87,9 @@ typedef struct VexecPlanState
 	List	   *alts;			/* VexecAlt */
 	int			nalts;
 	int			dropped;		/* past the record's cap */
+	int			npossible;		/* vector nodes the oracle accepted, built or
+								 * added as paths: what
+								 * vexec.debug_require_vector asks of a plan */
 } VexecPlanState;
 
 /* The most alternatives one statement records. */
@@ -105,6 +112,9 @@ extern void vexec_cost_agg(PlannerInfo *root, Path *rowpath, Path *input,
 						   int ngroupcols, int ngroupcols_kernel,
 						   int naggs_kernel, double numgroups, VexecCost *cost);
 extern void vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, VexecCost *cost);
+extern void vexec_cost_plan_scan(Relation rel, const VexecSteps *quals,
+								 const VexecSteps *target, int ncols_in, int ncols_out,
+								 double rows, VexecCost *cost);
 
 /* reasons.c */
 extern VexecAlt *vexec_alt_record(VexecPlanState *ps, const char *node, const char *target,
@@ -117,6 +127,16 @@ extern Node *vexec_reasons_node(VexecPlanState *ps);
 
 /* paths.c */
 extern VexecPlanState *vexec_plan_state(PlannerInfo *root);
+extern const char *vexec_statement_gate(Query *parse, int cursorOptions);
+
+/* orca.c: ORCA's front end, through gp_orca's API */
+extern void vexec_orca_install(void);
+
+/* build.c */
+extern Path *vexec_scan_path(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
+							 const VexecCost *cost);
+extern Plan *vexec_build_scan_from_seqscan(SeqScan *seqscan);
+extern Plan *vexec_build_result_from_result(Result *result);
 
 /* explain.c */
 extern bool vexec_explain_requested(void *es);

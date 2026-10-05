@@ -40,10 +40,27 @@ x-run: &run
   volumes:
     - ..:/src:ro
     - ${VEXEC_WORK:-/nonexistent}:/work
+    - ${VEXEC_PORT_STAGE:-/nonexistent}:/cbstage:ro
   environment:
     VEXEC_SRC: /src
     VEXEC_WORK: /work
     CB_SRC_MOUNT: ${CB_SRC_MOUNT:-}
+    # the legs' own settings, passed through when the host sets them
+    VEXEC_SEED: ${VEXEC_SEED:-}
+    VEXEC_CORPORA: ${VEXEC_CORPORA:-}
+    VEXEC_SESSIONS: ${VEXEC_SESSIONS:-}
+    VEXEC_ROWS: ${VEXEC_ROWS:-}
+    VEXEC_STORAGES: ${VEXEC_STORAGES:-}
+    VEXEC_SOURCES: ${VEXEC_SOURCES:-}
+    VEXEC_SEGMENTS: ${VEXEC_SEGMENTS:-}
+    VEXEC_PRELOAD: ${VEXEC_PRELOAD:-}
+    VEXEC_SETTINGS: ${VEXEC_SETTINGS:-}
+    VEXEC_PG_MODES: ${VEXEC_PG_MODES:-}
+    VEXEC_PG_SCHEDULE: ${VEXEC_PG_SCHEDULE:-}
+    VEXEC_PORT_SUITES: ${VEXEC_PORT_SUITES:-}
+    VEXEC_PORT_PASSES: ${VEXEC_PORT_PASSES:-}
+    VEXEC_PORT_SESSIONS: ${VEXEC_PORT_SESSIONS:-}
+    MAKE_JOBS: ${MAKE_JOBS:-4}
 
 services:
   vexec-dev-vanilla:
@@ -61,6 +78,43 @@ services:
       args:
         BASE_IMAGE: pg_accel/cb-ext:${CB_COMMIT:-unset}
     profiles: ["build"]
+
+  # The port's build tools on vexec's dev image of the port: the port's
+  # modules built from a worktree of the port (V1's branch, vexec_v1) by the
+  # portbuild service.
+  vexec-dev-portdev:
+    image: pg_accel/vexec-dev:portdev-${CB_COMMIT:-unset}
+    build:
+      context: .
+      dockerfile: Dockerfile.portdev
+      args:
+        BASE_IMAGE: pg_accel/vexec-dev:port-${CB_COMMIT:-unset}
+    profiles: ["build"]
+
+  # The port's modules built from VEXEC_PORT_SRC, a worktree of the port, into
+  # VEXEC_PORT_BUILD, and staged there for the legs (test/vexec/portbuild.sh).
+  # PAX's two submodules, which a worktree does not check out, are clones of
+  # the commits the tree pins, mounted over their empty directories.
+  portbuild:
+    image: pg_accel/vexec-dev:portdev-${CB_COMMIT:-unset}
+    user: postgres
+    network_mode: none
+    entrypoint: ["/src/test/vexec/portbuild.sh"]
+    mem_limit: ${VEXEC_PORTBUILD_MEM:-16g}
+    memswap_limit: ${VEXEC_PORTBUILD_MEM:-16g}
+    cpus: ${VEXEC_CPUS:-0}
+    tmpfs:
+      - /tmp:exec
+    volumes:
+      - ..:/src:ro
+      - ${VEXEC_PORT_SRC:-/nonexistent}:/cbsrc:ro
+      - ${VEXEC_PAX_CONTRIB:-/nonexistent}/tabulate:/cbsrc/contrib/pax_storage/src/cpp/contrib/tabulate:ro
+      - ${VEXEC_PAX_CONTRIB:-/nonexistent}/googletest:/cbsrc/contrib/pax_storage/src/cpp/contrib/googletest:ro
+      - ${VEXEC_PORT_BUILD:-/nonexistent}:/cbbuild
+    environment:
+      PORTBUILD_JOBS: ${PORTBUILD_JOBS:-8}
+      PORTBUILD_COMMIT: ${PORTBUILD_COMMIT:-unknown}
+    profiles: ["run"]
 
   vanilla:
     <<: *run
@@ -101,6 +155,7 @@ services:
       - /var/lib/cbdisk
       - ..:/src:ro
       - ${VEXEC_WORK:-/nonexistent}:/work
+      - ${VEXEC_PORT_STAGE:-/nonexistent}:/cbstage:ro
     environment:
       VEXEC_FULLRUN_PRELOAD: ${VEXEC_FULLRUN_PRELOAD:-1}
       RESULTS_DIR: /work/fullrun-${VEXEC_FULLRUN_PRELOAD:-1}

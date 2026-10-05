@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: Apache-2.0
+#
+# The port's modules, built from a worktree of the port beside vexec
+# (pg_vector_executor.md §5 V1): PAX's and gp_ao's batch readers, gp_orca's
+# API and gp_core's list of settings are the port's code, under pg19/, and V1
+# changes them on a branch of its own (vexec_v1).  This image is vexec's dev
+# image of the port with the port's build tools on it, so that meson and
+# ninja build the port's modules from the worktree incrementally, into a
+# build directory of the cache, and stage them for the legs to install over
+# the image's own (test/vexec/portbuild.sh).
+#
+# The packages are the build stage's of the port's Dockerfile.cbext.
+
+ARG BASE_IMAGE=pg_accel/vexec-dev:port-unset
+
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        meson ninja-build pkg-config bison flex \
+        libreadline-dev zlib1g-dev libicu-dev libssl-dev liblz4-dev libzstd-dev \
+        libxml2-dev libxslt1-dev libxerces-c-dev \
+        libcurl4-openssl-dev libapr1-dev libevent-dev libyaml-dev libjansson-dev \
+        protobuf-compiler libprotobuf-dev liburing-dev \
+        libuv1-dev \
+    && rm -rf /var/lib/apt/lists/*
+USER postgres
