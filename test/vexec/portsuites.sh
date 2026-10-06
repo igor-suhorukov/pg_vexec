@@ -18,9 +18,9 @@
 # Every server a suite starts has vexec after its own preload list and the
 # session's settings, as the full run's wrapper gives them (fullrun.sh):
 # the real binary keeps its name in a directory of its own, and runs with
-# the wrapper's name, so that gpMgmt finds it.  Each run keeps its work
-# directory, and its results are compared with the reference's by the
-# differential runner's comparison (differential.py): rows, plans dropped
+# the wrapper's name, so that gpMgmt finds it.  Each run's results are
+# compared with the reference's by the differential runner's comparison
+# (differential.py): rows, plans dropped
 # and unordered results sorted, and the SQLSTATEs of each test's errors from
 # the servers' logs.  The greenplum suite's results are first read as
 # Cloudberry's gpdiff.pl reads them, through atmsort.pm with Cloudberry's and
@@ -31,9 +31,16 @@
 # against Cloudberry's expected output, are not the measure here: a vector
 # plan prints otherwise.
 #
+# A suite keeps its work directory (KEEP=1) until its results and logs are
+# read; then the session's clusters are deleted, and their servers' logs and
+# the suite's diffs stay in logs/ of its work directory.  A greenplum
+# session's databases take ~10 GB and a whole run's ~117 GB; kept runs filled
+# the host's disk on 2026-10-06.
+#
 #   VEXEC_PORT_SUITES    "singlenode greenplum"
 #   VEXEC_PORT_PASSES    "planner orca"
 #   VEXEC_PORT_SESSIONS  "off off-again postgres arrow random"
+#   VEXEC_PORT_KEEP      set: each session's clusters kept, databases and all
 #   VEXEC_SEED           the random session's seed: drawn and printed
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -130,6 +137,18 @@ for suite in ${VEXEC_PORT_SUITES:-singlenode greenplum}; do
 				cat "$l"
 			done > "$dest/postmaster.log" 2> /dev/null
 			echo "    $(ls "$dest/results" | wc -l) results kept"
+
+			# the session's clusters, once read: their servers' logs and the
+			# suite's diffs kept in logs/, the rest deleted
+			if [ -z "${VEXEC_PORT_KEEP:-}" ]; then
+				for c in "$work"/cb-$suite-*; do
+					[ -d "$c" ] || continue
+					mkdir -p "$work/logs"
+					(cd "$work" && find "${c##*/}" -type f \( -name '*.log' -o -name log -o -name '*.diffs' -o -path '*/log/*' \) \
+						-exec cp --parents -t logs {} +)
+					rm -rf "$c"
+				done
+			fi
 			sessions="$sessions $s"
 		done
 		python3 "$here/differential.py" "$CMP/$suite-$pass" $sessions \
