@@ -110,6 +110,11 @@ UPDATE src SET i4 = NULL, n = NULL, b = NULL, ts = NULL WHERE id % 101 = 7;
 -- porc_vec keeps a numeric only with a typmod of precision 35 at most
 CREATE TABLE src_pv AS SELECT * FROM src;
 ALTER TABLE src_pv ALTER COLUMN nfree TYPE numeric(30,4);
+-- the queries that join them have their statistics in every session: ORCA
+-- notes a table without them, and whether autovacuum had come by first
+-- would decide the note
+ANALYZE src;
+ANALYZE src_pv;
 SQL
 q "$D" postgres "$(cat "$D/data.sql")" > /dev/null
 for s in $STORAGES; do
