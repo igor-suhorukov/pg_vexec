@@ -125,6 +125,18 @@ NAME(VexecKernelCall *kc) \
 			out[w] = word; \
 		} \
 	} \
+	else if (l->encoding == VEXEC_CONST && r->encoding == VEXEC_CONST) \
+	{ \
+		/* two constants -- a missing value against a literal: one answer */ \
+		uint64		word = CMP((CT) a[0], (CT) b[0], op) ? ~UINT64CONST(0) : 0; \
+		\
+		for (w = 0; w < VEXEC_WORDS(n); w++) \
+		{ \
+			int			m = Min(64, n - w * 64); \
+			\
+			out[w] = m == 64 ? word : word & ((UINT64CONST(1) << m) - 1); \
+		} \
+	} \
 	else if (r->encoding == VEXEC_CONST) \
 	{ \
 		CT			y = (CT) b[0]; \

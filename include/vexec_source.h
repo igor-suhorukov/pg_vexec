@@ -46,7 +46,7 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		0
+#define VEXEC_SOURCE_MINOR		1	/* 1: aggregate */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -162,6 +162,37 @@ typedef struct VexecSourceBatch
 } VexecSourceBatch;
 
 /*
+ * An aggregate a source may answer from the statistics it keeps of a unit
+ * of its own -- a file, a group of rows -- in place of the unit's rows
+ * (pg_vector_executor.md §3.14, H2): aggregate(), from minor version 1.
+ */
+typedef enum VexecSourceAggKind
+{
+	VEXEC_SRC_AGG_ROWS,			/* the unit's rows: count(*) */
+	VEXEC_SRC_AGG_COUNT,		/* its values of attnum that are not NULL */
+	VEXEC_SRC_AGG_MIN,			/* the least of them, by the btree ordering
+								 * of the type's min() */
+	VEXEC_SRC_AGG_MAX,			/* the greatest */
+	VEXEC_SRC_AGG_SUM			/* their sum, as the type's sum() returns it */
+} VexecSourceAggKind;
+
+typedef struct VexecSourceAgg
+{
+	uint8		kind;			/* VexecSourceAggKind */
+	AttrNumber	attnum;			/* 0 for ROWS */
+	Oid			type;			/* the answer's: int8 for ROWS and COUNT,
+								 * the column's for MIN and MAX, sum()'s
+								 * result for SUM */
+	Oid			collation;		/* MIN and MAX: the aggregate's */
+} VexecSourceAgg;
+
+typedef struct VexecSourceAggAnswer
+{
+	Datum		value;
+	bool		isnull;			/* MIN, MAX, SUM: no value is not NULL */
+} VexecSourceAggAnswer;
+
+/*
  * A source.  vexec begins the scan itself through the generic wrappers
  * (table_beginscan, table_beginscan_parallel), so the access method keeps
  * the snapshot's registration, predicate locks, parallel units, rescan and
@@ -190,6 +221,20 @@ typedef struct VexecSourceRoutine
 	void		(*estimate) (Relation rel, Snapshot snapshot,
 							 const VexecSourceSpec *spec,
 							 double *rows, double *bytes);
+
+	/*
+	 * Optional, from minor version 1: every request answered from the
+	 * statistics of the scan's next unit, which is then passed over as read
+	 * -- true -- or the unit left to next(), which hands its rows as it
+	 * would have -- false.  Called only between batches, of a scan begun
+	 * with no quals and no keys; a source answers only at the start of a
+	 * unit, for one none of whose rows is deleted, where its statistics are
+	 * exact.  *nrows is the unit's rows, which it counts in the statistics
+	 * as next() counts the rows it hands.  A by-reference answer lives
+	 * until the next call.
+	 */
+	bool		(*aggregate) (void *state, int nreqs, const VexecSourceAgg *reqs,
+							  VexecSourceAggAnswer *answers, int64 *nrows);
 } VexecSourceRoutine;
 
 /*

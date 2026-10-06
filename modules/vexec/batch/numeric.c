@@ -262,9 +262,75 @@ vexec_numeric_dscale(Datum num)
 }
 
 /*
+ * A numeric Datum's parts, as its header and digits hold them: what
+ * numeric.c's NumericVar holds, for writing a NumericAggState's
+ * serialization (numericvar_serialize, numeric.c:7522-7533).  False for NaN
+ * and the infinities, which parts->special names.  The digits point into the
+ * value, detoasted into the current memory context where it must be.
+ */
+bool
+vexec_numeric_parts(Datum num, VexecNumericParts *parts)
+{
+	varlena    *vl = (varlena *) DatumGetPointer(num);
+	const char *payload;
+	int			len;
+	uint16		header;
+
+	memset(parts, 0, sizeof(VexecNumericParts));
+	if (VARATT_IS_EXTERNAL(vl) || VARATT_IS_COMPRESSED(vl))
+		vl = detoast_attr(vl);
+	payload = VARDATA_ANY(vl);
+	len = (int) VARSIZE_ANY_EXHDR(vl);
+	if (len < (int) sizeof(uint16))
+		elog(ERROR, "vexec: a numeric of %d bytes", len);
+	header = read_u16(payload);
+	if ((header & N_SIGN_MASK) == N_SPECIAL)
+	{
+		/* NUMERIC_NAN 0xC000, NUMERIC_PINF 0xD000, NUMERIC_NINF 0xF000 */
+		switch (header & 0xF000)
+		{
+			case 0xD000:
+				parts->special = VEXEC_NUMERIC_PINF;
+				break;
+			case 0xF000:
+				parts->special = VEXEC_NUMERIC_NINF;
+				break;
+			default:
+				parts->special = VEXEC_NUMERIC_NAN;
+				break;
+		}
+		return false;
+	}
+	if ((header & N_SIGN_MASK) == N_SHORT)
+	{
+		parts->sign = (header & N_SHORT_SIGN) ? N_NEG : N_POS;
+		parts->dscale = (header & N_SHORT_DSCALE_MASK) >> N_SHORT_DSCALE_SHIFT;
+		parts->weight = (header & N_SHORT_WEIGHT_SIGN) ?
+			(int) (~N_SHORT_WEIGHT_MASK | (header & N_SHORT_WEIGHT_MASK)) :
+			(int) (header & N_SHORT_WEIGHT_MASK);
+		parts->digits = payload + sizeof(uint16);
+		parts->ndigits = (len - (int) sizeof(uint16)) / (int) sizeof(int16);
+	}
+	else
+	{
+		int16		w;
+
+		if (len < (int) (2 * sizeof(uint16)))
+			elog(ERROR, "vexec: a numeric of %d bytes", len);
+		parts->sign = header & N_SIGN_MASK;
+		parts->dscale = header & N_DSCALE_MASK;
+		memcpy(&w, payload + sizeof(uint16), sizeof(int16));
+		parts->weight = w;
+		parts->digits = payload + 2 * sizeof(uint16);
+		parts->ndigits = (len - 2 * (int) sizeof(uint16)) / (int) sizeof(int16);
+	}
+	return true;
+}
+
+/*
  * An integer at a scale as a numeric Datum, written into the batch's arena
- * with a 4-byte header: the form numeric's accessors take without a copy
- * (§3.4.2).  It is the numeric PostgreSQL's make_result() would make of the
+ * -- or palloc'd, when batch is NULL -- with a 4-byte header: the form
+ * numeric's accessors take without a copy (§3.4.2).  It is the numeric PostgreSQL's make_result() would make of the
  * same value and display scale (numeric.c:7577-7660): digits stripped of
  * leading and trailing zeros, zero with no digits, the short form wherever
  * it fits.
@@ -370,7 +436,7 @@ vexec_scaled_to_numeric(VexecBatch *batch, int128 value, int scale)
 		uint16		header;
 
 		len = VARHDRSZ + sizeof(uint16) + ndigits * sizeof(int16);
-		p = vexec_arena_alloc(&batch->arena, len, sizeof(int32), NULL, NULL);
+		p = batch ? vexec_arena_alloc(&batch->arena, len, sizeof(int32), NULL, NULL) : palloc(len);
 		SET_VARSIZE(p, len);
 		header = (uint16) ((sign == N_NEG ? (N_SHORT | N_SHORT_SIGN) : N_SHORT) |
 						   (scale << N_SHORT_DSCALE_SHIFT) |
@@ -385,7 +451,7 @@ vexec_scaled_to_numeric(VexecBatch *batch, int128 value, int scale)
 		int16		w = (int16) weight;
 
 		len = VARHDRSZ + 2 * sizeof(uint16) + ndigits * sizeof(int16);
-		p = vexec_arena_alloc(&batch->arena, len, sizeof(int32), NULL, NULL);
+		p = batch ? vexec_arena_alloc(&batch->arena, len, sizeof(int32), NULL, NULL) : palloc(len);
 		SET_VARSIZE(p, len);
 		header = (uint16) (sign | (scale & N_DSCALE_MASK));
 		memcpy(p + VARHDRSZ, &header, sizeof(uint16));

@@ -16,11 +16,11 @@
  * With vexec.mode = off, every hook calls the one it took the place of and
  * adds nothing, so plans are PostgreSQL's (§1.2).  In explain mode the
  * alternatives are costed and recorded but never added, so plans are
- * PostgreSQL's still.  In auto mode a VecScan path competes with the
- * relation's other paths in add_path, by cost; in force mode it replaces
- * them, wherever the oracle accepts it.  The join, aggregation and sort
- * alternatives are still only costed and recorded: their nodes come in V2
- * to V4.
+ * PostgreSQL's still.  In auto mode a VecScan path, and VecAgg's paths of a
+ * grouped relation (agg.c), compete with the relation's other paths in
+ * add_path, by cost; in force mode they replace them, wherever the oracle
+ * accepts them.  The join and sort alternatives are still only costed and
+ * recorded: their nodes come in V3 and V4.
  *
  * The scan hook works before it calls the hook it took the place of, so
  * that on a cluster's coordinator gp_core's hook, which empties the path
@@ -588,119 +588,6 @@ upper_target(PlannerInfo *root, const char *stage)
 	return root->plan_name ? psprintf("%s (%s)", stage, root->plan_name) : stage;
 }
 
-/*
- * Whether the query's aggregates can run in VecAgg (§3.8): no DISTINCT or
- * ORDER BY inside, no ordered-set or hypothetical aggregate, and no
- * grouping sets.  Which have vector transitions is the oracle's, from V2;
- * the others call their transition functions through fmgr.
- */
-static const char *
-agg_refusal(PlannerInfo *root)
-{
-	ListCell   *lc;
-
-	if (root->parse->groupingSets != NIL)
-		return "grouping sets";
-	foreach(lc, root->agginfos)
-	{
-		AggInfo    *ai = lfirst(lc);
-		Aggref	   *aggref = linitial_node(Aggref, ai->aggrefs);
-
-		if (aggref->aggdistinct != NIL)
-			return "DISTINCT inside an aggregate";
-		if (aggref->aggorder != NIL)
-			return "ORDER BY inside an aggregate";
-		if (aggref->aggkind != AGGKIND_NORMAL)
-			return "an ordered-set aggregate";
-	}
-	return NULL;
-}
-
-/*
- * An aggregation's vector alternative (§3.3.3, Aggregation): plain, or
- * hashed where the grouping is hashable and hash aggregation is enabled,
- * over the input's cheapest path.  The partial and final pair is V2's.
- */
-static void
-consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
-			 GroupPathExtraData *extra, VexecPlanState *ps)
-{
-	VexecAlt   *alt;
-	Path	   *input = input_rel->cheapest_total_path;
-	AggStrategy strategy;
-	AggPath    *rowpath;
-	VexecCost	cost;
-	const char *refusal;
-	double		numgroups;
-	List	   *groupclause = root->processed_groupClause;
-	AggClauseCosts agg_costs;
-
-	alt = vexec_alt_record(ps, "VecAgg",
-						   upper_target(root, groupclause ? "GROUP BY" : "aggregates"), root, NULL);
-	if (alt == NULL)
-		return;
-
-	/*
-	 * The groups core estimated: its own paths of the grouped relation, made
-	 * before the hook, carry them; the relation's rows are set later.
-	 */
-	if (output_rel->pathlist != NIL)
-		numgroups = ((Path *) linitial(output_rel->pathlist))->rows;
-	else
-		numgroups = Max(output_rel->rows, 1);
-	if (!vexec_enable_agg)
-	{
-		vexec_alt_refuse(ps, alt, "vexec.enable_agg is off");
-		return;
-	}
-	if ((refusal = agg_refusal(root)) != NULL)
-	{
-		vexec_alt_refuse(ps, alt, refusal);
-		return;
-	}
-	if (input == NULL || PATH_REQ_OUTER(input) != NULL)
-	{
-		vexec_alt_refuse(ps, alt, "a parameterized input");
-		return;
-	}
-	if (groupclause != NIL)
-	{
-		if (!grouping_is_hashable(groupclause))
-		{
-			vexec_alt_refuse(ps, alt, "a grouping that cannot be hashed");
-			return;
-		}
-		if (!enable_hashagg)
-		{
-			vexec_alt_refuse(ps, alt, "hash aggregation is disabled");
-			return;
-		}
-		strategy = AGG_HASHED;
-	}
-	else
-		strategy = AGG_PLAIN;
-	if (ps->mode != VEXEC_MODE_FORCE && input->rows < vexec_min_rows)
-	{
-		vexec_alt_refuse(ps, alt, psprintf("%.0f input rows, fewer than vexec.min_rows", input->rows));
-		return;
-	}
-
-	/* the aggregates' costs as core's own Agg is given them (planner.c) */
-	MemSet(&agg_costs, 0, sizeof(AggClauseCosts));
-	get_agg_clause_costs(root, AGGSPLIT_SIMPLE, &agg_costs);
-	rowpath = create_agg_path(root, output_rel, input, output_rel->reltarget, strategy,
-							  AGGSPLIT_SIMPLE, groupclause,
-							  (List *) extra->havingQual, &agg_costs,
-							  strategy == AGG_PLAIN ? 1 : numgroups);
-	vexec_cost_agg(root, &rowpath->path, input, list_length(groupclause), 0, 0,
-				   strategy == AGG_PLAIN ? 1 : numgroups, &cost);
-	vexec_alt_costed(ps, alt, &cost,
-					 psprintf("%s, %s, %s; transitions through fmgr",
-							  strategy == AGG_HASHED ? "hashed" : "plain",
-							  count_of(list_length(groupclause), "grouping column", "grouping columns"),
-							  count_of(list_length(root->agginfos), "aggregate", "aggregates")));
-}
-
 /* A sort's vector alternative (§3.3.3, UPPERREL_ORDERED): V4's node. */
 static void
 consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
@@ -745,13 +632,11 @@ vexec_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 {
 	VexecPlanState *ps = vexec_plan_state(root);
 
-	if (ps != NULL && ps->record)
-	{
-		if (stage == UPPERREL_GROUP_AGG)
-			consider_agg(root, input_rel, output_rel, (GroupPathExtraData *) extra, ps);
-		else if (stage == UPPERREL_ORDERED)
-			consider_sort(root, input_rel, output_rel, ps);
-	}
+	if (ps != NULL && stage == UPPERREL_GROUP_AGG)
+		vexec_consider_agg(root, input_rel, output_rel, (GroupPathExtraData *) extra, ps,
+						   upper_target(root, root->processed_groupClause ? "GROUP BY" : "aggregates"));
+	else if (ps != NULL && ps->record && stage == UPPERREL_ORDERED)
+		consider_sort(root, input_rel, output_rel, ps);
 
 	if (prev_create_upper_paths)
 		prev_create_upper_paths(root, stage, input_rel, output_rel, extra);

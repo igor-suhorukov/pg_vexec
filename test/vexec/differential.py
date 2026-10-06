@@ -30,7 +30,9 @@ A corpus whose output varies from run to run of the same settings -- object
 ids, temporary schemas' numbers -- names what varies in <kept>/volatile: a
 regular expression a line, each match -- or each of its groups, when it has
 them -- replaced by "#" in every session's results before they are compared;
-"@<test> <expression>" for one test's results alone.
+"@<test> <expression>" for one test's results alone.  An expression after
+"!" names lines that come and go -- a NOTICE that depends on whether
+autovacuum got there first -- and drops every line it matches.
 """
 
 import collections
@@ -94,10 +96,12 @@ def volatile_mark(m):
     return text + m.string[at:m.end()]
 
 
-def normalize(path, volatile=()):
+def normalize(path, volatile=(), drops=()):
     """A results file with plans dropped and unordered results sorted."""
     with open(path, encoding='utf-8', errors='replace') as f:
         lines = f.read().split('\n')
+    for d in drops:
+        lines = [line for line in lines if not d.search(line)]
     for v in volatile:
         lines = [v.sub(volatile_mark, line) for line in lines]
     out = []
@@ -163,9 +167,10 @@ def compare(reference, other, volatile=()):
         if not os.path.exists(b_path):
             diffs[t] = 'no results in this session\n'
             continue
-        mine = [v for (test, v) in volatile if test in (None, t)]
-        a = normalize(a_path, mine)
-        b = normalize(b_path, mine)
+        mine = [v for (test, v, drop) in volatile if test in (None, t) and not drop]
+        drops = [v for (test, v, drop) in volatile if test in (None, t) and drop]
+        a = normalize(a_path, mine, drops)
+        b = normalize(b_path, mine, drops)
         d = ''.join(difflib.unified_diff([x + '\n' for x in a], [x + '\n' for x in b],
                                          'reference', 'session', n=2))
         sa = sorted(ref_states.get(t, []))
@@ -208,7 +213,8 @@ def main(argv):
                 test = None
                 if l.startswith('@'):
                     test, l = l[1:].split(' ', 1)
-                volatile.append((test, re.compile(l)))
+                drop = l.startswith('!')
+                volatile.append((test, re.compile(l[1:] if drop else l), drop))
     failed = False
     for s in sessions[1:]:
         diffs, tests = compare(reference, os.path.join(corpus, s), volatile)

@@ -87,7 +87,7 @@ DROP TYPE vexec_mood;
 DROP DOMAIN vexec_price;
 -- the sources storage modules registered: none in this build
 SELECT * FROM vexec.sources();
- source | access_method | minor | estimates 
---------+---------------+-------+-----------
+ source | access_method | minor | estimates | aggregates 
+--------+---------------+-------+-----------+------------
 (0 rows)
 

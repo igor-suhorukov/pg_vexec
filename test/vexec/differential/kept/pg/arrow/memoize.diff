@@ -1,6 +1,6 @@
 --- reference
 +++ session
-@@ -38,18 +38,18 @@
+@@ -38,19 +38,19 @@
  INNER JOIN tenk1 t2 ON t1.unique1 = t2.twenty
  WHERE t2.unique1 < 1000;', false);
 -                                       explain_memoize                                        
@@ -17,6 +17,7 @@
 -         ->  Memoize (actual rows=1.00 loops=N)
 -         ->  Seq Scan on tenk1 t2 (actual rows=1000.00 loops=N)
 -   ->  Nested Loop (actual rows=1000.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
 +                              explain_memoize                              
 +---------------------------------------------------------------------------
 +                     Filter: (unique1 < 1000)
@@ -31,8 +32,9 @@
 +         ->  Sort (actual rows=21.00 loops=N)
 +         Merge Cond: (t1.unique1 = t2.twenty)
 +   ->  Merge Join (actual rows=1000.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
++ Vec Aggregate (actual rows=1.00 loops=N)
  (13 rows)
+ 
 @@ -70,10 +70,9 @@
           WHERE t1.twenty = t2.unique1 OFFSET 0) t2
  WHERE t1.unique1 < 1000;', false);
@@ -55,8 +57,9 @@
 -         ->  Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
     ->  Nested Loop (actual rows=1000.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
 -(13 rows)
++ Vec Aggregate (actual rows=1.00 loops=N)
 +(12 rows)
  
  -- And check we get the expected results.
@@ -75,7 +78,7 @@
 +                     ->  Vec Seq Scan on tenk1 t2_1 (actual rows=4.00 loops=N)
                       Filter: (t1.two = t2.two)
                       Rows Removed by Filter: 2
-@@ -115,9 +114,9 @@
+@@ -115,11 +114,11 @@
                 Cache Key: t1.two
                 Cache Mode: binary
 +               Filter: (unique1 < 10)
@@ -87,7 +90,10 @@
           ->  Memoize (actual rows=2.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=10.00 loops=N)
     ->  Nested Loop Left Join (actual rows=20.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
++ Vec Aggregate (actual rows=1.00 loops=N)
+ (15 rows)
+ 
 @@ -141,11 +140,9 @@
  LATERAL (SELECT t1.two+1 AS c1, t2.unique1 AS c2 FROM tenk1 t2) s ON TRUE
  WHERE s.c1 = s.c2 AND t1.unique1 < 1000;', false);
@@ -109,8 +115,9 @@
 -         ->  Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
     ->  Nested Loop (actual rows=1000.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
 -(14 rows)
++ Vec Aggregate (actual rows=1.00 loops=N)
 +(12 rows)
  
  -- And check we get the expected results.
@@ -121,13 +128,16 @@
 +               ->  Vec Seq Scan on tenk1 t2 (actual rows=1.00 loops=N)
                 Cache Key: t1.two, t1.twenty
                 Cache Mode: binary
-@@ -185,5 +182,5 @@
+@@ -185,7 +182,7 @@
                 Rows Removed by Filter: 9000
           ->  Memoize (actual rows=1.00 loops=N)
 -         ->  Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
     ->  Nested Loop (actual rows=1000.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
++ Vec Aggregate (actual rows=1.00 loops=N)
+ (12 rows)
+ 
 @@ -215,18 +212,14 @@
  SELECT * FROM expr_key t1 INNER JOIN expr_key t2
  ON t1.x = t2.t::numeric AND t1.t::numeric = t2.x;', false);
@@ -183,8 +193,9 @@
 +         Join Filter: (t1.unique1 = t2.thousand)
 +         Rows Removed by Join Filter: 11998800
     ->  Nested Loop (actual rows=1200.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
 -(13 rows)
++ Vec Aggregate (actual rows=1.00 loops=N)
 +(10 rows)
  
  CREATE TABLE flt (f float);
@@ -199,10 +210,13 @@
 +                                 ->  Vec Seq Scan on tab_anti t2_1 (actual rows=100.00 loops=N)
                                   Sort Key: t2_1.a
                                   Sort Method: quicksort  Memory: NkB
-@@ -497,5 +487,5 @@
+@@ -497,7 +487,7 @@
                 Hits: 97  Misses: 3  Evictions: Zero  Overflows: 0  Memory Usage: NkB
           ->  Memoize (actual rows=0.67 loops=N)
 -         ->  Seq Scan on tab_anti t1 (actual rows=100.00 loops=N)
 +         ->  Vec Seq Scan on tab_anti t1 (actual rows=100.00 loops=N)
     ->  Nested Loop Anti Join (actual rows=33.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
++ Vec Aggregate (actual rows=1.00 loops=N)
+ (15 rows)
+ 

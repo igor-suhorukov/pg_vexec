@@ -66,7 +66,9 @@
 #                      that tie in its ORDER BY taken otherwise
 #   TPC_KINDS          "h ds"
 #   TPC_QUERIES        the queries to run, "q01 q15 05 24" (all)
-#   TPC_SEGMENTS       4
+#   TPC_SEGMENTS       4; 0: one node, no cluster -- gp_core, gp_orca and
+#                      gp_sql loaded, no gp.role -- where ORCA's plans have
+#                      no Motions (pg_vector_executor.md V2's measurement)
 #   TPC_TIMEOUT        each statement's, 120 s
 #   TPC_ROUNDS         each query's runs, least time kept: 1
 #   TPC_WORKERS        the parallel workers per segment each query is run
@@ -75,6 +77,11 @@
 #                      node given room for them, gp.enable_parallel on and
 #                      max_parallel_workers_per_gather that many
 #   TPC_SHARED_BUFFERS each node's: 256MB checked, 1GB timed
+#   TPC_PLANNING       1: after the rounds, planning times (§6.8 of
+#                      pg_vector_executor.md): EXPLAIN (SUMMARY)'s, with
+#                      vexec off and in auto mode, under both planners, the
+#                      least of three -- each query, a thousand one-row
+#                      lookups by key, a five-table join; planning.tsv
 #   TPC_PYTHON         /opt/duckdb/bin/python, the venv's
 #   TPC_DUCKDB_EXTENSIONS  /opt/duckdb/extensions, the extensions it loads
 #
@@ -116,10 +123,16 @@ if [ "${TPC_VEXEC:-1}" = 1 ] && [ -f "$("$BINDIR/pg_config" --pkglibdir)/vexec.s
 fi
 VEXEC_OPTIONS=""
 [ -n "$VEXEC_PRELOAD" ] && VEXEC_OPTIONS="-c vexec.mode=${TPC_VEXEC_MODE:-off} -c vexec.batch_format=${TPC_VEXEC_FORMAT:-postgres}"
-# in force mode, a statement planned without a vector node where one could
-# be built fails (vexec.debug_require_vector): every query's plan is then
-# known to carry its vector scans
-[ -n "$VEXEC_PRELOAD" ] && [ "${TPC_VEXEC_MODE:-off}" = force ] && VEXEC_OPTIONS="$VEXEC_OPTIONS -c vexec.debug_require_vector=on"
+# TPC_VEXEC_NUMERIC: vexec.batch_numeric_layout, scaled or varlena, which
+# separates the scaled numeric's gain from batching's (§3.4.4, V2)
+[ -n "$VEXEC_PRELOAD" ] && [ -n "${TPC_VEXEC_NUMERIC:-}" ] && VEXEC_OPTIONS="$VEXEC_OPTIONS -c vexec.batch_numeric_layout=$TPC_VEXEC_NUMERIC"
+# in force mode, checked, a statement planned without a vector node where
+# one could be built fails (vexec.debug_require_vector): every query's plan
+# is then known to carry its vector scans.  Timed, the check is left out of
+# the times, and the planner's route, which the check does not run, is not
+# failed by it.
+[ -n "$VEXEC_PRELOAD" ] && [ "${TPC_VEXEC_MODE:-off}" = force ] && [ "$MODE" = check ] &&
+	VEXEC_OPTIONS="$VEXEC_OPTIONS -c vexec.debug_require_vector=on"
 SF="${TPC_SF:-1}"
 KINDS="${TPC_KINDS:-h ds}"
 SEGMENTS="${TPC_SEGMENTS:-4}"
@@ -151,6 +164,7 @@ cleanup() {
 	done
 	if [ -n "${RESULTS_DIR:-}" ]; then
 		cp "$ROOT/results.tsv" "$RESULTS_DIR/tpc-results.tsv" 2> /dev/null
+		cp "$ROOT/planning.tsv" "$RESULTS_DIR/tpc-planning.tsv" 2> /dev/null
 		[ -d "$ROOT/out" ] && cp -r "$ROOT/out" "$RESULTS_DIR/tpc-out"
 	fi
 	[ -n "${KEEP:-}" ] && echo "kept: $ROOT" || rm -rf "$ROOT"
@@ -162,7 +176,11 @@ q() {						# q <db> <sql>
 	"$PSQL" -X -q -t -A -h "$(sockdir 0)" -p "$(port 0)" -d "$1" -c "$2" 2>&1
 }
 
-echo "TPC-H and TPC-DS, ${MODE}ed: scale factor $SF, a coordinator and $SEGMENTS segments, $STORAGE tables"
+if [ "$SEGMENTS" -gt 0 ]; then
+	echo "TPC-H and TPC-DS, ${MODE%e}ed: scale factor $SF, a coordinator and $SEGMENTS segments, $STORAGE tables"
+else
+	echo "TPC-H and TPC-DS, ${MODE%e}ed: scale factor $SF, one node, $STORAGE tables"
+fi
 [ -n "$VEXEC_PRELOAD" ] && echo "  vexec    preloaded on every node: $VEXEC_OPTIONS"
 echo "  bindir   $BINDIR"
 echo "  root     $ROOT"
@@ -191,9 +209,11 @@ for n in $NODES; do
 		echo "unix_socket_directories = '$(sockdir "$n")'"
 		echo "listen_addresses = ''"
 		echo "port = $(port "$n")"
-		echo "gp.cluster_config = '$CONF'"
-		echo "gp.dbid = $((n + 1))"
-		echo "gp.cluster_secret = '$SECRET'"
+		if [ "$SEGMENTS" -gt 0 ]; then
+			echo "gp.cluster_config = '$CONF'"
+			echo "gp.dbid = $((n + 1))"
+			echo "gp.cluster_secret = '$SECRET'"
+		fi
 		echo "max_prepared_transactions = 100"
 		echo "max_connections = 300"
 		echo "shared_buffers = $SHARED_BUFFERS"
@@ -207,7 +227,7 @@ for n in $NODES; do
 		echo "jit = off"
 		echo "fsync = off"
 		echo "synchronous_commit = off"
-		[ "$n" -eq 0 ] && echo "gp.role = 'dispatch'"
+		[ "$n" -eq 0 ] && [ "$SEGMENTS" -gt 0 ] && echo "gp.role = 'dispatch'"
 	} >> "$(datadir "$n")/postgresql.auto.conf"
 done
 for n in $(seq 1 "$SEGMENTS") 0; do
@@ -311,6 +331,67 @@ for round in $(seq 1 "$ROUNDS"); do
 	echo "  round $round: $(awk -v r="$round" '$1 == r' "$ROOT/results.tsv" | wc -l) queries in $(( $(date +%s) - start )) s"
 done
 echo
+
+# Planning times: a statement's EXPLAIN (SUMMARY) Planning Time, the least
+# of three, summed over a file's statements, each given on a line of its own.
+plan_ms() {					# plan_ms <db> <optimizer on|off> <vexec mode> <file>
+	local best="" ms
+	for i in 1 2 3; do
+		ms=$("$TPC_PYTHON" -c '
+import sys
+text = "\n".join(l.split("--")[0] for l in open(sys.argv[1]).read().splitlines())
+for s in (x.strip() for x in text.split(";")):
+    if s:
+        print("EXPLAIN (SUMMARY ON, COSTS OFF) " + " ".join(s.split()) + ";")
+' "$4" | PGOPTIONS="-c gp.optimizer=$2 -c vexec.mode=$3 -c statement_timeout=${TIMEOUT}s" \
+			"$PSQL" -X -h "$(sockdir 0)" -p "$(port 0)" -d "$1" -At 2>&1 |
+			awk '/^Planning Time: / { s += $3; n++ } END { if (n) printf "%.3f", s }')
+		[ -z "$ms" ] && { echo "-"; return; }
+		if [ -z "$best" ] || awk -v a="$ms" -v b="$best" 'BEGIN { exit !(a < b) }'; then best=$ms; fi
+	done
+	echo "$best"
+}
+if [ "${TPC_PLANNING:-0}" = 1 ] && [ -n "$VEXEC_PRELOAD" ]; then
+	start=$(date +%s)
+	: > "$ROOT/planning.tsv"
+	# a thousand one-row lookups by key, and a five-table join, in TPC-H's
+	if [[ " $KINDS " == *" h "* ]]; then
+		for k in $(seq 1 1000); do
+			echo "SELECT o_orderstatus FROM orders WHERE o_orderkey = $(( (k * 5987) % 1500000 + 1 ));"
+		done > "$ROOT/lookups.sql"
+		echo "SELECT n_name, count(*) FROM customer, orders, lineitem, supplier, nation
+WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey AND l_suppkey = s_suppkey
+  AND c_nationkey = s_nationkey AND s_nationkey = n_nationkey GROUP BY n_name;" > "$ROOT/join5.sql"
+	fi
+	for opt in on off; do
+		for vm in off auto; do
+			for kind in $KINDS; do
+				for f in "$ROOT/$kind/q/"*.sql; do
+					name=$(basename "$f" .sql)
+					[ -n "${TPC_QUERIES:-}" ] && [[ " $TPC_QUERIES " != *" $name "* ]] && continue
+					printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$name" "$opt" "$vm" "$(plan_ms "tpc$kind" $opt $vm "$f")" >> "$ROOT/planning.tsv"
+				done
+			done
+			if [ -f "$ROOT/lookups.sql" ]; then
+				printf '%s\t%s\t%s\t%s\t%s\n' h lookups1000 $opt $vm "$(plan_ms tpch $opt $vm "$ROOT/lookups.sql")" >> "$ROOT/planning.tsv"
+				printf '%s\t%s\t%s\t%s\t%s\n' h join5 $opt $vm "$(plan_ms tpch $opt $vm "$ROOT/join5.sql")" >> "$ROOT/planning.tsv"
+			fi
+		done
+	done
+	echo "  planning times: $(wc -l < "$ROOT/planning.tsv") measured in $(( $(date +%s) - start )) s"
+	awk -F'\t' '$5 != "-" { k = $3 "/" $4; if ($2 == "lookups1000" || $2 == "join5") { x[$2 " " k] = $5; next }
+			s[k] += $5; n[k]++; l[k] += log($5 > 0.001 ? $5 : 0.001) }
+		END {
+			for (o = 0; o < 2; o++) { opt = o ? "off" : "on"; name = o ? "the planner" : "ORCA"
+				a = opt "/off"; b = opt "/auto"
+				if (n[a] && n[b])
+					printf "  planning, %s: the queries %.1f ms with vexec off, %.1f ms in auto mode; auto/off %.3f (geometric mean)\n",
+						name, s[a], s[b], exp(l[b] / n[b] - l[a] / n[a])
+				if (("lookups1000 " a) in x)
+					printf "  planning, %s: a thousand lookups %.1f ms off, %.1f ms auto; the five-table join %.2f ms off, %.2f ms auto\n",
+						name, x["lookups1000 " a], x["lookups1000 " b], x["join5 " a], x["join5 " b] }
+		}' "$ROOT/planning.tsv"
+fi
 
 "$TPC_PYTHON" "$here/tpc.py" report "$ROOT" "$MODE"
 rc=$?

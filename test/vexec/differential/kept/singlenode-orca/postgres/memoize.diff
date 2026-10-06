@@ -1,12 +1,18 @@
 --- reference
 +++ session
-@@ -45,5 +45,5 @@
+@@ -45,9 +45,9 @@
                 Buckets: 1024  Batches: 1  Memory Usage: NkB
           ->  Hash (actual rows=1000.00 loops=N)
 -         ->  Seq Scan on tenk1 t1 (actual rows=10000.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=10000.00 loops=N)
           Hash Cond: (t1.unique1 = t2.twenty)
     ->  Hash Join (actual rows=1000.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
+- Optimizer: GPORCA
++ Optimizer: GPORCA
++ Vec Aggregate (actual rows=1.00 loops=N)
+ (10 rows)
+ 
 @@ -67,10 +67,9 @@
           WHERE t1.twenty = t2.unique1 OFFSET 0) t2
  WHERE t1.unique1 < 1000;', false);
@@ -29,9 +35,10 @@
 -         ->  Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
     ->  Nested Loop (actual rows=1000.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
   Optimizer: Postgres query optimizer
 -(14 rows)
++ Vec Aggregate (actual rows=1.00 loops=N)
 +(13 rows)
  
  -- And check we get the expected results.
@@ -50,7 +57,7 @@
 +                     ->  Vec Seq Scan on tenk1 t2_1 (actual rows=4.00 loops=N)
                       Filter: (t1.two = t2.two)
                       Rows Removed by Filter: 2
-@@ -113,9 +112,9 @@
+@@ -113,12 +112,12 @@
                 Cache Key: t1.two
                 Cache Mode: binary
 +               Filter: (unique1 < 10)
@@ -62,7 +69,11 @@
           ->  Memoize (actual rows=2.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=10.00 loops=N)
     ->  Nested Loop Left Join (actual rows=20.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
+  Optimizer: Postgres query optimizer
++ Vec Aggregate (actual rows=1.00 loops=N)
+ (16 rows)
+ 
 @@ -140,11 +139,9 @@
  LATERAL (SELECT t1.two+1 AS c1, t2.unique1 AS c2 FROM tenk1 t2) s ON TRUE
  WHERE s.c1 = s.c2 AND t1.unique1 < 1000;', false);
@@ -84,9 +95,10 @@
 -         ->  Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
     ->  Nested Loop (actual rows=1000.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
   Optimizer: Postgres query optimizer
 -(15 rows)
++ Vec Aggregate (actual rows=1.00 loops=N)
 +(13 rows)
  
  -- And check we get the expected results.
@@ -97,13 +109,17 @@
 +               ->  Vec Seq Scan on tenk1 t2 (actual rows=1.00 loops=N)
                 Cache Key: t1.two, t1.twenty
                 Cache Mode: binary
-@@ -185,5 +182,5 @@
+@@ -185,8 +182,8 @@
                 Rows Removed by Filter: 9000
           ->  Memoize (actual rows=1.00 loops=N)
 -         ->  Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=1000.00 loops=N)
     ->  Nested Loop (actual rows=1000.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
+  Optimizer: Postgres query optimizer
++ Vec Aggregate (actual rows=1.00 loops=N)
+ (13 rows)
+ 
 @@ -222,5 +219,5 @@
           Index Searches: N
     ->  Index Scan using expr_key_idx_x_t on expr_key t2 (actual rows=2.00 loops=N)
@@ -111,13 +127,19 @@
 +   ->  Vec Seq Scan on expr_key t1 (actual rows=40.00 loops=N)
     Join Filter: true
   Nested Loop (actual rows=80.00 loops=N)
-@@ -246,5 +243,5 @@
+@@ -246,9 +243,9 @@
                 Buckets: 2048  Batches: 1  Memory Usage: NkB
           ->  Hash (actual rows=1200.00 loops=N)
 -         ->  Seq Scan on tenk1 t1 (actual rows=10000.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=10000.00 loops=N)
           Hash Cond: (t1.unique1 = t2.thousand)
     ->  Hash Join (actual rows=1200.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
+- Optimizer: GPORCA
++ Optimizer: GPORCA
++ Vec Aggregate (actual rows=1.00 loops=N)
+ (10 rows)
+ 
 @@ -267,5 +264,5 @@
           Index Searches: N
     ->  Index Scan using flt_f_idx on flt f2 (actual rows=2.00 loops=N)
@@ -187,10 +209,14 @@
 +                                 ->  Vec Seq Scan on tab_anti t2_1 (actual rows=100.00 loops=N)
                                   Sort Key: t2_1.a
                                   Sort Method: quicksort  Memory: NkB
-@@ -460,5 +457,5 @@
+@@ -460,8 +457,8 @@
                 Hits: 97  Misses: 3  Evictions: Zero  Overflows: 0  Memory Usage: NkB
           ->  Memoize (actual rows=0.67 loops=N)
 -         ->  Seq Scan on tab_anti t1 (actual rows=100.00 loops=N)
 +         ->  Vec Seq Scan on tab_anti t1 (actual rows=100.00 loops=N)
     ->  Nested Loop Anti Join (actual rows=33.00 loops=N)
-  Aggregate (actual rows=1.00 loops=N)
+- Aggregate (actual rows=1.00 loops=N)
+  Optimizer: Postgres query optimizer
++ Vec Aggregate (actual rows=1.00 loops=N)
+ (16 rows)
+ 

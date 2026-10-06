@@ -45,12 +45,40 @@
 
 #define VEXEC_SCAN_NAME		"VecScan"
 #define VEXEC_RESULT_NAME	"VecResult"
+#define VEXEC_AGG_NAME		"VecAgg"
 
 typedef enum VexecNodeKind
 {
 	VEXEC_NODE_SCAN,
-	VEXEC_NODE_RESULT
+	VEXEC_NODE_RESULT,
+	VEXEC_NODE_AGG
 } VexecNodeKind;
+
+/*
+ * VecAgg's plan, as its custom_private holds it (vecagg.c encodes and
+ * decodes it).  The scan tuple, which custom_scan_tlist describes, is a
+ * group's keys, the columns it keeps from its first row, and its
+ * aggregates' results; the node's HAVING qual and target list read it as
+ * INDEX_VAR.  The aggregates are in executor form: their arguments and
+ * FILTERs read the child's output as OUTER_VAR.
+ */
+#define VEXEC_AGGCOL_KEY	0	/* outsrc: the key's index */
+#define VEXEC_AGGCOL_EXTRA	1	/* outsrc: the child's column, from 1 */
+#define VEXEC_AGGCOL_AGG	2	/* outsrc: the aggregate's aggno */
+
+typedef struct VexecAggPlan
+{
+	AggStrategy strategy;		/* AGG_PLAIN or AGG_HASHED */
+	AggSplit	split;
+	double		numgroups;
+	List	   *keycols;		/* the child's columns, from 1 */
+	List	   *eqops;			/* their grouping operators */
+	List	   *collations;
+	List	   *outkind;		/* per scan tuple column, VEXEC_AGGCOL_* */
+	List	   *outsrc;
+	List	   *aggrefs;		/* each aggno once, in aggno order */
+	int			ntrans;			/* transition states: aggtransno's range */
+} VexecAggPlan;
 
 typedef struct VexecNode VexecNode;
 
@@ -93,6 +121,9 @@ struct VexecNode
 	int			ntargets;
 	VexecTop   *targets;		/* the target list's, in its order */
 	bool		any_lazy_target;
+	bool	   *target_inexact; /* per target, or NULL: evaluated for rows
+								 * PostgreSQL may not evaluate it for, as
+								 * an aggregate's argument under a FILTER */
 	int			nkernels;		/* compiled */
 	int			nfallbacks;
 	ExprContext *eager_econtext;	/* the fallback's and parameters' */
@@ -122,6 +153,7 @@ extern bool vexec_is_vector_node(Plan *plan);
 extern bool vexec_is_vector_state(PlanState *ps);
 extern const CustomScanMethods *vexec_scan_methods(void);
 extern const CustomScanMethods *vexec_result_methods(void);
+extern const CustomScanMethods *vexec_agg_methods(void);
 
 /* node.c: what every node shares */
 extern void vexec_node_begin(VexecNode *node, EState *estate);
@@ -137,9 +169,17 @@ extern VexecBatch *vexec_next_batch(PlanState *ps);
 extern bool vexec_node_batchable(VexecNode *node);
 extern TupleTableSlot *vexec_resolve_row(VexecNode *node, int row);
 extern TupleTableSlot *vexec_node_unprojected(VexecNode *node, TupleTableSlot *input);
+extern bool vexec_node_next_input(VexecNode *node);
 
-/* vecscan.c, vecresult.c */
+/* vecscan.c, vecresult.c, vecagg.c */
 extern Node *vexec_create_scan_state(CustomScan *cscan);
+extern bool vexec_scan_can_aggregate(VexecNode *node);
+extern bool vexec_scan_aggregate(VexecNode *node, int nreqs, const VexecSourceAgg *reqs,
+								 VexecSourceAggAnswer *answers, int64 *nrows);
+extern const char *vexec_scan_source_name(VexecNode *node);
 extern Node *vexec_create_result_state(CustomScan *cscan);
+extern Node *vexec_create_agg_state(CustomScan *cscan);
+extern List *vexec_agg_plan_encode(const VexecAggPlan *plan);
+extern void vexec_agg_plan_decode(CustomScan *cscan, VexecAggPlan *plan);
 
 #endif							/* VEXEC_EXEC_H */

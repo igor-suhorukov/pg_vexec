@@ -22,6 +22,14 @@
 # A storage module's own queries are in sources/<module>.queries, a query a
 # line, %t its table.
 #
+# H2: on PAX, aggregates answered from its statistics, a file or a group at
+# a time (vexec.aggregate_statistics): a table keeping min and max of its
+# integer and time columns, in files of many groups, answers alike with
+# vexec off, with the statistics, without them and under ORCA -- before and
+# after rows are deleted, with a column added since, a column of NULLs, an
+# aggregate the statistics cannot give and a qual -- and its plans show the
+# units the statistics answered, their rows counted as the scan's.
+#
 #   VEXEC_ROWS        the table's rows: 30000
 #   VEXEC_STORAGES    "heap ao_row ao_column pax pax_porc_vec"
 #   VEXEC_SOURCES     "ao_row=gp_ao ao_column=gp_ao pax=pax pax_porc_vec=pax":
@@ -116,6 +124,14 @@ QUERIES=(
 	"SELECT id, length(longt), substr(longt, 1, 8) FROM %t WHERE id % 50 = 0 AND id < 2000 ORDER BY id"
 	"SELECT count(*) FROM %t WHERE later = 42 AND id > $ROWS"
 	"SELECT extract(year FROM d), count(*) FROM %t GROUP BY 1 ORDER BY 1"
+	# DISTINCT aggregates: the planner's H3 in two VecAggs, and ORCA's own,
+	# which keeps one Agg on a single node and VecAgg never takes
+	"SELECT count(DISTINCT i4), sum(i4), count(DISTINCT t), max(d) FROM %t"
+	"SELECT i2 % 7, count(DISTINCT i8), sum(n), count(*) FROM %t GROUP BY 1"
+	"SELECT b, count(DISTINCT n), avg(i2) FROM %t GROUP BY b"
+	# H7 and H8: length, date_trunc, SUM(x + k) over an int2
+	"SELECT sum(length(t)), max(octet_length(t)), count(DISTINCT date_trunc('hour', ts)) FROM %t"
+	"SELECT sum(i2), sum(i2 + 1), sum(i2 + 2), sum(i2 - 3), sum(7 + i2), count(i2) FROM %t"
 	"SELECT ch, o, arr, j, iv FROM %t WHERE id < 20 ORDER BY id"
 	"SELECT id, ctid IS NOT NULL, tableoid::regclass::text LIKE 't_%' FROM %t WHERE id < 5 ORDER BY id"
 	"/* error */ SELECT i4 / (i2 - i2) FROM %t WHERE id = 3"
@@ -201,5 +217,105 @@ for s in $STORAGES; do
 		done
 	done
 done
+# H2: PAX's statistics.  h2_<storage>, in files of groups of 1,000 rows,
+# then 102 rows deleted, from two of them; h2a_<storage>, a column added
+# between its files, which no DELETE touches: PAX's own DELETE fails on a
+# file of more than one group written before ALTER TABLE ... ADD COLUMN
+# (pg_vector_executor.md V2, "Found").
+H2_QUERIES=(
+	"SELECT count(*), count(i2), min(i2), max(i2), sum(i2), avg(i2), count(i4), min(i4), max(i4), sum(i4), avg(i4) FROM %t"
+	"SELECT min(i8), max(i8), sum(i8), avg(i8), min(d), max(d), min(ts), max(ts), min(tz), max(tz) FROM %t"
+	"SELECT count(*) FROM %t"
+	"SELECT count(nothing), min(nothing), max(nothing), sum(nothing), avg(nothing) FROM %t"
+	"SELECT min(i4), sum(f8), count(*) FROM %t"
+	"SELECT min(i4), max(i4), count(*) FROM %t WHERE i2 > 0"
+	"SELECT count(later), min(later), max(later), sum(later), count(*), min(i4), sum(i2) FROM %a"
+)
+H2_SESSIONS=("off" "force-postgres" "force-arrow" "nostats" "orca-postgres")
+h2_opts() {
+	case "$1" in
+		nostats) echo "-c vexec.mode=force -c vexec.aggregate_statistics=off" ;;
+		*) session_opts "$1" ;;
+	esac
+}
+# h2_units <table> <orca on|off>: the units the statistics answered in the
+# plan of a query they can answer, and whether its VecScan's rows are the
+# table's
+h2_units() {
+	local plan rows units
+	plan=$(q "$D" postgres "SET gp.optimizer = $2; SET vexec.mode = force; EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*), min(i4), max(i4), sum(i2) FROM $1")
+	units=$(echo "$plan" | sed -n 's/^ *Units From Statistics: //p' | head -1)
+	rows=$(echo "$plan" | grep -E "Vec (Seq )?Scan" | sed -n 's/.*actual rows=\([0-9]*\).*/\1/p' | head -1)
+	if ! echo "$plan" | grep -q "From Statistics: pax"; then
+		echo "none: no VecAgg asks pax"
+		echo "$plan" | sed 's/^/      /' >&2
+	elif [ "$rows" != "$(q "$D" postgres "SELECT count(*) FROM $1")" ]; then
+		echo "none: its VecScan's rows are $rows"
+	else
+		echo "${units:-0}"
+	fi
+}
+h2_table() {					# h2_table <table> <format> <later: 0 or 1>
+	local cols="id, i2, i4, i8, d, ts, tz, f8, NULL"
+	q "$D" postgres "SET client_min_messages = warning;
+		CREATE TABLE $1 (id int, i2 int2, i4 int4, i8 int8, d date, ts timestamp, tz timestamptz,
+		                 f8 float8, nothing int4)
+			USING pax WITH (storage_format=$2, minmax_columns='i2,i4,i8,d,ts,tz,nothing')"
+	q "$D" postgres "SET pax.max_tuples_per_group = 1000; INSERT INTO $1 SELECT $cols FROM src WHERE id <= $ROWS / 2"
+	q "$D" postgres "SET pax.max_tuples_per_group = 1000; INSERT INTO $1 SELECT $cols FROM src WHERE id > $ROWS / 2"
+	if [ "$3" = 1 ]; then
+		q "$D" postgres "ALTER TABLE $1 ADD COLUMN later int DEFAULT 42"
+		q "$D" postgres "INSERT INTO $1 (id, i2, i4, later) SELECT $ROWS + g, g, g, g FROM generate_series(1, 500) g"
+	else
+		q "$D" postgres "INSERT INTO $1 (id, i2, i4) SELECT $ROWS + g, g, g FROM generate_series(1, 500) g"
+	fi
+	q "$D" postgres "ANALYZE $1"
+}
+for s in $STORAGES; do
+	case "$s" in pax) fmt=porc ;; pax_porc_vec) fmt=porc_vec ;; *) continue ;; esac
+	t="h2_$s"
+	a="h2a_$s"
+	out="$(h2_table "$t" $fmt 0)$(h2_table "$a" $fmt 1)"
+	case "$out" in *ERROR*) echo "the H2 tables in $s: $out"; fail=1; continue ;; esac
+	for phase in written deleted; do
+		if [ $phase = deleted ]; then
+			before=$(q "$D" postgres "SELECT count(*) FROM $t")
+			out=$(q "$D" postgres "DELETE FROM $t WHERE id BETWEEN 2000 AND 2100 OR id = $ROWS + 7")
+			after=$(q "$D" postgres "SELECT count(*) FROM $t")
+			if [ -n "$out" ] || [ $(( before - after )) -ne 102 ]; then
+				echo "  FAILED $s: the DELETE of 102 rows from $t deleted $(( before - after )): $out"
+				fail=1
+			fi
+		fi
+		for orca in off on; do
+			for tab in $t $a; do
+				[ $phase = deleted ] && [ $tab = $a ] && continue
+				units=$(h2_units "$tab" $orca)
+				case "$units" in
+					''|none*|0) echo "  FAILED $tab, $phase: under $([ $orca = on ] && echo ORCA || echo the planner) no unit was answered from PAX's statistics: $units"; fail=1 ;;
+					*) echo "  ok $tab, $phase: under $([ $orca = on ] && echo ORCA || echo the planner) $units units answered from PAX's statistics" ;;
+				esac
+			done
+		done
+		for qt in "${H2_QUERIES[@]}"; do
+			sql="${qt//%t/$t}"
+			sql="${sql//%a/$a}"
+			ref=""
+			for sess in "${H2_SESSIONS[@]}"; do
+				res=$(PGOPTIONS="$(h2_opts "$sess")" q "$D" postgres "$sql")
+				if [ "$sess" = off ]; then
+					ref="$res"
+					case "$res" in *ERROR:*) echo "  FAILED $s, $phase, off raised an error: $sql"; fail=1 ;; esac
+				elif [ "$res" != "$ref" ]; then
+					echo "  FAILED $s, $phase, $sess differs from off: $sql"
+					diff <(echo "$ref") <(echo "$res") | head -8 | sed 's/^/      /'
+					fail=1
+				fi
+				nq=$((nq + 1))
+			done
+		done
+	done
+done
+
 echo "sources: $nq queries over $(echo $STORAGES | wc -w) storages; $([ $fail -eq 0 ] && echo passed || echo FAILED)"
 exit $fail

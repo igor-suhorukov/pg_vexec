@@ -92,6 +92,7 @@ extern PGDLLIMPORT double vexec_batch_setup_cost;
 extern PGDLLIMPORT int vexec_min_rows;
 extern PGDLLIMPORT bool vexec_enable_scan;
 extern PGDLLIMPORT bool vexec_enable_agg;
+extern PGDLLIMPORT bool vexec_aggregate_statistics;
 extern PGDLLIMPORT bool vexec_enable_hashjoin;
 extern PGDLLIMPORT bool vexec_enable_sort;
 extern PGDLLIMPORT bool vexec_enable_window;

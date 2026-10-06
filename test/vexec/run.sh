@@ -80,6 +80,13 @@ export CB_SRC="${CB_SRC:-$(cd "$ROOT/.." && pwd)/cloudberry}"
 export PG_SRC="${PG_SRC:-$(cd "$ROOT/.." && pwd)/postgres}"
 export VEXEC_CPUS="${VEXEC_CPUS:-0}"
 export VEXEC_PORT_SRC="${VEXEC_PORT_SRC:-$(cd "$ROOT/.." && pwd)/cloudberry-vexec/wt}"
+# A timed run measures the server without its assertions (§6.3): the port's
+# images built without them, and the port's modules built against those.
+[ "${CB_TPC:-}" = time ] && [ -z "${VEXEC_NOASSERT:-}" ] && VEXEC_NOASSERT=1
+if [ "${VEXEC_NOASSERT:-0}" = 1 ]; then
+	export VEXEC_PORT_FLAVOR=portnoassert VEXEC_VANILLA_FLAVOR=vanilla-noassert VEXEC_CBEXT_SUFFIX=-noassert
+	export VEXEC_PORT_BUILD="${VEXEC_PORT_BUILD:-$VEXEC_CACHE/portbuild-noassert}"
+fi
 export VEXEC_PORT_BUILD="${VEXEC_PORT_BUILD:-$VEXEC_CACHE/portbuild}"
 export VEXEC_PAX_CONTRIB="${VEXEC_PAX_CONTRIB:-$VEXEC_CACHE/pax-contrib}"
 if [ "${VEXEC_PORT_STAGE:-}" = none ]; then
@@ -89,7 +96,7 @@ elif [ -z "${VEXEC_PORT_STAGE:-}" ] && [ -d "$VEXEC_PORT_BUILD/stage/usr/local/p
 fi
 
 if [ -z "${CB_COMMIT:-}" ]; then
-	CB_COMMIT="$(docker images pg_accel/cb-ext --format '{{.CreatedAt}} {{.Tag}}' 2> /dev/null | sort -r | awk 'NR == 1 {print $NF}')"
+	CB_COMMIT="$(docker images "pg_accel/cb-ext${VEXEC_CBEXT_SUFFIX:-}" --format '{{.CreatedAt}} {{.Tag}}' 2> /dev/null | sort -r | awk 'NR == 1 {print $NF}')"
 fi
 export CB_COMMIT
 
@@ -167,7 +174,8 @@ case "$cmd" in
 		for storage in ${*:-heap ao_column pax pax_porc_vec}; do
 			run="$(new_run "tpc-$storage")"
 			echo "== tpc on $storage: $run"
-			in_leg port "$run" "/src/test/vexec/build.sh > /dev/null && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} /src/test/tpc/run.sh" \
+			echo "  image pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-$CB_COMMIT, the port's modules from $(cat "${VEXEC_PORT_STAGE:-/nonexistent}/COMMIT" 2> /dev/null || echo 'the image')"
+			in_leg port "$run" "/src/test/vexec/build.sh > /dev/null && { grep -q '^#define USE_ASSERT_CHECKING' \"\$(pg_config --includedir-server)/pg_config.h\" && echo '  server with assertions' || echo '  server without assertions'; } && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} TPC_VEXEC_NUMERIC=${TPC_VEXEC_NUMERIC:-} TPC_SEGMENTS=${TPC_SEGMENTS:-4} TPC_ROUNDS=${TPC_ROUNDS:-1} TPC_KINDS='${TPC_KINDS:-h ds}' TPC_QUERIES='${TPC_QUERIES:-}' TPC_SF=${TPC_SF:-1} TPC_TIMEOUT=${TPC_TIMEOUT:-120} TPC_PLANNING=${TPC_PLANNING:-0} /src/test/tpc/run.sh" \
 				| tee "$run/output" || rc=1
 		done
 		exit $rc

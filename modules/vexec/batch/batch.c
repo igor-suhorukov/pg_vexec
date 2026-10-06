@@ -413,23 +413,30 @@ vexec_vec_flatten(VexecBatch *batch, VexecVec *v)
 {
 	VexecVec	flat;
 	const VexecVec *values;
+	int			nrows;
 	int			i;
 
 	if (v->encoding == VEXEC_FLAT)
 		return;
 	vexec_batch_column_changed(batch, v);
 
+	/*
+	 * A dictionary's codes count its rows; a constant has one value for
+	 * the batch's rows.  A copy flattened into another batch -- a node's
+	 * work batch, which counts no rows -- is a dictionary's.
+	 */
+	nrows = v->encoding == VEXEC_DICT ? v->nvalues : batch->nrows;
 	values = v->encoding == VEXEC_DICT ? v->dictionary : v;
 	flat.type = v->type;
-	vexec_vec_init(batch, &flat, &values->shape, batch->nrows);
+	vexec_vec_init(batch, &flat, &values->shape, nrows);
 	if (values->shape.layout == VEXEC_VIEW)
 		share_buffers(&flat, values);
 	else if (values->shape.layout == VEXEC_OFFSETS)
 		offsets_buffer_init(batch, &flat, 64);
 
 	if (v->validity != NULL)
-		flat.validity = vexec_bitmap_alloc(batch, batch->nrows, false);
-	for (i = 0; i < batch->nrows; i++)
+		flat.validity = vexec_bitmap_alloc(batch, nrows, false);
+	for (i = 0; i < nrows; i++)
 	{
 		int			from;
 

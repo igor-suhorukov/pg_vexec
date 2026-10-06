@@ -13,8 +13,8 @@
  * EXPLAIN's vexec option.
  *
  * In V1 the scan is vectorized: VecScan, and ORCA's Results over it as
- * VecResult.  Joins, aggregations and sorts are still only costed and
- * recorded (§5).
+ * VecResult; in V2 aggregation, VecAgg.  Joins and sorts are still only
+ * costed and recorded (§5).
  *
  *-------------------------------------------------------------------------
  */
@@ -109,8 +109,10 @@ extern void vexec_cost_hashjoin(PlannerInfo *root, Path *rowpath,
 								Path *outer, Path *inner, int nclauses,
 								int nclauses_kernel, VexecCost *cost);
 extern void vexec_cost_agg(PlannerInfo *root, Path *rowpath, Path *input,
-						   int ngroupcols, int ngroupcols_kernel,
+						   bool input_vector, int ngroupcols, int ngroupcols_kernel,
 						   int naggs_kernel, double numgroups, VexecCost *cost);
+extern void vexec_cost_plan_agg(Plan *agg, int ngroupcols, int naggs, int naggs_kernel,
+								bool input_vector, VexecCost *cost);
 extern void vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, VexecCost *cost);
 extern void vexec_cost_plan_scan(Relation rel, const VexecSteps *quals,
 								 const VexecSteps *target, int ncols_in, int ncols_out,
@@ -131,6 +133,13 @@ extern const char *vexec_statement_gate(Query *parse, int cursorOptions);
 
 /* orca.c: ORCA's front end, through gp_orca's API */
 extern void vexec_orca_install(void);
+
+/* agg.c */
+extern void vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel,
+							   RelOptInfo *output_rel, GroupPathExtraData *extra,
+							   VexecPlanState *ps, const char *target_name);
+extern const char *vexec_orca_agg_refusal(Agg *agg);
+extern Plan *vexec_build_agg_from_agg(Agg *agg);
 
 /* build.c */
 extern Path *vexec_scan_path(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,

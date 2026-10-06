@@ -23,6 +23,11 @@
  * does, so that an EXPLAIN without ANALYZE begins none.  The columns are
  * read in the format in effect when the node began (§3.4.4).
  *
+ * A VecAgg above a scan with no qual may have the source answer its
+ * aggregates from the statistics it keeps of a unit of rows -- a file, a
+ * group -- in place of the unit's batches (vexec_scan_aggregate(), H2): the
+ * unit's rows are counted as the scan's, as if they had been handed up.
+ *
  * The scan's tuple is the table's row: the plan's quals and target list
  * read Vars of scanrelid, as a SeqScan's do, so custom_scan_tlist is empty.
  * The node reads the attributes they name, the whole row for a whole-row
@@ -63,6 +68,10 @@ typedef struct VexecScanState
 	bool		need_tid;		/* the last input column is ctid */
 	int			maxattr;
 	bool		done;
+
+	/* H2: the units, and their rows, a source answered from statistics */
+	int64		stats_units;
+	int64		stats_rows;
 } VexecScanState;
 
 static bool scan_fetch(VexecNode *node);
@@ -376,6 +385,65 @@ scan_fetch(VexecNode *node)
 	return s->src != NULL ? fetch_source(s) : fetch_slots(s);
 }
 
+/*
+ * Whether the scan's source may answer aggregates from its statistics: it
+ * has the contract's aggregate(), and the scan no qual and no TIDs to read.
+ */
+bool
+vexec_scan_can_aggregate(VexecNode *node)
+{
+	VexecScanState *s = (VexecScanState *) node;
+	Plan	   *plan = node->css.ss.ps.plan;
+
+	Assert(node->kind == VEXEC_NODE_SCAN);
+	return s->src != NULL && VEXEC_SOURCE_HAS(s->src, aggregate) &&
+		plan->qual == NIL && !s->need_tid;
+}
+
+/*
+ * The source's next unit answered from its statistics, between batches:
+ * true, and its rows counted as handed up; false where the source leaves
+ * the unit to its batches, or the scan is done.
+ */
+bool
+vexec_scan_aggregate(VexecNode *node, int nreqs, const VexecSourceAgg *reqs,
+					 VexecSourceAggAnswer *answers, int64 *nrows)
+{
+	VexecScanState *s = (VexecScanState *) node;
+	PlanState  *ps = &node->css.ss.ps;
+	bool		ok;
+
+	Assert(vexec_scan_can_aggregate(node));
+	if (ps->chgParam != NULL)
+		ExecReScan(ps);
+	if (s->scan == NULL)
+		begin_scan(s);
+	if (s->done || node->finished)
+		return false;
+	CHECK_FOR_INTERRUPTS();
+	if (ps->instrument)
+		InstrStartNode(ps->instrument);
+	*nrows = 0;
+	ok = s->src->aggregate(s->srcstate, nreqs, reqs, answers, nrows);
+	if (ps->instrument)
+		InstrStopNode(ps->instrument, ok ? (double) *nrows : 0);
+	if (ok)
+	{
+		s->stats_units++;
+		s->stats_rows += *nrows;
+	}
+	return ok;
+}
+
+/* The scan's source's name, for EXPLAIN. */
+const char *
+vexec_scan_source_name(VexecNode *node)
+{
+	VexecScanState *s = (VexecScanState *) node;
+
+	return s->src != NULL && s->src->name != NULL ? s->src->name : "a registered source";
+}
+
 static TupleTableSlot *
 scan_exec(CustomScanState *css)
 {
@@ -430,5 +498,10 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 
 		(void) vexec_source_for(s->rel, &how);
 		ExplainPropertyText("Source", s->src != NULL ? how : "the slot path", es);
+	}
+	if (es->analyze && s->stats_units > 0)
+	{
+		ExplainPropertyInteger("Units From Statistics", NULL, s->stats_units, es);
+		ExplainPropertyInteger("Rows From Statistics", NULL, s->stats_rows, es);
 	}
 }

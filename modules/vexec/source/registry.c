@@ -110,8 +110,8 @@ vexec_sources(PG_FUNCTION_ARGS)
 	for (i = 0; i < reg->nsources; i++)
 	{
 		const VexecSourceRoutine *src = reg->sources[i];
-		Datum		values[4];
-		bool		nulls[4] = {false, false, false, false};
+		Datum		values[5];
+		bool		nulls[5] = {false, false, false, false, false};
 		char	   *amname = source_am_name(src);
 
 		values[0] = CStringGetTextDatum(src->name ? src->name : "");
@@ -121,6 +121,7 @@ vexec_sources(PG_FUNCTION_ARGS)
 			nulls[1] = true;
 		values[2] = Int32GetDatum(src->minor);
 		values[3] = BoolGetDatum(VEXEC_SOURCE_HAS(src, estimate));
+		values[4] = BoolGetDatum(VEXEC_SOURCE_HAS(src, aggregate));
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 

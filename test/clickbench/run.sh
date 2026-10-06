@@ -47,12 +47,15 @@
 #   CB_COMMIT, PG_PATCHED_COMMIT
 #                      the builds, the branches' heads; a baseline already
 #                      begun keeps the ones its environment.json names
-#   CB_VEXEC           vexec's sessions for "run" (bench.sh says which): in
-#                      check mode, vexec built by PGXS in vexec's own images
-#                      (test/vexec/run.sh images) into the cache, with the
-#                      port's modules of V1's worktree (VEXEC_PORT_STAGE, as
+#   CB_VEXEC           vexec's sessions for "run" (bench.sh says which): vexec
+#                      built by PGXS in vexec's own images (test/vexec/run.sh
+#                      images) into the cache, with the port's modules of the
+#                      phase's worktree (VEXEC_PORT_STAGE, as
 #                      test/vexec/run.sh portbuild stages them), and each
-#                      load's container started through vexec-entry.sh
+#                      load's container started through vexec-entry.sh.  In
+#                      time mode both are the builds without assertions
+#                      (VEXEC_NOASSERT=1 test/vexec/run.sh images and
+#                      portbuild), as the timed servers are
 #
 # One container runs at a time, and nothing else should: a timed run measures
 # the host.
@@ -163,26 +166,39 @@ environment() {
 }
 
 # vexec for the loads (CB_VEXEC): built in vexec's own images, whose servers
-# are these images' builds with assertions, and copied into the cache with
-# the port's stage, where vexec-entry.sh installs them in each container.
+# are these images' builds -- with assertions for check mode, without them
+# for time mode -- and copied into the cache with the port's stage, where
+# vexec-entry.sh installs them in each container.  ASSERTS says which build
+# it was made against, which vexec-entry.sh checks against the server's.
 vexec_build() {
-	local leg dest stage="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/portbuild/stage}"
+	local mode="$1" leg dest stage flavors=() asserts=yes
+	if [ "$mode" = time ]; then
+		stage="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/portbuild-noassert/stage}"
+		flavors=(VEXEC_PORT_FLAVOR=portnoassert VEXEC_VANILLA_FLAVOR=vanilla-noassert)
+		asserts=no
+	else
+		stage="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/portbuild/stage}"
+	fi
 	[ -d "$stage/usr/local/pgsql" ] || die "no port stage at $stage: test/vexec/run.sh portbuild makes it"
 	for leg in vanilla port; do
 		dest="$CLICKBENCH_CACHE/vexec/$leg"
 		rm -rf "$dest"
 		mkdir -p "$dest"
-		VEXEC_WORK="$dest" VEXEC_PORT_STAGE="$stage" CB_COMMIT="$CB_COMMIT" \
+		env "${flavors[@]}" VEXEC_WORK="$dest" VEXEC_PORT_STAGE="$stage" CB_COMMIT="$CB_COMMIT" \
 			docker compose -f "$ROOT/docker/vexec.yml" --profile run run --rm -T "$leg" bash -c '
 				/src/test/vexec/build.sh > /work/build.log 2>&1 || { cat /work/build.log; exit 1; }
 				mkdir -p /work/lib /work/extension
 				cp "$(pg_config --pkglibdir)/vexec.so" /work/lib/
 				cp "$(pg_config --sharedir)"/extension/vexec* /work/extension/
-				sed -n "s/^building against //p" /work/build.log > /work/BUILT' 2>&1 |
+				sed -n "s/^building against //p" /work/build.log > /work/BUILT
+				if grep -q "^#define USE_ASSERT_CHECKING" "$(pg_config --includedir-server)/pg_config.h"; then
+					echo yes; else echo no; fi > /work/ASSERTS' 2>&1 |
 			grep -v -E '^ (Container|Network) '
 		[ -f "$dest/lib/vexec.so" ] || die "vexec for the $leg route did not build"
+		[ "$(cat "$dest/ASSERTS" 2> /dev/null)" = "$asserts" ] ||
+			die "vexec for the $leg route was built against a server whose assertions are $(cat "$dest/ASSERTS" 2> /dev/null), not $asserts"
 		[ "$leg" = port ] && cp -a "$stage" "$dest/stage"
-		echo "  vexec for the $leg route: $(cat "$dest/BUILT")"
+		echo "  vexec for the $leg route: $(cat "$dest/BUILT"), assertions $asserts"
 	done
 }
 
@@ -279,8 +295,7 @@ case "$cmd" in
 		mode="$1"; shift
 		[ "$mode" = time ] && export CB_SUBSET="${CB_SUBSET:-10m}"
 		if [ -n "${CB_VEXEC:-}" ]; then
-			[ "$mode" = check ] || die "CB_VEXEC runs in check mode only"
-			vexec_build || exit 1
+			vexec_build "$mode" || exit 1
 		fi
 		run_loads "$mode" "$(date +%Y%m%dT%H%M%S)-$mode${CB_VEXEC:+-vexec}" "$@" ;;
 	baseline) baseline ;;

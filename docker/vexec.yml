@@ -6,10 +6,16 @@
 #
 #   vexec-dev-vanilla   the vanilla leg (pg_vector_executor.md §6.4): the
 #                       port's build of REL_19_STABLE, cloudberry/pg19-vanilla,
-#                       with a C toolchain and PostgreSQL's regression suite
+#                       with a C toolchain and PostgreSQL's regression suite;
+#                       with VEXEC_NOASSERT=1, its build without assertions,
+#                       cloudberry/pg19-vanilla-noassert, under the tag
+#                       vanilla-noassert
 #   vexec-dev-port      the port: pg_accel/cb-ext at CB_COMMIT, VB's build of
 #                       the port's modules on the patched server, with a C
-#                       toolchain
+#                       toolchain; with VEXEC_NOASSERT=1 (run.sh), for timed
+#                       runs, cb-ext-noassert's, the server and the port's
+#                       modules without assertions and ORCA without
+#                       GPOS_DEBUG, under the tag portnoassert-<commit>
 #
 # The checkouts are build contexts: PG_SRC (github/postgres), for the
 # regression suite at the server's own commit.
@@ -64,31 +70,31 @@ x-run: &run
 
 services:
   vexec-dev-vanilla:
-    image: pg_accel/vexec-dev:vanilla
+    image: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}
     build:
       <<: *dev
       args:
-        BASE_IMAGE: ${PG_VANILLA_IMAGE:-cloudberry/pg19-vanilla:latest}
+        BASE_IMAGE: ${PG_VANILLA_IMAGE:-cloudberry/pg19-vanilla${VEXEC_CBEXT_SUFFIX:-}:latest}
     profiles: ["build"]
 
   vexec-dev-port:
-    image: pg_accel/vexec-dev:port-${CB_COMMIT:-unset}
+    image: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-${CB_COMMIT:-unset}
     build:
       <<: *dev
       args:
-        BASE_IMAGE: pg_accel/cb-ext:${CB_COMMIT:-unset}
+        BASE_IMAGE: pg_accel/cb-ext${VEXEC_CBEXT_SUFFIX:-}:${CB_COMMIT:-unset}
     profiles: ["build"]
 
   # The port's build tools on vexec's dev image of the port: the port's
   # modules built from a worktree of the port (V1's branch, vexec_v1) by the
   # portbuild service.
   vexec-dev-portdev:
-    image: pg_accel/vexec-dev:portdev-${CB_COMMIT:-unset}
+    image: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}dev-${CB_COMMIT:-unset}
     build:
       context: .
       dockerfile: Dockerfile.portdev
       args:
-        BASE_IMAGE: pg_accel/vexec-dev:port-${CB_COMMIT:-unset}
+        BASE_IMAGE: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-${CB_COMMIT:-unset}
     profiles: ["build"]
 
   # The port's modules built from VEXEC_PORT_SRC, a worktree of the port, into
@@ -96,7 +102,7 @@ services:
   # PAX's two submodules, which a worktree does not check out, are clones of
   # the commits the tree pins, mounted over their empty directories.
   portbuild:
-    image: pg_accel/vexec-dev:portdev-${CB_COMMIT:-unset}
+    image: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}dev-${CB_COMMIT:-unset}
     user: postgres
     network_mode: none
     entrypoint: ["/src/test/vexec/portbuild.sh"]
@@ -118,12 +124,12 @@ services:
 
   vanilla:
     <<: *run
-    image: pg_accel/vexec-dev:vanilla
+    image: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}
     profiles: ["run"]
 
   port:
     <<: *run
-    image: pg_accel/vexec-dev:port-${CB_COMMIT:-unset}
+    image: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-${CB_COMMIT:-unset}
     profiles: ["run"]
 
   # The port's full run with vexec on every node (test/vexec/fullrun.sh), as

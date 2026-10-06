@@ -11,6 +11,7 @@ SELECT name,
 FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
             name             |          setting          | unit |  context   | vartype | min_val |   max_val    |          enumvals           | explain 
 -----------------------------+---------------------------+------+------------+---------+---------+--------------+-----------------------------+---------
+ vexec.aggregate_statistics  | on                        |      | user       | bool    |         |              |                             | f
  vexec.batch_bool_layout     | format                    |      | user       | enum    |         |              | {format,byte,bit}           | t
  vexec.batch_dictionary      | off                       |      | user       | bool    |         |              |                             | f
  vexec.batch_format          | postgres                  |      | user       | enum    |         |              | {postgres,arrow}            | t
@@ -42,7 +43,7 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.min_rows              | 10000                     |      | user       | integer | 0       | 2147483647   |                             | t
  vexec.mode                  | off                       |      | user       | enum    |         |              | {off,explain,auto,force}    | t
  vexec.orca                  | on                        |      | user       | bool    |         |              |                             | t
-(31 rows)
+(32 rows)
 
 -- the modes
 SET vexec.mode = explain;

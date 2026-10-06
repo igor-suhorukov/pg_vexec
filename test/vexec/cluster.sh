@@ -147,6 +147,8 @@ out=$("$BINDIR/psql" -X -q -At -v ON_ERROR_STOP=1 -h "$(sockdir 0)" -p "$(port 0
 # the workload, each query over each table
 QUERIES=(
 	"SELECT count(*), sum(v), min(s), max(d) FROM %t"
+	# H2: PAX's counts, from its statistics, under each segment's partial VecAgg
+	"SELECT count(*), count(k), count(d) FROM %t"
 	"SELECT k, count(*), sum(n), avg(v) FROM %t WHERE b GROUP BY k"
 	"SELECT s, count(DISTINCT k) FROM %t GROUP BY s HAVING count(*) > 90"
 	"SELECT a.k, count(*) FROM %t a JOIN %t b ON a.id = b.v WHERE b.k < 10 GROUP BY a.k"
@@ -223,6 +225,34 @@ for t in t_heap t_aoco t_porc t_porc_vec; do
 				print c; exit }')
 	check "each of the $SEGMENTS segments ran the vector scan of $t, with rows of its own" "$out" "$SEGMENTS"
 done
+# under ORCA: aggregation in two stages (§3.10), a partial VecAgg on every
+# segment below the Motion, the final one after it -- on the segments past a
+# Redistribute for a grouping, on the coordinator past the Gather for none
+for t in t_heap t_aoco t_porc t_porc_vec; do
+	for q in "SELECT k, count(*), sum(n), avg(v) FROM $t GROUP BY k" "SELECT count(*), sum(n), max(v) FROM $t"; do
+		plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.optimizer_force_multistage_agg = on;
+			EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) $q")
+		if echo "$plan" | grep -q "GPORCA" && echo "$plan" | grep -q -E "Vec Partial (Hash)?Aggregate \(actual rows=[1-9]" \
+			&& echo "$plan" | grep -q -E "Vec Finalize (Hash)?Aggregate"; then
+			echo "  ok ORCA aggregates $t in two VecAgg stages: $(echo "$q" | cut -c1-40)..."
+		else
+			echo "  FAILED ORCA's plan of $q has no partial and final VecAgg:"
+			echo "$plan" | sed 's/^/    /'
+			fail=1
+		fi
+	done
+	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.optimizer_force_multistage_agg = on; SET gp.enable_explain_allstat = on;
+		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*), sum(n) FROM $t" |
+		awk '/Vec Partial Aggregate/ { found = 1 }
+			found && /allstat:/ { sub(/.*allstat: /, ""); n = split($0, e, "/"); c = 0
+				for (i = 2; i <= n; i++) { k = split(e[i], f, "_"); if (f[k] + 0 > 0) c++ }
+				print c; exit }')
+	check "each of the $SEGMENTS segments ran the partial VecAgg of $t" "$out" "$SEGMENTS"
+done
+# the gather route: the coordinator's VecAgg over the rows the segments send
+plan=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = force; EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM t_aoco GROUP BY k")
+echo "$plan" | grep -q "Vec HashAggregate" && echo "  ok on the gather route, the coordinator aggregates in a VecAgg" \
+	|| { echo "  FAILED the gather route's plan has no VecAgg:"; echo "$plan" | sed 's/^/    /'; fail=1; }
 seg_rows=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) SELECT k FROM t_heap WHERE v > 1000" | grep -c '"Custom Plan Provider": "VecScan"')
 [ "$seg_rows" -gt 0 ] && echo "  ok EXPLAIN ANALYZE's JSON names the VecScan the segments ran" \
 	|| { echo "  FAILED EXPLAIN ANALYZE's JSON names no VecScan"; fail=1; }

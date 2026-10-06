@@ -18,6 +18,8 @@
  *						int64_div_fast_to_numeric() makes them
  *	date_part(f, timestamp)	the same fields as float8, in the same
  *						expressions as timestamp_part_common()
+ *	date_trunc(f, timestamp)	for a day and less: the timestamp less its
+ *						remainder, as timestamp_trunc() zeroes the fields
  *
  * The field is a constant, decoded when the call is bound with
  * DecodeUnits() and DecodeSpecial(), as those functions decode it; a field
@@ -55,7 +57,8 @@ typedef enum DtKind
 	DT_TS_TO_DATE,
 	DT_EXTRACT_DATE,
 	DT_EXTRACT_TS,
-	DT_DATE_PART_TS
+	DT_DATE_PART_TS,
+	DT_TRUNC_TS
 } DtKind;
 
 typedef struct DtInfo
@@ -70,7 +73,10 @@ typedef struct DtField
 	int			type;			/* UNITS or RESERV */
 	int			val;			/* DTK_* */
 	int			scale;			/* extract's: 0, 3 or 6 */
+	int64		unit;			/* date_trunc's: the unit in microseconds */
 } DtField;
+
+static void trunc_ts(VexecKernelCall *kc);
 
 /* A temporal argument in PostgreSQL's epoch (§3.4.2). */
 static void
@@ -438,6 +444,12 @@ dt_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
 			v->result.scale = ((const DtField *) kc->call->extra)->scale;
 			v->fn = k == DT_EXTRACT_DATE ? extract_date : extract_ts;
 			return true;
+		case DT_TRUNC_TS:
+			pg_epoch(kc, &args[1]);
+			v->result.layout = VEXEC_FIXED;
+			v->result.width = v->result.stride = 8;
+			v->fn = trunc_ts;
+			return true;
 		default:				/* DT_DATE_PART_TS */
 			pg_epoch(kc, &args[1]);
 			v->result.layout = VEXEC_FIXED;
@@ -445,6 +457,92 @@ dt_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
 			v->fn = extract_ts;
 			return true;
 	}
+}
+
+/* ---- date_trunc ---- */
+
+/*
+ * date_trunc(unit, timestamp) for a unit of a day or less: the timestamp
+ * less its remainder modulo the unit, the remainder taken upward as
+ * timestamp2tm() takes a time of day, from 0 (timestamp.c:4690-4835, which
+ * zeroes the fields below the unit); an infinity unchanged, as it returns
+ * one.  Days are of the same length in a timestamp without time zone, and
+ * both epochs begin one, so the remainder is the fields' sum.  The calendar's
+ * units -- week, month and up -- keep PostgreSQL's function.
+ */
+static void
+trunc_ts(VexecKernelCall *kc)
+{
+	const DtField *f = kc->call->extra;
+	const VexecVec *v = kc->args[1];
+	Timestamp  *out = kc->result->values;
+	int64		u = f->unit;
+
+	VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+	{
+		Timestamp	t = ((const Timestamp *) v->values)[vexec_arg_row(v, i)];
+		int64		r;
+
+		if (TIMESTAMP_NOT_FINITE(t))
+		{
+			out[i] = t;
+			continue;
+		}
+		r = t % u;
+		if (r < 0)
+			r += u;
+		out[i] = t - r;
+	}
+}
+
+static bool
+trunc_bind(VexecExpr *call, const void *info)
+{
+	List	   *args = ((FuncExpr *) call->expr)->args;
+	Const	   *c;
+	text	   *units;
+	char	   *lowunits;
+	DtField    *f;
+	int			val;
+
+	if (call->kind != VE_CALL || !IsA(call->expr, FuncExpr) || list_length(args) != 2)
+		return false;
+	if (!IsA(linitial(args), Const) || ((Const *) linitial(args))->constisnull)
+		return false;
+	c = linitial_node(Const, args);
+	units = DatumGetTextPP(c->constvalue);
+	lowunits = downcase_truncate_identifier(VARDATA_ANY(units), VARSIZE_ANY_EXHDR(units), false);
+	if (DecodeUnits(0, lowunits, &val) != UNITS)
+		return false;
+	f = palloc0(sizeof(DtField));
+	f->kind = ((const DtInfo *) info)->kind;
+	f->type = UNITS;
+	f->val = val;
+	switch (val)
+	{
+		case DTK_DAY:
+			f->unit = USECS_PER_DAY;
+			break;
+		case DTK_HOUR:
+			f->unit = USECS_PER_HOUR;
+			break;
+		case DTK_MINUTE:
+			f->unit = USECS_PER_MINUTE;
+			break;
+		case DTK_SECOND:
+			f->unit = USECS_PER_SEC;
+			break;
+		case DTK_MILLISEC:
+			f->unit = 1000;
+			break;
+		case DTK_MICROSEC:
+			f->unit = 1;
+			break;
+		default:
+			return false;
+	}
+	call->extra = f;
+	return true;
 }
 
 static bool
@@ -456,12 +554,14 @@ cast_bind(VexecExpr *call, const void *info)
 
 static const VexecKernelDef dt_cast_def = {"date cast", true, cast_bind, dt_variant};
 static const VexecKernelDef dt_field_def = {"date field", true, field_bind, dt_variant};
+static const VexecKernelDef dt_trunc_def = {"date_trunc", false, trunc_bind, dt_variant};
 
 static const DtInfo info_date_to_ts = {DT_DATE_TO_TS};
 static const DtInfo info_ts_to_date = {DT_TS_TO_DATE};
 static const DtInfo info_extract_date = {DT_EXTRACT_DATE};
 static const DtInfo info_extract_ts = {DT_EXTRACT_TS};
 static const DtInfo info_date_part_ts = {DT_DATE_PART_TS};
+static const DtInfo info_trunc_ts = {DT_TRUNC_TS};
 
 void
 vexec_kernels_datetime(void (*add) (Oid, const VexecKernelDef *, const void *))
@@ -471,4 +571,5 @@ vexec_kernels_datetime(void (*add) (Oid, const VexecKernelDef *, const void *))
 	add(F_EXTRACT_TEXT_DATE, &dt_field_def, &info_extract_date);
 	add(F_EXTRACT_TEXT_TIMESTAMP, &dt_field_def, &info_extract_ts);
 	add(F_DATE_PART_TEXT_TIMESTAMP, &dt_field_def, &info_date_part_ts);
+	add(F_DATE_TRUNC_TEXT_TIMESTAMP, &dt_trunc_def, &info_trunc_ts);
 }

@@ -1,6 +1,6 @@
 --- reference
 +++ session
-@@ -1761,7 +1761,7 @@
+@@ -1723,7 +1723,7 @@
  $$;
  select * from explain_sq_limit();
 -                   explain_sq_limit                    

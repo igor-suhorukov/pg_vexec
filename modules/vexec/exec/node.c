@@ -234,10 +234,13 @@ eval_batch(VexecNode *node)
 	 * The eager targets, over the rows past the eager quals; none where no
 	 * row is, so that nothing of them is evaluated for none.
 	 */
-	ev.exact = node->first_lazy == node->nquals;
 	for (i = 0; i < node->ntargets; i++)
+	{
+		ev.exact = node->first_lazy == node->nquals &&
+			!(node->target_inexact != NULL && node->target_inexact[i]);
 		node->outputs[i] = node->targets[i].eager && vexec_bits_any(active, n) ?
 			vexec_eval(&ev, node->targets[i].eager, active) : NULL;
+	}
 
 	node->redo = ev.redo;
 	node->candidates = vexec_bits_andnot(node->work, active, ev.redo, n);
@@ -274,6 +277,16 @@ next_batch(VexecNode *node)
 		node->next_row = 0;
 		return true;
 	}
+}
+
+/*
+ * The next input batch and its eager parts, for a node that consumes its
+ * input itself, as VecAgg does: false at the end.
+ */
+bool
+vexec_node_next_input(VexecNode *node)
+{
+	return next_batch(node);
 }
 
 /*
@@ -448,12 +461,14 @@ vexec_node_exec(VexecNode *node)
 /*
  * Whether the node can hand batches to a vector parent: every qual and
  * target of it eager, and its input batches -- a VecResult's child hands
- * them up too.
+ * them up too.  A VecAgg's targets are its aggregates' inputs, not its
+ * output: it hands up rows.
  */
 bool
 vexec_node_batchable(VexecNode *node)
 {
-	return node->first_lazy == node->nquals && !node->any_lazy_target &&
+	return node->kind != VEXEC_NODE_AGG &&
+		node->first_lazy == node->nquals && !node->any_lazy_target &&
 		!node->row_input;
 }
 

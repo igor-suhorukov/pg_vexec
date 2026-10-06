@@ -3,7 +3,7 @@
  *
  * k_text.c
  *	  Kernels over text, varchar and bpchar (pg_vector_executor.md §3.7,
- *	  H7 of §3.14): comparisons, and LIKE.
+ *	  H7 of §3.14): comparisons, LIKE, and length.
  *
  * Collations.  A kernel is bound only under a deterministic collation; a
  * nondeterministic one keeps PostgreSQL's function (§3.7, "Collations").
@@ -421,6 +421,136 @@ like_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
 
 static const VexecKernelDef like_def = {"like", false, like_bind, like_variant};
 
+/* ---- length ---- */
+
+/*
+ * length(text), char_length() and character_length(): characters, as
+ * text_length() counts them (varlena.c).  In a single-byte encoding, the
+ * bytes.  In UTF8, pg_mbstrlen_with_len()'s walk (mbutils.c): each
+ * character as long as pg_utf_mblen() reads from its first byte, a NUL
+ * where a character begins ending the value, and a character running past
+ * the value's end an error -- the row fails, and PostgreSQL raises it.  A
+ * corrupt value's count is the walk's, not its bytes'.  Another multibyte
+ * encoding binds no kernel.  octet_length(text): the bytes.
+ */
+typedef struct LenInfo
+{
+	bool		octets;
+} LenInfo;
+
+static bool
+len_bind(VexecExpr *call, const void *info)
+{
+	const LenInfo *li = info;
+
+	if (!li->octets && GetDatabaseEncoding() != PG_UTF8 &&
+		pg_database_encoding_max_length() != 1)
+		return false;
+	call->extra = (void *) info;
+	return true;
+}
+
+/* pg_utf_mblen() (wchar.c), inline */
+static inline int
+utf8_char_len(unsigned char c)
+{
+	if ((c & 0x80) == 0)
+		return 1;
+	if ((c & 0xe0) == 0xc0)
+		return 2;
+	if ((c & 0xf0) == 0xe0)
+		return 3;
+	if ((c & 0xf8) == 0xf0)
+		return 4;
+	return 1;
+}
+
+/*
+ * The characters of a UTF8 value, or -1 where a character runs past its
+ * end.  Eight bytes at a time while they are ASCII and none is a NUL.
+ */
+static int32
+utf8_chars(const char *a, int alen)
+{
+	const uint64 ones = UINT64CONST(0x0101010101010101);
+	const uint64 highs = UINT64CONST(0x8080808080808080);
+	int32		n = 0;
+	int			j = 0;
+
+	for (;;)
+	{
+		unsigned char c;
+		int			l;
+
+		while (j + 8 <= alen)
+		{
+			uint64		w;
+
+			memcpy(&w, a + j, 8);
+			if (((w | ((w - ones) & ~w)) & highs) != 0)
+				break;
+			j += 8;
+			n += 8;
+		}
+		if (j >= alen)
+			break;
+		c = (unsigned char) a[j];
+		if (c == 0)
+			break;
+		l = utf8_char_len(c);
+		if (l > alen - j)
+			return -1;
+		j += l;
+		n++;
+	}
+	return n;
+}
+
+static void
+len_kernel(VexecKernelCall *kc)
+{
+	const LenInfo *li = kc->call->extra;
+	const VexecVec *s = kc->args[0];
+	bool		bytes = li->octets || pg_database_encoding_max_length() == 1;
+	int32	   *out = (int32 *) kc->result->values;
+
+	VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+	{
+		const char *a;
+		int			alen;
+
+		bytes_at(s, i, &a, &alen);
+		if (bytes)
+			out[i] = alen;
+		else
+		{
+			int32		n = utf8_chars(a, alen);
+
+			if (n < 0)
+			{
+				vexec_fail(kc, i);
+				n = 0;
+			}
+			out[i] = n;
+		}
+	}
+}
+
+static bool
+len_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
+{
+	args[0] = plain(kc, args[0]);
+	memset(&v->result, 0, sizeof(VexecShape));
+	v->result.layout = VEXEC_FIXED;
+	v->result.width = 4;
+	v->result.stride = 4;
+	v->fn = len_kernel;
+	return true;
+}
+
+static const VexecKernelDef len_def = {"length", true, len_bind, len_variant};
+static const VexecKernelDef octet_len_def = {"octet_length", false, len_bind, len_variant};
+
 /* ---- the table ---- */
 
 static const struct
@@ -439,6 +569,8 @@ static const struct
 
 static const LikeInfo like_pos = {false};
 static const LikeInfo like_neg = {true};
+static const LenInfo len_chars = {false};
+static const LenInfo len_octets = {true};
 
 void
 vexec_kernels_text(void (*add) (Oid, const VexecKernelDef *, const void *))
@@ -453,4 +585,8 @@ vexec_kernels_text(void (*add) (Oid, const VexecKernelDef *, const void *))
 	add(F_BPCHARNLIKE, &like_def, &like_neg);
 	add(F_LIKE_TEXT_TEXT, &like_def, &like_pos);
 	add(F_NOTLIKE_TEXT_TEXT, &like_def, &like_neg);
+	add(F_LENGTH_TEXT, &len_def, &len_chars);
+	add(F_CHAR_LENGTH_TEXT, &len_def, &len_chars);
+	add(F_CHARACTER_LENGTH_TEXT, &len_def, &len_chars);
+	add(F_OCTET_LENGTH_TEXT, &octet_len_def, &len_octets);
 }

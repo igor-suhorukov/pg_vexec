@@ -1,6 +1,140 @@
 --- reference
 +++ session
-@@ -1131,168 +1131,141 @@
+@@ -1015,20 +1015,19 @@
+ set max_parallel_workers_per_gather = 2;
+ select explain_parallel_append('execute ab_q4 (2, 2)');
+-                              explain_parallel_append                               
+-------------------------------------------------------------------------------------
+-                           Filter: ((a >= $1) AND (a <= $2) AND (b < 4))
+-                           Filter: ((a >= $1) AND (a <= $2) AND (b < 4))
+-                           Filter: ((a >= $1) AND (a <= $2) AND (b < 4))
+-                     ->  Parallel Seq Scan on ab_a2_b1 ab_1 (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on ab_a2_b2 ab_2 (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on ab_a2_b3 ab_3 (actual rows=N loops=N)
+-                     Subplans Removed: 6
+-               ->  Parallel Append (actual rows=N loops=N)
+-         ->  Partial Aggregate (actual rows=N loops=N)
++                           explain_parallel_append                            
++------------------------------------------------------------------------------
++                     Filter: ((a >= $1) AND (a <= $2) AND (b < 4))
++                     Filter: ((a >= $1) AND (a <= $2) AND (b < 4))
++                     Filter: ((a >= $1) AND (a <= $2) AND (b < 4))
++               ->  Parallel Seq Scan on ab_a2_b1 ab_1 (actual rows=N loops=N)
++               ->  Parallel Seq Scan on ab_a2_b2 ab_2 (actual rows=N loops=N)
++               ->  Parallel Seq Scan on ab_a2_b3 ab_3 (actual rows=N loops=N)
++               Subplans Removed: 6
++         ->  Parallel Append (actual rows=N loops=N)
+          Workers Launched: N
+          Workers Planned: 2
+    ->  Gather (actual rows=N loops=N)
+- Finalize Aggregate (actual rows=N loops=N)
+-(13 rows)
++ Vec Aggregate (actual rows=N loops=N)
++(12 rows)
+ 
+ -- Test run-time pruning with IN lists.
+@@ -1036,57 +1035,54 @@
+ select avg(a) from ab where a in($1,$2,$3) and b < 4;
+ select explain_parallel_append('execute ab_q5 (1, 1, 1)');
+-                              explain_parallel_append                               
+-------------------------------------------------------------------------------------
+-                           Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
+-                           Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
+-                           Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
+-                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
+-                     Subplans Removed: 6
+-               ->  Parallel Append (actual rows=N loops=N)
+-         ->  Partial Aggregate (actual rows=N loops=N)
++                           explain_parallel_append                            
++------------------------------------------------------------------------------
++                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
++                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
++                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
++               ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++               ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++               ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++               Subplans Removed: 6
++         ->  Parallel Append (actual rows=N loops=N)
+          Workers Launched: N
+          Workers Planned: 2
+    ->  Gather (actual rows=N loops=N)
+- Finalize Aggregate (actual rows=N loops=N)
+-(13 rows)
++ Vec Aggregate (actual rows=N loops=N)
++(12 rows)
+ 
+ select explain_parallel_append('execute ab_q5 (2, 3, 3)');
+-                              explain_parallel_append                               
+-------------------------------------------------------------------------------------
+-                           Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
+-                           Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
+-                           Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
+-                           Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
+-                           Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
+-                           Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
+-                     ->  Parallel Seq Scan on ab_a2_b1 ab_1 (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on ab_a2_b2 ab_2 (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on ab_a2_b3 ab_3 (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on ab_a3_b1 ab_4 (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on ab_a3_b2 ab_5 (actual rows=N loops=N)
+-                     ->  Parallel Seq Scan on ab_a3_b3 ab_6 (actual rows=N loops=N)
+-                     Subplans Removed: 3
+-               ->  Parallel Append (actual rows=N loops=N)
+-         ->  Partial Aggregate (actual rows=N loops=N)
++                           explain_parallel_append                            
++------------------------------------------------------------------------------
++                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
++                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
++                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
++                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
++                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
++                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
++               ->  Parallel Seq Scan on ab_a2_b1 ab_1 (actual rows=N loops=N)
++               ->  Parallel Seq Scan on ab_a2_b2 ab_2 (actual rows=N loops=N)
++               ->  Parallel Seq Scan on ab_a2_b3 ab_3 (actual rows=N loops=N)
++               ->  Parallel Seq Scan on ab_a3_b1 ab_4 (actual rows=N loops=N)
++               ->  Parallel Seq Scan on ab_a3_b2 ab_5 (actual rows=N loops=N)
++               ->  Parallel Seq Scan on ab_a3_b3 ab_6 (actual rows=N loops=N)
++               Subplans Removed: 3
++         ->  Parallel Append (actual rows=N loops=N)
+          Workers Launched: N
+          Workers Planned: 2
+    ->  Gather (actual rows=N loops=N)
+- Finalize Aggregate (actual rows=N loops=N)
+-(19 rows)
++ Vec Aggregate (actual rows=N loops=N)
++(18 rows)
+ 
+ -- Try some params whose values do not belong to any partition.
+ select explain_parallel_append('execute ab_q5 (33, 44, 55)');
+-                  explain_parallel_append                  
+------------------------------------------------------------
+-                     Subplans Removed: 9
+-               ->  Parallel Append (actual rows=N loops=N)
+-         ->  Partial Aggregate (actual rows=N loops=N)
++               explain_parallel_append               
++-----------------------------------------------------
++               Subplans Removed: 9
++         ->  Parallel Append (actual rows=N loops=N)
+          Workers Launched: N
+          Workers Planned: 2
+    ->  Gather (actual rows=N loops=N)
+- Finalize Aggregate (actual rows=N loops=N)
+-(7 rows)
++ Vec Aggregate (actual rows=N loops=N)
++(6 rows)
+ 
+ -- Test Parallel Append with PARAM_EXEC Params
+@@ -1108,5 +1104,5 @@
+    InitPlan expr_1
+    InitPlan expr_2
+- Aggregate (actual rows=N loops=N)
++ Vec Aggregate (actual rows=N loops=N)
+ (15 rows)
+ 
+@@ -1131,168 +1127,141 @@
  set enable_memoize = 0;
  select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(0, 0, 1)');
 -                                        explain_parallel_append                                         
@@ -55,7 +189,7 @@
 +         ->  Materialize (never executed)
 +         Join Filter: (ab.a = a.a)
 +   ->  Nested Loop (actual rows=N loops=N)
-+ Aggregate (actual rows=N loops=N)
++ Vec Aggregate (actual rows=N loops=N)
 +(22 rows)
  
  -- Ensure the same partitions are pruned when we make the nested loop
@@ -113,7 +247,7 @@
 +         ->  Materialize (never executed)
 +         Join Filter: (ab.a = (a.a + 0))
 +   ->  Nested Loop (actual rows=N loops=N)
-+ Aggregate (actual rows=N loops=N)
++ Vec Aggregate (actual rows=N loops=N)
 +(22 rows)
  
  insert into lprt_a values(3),(3);
@@ -170,7 +304,7 @@
 +         ->  Materialize (never executed)
 +         Join Filter: (ab.a = a.a)
 +   ->  Nested Loop (actual rows=N loops=N)
-+ Aggregate (actual rows=N loops=N)
++ Vec Aggregate (actual rows=N loops=N)
 +(22 rows)
  
  select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(1, 0, 0)');
@@ -227,7 +361,7 @@
 +         ->  Materialize (never executed)
 +         Join Filter: (ab.a = a.a)
 +   ->  Nested Loop (actual rows=N loops=N)
-+ Aggregate (actual rows=N loops=N)
++ Vec Aggregate (actual rows=N loops=N)
 +(22 rows)
  
  delete from lprt_a where a = 1;
@@ -285,11 +419,11 @@
 +         ->  Materialize (never executed)
 +         Join Filter: (ab.a = a.a)
 +   ->  Nested Loop (actual rows=N loops=N)
-+ Aggregate (actual rows=N loops=N)
++ Vec Aggregate (actual rows=N loops=N)
 +(22 rows)
  
  reset enable_hashjoin;
-@@ -2064,10 +2037,10 @@
+@@ -2064,10 +2033,10 @@
  -- the plan as it's pulled in setref.c due to having just a single subnode).
  select explain_parallel_append('select * from listp where a = (select 1);');
 -                       explain_parallel_append                        
@@ -304,7 +438,7 @@
 +         ->  Vec Seq Scan on listp_12_2 listp_2 (never executed)
       ->  Result (actual rows=N loops=N)
     ->  Parallel Append (actual rows=N loops=N)
-@@ -2085,6 +2058,6 @@
+@@ -2085,6 +2054,6 @@
    union all
  select * from listp where a = (select 2);');
 -                              explain_parallel_append                              
@@ -313,7 +447,7 @@
 +------------------------------------------------------------------------------
                       Filter: (a = (InitPlan expr_1).col1)
                       Filter: (a = (InitPlan expr_1).col1)
-@@ -2093,8 +2066,8 @@
+@@ -2093,8 +2062,8 @@
                   ->  Result (actual rows=N loops=N)
                   ->  Result (actual rows=N loops=N)
 -               ->  Parallel Seq Scan on listp_12_2 listp_2 (actual rows=N loops=N)
@@ -326,7 +460,7 @@
 +               ->  Vec Seq Scan on listp_12_2 listp_5 (never executed)
                 InitPlan expr_1
                 InitPlan expr_2
-@@ -2236,65 +2209,65 @@
+@@ -2236,65 +2205,65 @@
  \gexec
  explain (costs off) select tableoid::regclass,* from hp_prefix_test where a is null and b is null and c is null and d is null
 - Seq Scan on hp_prefix_test_p0 hp_prefix_test

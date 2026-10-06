@@ -14,8 +14,9 @@
  *			PostgreSQL's planner (paths.c), with vexec.orca and vexec.mode;
  *	build	each node of the translated plan, children first, before its
  *			Motions are checked and its slice table made: a SeqScan becomes
- *			a VecScan, and a Result over a vector node a VecResult, where the
- *			oracle accepts them and the mode chooses them;
+ *			a VecScan, a Result over a vector node a VecResult, and a plain
+ *			or hashed Agg of any split a VecAgg (agg.c), where the oracle
+ *			accepts them and the mode chooses them;
  *	end		the plan check, the reasons for EXPLAIN (VEXEC), and
  *			vexec.debug_require_vector.
  *
@@ -47,6 +48,7 @@
 #include "gp_orca_vec.h"
 
 #include "vexec.h"
+#include "exec/aggtrans.h"
 #include "exec/exec.h"
 #include "plan/plan.h"
 #include "source/source.h"
@@ -201,8 +203,10 @@ orca_result(VexecPlanState *ps, Result *result)
 
 	if (result->plan.lefttree == NULL || result->resconstantqual != NULL)
 		return NULL;			/* a gating Result, or one with no input */
-	if (!vexec_is_vector_node(result->plan.lefttree))
-		return NULL;			/* a row child is not read a batch ahead */
+	if (!vexec_is_vector_node(result->plan.lefttree) ||
+		((CustomScan *) result->plan.lefttree)->methods == vexec_agg_methods())
+		return NULL;			/* a child handing up rows is not read a batch
+								 * ahead */
 	if (ps->record)
 		alt = vexec_alt_record(ps, "VecResult", "ORCA's Result", NULL, NULL);
 	memset(&steps, 0, sizeof(steps));
@@ -227,6 +231,77 @@ orca_result(VexecPlanState *ps, Result *result)
 	return vexec_build_result_from_result(result);
 }
 
+/* An Agg ORCA's translator built, and its VecAgg (§3.8). */
+static Plan *
+orca_agg(VexecPlanState *ps, Agg *agg)
+{
+	VexecAlt   *alt = NULL;
+	VexecSteps	steps;
+	VexecCost	cost;
+	const char *refusal;
+	int			naggs = 0;
+	int			nvec = 0;
+	ListCell   *lc;
+	List	   *aggrefs = NIL;
+
+	if (ps->record)
+		alt = vexec_alt_record(ps, "VecAgg", agg->numCols > 0 ? "ORCA's GROUP BY" : "ORCA's aggregates",
+							   NULL, NULL);
+	if (!vexec_enable_agg)
+	{
+		vexec_alt_refuse(ps, alt, "vexec.enable_agg is off");
+		return NULL;
+	}
+	if ((refusal = vexec_orca_agg_refusal(agg)) != NULL)
+	{
+		vexec_alt_refuse(ps, alt, refusal);
+		return NULL;
+	}
+	if (ps->mode != VEXEC_MODE_FORCE && agg->plan.lefttree->plan_rows < vexec_min_rows)
+	{
+		vexec_alt_refuse(ps, alt, psprintf("%.0f input rows, fewer than vexec.min_rows",
+										   agg->plan.lefttree->plan_rows));
+		return NULL;
+	}
+
+	/* the aggregates' arguments and FILTERs, as the oracle takes them */
+	memset(&steps, 0, sizeof(steps));
+	aggrefs = pull_var_clause((Node *) list_concat_copy(agg->plan.targetlist, agg->plan.qual),
+							  PVC_INCLUDE_AGGREGATES | PVC_RECURSE_PLACEHOLDERS |
+							  PVC_RECURSE_WINDOWFUNCS);
+	foreach(lc, aggrefs)
+	{
+		Aggref	   *aggref = (Aggref *) lfirst(lc);
+		Oid			argtype = InvalidOid;
+
+		if (!IsA(aggref, Aggref))
+			continue;
+		naggs++;
+		vexec_oracle_exprs(NULL, aggref->args, &steps);
+		if (aggref->aggfilter)
+			vexec_oracle_expr(NULL, (Node *) aggref->aggfilter, &steps);
+		if (aggref->args != NIL)
+			argtype = exprType((Node *) linitial_node(TargetEntry, aggref->args)->expr);
+		if (vexec_agg_vectorized(aggref->aggfnoid, agg->aggsplit, argtype, NULL))
+			nvec++;
+	}
+	if (steps.refusal)
+	{
+		vexec_alt_refuse(ps, alt, steps.refusal);
+		return NULL;
+	}
+	vexec_cost_plan_agg(&agg->plan, agg->numCols, naggs, nvec,
+						vexec_is_vector_node(agg->plan.lefttree), &cost);
+	vexec_alt_costed(ps, alt, &cost,
+					 psprintf("ORCA's %s aggregation, split %d; %d aggregates, %d with vector transitions",
+							  agg->aggstrategy == AGG_HASHED ? "hashed" : "plain",
+							  (int) agg->aggsplit, naggs, nvec));
+	ps->npossible++;
+	if (!chosen(ps, &cost))
+		return NULL;
+	return vexec_build_agg_from_agg(agg);
+}
+
 static Plan *
 orca_build(void *state, Plan *plan, List *rtable)
 {
@@ -240,6 +315,8 @@ orca_build(void *state, Plan *plan, List *rtable)
 			return orca_scan(ps, (SeqScan *) plan, rtable);
 		case T_Result:
 			return orca_result(ps, (Result *) plan);
+		case T_Agg:
+			return orca_agg(ps, (Agg *) plan);
 		default:
 			return NULL;
 	}

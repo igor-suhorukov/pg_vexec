@@ -16,3 +16,7 @@ resource queue id: (\d+)
 # tests' snapshots decide (the test itself ignores this output)
 @brin_aocs ^ +-1 \| +(\d+) \| +(\d+) \| +(\d+)$
 @brin_ao ^ +-1 \| +(\d+) \| +(\d+) \| +(\d+)$
+# whether autovacuum had analyzed a table when ORCA planned a query of it:
+# its NOTICE of missing statistics, and the HINT after it, come and go
+!^NOTICE:  One or more columns in the following table\(s\) do not have statistics: 
+!^HINT:  For non-partitioned tables, run analyze <table_name>\(<column_list>\)\. For partitioned tables, run analyze rootpartition

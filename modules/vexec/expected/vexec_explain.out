@@ -65,7 +65,7 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT b, count(*), sum(d) FROM vt WHERE a > 10 GROUP
    VecScan on vt: not chosen (explain mode)
      source: the slot path; quals: 1 kernel step, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecAgg on GROUP BY: not chosen (explain mode)
-     hashed, 1 grouping column, 2 aggregates; transitions through fmgr
+     hashed, 1 grouping column, 2 aggregates, 2 with vector transitions (count(*), numeric sum)
    VecSort on ORDER BY: not chosen (explain mode)
      1 sort key
 (13 rows)
@@ -250,8 +250,9 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT count(DISTINCT b) FROM vt;
  Vexec: mode explain, format postgres
    VecScan on vt: not chosen (explain mode)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
-   VecAgg on aggregates: not possible (DISTINCT inside an aggregate)
-(8 rows)
+   VecAgg on aggregates: not chosen (explain mode)
+     two stages for count(DISTINCT): 0 grouping columns, the argument a key of the lower one; 1 aggregate
+(9 rows)
 
 EXPLAIN (VEXEC, COSTS OFF) SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a) FROM vt;
                                                   QUERY PLAN                                                  
@@ -293,15 +294,15 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT m, count(*) FROM vt GROUP BY m;
 
 SET enable_seqscan = off;
 EXPLAIN (VEXEC, COSTS OFF) SELECT count(*) FROM vt;
-                              QUERY PLAN                              
-----------------------------------------------------------------------
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
  Aggregate
    ->  Seq Scan on vt
          Disabled: true
  Vexec: mode explain, format postgres
    VecScan on vt: not possible (sequential scans are disabled)
    VecAgg on aggregates: not chosen (explain mode)
-     plain, 0 grouping columns, 1 aggregate; transitions through fmgr
+     plain, 0 grouping columns, 1 aggregate, 1 with vector transitions (count(*))
 (7 rows)
 
 RESET enable_seqscan;
@@ -370,7 +371,7 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT a FROM vt WHERE b < (SELECT max(e) FROM vu WHE
    VecScan on vu (expr_1): not chosen (explain mode)
      source: the slot path; quals: 1 kernel step, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecAgg on aggregates (expr_1): not chosen (explain mode)
-     plain, 0 grouping columns, 1 aggregate; transitions through fmgr
+     plain, 0 grouping columns, 1 aggregate, 1 with vector transitions (max)
    VecScan on vt: not chosen (explain mode)
      source: the slot path; quals: 3 kernel steps, 2 fallback steps; target: 0 kernel steps, 0 fallback steps
 (17 rows)
@@ -424,28 +425,28 @@ SET vexec.mode = auto;
 EXPLAIN (VEXEC, COSTS OFF) SELECT b, count(*) FROM vt GROUP BY b;
                                                   QUERY PLAN                                                  
 --------------------------------------------------------------------------------------------------------------
- HashAggregate
+ Vec HashAggregate
    Group Key: b
    ->  Vec Seq Scan on vt
  Vexec: mode auto, format postgres
    VecScan on vt: added (to be chosen by cost)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
-   VecAgg on GROUP BY: not built (VecAgg is built from V2)
-     hashed, 1 grouping column, 1 aggregate; transitions through fmgr
+   VecAgg on GROUP BY: added (to be chosen by cost)
+     hashed, 1 grouping column, 1 aggregate, 1 with vector transitions (count(*))
 (8 rows)
 
 SET vexec.mode = force;
 EXPLAIN (VEXEC, COSTS OFF) SELECT b, count(*) FROM vt GROUP BY b;
                                                   QUERY PLAN                                                  
 --------------------------------------------------------------------------------------------------------------
- HashAggregate
+ Vec HashAggregate
    Group Key: b
    ->  Vec Seq Scan on vt
  Vexec: mode force, format postgres
    VecScan on vt: added (forced: the relation's scan, beside its partial paths)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
-   VecAgg on GROUP BY: not built (VecAgg is built from V2)
-     hashed, 1 grouping column, 1 aggregate; transitions through fmgr
+   VecAgg on GROUP BY: added (forced: the aggregation's paths)
+     hashed, 1 grouping column, 1 aggregate, 1 with vector transitions (count(*))
 (8 rows)
 
 -- the other formats are priced too, and recorded
@@ -453,13 +454,13 @@ SET vexec.batch_format = arrow;
 EXPLAIN (VEXEC, COSTS OFF) SELECT count(*) FROM vt;
                                                   QUERY PLAN                                                  
 --------------------------------------------------------------------------------------------------------------
- Aggregate
+ Vec Aggregate
    ->  Vec Seq Scan on vt
  Vexec: mode force, format arrow
    VecScan on vt: added (forced: the relation's scan, beside its partial paths)
      source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
-   VecAgg on aggregates: not built (VecAgg is built from V2)
-     plain, 0 grouping columns, 1 aggregate; transitions through fmgr
+   VecAgg on aggregates: added (forced: the aggregation's paths)
+     plain, 0 grouping columns, 1 aggregate, 1 with vector transitions (count(*))
 (7 rows)
 
 RESET vexec.batch_format;
@@ -543,7 +544,7 @@ EXPLAIN (VEXEC, COSTS OFF, FORMAT JSON) SELECT b, count(*) FROM vt GROUP BY b;
            "Possible": true,                                                                                                   +
            "Status": "not chosen",                                                                                             +
            "Reason": "explain mode",                                                                                           +
-           "Detail": "hashed, 1 grouping column, 1 aggregate; transitions through fmgr"                                        +
+           "Detail": "hashed, 1 grouping column, 1 aggregate, 1 with vector transitions (count(*))"                            +
          }                                                                                                                     +
        ]                                                                                                                       +
      }                                                                                                                         +

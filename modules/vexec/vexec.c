@@ -48,6 +48,7 @@ int			vexec_min_rows = 10000;
 /* per node kind */
 bool		vexec_enable_scan = true;
 bool		vexec_enable_agg = true;
+bool		vexec_aggregate_statistics = true;
 bool		vexec_enable_hashjoin = true;
 bool		vexec_enable_sort = true;
 bool		vexec_enable_window = true;
@@ -229,6 +230,12 @@ define_settings(void)
 							 "Enables vector aggregation.",
 							 NULL, &vexec_enable_agg, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.aggregate_statistics",
+							 "Lets a batch source answer a vector aggregate from the statistics it keeps.",
+							 "A plain aggregate over a scan with no qual takes a unit of rows -- "
+							 "a file, a group -- from its statistics where they are exact.",
+							 &vexec_aggregate_statistics, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_hashjoin",
 							 "Enables vector hash joins.",
 							 NULL, &vexec_enable_hashjoin, true,

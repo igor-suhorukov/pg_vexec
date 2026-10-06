@@ -151,7 +151,7 @@ vexec_cost_hashjoin(PlannerInfo *root, Path *rowpath, Path *outer, Path *inner,
  * and the groups the tuple factor.
  */
 void
-vexec_cost_agg(PlannerInfo *root, Path *rowpath, Path *input,
+vexec_cost_agg(PlannerInfo *root, Path *rowpath, Path *input, bool input_vector,
 			   int ngroupcols, int ngroupcols_kernel, int naggs_kernel,
 			   double numgroups, VexecCost *cost)
 {
@@ -168,7 +168,13 @@ vexec_cost_agg(PlannerInfo *root, Path *rowpath, Path *input,
 	cost->row_total = rowpath->total_cost;
 	cost->rows = rowpath->rows;
 
+	/*
+	 * Rows in are transposed; a vector child's batches are read as they are,
+	 * and the handing out of its rows that its cost carries is saved.
+	 */
 	cost->convert_in = vexec_convert_cost * path_width_cols(input) * input->rows;
+	if (input_vector)
+		cost->convert_in = -cost->convert_in;
 	cost->rowout = vexec_convert_cost * path_width_cols(rowpath) * rowpath->rows;
 	cost->startup = rowpath->startup_cost - save_hash - save_trans +
 		vexec_batch_setup_cost + cost->convert_in;
@@ -229,4 +235,38 @@ vexec_cost_plan_scan(Relation rel, const VexecSteps *quals, const VexecSteps *ta
 	cost->rowout = vexec_convert_cost * ncols_out * rows;
 	cost->startup = vexec_batch_setup_cost;
 	cost->total = cost->startup + disk + cpu + cost->convert_in + cost->rowout;
+}
+
+/*
+ * An Agg ORCA's translator built, priced as a row Agg and as VecAgg in
+ * PostgreSQL's units, as cost_agg() would price it (costsize.c): a
+ * cpu_operator_cost a grouping column and an aggregate an input row, a
+ * cpu_tuple_cost a group; the vector transitions and the keys' hashing at
+ * the operator factor.  ORCA's choices are its own until V5; in auto mode
+ * its Agg becomes VecAgg where this prices it lower.
+ */
+void
+vexec_cost_plan_agg(Plan *agg, int ngroupcols, int naggs, int naggs_kernel,
+					bool input_vector, VexecCost *cost)
+{
+	Plan	   *input = agg->lefttree;
+	double		in_rows = input ? Max(input->plan_rows, 1) : 1;
+	double		groups = Max(agg->plan_rows, 1);
+	int			in_cols = input ? Max(list_length(input->targetlist), 1) : 1;
+	Cost		row_cpu;
+	Cost		cpu;
+
+	memset(cost, 0, sizeof(VexecCost));
+	row_cpu = cpu_operator_cost * (ngroupcols + naggs) * in_rows + cpu_tuple_cost * groups;
+	cpu = cpu_operator_cost * (ngroupcols * vexec_cpu_operator_factor +
+							   naggs_kernel * vexec_cpu_operator_factor +
+							   (naggs - naggs_kernel)) * in_rows +
+		cpu_tuple_cost * vexec_cpu_tuple_factor * groups;
+	cost->rows = groups;
+	cost->row_startup = row_cpu;
+	cost->row_total = row_cpu;
+	cost->convert_in = vexec_convert_cost * in_cols * in_rows * (input_vector ? -1 : 1);
+	cost->rowout = vexec_convert_cost * Max(list_length(agg->targetlist), 1) * groups;
+	cost->startup = vexec_batch_setup_cost + cpu + cost->convert_in;
+	cost->total = cost->startup + cost->rowout;
 }

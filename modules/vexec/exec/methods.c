@@ -32,11 +32,17 @@ static const CustomScanMethods result_methods = {
 	.CreateCustomScanState = vexec_create_result_state,
 };
 
+static const CustomScanMethods agg_methods = {
+	.CustomName = VEXEC_AGG_NAME,
+	.CreateCustomScanState = vexec_create_agg_state,
+};
+
 void
 vexec_exec_install(void)
 {
 	RegisterCustomScanMethods(&scan_methods);
 	RegisterCustomScanMethods(&result_methods);
+	RegisterCustomScanMethods(&agg_methods);
 }
 
 const CustomScanMethods *
@@ -51,6 +57,12 @@ vexec_result_methods(void)
 	return &result_methods;
 }
 
+const CustomScanMethods *
+vexec_agg_methods(void)
+{
+	return &agg_methods;
+}
+
 /* Whether a plan node is one of vexec's vector nodes. */
 bool
 vexec_is_vector_node(Plan *plan)
@@ -60,7 +72,8 @@ vexec_is_vector_node(Plan *plan)
 	if (plan == NULL || !IsA(plan, CustomScan))
 		return false;
 	cscan = (CustomScan *) plan;
-	return cscan->methods == &scan_methods || cscan->methods == &result_methods;
+	return cscan->methods == &scan_methods || cscan->methods == &result_methods ||
+		cscan->methods == &agg_methods;
 }
 
 /* Whether a plan state is one of vexec's vector nodes'. */

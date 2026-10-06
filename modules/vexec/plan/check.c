@@ -36,9 +36,9 @@ typedef struct CheckContext
 
 /*
  * Whether a CustomScan is one of vexec's vector nodes, and that it is in
- * its canonical form (build.c): a VecScan scans a relation with no
+ * its canonical form (build.c, agg.c): a VecScan scans a relation with no
  * custom_scan_tlist; a VecResult has its child in lefttree and no
- * relation.
+ * relation; a VecAgg too, with a scan tuple of its plan's columns.
  */
 static bool
 is_vector_node(CustomScan *cscan)
@@ -50,6 +50,18 @@ is_vector_node(CustomScan *cscan)
 		if (cscan->scan.scanrelid == 0 || cscan->custom_scan_tlist != NIL ||
 			cscan->scan.plan.lefttree != NULL)
 			elog(ERROR, "vexec plan check: a VecScan not in its canonical form");
+	}
+	else if (cscan->methods == vexec_agg_methods())
+	{
+		VexecAggPlan plan;
+
+		if (cscan->scan.scanrelid != 0 || cscan->scan.plan.lefttree == NULL ||
+			cscan->custom_plans != NIL)
+			elog(ERROR, "vexec plan check: a VecAgg not in its canonical form");
+		vexec_agg_plan_decode(cscan, &plan);
+		if (list_length(plan.outkind) != list_length(cscan->custom_scan_tlist) ||
+			list_length(plan.keycols) != list_length(plan.eqops))
+			elog(ERROR, "vexec plan check: a VecAgg whose scan tuple is not its plan's");
 	}
 	else if (cscan->scan.scanrelid != 0 || cscan->scan.plan.lefttree == NULL)
 		elog(ERROR, "vexec plan check: a VecResult not in its canonical form");

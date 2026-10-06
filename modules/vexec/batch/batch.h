@@ -295,7 +295,27 @@ extern VEXEC_API bool vexec_vec_convert(VexecBatch *batch, VexecVec *v,
 extern VEXEC_API bool vexec_batch_apply_config(VexecBatch *batch,
 													const VexecLayoutConfig *cfg);
 
+/* A numeric's parts (numeric.c's NumericVar), or which special value it is. */
+typedef enum VexecNumericSpecial
+{
+	VEXEC_NUMERIC_FINITE,
+	VEXEC_NUMERIC_NAN,
+	VEXEC_NUMERIC_PINF,
+	VEXEC_NUMERIC_NINF
+} VexecNumericSpecial;
+
+typedef struct VexecNumericParts
+{
+	int			special;		/* VexecNumericSpecial */
+	int			sign;			/* NUMERIC_POS 0x0000, NUMERIC_NEG 0x4000 */
+	int			weight;
+	int			dscale;
+	int			ndigits;
+	const char *digits;			/* int16s in base 10000, unaligned */
+} VexecNumericParts;
+
 /* numeric.c */
+extern VEXEC_API bool vexec_numeric_parts(Datum num, VexecNumericParts *parts);
 extern VEXEC_API bool vexec_numeric_to_scaled(Datum num, int scale, int digits,
 												   int width, int128 *result);
 extern VEXEC_API Datum vexec_scaled_to_numeric(VexecBatch *batch, int128 value, int scale);
