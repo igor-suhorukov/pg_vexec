@@ -18,6 +18,8 @@
 #   run.sh checks                the header copies, the notices, the tree
 #                                (on the host)
 #   run.sh suite [leg]           vexec's own regression suite
+#   run.sh ipc [leg]             the IPC codec against pyarrow (V7_0), in
+#                                the leg's -arrow container: ipc.sh
 #   run.sh states [leg]          vexec's states of §1.2: installed and not
 #                                preloaded, its objects without its library,
 #                                its library removed
@@ -180,6 +182,16 @@ case "$cmd" in
 			run="$(new_run "$leg-$cmd")"
 			echo "== $cmd on the $leg leg: $run"
 			in_leg "$leg" "$run" "/src/test/vexec/$cmd.sh" | tee "$run/output" || rc=1
+		done
+		exit $rc
+		;;
+	ipc)
+		rc=0
+		for leg in $(legs "$@"); do
+			[ "$leg" = port ] && [ -z "$CB_COMMIT" ] && die "no pg_accel/cb-ext image: run test/clickbench/run.sh images"
+			run="$(new_run "$leg-ipc")"
+			echo "== ipc on the $leg leg, against pyarrow: $run"
+			in_leg "$leg-arrow" "$run" "/src/test/vexec/ipc.sh" | tee "$run/output" || rc=1
 		done
 		exit $rc
 		;;

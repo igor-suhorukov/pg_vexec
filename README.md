@@ -50,6 +50,11 @@ The plan's phases land here in order, each on a branch of its own:
   `vexec_testpack`.  The packs themselves, `vexec_pgvector` and
   `vexec_postgis`, are repositories of their own beside this one.  Nothing
   of the port changes.
+- **V7_0, Arrow IPC messages** (`v7_0`, and `v10` after it; the plan's
+  §5): the codec V7's frames and V10's egress share, which `vexec` writes
+  and reads with its own code for the flatbuffer tables of Arrow's
+  `Message.fbs` and `Schema.fbs` -- a message's body going out as pieces
+  where its arrays lie, a message coming in checked as a client's input.
 
 ## Layout
 
@@ -63,13 +68,15 @@ The plan's phases land here in order, each on a branch of its own:
 | `modules/vexec/exec/` | the vector nodes, `VecScan` and `VecBitmapHeapScan`, `VecResult`, `VecAgg`, `VecHashJoin`, `VecSort` and `VecRepartition`, with their row and batch interfaces, and the aggregates' transitions |
 | `modules/vexec/expr/` | the expression compiler and evaluator: kernels bound by function OID, the fallback, PostgreSQL's evaluator for what may raise; calls bound to kernel packs' declarations (`packs.c`), kept per backend and dropped by syscache callbacks |
 | `modules/vexec/source/` | `vexec`'s side of the source registry, and heap's page reader |
+| `modules/vexec/ipc/` | Arrow IPC messages, written and read by `vexec`'s own code (V7_0) |
 | `modules/vexec/pgxs/include/` | copies of the port's headers the PGXS build compiles against, kept equal to the originals |
 | `modules/vexec/sql`, `expected` | `vexec`'s own regression suite, and the layouts' semantics corpus |
-| `modules/vexec_test/` | a module of the tests alone: round trips through every layout, and the export check with nanoarrow, vendored there only |
+| `modules/vexec_test/` | a module of the tests alone: round trips through every layout, the export check with nanoarrow, vendored there only, and the IPC codec's checks |
 | `modules/vexec_testpack/` | a kernel pack of the tests alone: an extension's functions and a pack's declarations of them in one library, preloaded before `vexec` by the suite (`vexec_packs`) |
 | `test/vexec/` | `vexec`'s legs: `run.sh` on the host, the scripts each leg runs in a container, the differential runner, the checks |
 | `test/tpc/` | the port's tpc suite, with `TPC_STORAGE` (heap, `ao_column`, PAX porc and porc_vec) and `vexec` preloaded |
 | `docker/vexec.yml`, `docker/Dockerfile.vexec` | `vexec`'s images and containers: a server image with a C toolchain, vanilla or the port's |
+| `docker/Dockerfile.arrow` | pyarrow on those images, against which the IPC codec is checked |
 | `docker/compose.yml`, `docker/Dockerfile.clickbench` | ClickBench's images and containers (VB) |
 | `test/clickbench/` | ClickBench's suite and its baseline (VB) |
 

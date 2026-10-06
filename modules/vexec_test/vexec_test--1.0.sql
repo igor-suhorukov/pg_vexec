@@ -37,3 +37,54 @@ CREATE FUNCTION scaled(value numeric, scale int4, width int4 DEFAULT 16)
 RETURNS text
 AS 'MODULE_PATHNAME', 'vexec_test_scaled'
 LANGUAGE C STRICT IMMUTABLE;
+
+-- The IPC codec (V7_0): every batch of a query, exported as export() exports
+-- it, written as Arrow IPC messages and read back, validated, and compared
+-- with the export bit for bit.  An error names the first difference.
+CREATE FUNCTION ipc(query text, format text DEFAULT 'postgres',
+                    varlena text DEFAULT 'format', bool text DEFAULT 'format',
+                    temporal text DEFAULT 'format', "numeric" text DEFAULT 'format',
+                    OUT col int4, OUT type text, OUT arrow text, OUT rows int8,
+                    OUT nulls int8, OUT schemas int4, OUT batches int4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_test_ipc'
+LANGUAGE C VOLATILE;
+
+-- The same batches as encapsulated streams, a stream for each run of
+-- batches of one schema, with the export's format strings.
+CREATE FUNCTION ipc_stream(query text, format text DEFAULT 'postgres',
+                           varlena text DEFAULT 'format', bool text DEFAULT 'format',
+                           temporal text DEFAULT 'format', "numeric" text DEFAULT 'format',
+                           OUT stream bytea, OUT formats text[], OUT batches int4,
+                           OUT rows int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_test_ipc_stream'
+LANGUAGE C VOLATILE;
+
+-- A stream read by vexec's reader and written back by its writer; read from
+-- an 8-byte aligned copy, or from one byte past it.
+CREATE FUNCTION ipc_reencode(stream bytea, aligned bool DEFAULT true)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'vexec_test_ipc_reencode'
+LANGUAGE C STRICT VOLATILE;
+
+-- Where a stream's messages lie.
+CREATE FUNCTION ipc_messages(stream bytea, OUT n int4, OUT kind text, OUT start int8,
+                             OUT metadata_len int8, OUT body_start int8, OUT body_len int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_test_ipc_messages'
+LANGUAGE C STRICT VOLATILE;
+
+-- A stream with one number of its message-th message changed: version,
+-- body_length, batch_length, node_length, node_nulls, buffer_offset or
+-- buffer_length, the last four of FieldNode or Buffer idx.
+CREATE FUNCTION ipc_patch(stream bytea, message int4, what text, idx int4, value int8)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'vexec_test_ipc_patch'
+LANGUAGE C STRICT VOLATILE;
+
+-- A value's bytes as PostgreSQL holds them: a varlena's payload, detoasted.
+CREATE FUNCTION raw(value anyelement)
+RETURNS bytea
+AS 'MODULE_PATHNAME', 'vexec_test_raw'
+LANGUAGE C STRICT IMMUTABLE;

@@ -21,6 +21,8 @@
  *	vexec_test.scaled(value, scale, width)
  *		A numeric through its scaled form and back.
  *
+ * The IPC codec's checks are in ipc_test.c.
+ *
  * A module of the tests alone: nanoarrow is vendored here, and never in
  * vexec.  It reaches vexec by symbol, so vexec must be preloaded; without
  * it this library fails to load with an unresolved symbol.
@@ -64,6 +66,7 @@
 #include "vexec.h"
 #include "batch/batch.h"
 #include "batch/export.h"
+#include "vexec_test.h"
 
 PG_MODULE_MAGIC_EXT(
 					.name = "vexec_test",
@@ -74,19 +77,8 @@ PG_FUNCTION_INFO_V1(vexec_test_roundtrip);
 PG_FUNCTION_INFO_V1(vexec_test_export);
 PG_FUNCTION_INFO_V1(vexec_test_scaled);
 
-/* A query's rows, a batch at a time, through an SPI cursor. */
-typedef struct Rows
-{
-	Portal		portal;
-	TupleDesc	desc;
-	int			natts;
-	VexecType **types;
-	Datum	   *values;			/* [row * natts + col] */
-	bool	   *nulls;
-	int			nrows;
-} Rows;
-
-static void
+/* A query's rows, a batch at a time, through an SPI cursor (vexec_test.h). */
+void
 rows_open(Rows *rows, const char *query, ArrayType *typmods)
 {
 	SPIPlanPtr	plan;
@@ -123,7 +115,7 @@ rows_open(Rows *rows, const char *query, ArrayType *typmods)
 }
 
 /* The next batch's rows, deformed; false at the end. */
-static bool
+bool
 rows_next(Rows *rows)
 {
 	uint64		i;
@@ -136,7 +128,7 @@ rows_next(Rows *rows)
 	return rows->nrows > 0;
 }
 
-static void
+void
 rows_fill(Rows *rows, VexecBatch *batch)
 {
 	int			r;
@@ -453,7 +445,7 @@ vexec_test_roundtrip(PG_FUNCTION_ARGS)
 
 /* ---- the export check ---- */
 
-static int
+int
 setting_value(const char *name, const char *value, const char *const *names, int n)
 {
 	int			i;
@@ -482,7 +474,7 @@ na_check(int code, struct ArrowError *error, const char *what, int col)
  * zero past the value, and a long value's buffer index, its range within
  * that buffer, and its prefix.
  */
-static void
+void
 check_views(struct ArrowArray *a, int col)
 {
 	const uint64 *validity = a->buffers[0];
@@ -763,11 +755,11 @@ check_value(struct ArrowArrayView *view, struct ArrowSchemaView *sv, int64 r,
 	}
 }
 
-static const char *const format_names[] = {"postgres", "arrow"};
-static const char *const varlena_names[] = {"format", "datum", "view", "offsets"};
-static const char *const bool_names[] = {"format", "byte", "bit"};
-static const char *const temporal_names[] = {"format", "postgres", "arrow"};
-static const char *const numeric_names[] = {"format", "scaled", "varlena"};
+const char *const format_names[] = {"postgres", "arrow"};
+const char *const varlena_names[] = {"format", "datum", "view", "offsets"};
+const char *const bool_names[] = {"format", "byte", "bit"};
+const char *const temporal_names[] = {"format", "postgres", "arrow"};
+const char *const numeric_names[] = {"format", "scaled", "varlena"};
 
 static char *
 metadata_value(const char *metadata, const char *key)

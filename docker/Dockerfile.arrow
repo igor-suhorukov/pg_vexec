@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: Apache-2.0
+#
+# pyarrow on vexec's dev images (pg_vector_executor.md §5, V7_0 and V10):
+# Arrow's own implementation, which reads the streams vexec's IPC codec
+# writes and writes the streams it reads, so that the codec is checked both
+# ways against it, and which reads what the egress API sends.  In a virtual
+# environment of its own, /opt/arrow, which sees the system's packages and
+# comes first on the PATH; pinned, so that a leg's results name what they
+# were checked against.
+#
+#   BASE_IMAGE        vexec's image: pg_accel/vexec-dev:vanilla, or the port's
+#   PYARROW_VERSION   25.0.1, the newest on 2026-10-06
+
+ARG BASE_IMAGE=pg_accel/vexec-dev:vanilla
+
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+ARG PYARROW_VERSION=25.0.1
+RUN python3 -m venv --system-site-packages /opt/arrow \
+    && /opt/arrow/bin/pip install --no-cache-dir "pyarrow==${PYARROW_VERSION}" \
+    && /opt/arrow/bin/python -c 'import pyarrow; print("pyarrow", pyarrow.__version__)'
+ENV PATH=/opt/arrow/bin:$PATH
+USER postgres

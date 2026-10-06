@@ -86,6 +86,27 @@ services:
         BASE_IMAGE: pg_accel/cb-ext${VEXEC_CBEXT_SUFFIX:-}:${CB_COMMIT:-unset}
     profiles: ["build"]
 
+  # pyarrow on vexec's dev images (V7_0, V10): the IPC codec's streams are
+  # checked against Arrow's own implementation, both ways, and the egress
+  # API's results read by it (Dockerfile.arrow).
+  vexec-dev-vanillaarrow:
+    image: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-arrow
+    build:
+      context: .
+      dockerfile: Dockerfile.arrow
+      args:
+        BASE_IMAGE: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}
+    profiles: ["build"]
+
+  vexec-dev-portarrow:
+    image: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-arrow-${CB_COMMIT:-unset}
+    build:
+      context: .
+      dockerfile: Dockerfile.arrow
+      args:
+        BASE_IMAGE: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-${CB_COMMIT:-unset}
+    profiles: ["build"]
+
   # The port's build tools on vexec's dev image of the port: the port's
   # modules built from a worktree of the port (V1's branch, vexec_v1) by the
   # portbuild service.
@@ -179,6 +200,17 @@ services:
   port:
     <<: *run
     image: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-${CB_COMMIT:-unset}
+    profiles: ["run"]
+
+  # The two legs with pyarrow (V7_0, V10).
+  vanilla-arrow:
+    <<: *run
+    image: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-arrow
+    profiles: ["run"]
+
+  port-arrow:
+    <<: *run
+    image: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-arrow-${CB_COMMIT:-unset}
     profiles: ["run"]
 
   # The port's full run with vexec on every node (test/vexec/fullrun.sh), as

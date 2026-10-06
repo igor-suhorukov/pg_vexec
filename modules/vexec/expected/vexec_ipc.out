@@ -1,0 +1,574 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- The Arrow IPC codec (pg_vector_executor.md §3.10, "No library"; §5
+-- V7_0): every type of the layouts' corpus (§6.2), exported from both
+-- formats and with each per-structure setting, written as Arrow IPC
+-- messages and read back bit for bit; streams read and written back as
+-- they were; and malformed input refused with its SQLSTATE, never read
+-- outside its bytes.  vexec_test runs the checks (ipc_test.c);
+-- test/vexec/ipc.sh checks the codec against Arrow's own implementation.
+\i sql/vexec_corpus_setup.sql
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- The layouts' semantics corpus (pg_vector_executor.md §6.2, "Layouts"): a
+-- table of every kind of type vexec holds, with the values at each layout's
+-- edges, over 2,600 rows -- three batches, the last short -- with NULLs at
+-- the edges of the bitmaps' words and of the batches.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+CREATE EXTENSION IF NOT EXISTS vexec_test;
+RESET client_min_messages;
+CREATE TABLE corpus (
+	id int4,
+	b bool, i2 int2, i4 int4, i8 int8, f4 float4, f8 float8,
+	o oid, m money, ch "char",
+	d date, t time, ts timestamp, tstz timestamptz, iv interval, tz timetz,
+	n numeric, n10_2 numeric(10,2), n18_0 numeric(18,0), n38_5 numeric(38,5),
+	n5_m2 numeric(5,-2), n3_10 numeric(3,10), n40_2 numeric(40,2),
+	tx text, vc varchar(200), bp char(5), bt bytea, js json, jb jsonb,
+	u uuid, nm name, mac macaddr, mac8 macaddr8, ip inet, pt point,
+	a4 int4[], at text[], k int4, big text
+);
+-- big's long values are stored out of line, uncompressed
+ALTER TABLE corpus ALTER COLUMN big SET STORAGE EXTERNAL;
+-- a row's value is NULL where its id is at a word's edge, or every 7th
+CREATE FUNCTION corpus_null(id int4, col int4) RETURNS bool
+LANGUAGE sql IMMUTABLE AS
+$$ SELECT (id - 1) % 64 IN (0, 63) OR (id + col) % 7 = 0 OR id IN (1024, 1025, 2048) $$;
+INSERT INTO corpus
+SELECT g,
+	CASE WHEN corpus_null(g, 1) THEN NULL ELSE g % 3 = 0 END,
+	CASE WHEN corpus_null(g, 2) THEN NULL
+		 WHEN g % 50 = 1 THEN 32767 WHEN g % 50 = 2 THEN -32768 ELSE (g * 7) % 30000 - 15000 END,
+	CASE WHEN corpus_null(g, 3) THEN NULL
+		 WHEN g % 50 = 3 THEN 2147483647 WHEN g % 50 = 4 THEN -2147483648 ELSE (g::int8 * 1000003 % 1000000007)::int4 END,
+	CASE WHEN corpus_null(g, 4) THEN NULL
+		 WHEN g % 50 = 5 THEN 9223372036854775807 WHEN g % 50 = 6 THEN -9223372036854775808
+		 ELSE g::int8 * 1000000007 * 97 END,
+	CASE WHEN corpus_null(g, 5) THEN NULL
+		 WHEN g % 50 = 7 THEN 'NaN' WHEN g % 50 = 8 THEN '-0' WHEN g % 50 = 9 THEN '-Infinity'
+		 ELSE g / 7.0 END,
+	CASE WHEN corpus_null(g, 6) THEN NULL
+		 WHEN g % 50 = 10 THEN 'NaN' WHEN g % 50 = 11 THEN '-0' WHEN g % 50 = 12 THEN 'Infinity'
+		 WHEN g % 50 = 13 THEN 1e308 ELSE g / 3.0 END,
+	CASE WHEN corpus_null(g, 7) THEN NULL WHEN g % 50 = 14 THEN 4294967295 ELSE g END,
+	CASE WHEN corpus_null(g, 8) THEN NULL ELSE (g * 1.25)::money END,
+	CASE WHEN corpus_null(g, 9) THEN NULL ELSE chr(33 + g % 90)::"char" END,
+	-- dates: the infinities, PostgreSQL's limits
+	CASE WHEN corpus_null(g, 10) THEN NULL
+		 WHEN g % 50 = 15 THEN 'infinity' WHEN g % 50 = 16 THEN '-infinity'
+		 WHEN g % 50 = 17 THEN '4714-11-24 BC' WHEN g % 50 = 18 THEN '5874897-12-31'
+		 ELSE '2000-01-01'::date + (g * 37 - 40000) END,
+	-- time, 24:00:00 included
+	CASE WHEN corpus_null(g, 11) THEN NULL WHEN g % 50 = 19 THEN '24:00:00'
+		 ELSE '00:00:00'::time + g * interval '17 seconds' END,
+	-- timestamps: the infinities, the limits, and from 294247-01-10 on
+	CASE WHEN corpus_null(g, 12) THEN NULL
+		 WHEN g % 50 = 20 THEN 'infinity' WHEN g % 50 = 21 THEN '-infinity'
+		 WHEN g % 50 = 22 THEN '4714-11-24 00:00:00 BC'
+		 WHEN g % 50 = 23 AND g > 2000 THEN '294276-12-31 23:59:59.999999'
+		 WHEN g % 50 = 24 AND g > 2000 THEN '294247-01-10 04:00:54.775808'
+		 WHEN g % 50 = 25 THEN '294247-01-10 04:00:54.775807'
+		 ELSE '2000-01-01'::timestamp + g * interval '1 day 3 hours 7 minutes 11.123456 seconds' END,
+	CASE WHEN corpus_null(g, 13) THEN NULL
+		 WHEN g % 50 = 20 THEN 'infinity' WHEN g % 50 = 21 THEN '-infinity'
+		 WHEN g % 50 = 23 AND g > 2000 THEN '294276-12-30 23:59:59.999999+00'
+		 ELSE '1999-12-31 00:00:00+00'::timestamptz - g * interval '13 days 5 hours 0.5 seconds' END,
+	-- intervals: the infinities, and time parts on both sides of 292 years in ns
+	CASE WHEN corpus_null(g, 14) THEN NULL
+		 WHEN g % 50 = 26 THEN 'infinity' WHEN g % 50 = 27 AND g > 2000 THEN '-infinity'
+		 WHEN g % 50 = 28 AND g > 1000 THEN '2562048 hours'
+		 WHEN g % 50 = 29 THEN '2562047 hours 47 minutes 16.854775 seconds'
+		 ELSE make_interval(months => g % 13, days => g % 31, secs => g * 1.000001) END,
+	CASE WHEN corpus_null(g, 15) THEN NULL ELSE ('10:11:12.13'::time + g * interval '1 second')::timetz END,
+	-- numerics: NaN and the infinities, and each typmod's edges
+	CASE WHEN corpus_null(g, 16) THEN NULL
+		 WHEN g % 50 = 30 THEN 'NaN' WHEN g % 50 = 31 THEN 'Infinity' WHEN g % 50 = 32 THEN '-Infinity'
+		 WHEN g % 50 = 33 THEN 1.000 ELSE g / 7.0::numeric END,
+	CASE WHEN corpus_null(g, 17) THEN NULL
+		 WHEN g % 50 = 34 THEN 99999999.99 WHEN g % 50 = 35 THEN -99999999.99 WHEN g % 50 = 36 THEN 0
+		 ELSE g * 1.07 - 1000 END,
+	CASE WHEN corpus_null(g, 18) THEN NULL
+		 WHEN g % 50 = 34 THEN 999999999999999999 WHEN g % 50 = 35 THEN -999999999999999999
+		 ELSE g::int8 * 123456789 END,
+	CASE WHEN corpus_null(g, 19) THEN NULL
+		 WHEN g % 50 = 34 THEN 999999999999999999999999999999999.99999
+		 WHEN g % 50 = 35 THEN -999999999999999999999999999999999.99999
+		 WHEN g % 50 = 36 AND g > 1000 THEN 'NaN'
+		 ELSE g * 1234567890123456789.12345 END,
+	CASE WHEN corpus_null(g, 20) THEN NULL WHEN g % 50 = 34 THEN 9999900 ELSE g * 100 END,
+	CASE WHEN corpus_null(g, 21) THEN NULL ELSE g * 0.0000000001 / 1000 END,
+	CASE WHEN corpus_null(g, 22) THEN NULL ELSE g * 1.5 END,
+	-- strings: 12 and 13 bytes (a view's inline edge), 126 and 127 (the short
+	-- header's), compressed inline, and external
+	CASE WHEN corpus_null(g, 23) THEN NULL
+		 WHEN g % 50 = 37 THEN repeat('x', 12) WHEN g % 50 = 38 THEN repeat('y', 13)
+		 WHEN g % 50 = 39 THEN repeat('z', 126) WHEN g % 50 = 40 THEN repeat('w', 127)
+		 WHEN g % 50 = 41 THEN repeat('compressible ', 400)
+		 WHEN g % 50 = 42 THEN (SELECT string_agg(md5((g * 1000 + s)::text), '') FROM generate_series(1, 300) s)
+		 WHEN g % 50 = 43 THEN '' WHEN g % 50 = 44 THEN 'äöü €'
+		 ELSE 'row ' || g END,
+	CASE WHEN corpus_null(g, 24) THEN NULL ELSE repeat(chr(97 + g % 26), g % 200) END,
+	CASE WHEN corpus_null(g, 25) THEN NULL WHEN g % 50 = 45 THEN '' ELSE substr('abcdefgh', 1 + g % 5, g % 4) END,
+	CASE WHEN corpus_null(g, 26) THEN NULL
+		 WHEN g % 50 = 46 THEN '\x00ff00'::bytea WHEN g % 50 = 47 THEN decode(repeat('ab', 70), 'hex')
+		 ELSE int4send(g) END,
+	CASE WHEN corpus_null(g, 27) THEN NULL ELSE ('{"g": ' || g || ', "s": "' || repeat('j', g % 20) || '"}')::json END,
+	CASE WHEN corpus_null(g, 28) THEN NULL ELSE ('{"g": ' || g || ', "a": [1, 2, ' || g % 10 || ']}')::jsonb END,
+	CASE WHEN corpus_null(g, 29) THEN NULL ELSE md5(g::text)::uuid END,
+	CASE WHEN corpus_null(g, 30) THEN NULL ELSE ('name_' || g)::name END,
+	CASE WHEN corpus_null(g, 31) THEN NULL ELSE ('08:00:2b:01:02:' || lpad(to_hex(g % 256), 2, '0'))::macaddr END,
+	CASE WHEN corpus_null(g, 32) THEN NULL ELSE ('08:00:2b:01:02:03:04:' || lpad(to_hex(g % 256), 2, '0'))::macaddr8 END,
+	CASE WHEN corpus_null(g, 33) THEN NULL ELSE ('10.' || g % 256 || '.' || g / 256 % 256 || '.1/24')::inet END,
+	CASE WHEN corpus_null(g, 34) THEN NULL ELSE point(g, -g / 3.0) END,
+	CASE WHEN corpus_null(g, 35) THEN NULL ELSE ARRAY[g, g + 1, NULL, g % 5] END,
+	CASE WHEN corpus_null(g, 36) THEN NULL ELSE ARRAY['a' || g, NULL, repeat('t', g % 30)] END,
+	42,
+	CASE WHEN corpus_null(g, 37) THEN NULL WHEN g % 10 = 1 THEN repeat('external ' || g, 400)
+		 ELSE 'short ' || g END
+FROM generate_series(1, 2600) g;
+ANALYZE corpus;
+-- every batch written and read back, in each format: the schema, and every
+-- value bit for bit, read where it lies and from an unaligned copy
+SELECT * FROM vexec_test.ipc('SELECT * FROM corpus ORDER BY id', 'postgres');
+ col |            type             |   arrow    | rows | nulls | schemas | batches 
+-----+-----------------------------+------------+------+-------+---------+---------
+   1 | integer                     | i          | 2600 |     0 |       2 |       3
+   2 | boolean                     | c          | 2600 |   441 |       2 |       3
+   3 | smallint                    | s          | 2600 |   440 |       2 |       3
+   4 | integer                     | i          | 2600 |   440 |       2 |       3
+   5 | bigint                      | l          | 2600 |   441 |       2 |       3
+   6 | real                        | f          | 2600 |   441 |       2 |       3
+   7 | double precision            | g          | 2600 |   441 |       2 |       3
+   8 | oid                         | I          | 2600 |   442 |       2 |       3
+   9 | money                       | l          | 2600 |   441 |       2 |       3
+  10 | "char"                      | c          | 2600 |   440 |       2 |       3
+  11 | date                        | i          | 2600 |   440 |       2 |       3
+  12 | time without time zone      | l          | 2600 |   441 |       2 |       3
+  13 | timestamp without time zone | l          | 2600 |   441 |       2 |       3
+  14 | timestamp with time zone    | l          | 2600 |   441 |       2 |       3
+  15 | interval                    | w:16       | 2600 |   442 |       2 |       3
+  16 | time with time zone         | w:12       | 2600 |   441 |       2 |       3
+  17 | numeric                     | vz         | 2600 |   440 |       2 |       3
+  18 | numeric(10,2)               | d:10,2,64  | 2600 |   440 |       2 |       3
+  19 | numeric(18,0)               | d:18,0,64  | 2600 |   441 |       2 |       3
+  20 | numeric(38,5)               | d:38,5; vz | 2600 |   441 |       2 |       3
+  21 | numeric(5,-2)               | d:7,0,64   | 2600 |   441 |       2 |       3
+  22 | numeric(3,10)               | d:3,10,64  | 2600 |   442 |       2 |       3
+  23 | numeric(40,2)               | vz         | 2600 |   441 |       2 |       3
+  24 | text                        | vu         | 2600 |   440 |       2 |       3
+  25 | character varying(200)      | vu         | 2600 |   440 |       2 |       3
+  26 | character(5)                | vu         | 2600 |   441 |       2 |       3
+  27 | bytea                       | vz         | 2600 |   441 |       2 |       3
+  28 | json                        | vu         | 2600 |   441 |       2 |       3
+  29 | jsonb                       | vz         | 2600 |   442 |       2 |       3
+  30 | uuid                        | w:16       | 2600 |   441 |       2 |       3
+  31 | name                        | w:64       | 2600 |   440 |       2 |       3
+  32 | macaddr                     | w:6        | 2600 |   440 |       2 |       3
+  33 | macaddr8                    | w:8        | 2600 |   441 |       2 |       3
+  34 | inet                        | vz         | 2600 |   441 |       2 |       3
+  35 | point                       | w:16       | 2600 |   441 |       2 |       3
+  36 | integer[]                   | vz         | 2600 |   442 |       2 |       3
+  37 | text[]                      | vz         | 2600 |   441 |       2 |       3
+  38 | integer                     | i          | 2600 |     0 |       2 |       3
+  39 | text                        | vu         | 2600 |   440 |       2 |       3
+(39 rows)
+
+SELECT * FROM vexec_test.ipc('SELECT * FROM corpus ORDER BY id', 'arrow');
+ col |            type             |   arrow    | rows | nulls | schemas | batches 
+-----+-----------------------------+------------+------+-------+---------+---------
+   1 | integer                     | i          | 2600 |     0 |       2 |       3
+   2 | boolean                     | b          | 2600 |   441 |       2 |       3
+   3 | smallint                    | s          | 2600 |   440 |       2 |       3
+   4 | integer                     | i          | 2600 |   440 |       2 |       3
+   5 | bigint                      | l          | 2600 |   441 |       2 |       3
+   6 | real                        | f          | 2600 |   441 |       2 |       3
+   7 | double precision            | g          | 2600 |   441 |       2 |       3
+   8 | oid                         | I          | 2600 |   442 |       2 |       3
+   9 | money                       | l          | 2600 |   441 |       2 |       3
+  10 | "char"                      | c          | 2600 |   440 |       2 |       3
+  11 | date                        | i          | 2600 |   440 |       2 |       3
+  12 | time without time zone      | l          | 2600 |   441 |       2 |       3
+  13 | timestamp without time zone | l          | 2600 |   441 |       2 |       3
+  14 | timestamp with time zone    | l          | 2600 |   441 |       2 |       3
+  15 | interval                    | w:16       | 2600 |   442 |       2 |       3
+  16 | time with time zone         | w:12       | 2600 |   441 |       2 |       3
+  17 | numeric                     | vz         | 2600 |   440 |       2 |       3
+  18 | numeric(10,2)               | d:10,2,64  | 2600 |   440 |       2 |       3
+  19 | numeric(18,0)               | d:18,0,64  | 2600 |   441 |       2 |       3
+  20 | numeric(38,5)               | d:38,5; vz | 2600 |   441 |       2 |       3
+  21 | numeric(5,-2)               | d:7,0,64   | 2600 |   441 |       2 |       3
+  22 | numeric(3,10)               | d:3,10,64  | 2600 |   442 |       2 |       3
+  23 | numeric(40,2)               | vz         | 2600 |   441 |       2 |       3
+  24 | text                        | vu         | 2600 |   440 |       2 |       3
+  25 | character varying(200)      | vu         | 2600 |   440 |       2 |       3
+  26 | character(5)                | vu         | 2600 |   441 |       2 |       3
+  27 | bytea                       | vz         | 2600 |   441 |       2 |       3
+  28 | json                        | vu         | 2600 |   441 |       2 |       3
+  29 | jsonb                       | vz         | 2600 |   442 |       2 |       3
+  30 | uuid                        | w:16       | 2600 |   441 |       2 |       3
+  31 | name                        | w:64       | 2600 |   440 |       2 |       3
+  32 | macaddr                     | w:6        | 2600 |   440 |       2 |       3
+  33 | macaddr8                    | w:8        | 2600 |   441 |       2 |       3
+  34 | inet                        | vz         | 2600 |   441 |       2 |       3
+  35 | point                       | w:16       | 2600 |   441 |       2 |       3
+  36 | integer[]                   | vz         | 2600 |   442 |       2 |       3
+  37 | text[]                      | vz         | 2600 |   441 |       2 |       3
+  38 | integer                     | i          | 2600 |     0 |       2 |       3
+  39 | text                        | vu         | 2600 |   440 |       2 |       3
+(39 rows)
+
+-- Arrow's own date32, time64, timestamps and month_day_nano, where the
+-- values allow them
+SELECT col, type, arrow, rows, nulls FROM vexec_test.ipc(
+	'SELECT d, t, ts, tstz, iv FROM corpus WHERE id % 50 NOT BETWEEN 15 AND 29 ORDER BY id', 'arrow');
+ col |            type             |  arrow  | rows | nulls 
+-----+-----------------------------+---------+------+-------
+   1 | date                        | tdD     | 1820 |   305
+   2 | time without time zone      | ttu     | 1820 |   311
+   3 | timestamp without time zone | tsu:    | 1820 |   312
+   4 | timestamp with time zone    | tsu:UTC | 1820 |   305
+   5 | interval                    | tin     | 1820 |   309
+(5 rows)
+
+-- each per-structure setting changed alone, in each format
+SELECT f.format, v.varlena, b.bool, t.temporal, n.numeric,
+       count(*) AS columns, sum(e.nulls) AS nulls, min(e.rows) AS rows,
+       max(e.schemas) AS schemas, string_agg(DISTINCT e.arrow, ' ' ORDER BY e.arrow) AS formats
+FROM (VALUES ('postgres'), ('arrow')) f(format),
+     (VALUES ('format'), ('datum'), ('view'), ('offsets')) v(varlena),
+     (VALUES ('format'), ('byte'), ('bit')) b(bool),
+     (VALUES ('format'), ('postgres'), ('arrow')) t(temporal),
+     (VALUES ('format'), ('scaled'), ('varlena')) n(numeric),
+     LATERAL vexec_test.ipc('SELECT * FROM corpus ORDER BY id', f.format,
+                            v.varlena, b.bool, t.temporal, n.numeric) e
+WHERE (v.varlena = 'format')::int + (b.bool = 'format')::int +
+      (t.temporal = 'format')::int + (n.numeric = 'format')::int >= 3
+GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5;
+  format  | varlena |  bool  | temporal | numeric | columns | nulls | rows | schemas |                                            formats                                             
+----------+---------+--------+----------+---------+---------+-------+------+---------+------------------------------------------------------------------------------------------------
+ arrow    | datum   | format | format   | format  |      39 | 16311 | 2600 |       2 | I b c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ arrow    | format  | bit    | format   | format  |      39 | 16311 | 2600 |       2 | I b c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ arrow    | format  | byte   | format   | format  |      39 | 16311 | 2600 |       2 | I c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ arrow    | format  | format | arrow    | format  |      39 | 16311 | 2600 |       2 | I b c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ arrow    | format  | format | format   | format  |      39 | 16311 | 2600 |       2 | I b c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ arrow    | format  | format | format   | scaled  |      39 | 16311 | 2600 |       2 | I b c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ arrow    | format  | format | format   | varlena |      39 | 16311 | 2600 |       2 | I b c f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ arrow    | format  | format | postgres | format  |      39 | 16311 | 2600 |       2 | I b c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ arrow    | offsets | format | format   | format  |      39 | 16311 | 2600 |       2 | I b c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; z d:7,0,64 f g i l s u w:12 w:16 w:6 w:64 w:8 z
+ arrow    | view    | format | format   | format  |      39 | 16311 | 2600 |       2 | I b c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ postgres | datum   | format | format   | format  |      39 | 16311 | 2600 |       2 | I c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ postgres | format  | bit    | format   | format  |      39 | 16311 | 2600 |       2 | I b c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ postgres | format  | byte   | format   | format  |      39 | 16311 | 2600 |       2 | I c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ postgres | format  | format | arrow    | format  |      39 | 16311 | 2600 |       2 | I c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ postgres | format  | format | format   | format  |      39 | 16311 | 2600 |       2 | I c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ postgres | format  | format | format   | scaled  |      39 | 16311 | 2600 |       2 | I c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ postgres | format  | format | format   | varlena |      39 | 16311 | 2600 |       1 | I c f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ postgres | format  | format | postgres | format  |      39 | 16311 | 2600 |       2 | I c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+ postgres | offsets | format | format   | format  |      39 | 16311 | 2600 |       2 | I c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; z d:7,0,64 f g i l s u w:12 w:16 w:6 w:64 w:8 z
+ postgres | view    | format | format   | format  |      39 | 16311 | 2600 |       2 | I c d:10,2,64 d:18,0,64 d:3,10,64 d:38,5; vz d:7,0,64 f g i l s vu vz w:12 w:16 w:6 w:64 w:8
+(20 rows)
+
+-- empty results: a schema and an empty batch
+SELECT col, arrow, rows, nulls, schemas, batches
+FROM vexec_test.ipc('SELECT * FROM corpus WHERE false', 'arrow', 'offsets')
+WHERE col <= 3 OR arrow IN ('u', 'z');
+ col | arrow | rows | nulls | schemas | batches 
+-----+-------+------+-------+---------+---------
+   1 | i     |    0 |     0 |       1 |       1
+   2 | b     |    0 |     0 |       1 |       1
+   3 | s     |    0 |     0 |       1 |       1
+  17 | z     |    0 |     0 |       1 |       1
+  23 | z     |    0 |     0 |       1 |       1
+  24 | u     |    0 |     0 |       1 |       1
+  25 | u     |    0 |     0 |       1 |       1
+  26 | u     |    0 |     0 |       1 |       1
+  27 | z     |    0 |     0 |       1 |       1
+  28 | u     |    0 |     0 |       1 |       1
+  29 | z     |    0 |     0 |       1 |       1
+  34 | z     |    0 |     0 |       1 |       1
+  36 | z     |    0 |     0 |       1 |       1
+  37 | z     |    0 |     0 |       1 |       1
+  39 | u     |    0 |     0 |       1 |       1
+(15 rows)
+
+-- the corpus as streams, read and written back as they were, from aligned
+-- and unaligned bytes
+SELECT f.format, count(*) AS streams, sum(s.batches) AS batches, sum(s.rows) AS rows,
+       bool_and(vexec_test.ipc_reencode(s.stream) = s.stream) AS same,
+       bool_and(vexec_test.ipc_reencode(s.stream, false) = s.stream) AS same_unaligned
+FROM (VALUES ('postgres'), ('arrow')) f(format),
+     LATERAL vexec_test.ipc_stream('SELECT * FROM corpus ORDER BY id', f.format) s
+GROUP BY 1 ORDER BY 1;
+  format  | streams | batches | rows | same | same_unaligned 
+----------+---------+---------+------+------+----------------
+ arrow    |       2 |       3 | 2600 | t    | t
+ postgres |       2 |       3 | 2600 | t    | t
+(2 rows)
+
+DROP TABLE corpus;
+DROP FUNCTION corpus_null(int4, int4);
+-- Malformed and unsupported input, each refused with its SQLSTATE
+CREATE FUNCTION ipc_try(stream bytea, aligned bool DEFAULT true) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	detail text;
+BEGIN
+	PERFORM vexec_test.ipc_reencode(stream, aligned);
+	RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+	RETURN SQLSTATE || ' ' || SQLERRM || CASE WHEN detail <> '' THEN ': ' || detail ELSE '' END;
+END $$;
+-- nested types and unions, written by pyarrow 25.0.1: a list, a large
+-- list, a fixed-size list, a struct of a list of views, a sorted map, a
+-- dense union of type ids 5, 17 and 2 and a sparse one of 3 and 7, decimal256,
+-- month_day_nano and null, four rows; read, written back, and written back
+-- the same again
+CREATE TABLE ipc_nested AS SELECT decode('
+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
+UAEAAAAAAAAQAAAAAAAAAGABAAAAAAAAAwAAAAAAAABoAQAAAAAAAAEAAAAAAAAAcAEAAAAAAAAM
+AAAAAAAAAIABAAAAAAAABAAAAAAAAACIAQAAAAAAABAAAAAAAAAAmAEAAAAAAAABAAAAAAAAAKAB
+AAAAAAAACAAAAAAAAACoAQAAAAAAAAAAAAAAAAAAqAEAAAAAAAAIAAAAAAAAALABAAAAAAAAHQAA
+AAAAAADQAQAAAAAAAAAAAAAAAAAA0AEAAAAAAAAIAAAAAAAAANgBAAAAAAAAAAAAAAAAAADYAQAA
+AAAAAAEAAAAAAAAA4AEAAAAAAAAEAAAAAAAAAOgBAAAAAAAAAQAAAAAAAADwAQAAAAAAACAAAAAA
+AAAAEAIAAAAAAAABAAAAAAAAABgCAAAAAAAAFAAAAAAAAAAwAgAAAAAAAAIAAAAAAAAAOAIAAAAA
+AAABAAAAAAAAAEACAAAAAAAAgAAAAAAAAADAAgAAAAAAAAEAAAAAAAAAyAIAAAAAAABAAAAAAAAA
+AAAAAAAZAAAABAAAAAAAAAABAAAAAAAAAAQAAAAAAAAAAQAAAAAAAAAEAAAAAAAAAAEAAAAAAAAA
+AwAAAAAAAAABAAAAAAAAAAQAAAAAAAAAAQAAAAAAAAAMAAAAAAAAAAQAAAAAAAAABAAAAAAAAAAB
+AAAAAAAAAAQAAAAAAAAAAQAAAAAAAAAEAAAAAAAAAAEAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAQA
+AAAAAAAAAQAAAAAAAAADAAAAAAAAAAAAAAAAAAAAAwAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAQAA
+AAAAAAAEAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAABAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAA
+AAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAEAAAAA
+AAAABAAAAAAAAAABAAAAAAAAAAQAAAAAAAAAAQAAAAAAAAAEAAAAAAAAAAEAAAAAAAAABAAAAAAA
+AAAEAAAAAAAAAA0AAAAAAAAAAAAAAAMAAAADAAAAAwAAAAQAAAAAAAAADQAAAAAAAAABAAAAAAAA
+AAMAAAAEAAAADQAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAACAAAAAAAAAAMAAAAAAAAA
+BQAAAAAAAAAAAAAAAQAAAAEAAAAEAAAAYWJjZAAAAAANAAAAAAAAAIcPAAAAAAAAAQACAAMAAAAA
+AAAAAAAFAAYABwAIAAkADQAAAAAAAAALAAAAAAAAAAEAAAAAAAAAAAAAAAQAAAALAAAAAAAAAAAA
+AAACAAAAAgAAAAIAAAACAAAAAAAAAAEAAAB4AAAAAAAAAAAAAAAZAAAAYSB2aQAAAAAAAAAAYSB2
+aWV3IGxvbmdlciB0aGFuIHR3ZWx2ZQAAAAAAAAANAAAAAAAAAAAAAAACAAAAAgAAAAIAAAADAAAA
+AAAAAAAAAAABAAAAAgAAAAMAAABrbG0AAAAAAAUAAAAAAAAAAQAAAAAAAAADAAAAAAAAAAURBQIA
+AAAAAAAAAAAAAAABAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAAAAAAAHQAAAGEgdW5pb24ncyBzdHJp
+bmcsIG91dCBvZiBsaW5lAAAAAAAAAAEAAAABAAAAAAAAAAMHBwMAAAAADQAAAAAAAAAAAAAAAAD4
+PwAAAAAAAAAAAAAAAAAAAAAAAAAAAADwvwsAAAAAAAAAAAAAAAEAAAACAAAAAgAAAAIAAAAAAAAA
+eHkAAAAAAAANAAAAAAAAAJYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4/////////////////////////////////////////wAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADQAAAAAAAAABAAAAAgAAAAMAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAP/////+/////f////////8AAAAAAAAAAAAAAAAAAAAA/////wAAAAA=', 'base64') AS stream;
+SELECT ipc_try(stream) AS outcome,
+       vexec_test.ipc_reencode(vexec_test.ipc_reencode(stream)) =
+       vexec_test.ipc_reencode(stream) AS same_again,
+       vexec_test.ipc_reencode(stream, false) = vexec_test.ipc_reencode(stream) AS same_unaligned
+FROM ipc_nested;
+ outcome | same_again | same_unaligned 
+---------+------------+----------------
+ ok      | t          | t
+(1 row)
+
+-- its children made shorter than their parents need: FieldNodes in the
+-- schema's pre-order, 1 the list's values, 5 the fixed-size list's, 7 the
+-- struct's first child, 11 the map's entries, 16 the dense union's
+-- strings, 20 the sparse union's first child
+SELECT c.what, ipc_try(vexec_test.ipc_patch(stream, 2, 'node_length', c.node, c.length)) AS outcome
+FROM ipc_nested,
+     (VALUES ('a list''s values', 1, 2), ('a fixed-size list''s values', 5, 11),
+             ('a struct''s child', 7, 3), ('a map''s entries', 11, 1),
+             ('a dense union''s child', 16, 0), ('a sparse union''s child', 20, 3)) c(what, node, length)
+ORDER BY c.node;
+            what            |                                                             outcome                                                              
+----------------------------+----------------------------------------------------------------------------------------------------------------------------------
+ a list's values            | 22P03 malformed Arrow IPC message: Field "list": its last offset, 4, lies past its child's 2 values.
+ a fixed-size list's values | 22P03 malformed Arrow IPC message: Field "fixed_list" of 4 lists of 3 has a child of 11 values.
+ a struct's child           | 22P03 malformed Arrow IPC message: Field "struct" of 4 values has a child of 3.
+ a map's entries            | 22P03 malformed Arrow IPC message: Field "map": its last offset, 3, lies past its child's 1 values.
+ a dense union's child      | 22P03 malformed Arrow IPC message: Field "dense": row 1's offset, 0, is less than the last of its child's, or past its 0 values.
+ a sparse union's child     | 22P03 malformed Arrow IPC message: Field "sparse" of 4 values has a child of 3.
+(6 rows)
+
+DROP TABLE ipc_nested;
+-- two small streams: utf8 with offsets, and with views; the second value
+-- of each row is longer than a view holds inline
+CREATE TABLE ipc_small AS
+SELECT l.layout, s.stream
+FROM (VALUES ('offsets'), ('view')) l(layout),
+     LATERAL vexec_test.ipc_stream($$SELECT 'abc'::text AS t,
+                                    'Ünïcödé, longer than a view holds'::text AS u,
+                                    7 AS i$$, 'arrow', l.layout) s;
+SELECT l.layout, m.* FROM ipc_small l, vexec_test.ipc_messages(l.stream) m ORDER BY 1, 2;
+ layout  | n |     kind     | start | metadata_len | body_start | body_len 
+---------+---+--------------+-------+--------------+------------+----------
+ offsets | 1 | schema       |     0 |          888 |        896 |        0
+ offsets | 2 | record batch |   896 |          264 |       1168 |       72
+ offsets | 3 | end          |  1240 |            0 |       1248 |        0
+ view    | 1 | schema       |     0 |          888 |        896 |        0
+ view    | 2 | record batch |   896 |          296 |       1200 |      136
+ view    | 3 | end          |  1336 |            0 |       1344 |        0
+(6 rows)
+
+-- cut short anywhere: only a cut between messages reads
+SELECT CASE WHEN outcome = 'ok' THEN 'ok' ELSE 'refused' END AS outcome,
+       count(*) AS cuts, string_agg(DISTINCT outcome, ' | ') FILTER (WHERE outcome <> 'ok') AS how
+FROM (SELECT k, ipc_try(substring(stream FROM 1 FOR k)) AS outcome
+      FROM ipc_small, generate_series(0, length(stream)) k WHERE layout = 'offsets') x
+GROUP BY 1 ORDER BY 1;
+ outcome | cuts |                                                                                  how                                                                                  
+---------+------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ ok      |    4 | 
+ refused | 1245 | 22P03 malformed Arrow IPC stream: The stream ends within a message's body. | 22P03 malformed Arrow IPC stream: The stream ends within a message's prefix or metadata.
+(2 rows)
+
+SELECT k, ipc_try(substring(stream FROM 1 FOR k)) AS outcome
+FROM ipc_small, LATERAL (SELECT (body_start + body_len)::int AS k FROM vexec_test.ipc_messages(stream)) m
+WHERE layout = 'offsets' ORDER BY k;
+  k   | outcome 
+------+---------
+  896 | ok
+ 1240 | ok
+ 1248 | ok
+(3 rows)
+
+-- the body of the offsets stream: t's offsets at 0 and data at 8, u's
+-- offsets at 16 and data at 24, i's value at 64
+CREATE TABLE ipc_case (name text, stream bytea);
+INSERT INTO ipc_case
+SELECT c.name, CASE c.name
+	WHEN 'an offset past its data' THEN overlay(stream PLACING '\x10000000' FROM b + 5)
+	WHEN 'an offset before the one before' THEN overlay(stream PLACING '\xfeffffff' FROM b + 21)
+	WHEN 'a first offset below 0' THEN overlay(stream PLACING '\xffffffff' FROM b + 1)
+	WHEN 'utf8: a byte that starts nothing' THEN overlay(stream PLACING '\xff' FROM b + 9)
+	WHEN 'utf8: an overlong form' THEN overlay(stream PLACING '\xc080' FROM b + 25)
+	WHEN 'utf8: a surrogate' THEN overlay(stream PLACING '\xeda080' FROM b + 25)
+	WHEN 'utf8: a character cut short' THEN overlay(stream PLACING '\x61' FROM b + 26)
+	WHEN 'utf8: U+0000, which Arrow allows' THEN overlay(stream PLACING '\x00' FROM b + 10)
+	WHEN 'a buffer past the body' THEN vexec_test.ipc_patch(stream, 2, 'buffer_offset', 1, 4096)
+	WHEN 'a buffer of 2^40 bytes' THEN vexec_test.ipc_patch(stream, 2, 'buffer_length', 2, 1099511627776)
+	WHEN 'a buffer at -8' THEN vexec_test.ipc_patch(stream, 2, 'buffer_offset', 4, -8)
+	WHEN 'a body shorter than its buffers' THEN vexec_test.ipc_patch(stream, 2, 'body_length', 0, 16)
+	WHEN 'more NULLs than values' THEN vexec_test.ipc_patch(stream, 2, 'node_nulls', 0, 2)
+	WHEN 'a NULL without a validity bitmap' THEN vexec_test.ipc_patch(stream, 2, 'node_nulls', 1, 1)
+	WHEN 'a column shorter than its batch' THEN vexec_test.ipc_patch(stream, 2, 'node_length', 2, 0)
+	WHEN 'a batch longer than its columns' THEN vexec_test.ipc_patch(stream, 2, 'batch_length', 0, 5)
+	WHEN 'a batch of 2^40 rows' THEN vexec_test.ipc_patch(stream, 2, 'batch_length', 0, 1099511627776)
+	WHEN 'metadata version V3' THEN vexec_test.ipc_patch(stream, 1, 'version', 0, 2)
+	WHEN 'metadata version V4' THEN vexec_test.ipc_patch(vexec_test.ipc_patch(stream, 1, 'version', 0, 3), 2, 'version', 0, 3)
+	END
+FROM ipc_small, LATERAL (SELECT body_start::int AS b FROM vexec_test.ipc_messages(stream) WHERE n = 2) m,
+     (VALUES ('an offset past its data'), ('an offset before the one before'),
+             ('a first offset below 0'), ('utf8: a byte that starts nothing'),
+             ('utf8: an overlong form'), ('utf8: a surrogate'), ('utf8: a character cut short'),
+             ('utf8: U+0000, which Arrow allows'), ('a buffer past the body'),
+             ('a buffer of 2^40 bytes'), ('a buffer at -8'), ('a body shorter than its buffers'),
+             ('more NULLs than values'), ('a NULL without a validity bitmap'),
+             ('a column shorter than its batch'), ('a batch longer than its columns'),
+             ('a batch of 2^40 rows'), ('metadata version V3'), ('metadata version V4')) c(name)
+WHERE layout = 'offsets';
+-- the body of the views stream: t's inline view at 0, then t's variadic
+-- buffer, the batch's arena, which holds both values, varlena headers and
+-- all; then u's view, found by its size and prefix, and u's variadic
+-- buffer, the arena again, where u's view points.  No view of t points into
+-- t's buffer, so its bytes need not be UTF-8.
+INSERT INTO ipc_case
+SELECT c.name, CASE c.name
+	WHEN 'utf8_view: an inline value that is not UTF-8' THEN overlay(stream PLACING '\xff' FROM b + 5)
+	WHEN 'utf8_view: inline padding that is not zero' THEN overlay(stream PLACING '\x78' FROM b + 9)
+	WHEN 'utf8_view: a value that is not UTF-8' THEN overlay(stream PLACING '\xc0' FROM v2 + 6)
+	WHEN 'utf8_view: bytes no view refers to, not UTF-8' THEN overlay(stream PLACING '\xc0' FROM v1 + 6)
+	WHEN 'utf8_view: a prefix that is not its value''s' THEN overlay(stream PLACING '\x58' FROM uv + 4)
+	WHEN 'utf8_view: a value past its buffer' THEN overlay(stream PLACING '\xffffff7f' FROM uv + 12)
+	WHEN 'utf8_view: a buffer index past the buffers' THEN overlay(stream PLACING '\xffffff7f' FROM uv + 8)
+	WHEN 'utf8_view: a size below 0' THEN overlay(stream PLACING '\xffffffff' FROM uv)
+	END
+FROM ipc_small,
+     LATERAL (SELECT body_start::int AS b FROM vexec_test.ipc_messages(stream) WHERE n = 2) m,
+     LATERAL (SELECT position('\x25000000c39c6ec3'::bytea IN stream) AS uv,
+                     position(convert_to('Ünïcödé', 'UTF8') IN stream) AS v1) p,
+     LATERAL (SELECT v1 + position(convert_to('Ünïcödé', 'UTF8') IN substring(stream FROM v1 + 1)) AS v2) q,
+     (VALUES ('utf8_view: an inline value that is not UTF-8'),
+             ('utf8_view: inline padding that is not zero'), ('utf8_view: a value that is not UTF-8'),
+             ('utf8_view: bytes no view refers to, not UTF-8'),
+             ('utf8_view: a prefix that is not its value''s'), ('utf8_view: a value past its buffer'),
+             ('utf8_view: a buffer index past the buffers'), ('utf8_view: a size below 0')) c(name)
+WHERE layout = 'view';
+-- written by Arrow's own implementation (pyarrow 25.0.1): a dictionary-
+-- encoded field; an int32 column's body compressed with zstd; a stream
+-- whose second message is a DictionaryBatch; and two that read, the int32
+-- column in metadata V4 and in the format before 0.15, without
+-- continuation markers
+INSERT INTO ipc_case VALUES
+('a dictionary-encoded field', decode('/////5AAAAAQAAAAAAAKAAwABgAFAAgACgAAAAABBAAEAAAAvP///wQAAAABAAAAFAAAABAAGAAIAAYABwAMABAAFAAQAAAAAAABBRQAAABAAAAAHAAAAAQAAAAAAAAAAQAAAGQAAAAIAAgAAAAEAAgAAAAMAAAACAAMAAgABwAIAAAAAAAAASAAAAAEAAQABAAAAAAAAAD/////qAAAABQAAAAAAAAADAAUAAYABQAIAAwADAAAAAACBAAUAAAAGAAAAAAAAAAIAAoAAAAEAAgAAAAQAAAAAAAKABgADAAEAAgACgAAAEwAAAAQAAAAAgAAAAAAAAAAAAAAAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAAAAAAAEAAAAAAAAAACAAAAAAAAAAAAAAABAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAgAAAAAAAAB4eQAAAAAAAP////+IAAAAFAAAAAAAAAAMABYABgAFAAgADAAMAAAAAAMEABgAAAAQAAAAAAAAAAAACgAYAAwABAAIAAoAAAA8AAAAEAAAAAMAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAABAAAAAwAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAD/////AAAAAA==', 'base64')),
+('a compressed body', decode('/////3gAAAAQAAAAAAAKAAwABgAFAAgACgAAAAABBAAMAAAACAAIAAAABAAIAAAABAAAAAEAAAAUAAAAEAAUAAgABgAHAAwAAAAQABAAAAAAAAECEAAAABwAAAAEAAAAAAAAAAEAAABjAAAACAAMAAgABwAIAAAAAAAAASAAAAD/////oAAAABQAAAAAAAAADAAYAAYABQAIAAwADAAAAAADBAAcAAAAIAAAAAAAAAAAAAAADAAeABAABAAIAAwADAAAAFAAAAAkAAAAGAAAAAMAAAAAAAAAAAAAAAAABgAIAAcABgAAAAAAAAECAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHQAAAAAAAAAAAAAAAQAAAAMAAAAAAAAAAAAAAAAAAAAMAAAAAAAAACi1L/0gDGEAAAEAAAACAAAAAwAAAAAAAP////8AAAAA', 'base64')),
+('a DictionaryBatch message', decode('/////3gAAAAQAAAAAAAKAAwABgAFAAgACgAAAAABBAAMAAAACAAIAAAABAAIAAAABAAAAAEAAAAUAAAAEAAUAAgABgAHAAwAAAAQABAAAAAAAAECEAAAABwAAAAEAAAAAAAAAAEAAABjAAAACAAMAAgABwAIAAAAAAAAASAAAAD/////qAAAABQAAAAAAAAADAAUAAYABQAIAAwADAAAAAACBAAUAAAAGAAAAAAAAAAIAAoAAAAEAAgAAAAQAAAAAAAKABgADAAEAAgACgAAAEwAAAAQAAAAAgAAAAAAAAAAAAAAAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAAAAAAAAAEAAAAAAAAAACAAAAAAAAAAAAAAABAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAgAAAAAAAAB4eQAAAAAAAP////8AAAAA', 'base64')),
+('pyarrow, metadata version V4', decode('/////3gAAAAQAAAAAAAKAAwABgAFAAgACgAAAAABAwAMAAAACAAIAAAABAAIAAAABAAAAAEAAAAUAAAAEAAUAAgABgAHAAwAAAAQABAAAAAAAAECEAAAABwAAAAEAAAAAAAAAAEAAABjAAAACAAMAAgABwAIAAAAAAAAASAAAAD/////iAAAABQAAAAAAAAADAAWAAYABQAIAAwADAAAAAADAwAYAAAAEAAAAAAAAAAAAAoAGAAMAAQACAAKAAAAPAAAABAAAAADAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADAAAAAAAAAAAAAAAAQAAAAMAAAAAAAAAAAAAAAAAAAABAAAAAgAAAAMAAAAAAAAA/////wAAAAA=', 'base64')),
+('pyarrow, the format before 0.15', decode('fAAAABAAAAAAAAoADAAGAAUACAAKAAAAAAEEAAwAAAAIAAgAAAAEAAgAAAAEAAAAAQAAABQAAAAQABQACAAGAAcADAAAABAAEAAAAAAAAQIQAAAAHAAAAAQAAAAAAAAAAQAAAGMAAAAIAAwACAAHAAgAAAAAAAABIAAAAAAAAACMAAAAFAAAAAAAAAAMABYABgAFAAgADAAMAAAAAAMEABgAAAAQAAAAAAAAAAAACgAYAAwABAAIAAoAAAA8AAAAEAAAAAMAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAABAAAAAwAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAgAAAAMAAAAAAAAAAAAAAA==', 'base64'));
+SELECT name, ipc_try(stream) AS outcome, ipc_try(stream, false) = ipc_try(stream) AS same_unaligned
+FROM ipc_case ORDER BY name;
+                     name                      |                                                           outcome                                                            | same_unaligned 
+-----------------------------------------------+------------------------------------------------------------------------------------------------------------------------------+----------------
+ a DictionaryBatch message                     | 0A000 unsupported Arrow IPC message: A DictionaryBatch message: dictionaries are not read.                                   | t
+ a NULL without a validity bitmap              | 22P03 malformed Arrow IPC message: Field "u": its validity buffer holds 0 bytes, not the 1 it needs.                         | t
+ a batch longer than its columns               | 22P03 malformed Arrow IPC message: Field "t" has 1 values, and its record batch 5 rows.                                      | t
+ a batch of 2^40 rows                          | 0A000 unsupported Arrow IPC message: A record batch of 1099511627776 rows, more than 2147483647.                             | t
+ a body shorter than its buffers               | 22P03 malformed Arrow IPC message: Buffer 4, 8 bytes at 16, lies outside the body's 16 bytes.                                | t
+ a buffer at -8                                | 22P03 malformed Arrow IPC message: Buffer 4, 8 bytes at -8, lies outside the body's 72 bytes.                                | t
+ a buffer of 2^40 bytes                        | 22P03 malformed Arrow IPC message: Buffer 2, 1099511627776 bytes at 8, lies outside the body's 72 bytes.                     | t
+ a buffer past the body                        | 22P03 malformed Arrow IPC message: Buffer 1, 8 bytes at 4096, lies outside the body's 72 bytes.                              | t
+ a column shorter than its batch               | 22P03 malformed Arrow IPC message: Field "i" has 0 values, and its record batch 1 rows.                                      | t
+ a compressed body                             | 0A000 unsupported Arrow IPC message: The message's body is compressed.                                                       | t
+ a dictionary-encoded field                    | 0A000 unsupported Arrow IPC message: Field "d" is dictionary-encoded: dictionaries are not read.                             | t
+ a first offset below 0                        | 22P03 malformed Arrow IPC message: Field "t": offset 0 is -1, less than 0.                                                   | t
+ an offset before the one before               | 22P03 malformed Arrow IPC message: Field "u": offset 1 is -2, less than the one before.                                      | t
+ an offset past its data                       | 22P03 malformed Arrow IPC message: Field "t": its data buffer holds 3 bytes, not the 16 it needs.                            | t
+ metadata version V3                           | 0A000 unsupported Arrow IPC message: The message's metadata version is V3; V4 and V5 are read.                               | t
+ metadata version V4                           | ok                                                                                                                           | t
+ more NULLs than values                        | 22P03 malformed Arrow IPC message: Field "t": a FieldNode of 1 values, 2 of them NULL.                                       | t
+ pyarrow, metadata version V4                  | ok                                                                                                                           | t
+ pyarrow, the format before 0.15               | ok                                                                                                                           | t
+ utf8: U+0000, which Arrow allows              | ok                                                                                                                           | t
+ utf8: a byte that starts nothing              | 22P03 malformed Arrow IPC message: Field "t": row 0 is not valid UTF-8.                                                      | t
+ utf8: a character cut short                   | 22P03 malformed Arrow IPC message: Field "u": row 0 is not valid UTF-8.                                                      | t
+ utf8: a surrogate                             | 22P03 malformed Arrow IPC message: Field "u": row 0 is not valid UTF-8.                                                      | t
+ utf8: an overlong form                        | 22P03 malformed Arrow IPC message: Field "u": row 0 is not valid UTF-8.                                                      | t
+ utf8_view: a buffer index past the buffers    | 22P03 malformed Arrow IPC message: Field "u": row 0's view of 37 bytes at 5 of buffer 2147483647 lies outside its 1 buffers. | t
+ utf8_view: a prefix that is not its value's   | 22P03 malformed Arrow IPC message: Field "u": row 0's view has a prefix that is not its value's.                             | t
+ utf8_view: a size below 0                     | 22P03 malformed Arrow IPC message: Field "u": row 0's view has a size of -1.                                                 | t
+ utf8_view: a value past its buffer            | 22P03 malformed Arrow IPC message: Field "u": row 0's view of 37 bytes at 2147483647 of buffer 0 lies outside its 1 buffers. | t
+ utf8_view: a value that is not UTF-8          | 22P03 malformed Arrow IPC message: Field "u": row 0 is not valid UTF-8.                                                      | t
+ utf8_view: an inline value that is not UTF-8  | 22P03 malformed Arrow IPC message: Field "t": row 0 is not valid UTF-8.                                                      | t
+ utf8_view: bytes no view refers to, not UTF-8 | ok                                                                                                                           | t
+ utf8_view: inline padding that is not zero    | 22P03 malformed Arrow IPC message: Field "t": row 0's inline view is not padded with zeros.                                  | t
+(32 rows)
+
+DROP TABLE ipc_case;
+DROP TABLE ipc_small;
+DROP FUNCTION ipc_try(bytea, bool);

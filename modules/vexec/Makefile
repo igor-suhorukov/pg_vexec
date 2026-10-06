@@ -41,6 +41,9 @@ OBJS = \
 	expr/k_text.o \
 	expr/kernels.o \
 	expr/packs.o \
+	ipc/flatbuf.o \
+	ipc/read.o \
+	ipc/write.o \
 	plan/agg.o \
 	plan/build.o \
 	plan/check.o \
@@ -65,7 +68,7 @@ DATA = vexec--1.0.sql
 # server's include directory, under extension/vexec/.
 HEADERS = ../../include/vexec_source.h ../../include/vexec_kernels.h
 
-REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs
+REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs
 
 PG_CPPFLAGS = -I$(srcdir) -I$(srcdir)/pgxs/include -I$(srcdir)/../../include
 
