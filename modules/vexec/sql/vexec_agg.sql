@@ -259,6 +259,66 @@ RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 RESET max_parallel_workers_per_gather;
 
+-- H5: the final stage in each participant too, below the Gather, over a
+-- VecRepartition that deals the partial groups out by their keys' hash
+-- (exec/vecrepart.c): the Gather receives final groups only.  A group's
+-- partial states all meet in one partition, whichever participants made
+-- them: sums of integers and numerics are the same bits.
+CREATE TABLE ah AS
+  SELECT g AS id, (g::int8 * 7919 % 40000)::int AS k, (g % 13)::numeric(10,2) / 4 AS n,
+         'v' || (g % 25000) AS t, date '2020-01-01' + (g % 100) AS d
+  FROM generate_series(1, 120000) g;
+ANALYZE ah;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0.01;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM ah GROUP BY k;
+SELECT agg_check('SELECT k, count(*), sum(id), sum(n), max(t), min(d) FROM ah GROUP BY k');
+SELECT agg_check('SELECT t, k % 3, count(*), sum(n) FROM ah GROUP BY 1, 2 HAVING count(*) > 1');
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'Repartition|^ *Partitions:');
+-- ordered: sorted in each participant too, under a Gather Merge
+EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM ah GROUP BY k ORDER BY 3 DESC, 1;
+SELECT agg_check('SELECT k, count(*), sum(n) FROM ah GROUP BY k ORDER BY 3 DESC, 1 LIMIT 7 OFFSET 3');
+-- no worker launched: the leader writes every group, and reads them
+SET max_parallel_workers = 0;
+SELECT agg_check('SELECT k, count(*), sum(id), sum(n) FROM ah GROUP BY k');
+RESET max_parallel_workers;
+-- the plan run serially, as a SQL function's last query runs a row at a
+-- time (functions.c): no DSM, and the node passes its child's groups on.
+-- The function's plan is cached at its first call, in force mode.
+CREATE FUNCTION ah_total() RETURNS numeric LANGUAGE sql
+  AS 'SELECT sum(c * s) FROM (SELECT k, count(*) c, sum(n) s FROM ah GROUP BY k) x';
+EXPLAIN (COSTS OFF) SELECT sum(c * s) FROM (SELECT k, count(*) c, sum(n) s FROM ah GROUP BY k) x;
+SELECT ah_total();
+SET vexec.mode = off;
+SELECT sum(c * s) FROM (SELECT k, count(*) c, sum(n) s FROM ah GROUP BY k) x;
+SET vexec.mode = force;
+DROP FUNCTION ah_total();
+-- rescanned: the Gather a nested loop's inner, the partitions made again
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+SET enable_memoize = off;
+EXPLAIN (COSTS OFF) WITH o AS MATERIALIZED (SELECT i FROM generate_series(0, 3) i)
+SELECT o.i, count(x.k), sum(x.s) FROM o LEFT JOIN (SELECT k, count(*) c, sum(n) s FROM ah GROUP BY k) x
+  ON x.c >= o.i + 2 GROUP BY o.i;
+SELECT agg_check($$WITH o AS MATERIALIZED (SELECT i FROM generate_series(0, 3) i)
+SELECT o.i, count(x.k), sum(x.s) FROM o LEFT JOIN (SELECT k, count(*) c, sum(n) s FROM ah GROUP BY k) x
+  ON x.c >= o.i + 2 GROUP BY o.i$$);
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
+RESET enable_memoize;
+-- vexec.enable_repartition off: the plans without it
+SET vexec.enable_repartition = off;
+EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM ah GROUP BY k;
+RESET vexec.enable_repartition;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+
 -- rescanned: in a correlated subquery, a parameter changing each time
 SELECT agg_check($$SELECT o.k, (SELECT count(*) FROM at WHERE at.k = o.k AND at.id < 1000),
        (SELECT sum(b) FROM at WHERE at.s = o.k) FROM (SELECT DISTINCT k FROM at) o$$);
@@ -303,5 +363,5 @@ EXPLAIN (COSTS OFF) SELECT k, count(*) FROM at GROUP BY k;
 DROP FUNCTION agg_check(text);
 DROP FUNCTION agg_error(text);
 DROP FUNCTION agg_explain(text, text);
-DROP TABLE at, ae, an, ak;
+DROP TABLE at, ae, an, ak, ah;
 DROP SEQUENCE aseq;

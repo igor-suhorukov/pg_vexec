@@ -19,6 +19,12 @@
 # V3: hash joins over each storage's batches, of each join type, keys of
 # each layout.
 #
+# V4: heap read through heap's page reader, and through the slot path in a
+# session of its own (vexec.heap_page_reader = off); every storage's scan
+# in parallel, a session with workers whose VecScans share each table among
+# a Gather's participants through its source; and sorts, VecSort under both
+# planners, bounded by a LIMIT.
+#
 # The table holds every type class of §3.4 with NULLs at the bitmaps' word
 # edges, rows deleted, values long enough to be compressed and to be stored
 # out of line, a dropped column and one added after the rows were written.
@@ -33,11 +39,20 @@
 # aggregate the statistics cannot give and a qual -- and its plans show the
 # units the statistics answered, their rows counted as the scan's.
 #
+# H6: a VecSort's running bound over each storage's scan, a table of rows
+# in the order of their sort key: every session answers alike, ties at the
+# bound's key, NULLs first and last, and an error PostgreSQL raises past the
+# bound among them; and on PAX, which keeps the key's minimum and maximum,
+# the groups past the bound are passed over unread (vexec_source.h,
+# set_keys): the rows its source hands the scan -- those it keeps and those
+# it drops by the bound -- are then fewer than two groups', where the other
+# storages hand the table's and the scan drops nearly all of them.
+#
 #   VEXEC_ROWS        the table's rows: 30000
 #   VEXEC_STORAGES    "heap ao_row ao_column pax pax_porc_vec"
 #   VEXEC_SOURCES     "ao_row=gp_ao ao_column=gp_ao pax=pax pax_porc_vec=pax":
-#                     the source each storage's VecScan must name ("the slot
-#                     path" for one not listed)
+#                     the source each storage's VecScan must name (heap's
+#                     "heap's pages", and "the slot path" for one not listed)
 #   VEXEC_SEED        the random session's seed: drawn and printed
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -162,6 +177,30 @@ QUERIES=(
 	"SELECT count(*), count(a.id), sum(b.id) FROM %t a RIGHT JOIN %t b ON a.ts = b.ts + interval '1 minute' AND a.id = b.id + 1 WHERE b.id < 1500"
 	"SELECT a.ch, count(*), sum(b.id) FROM %t a JOIN %t b ON a.ch = b.ch AND a.o = b.o GROUP BY a.ch ORDER BY a.ch"
 	"SELECT md5(string_agg(a.id || ':' || coalesce(b.longt, '-'), ',' ORDER BY a.id, b.id)) FROM %t a LEFT JOIN %t b ON a.id = b.id + 25 WHERE a.id % 100 = 1"
+	# V4: sorts -- keys of each layout, both directions, NULLs first and
+	# last, a bound -- over each storage's batches, and in parallel
+	"SELECT id, t, n, d FROM %t ORDER BY n DESC NULLS LAST, d, id LIMIT 25"
+	"SELECT id, u, bp FROM %t WHERE id % 7 = 3 ORDER BY u NULLS FIRST, bp DESC, id"
+	"SELECT t, count(*), sum(i8) FROM %t GROUP BY t ORDER BY count(*) DESC, t NULLS FIRST LIMIT 5"
+	"SELECT id, ts, tz, f8 FROM %t ORDER BY f8 DESC, ts, id LIMIT 1030"
+	"SELECT id, longt FROM %t WHERE id % 50 = 0 ORDER BY length(longt) DESC, id LIMIT 4"
+	"SELECT a.id, b.t FROM %t a JOIN %t b ON a.i4 = b.id ORDER BY b.t, a.id LIMIT 40"
+)
+# V4: in parallel, with workers, where every answer is the serial one's
+# whatever the order the participants read the rows in: no float sum, whose
+# order of addition the participants change, no LIMIT without an ORDER BY
+PARALLEL_QUERIES=(
+	"SELECT count(*), count(i2), count(t), count(u), count(later) FROM %t"
+	"SELECT count(*), sum(i2), sum(i4), sum(i8), sum(n), min(t), max(t), min(d), max(ts), count(DISTINCT bp) FROM %t"
+	"SELECT md5(string_agg(concat_ws(',', id, i2, i4, i8, f4, f8, n, nfree, t, v, bp, d, ts, tz, b, u, length(longt), ch, o, arr, j, iv, later), '|' ORDER BY id)) FROM %t"
+	"SELECT t, count(*), sum(i4), max(id) FROM %t GROUP BY t ORDER BY t NULLS FIRST"
+	"SELECT id, i4, t FROM %t WHERE i4 > 49000 ORDER BY id"
+	"SELECT count(*), sum(a.id), sum(b.id) FROM %t a JOIN %t b ON a.i2 = b.i4"
+	"SELECT count(*), count(b.id), sum(b.id) FROM %t a LEFT JOIN %t b ON a.u = b.u AND b.id % 3 = 0"
+	"SELECT count(*), sum(a.id) FROM %t a WHERE EXISTS (SELECT 1 FROM %t b WHERE b.bp = a.bp AND b.v > a.v)"
+	"SELECT count(*), sum(a.id) FROM %t a WHERE NOT EXISTS (SELECT 1 FROM %t b WHERE b.later = a.i4 AND b.id <> a.id)"
+	"SELECT id, t, n, d FROM %t ORDER BY n DESC NULLS LAST, d, id LIMIT 25"
+	"SELECT count(*), sum(i4) FROM %t WHERE 100 / (id % 97) >= 0"
 )
 # and each storage module's own, a query a line, from sources/*.queries
 for f in "$here"/sources/*.queries; do
@@ -171,26 +210,55 @@ for f in "$here"/sources/*.queries; do
 		QUERIES+=("$line")
 	done < "$f"
 done
-# each orca-off is the reference of the ORCA sessions after it
-SESSIONS=("off" "force-postgres" "force-arrow" "force-random" "orca-off" "orca-postgres" "orca-arrow")
+# Results compare in their order where the statement orders them at its
+# top, and sorted where it does not, as the differential runner compares
+# them (differential.py): under PostgreSQL's planner a VecAgg's groups come
+# in another order than an Agg's.
+#
+# each orca-off is the reference of the ORCA sessions after it.  The others
+# are PostgreSQL's planner's: gp_orca, loaded, plans with ORCA by default
+# (gp.optimizer), so they set it off -- until V4 they did not, and ran under
+# ORCA too.
+SESSIONS=("off" "force-postgres" "force-arrow" "force-random" "force-slots"
+		  "orca-off" "orca-postgres" "orca-arrow")
+PARALLEL="-c max_parallel_workers_per_gather=3 -c parallel_setup_cost=0 -c parallel_tuple_cost=0 -c min_parallel_table_scan_size=0"
 # each session's settings, given as options so that an error's text is the
 # statement's alone
 session_opts() {
 	case "$1" in
-		off) echo "-c vexec.mode=off" ;;
-		force-postgres) echo "-c vexec.mode=force -c vexec.batch_format=postgres" ;;
-		force-arrow) echo "-c vexec.mode=force -c vexec.batch_format=arrow" ;;
-		force-random) echo "-c vexec.mode=force -c vexec.debug_layout_seed=$SEED" ;;
+		off) echo "-c gp.optimizer=off -c vexec.mode=off" ;;
+		force-postgres) echo "-c gp.optimizer=off -c vexec.mode=force -c vexec.batch_format=postgres" ;;
+		force-arrow) echo "-c gp.optimizer=off -c vexec.mode=force -c vexec.batch_format=arrow" ;;
+		force-random) echo "-c gp.optimizer=off -c vexec.mode=force -c vexec.debug_layout_seed=$SEED" ;;
+		force-slots) echo "-c gp.optimizer=off -c vexec.mode=force -c vexec.heap_page_reader=off" ;;
+		force-parallel) echo "-c gp.optimizer=off -c vexec.mode=force $PARALLEL" ;;
+		off-parallel) echo "-c gp.optimizer=off -c vexec.mode=off $PARALLEL" ;;
 		orca-off) echo "-c gp.optimizer=on -c vexec.mode=off" ;;
 		orca-postgres) echo "-c gp.optimizer=on -c vexec.mode=force -c vexec.batch_format=postgres" ;;
 		orca-arrow) echo "-c gp.optimizer=on -c vexec.mode=force -c vexec.batch_format=arrow" ;;
 	esac
 }
 
+# A statement's result as it compares: sorted unless the statement orders
+# its rows at its top -- an ORDER BY outside every parenthesis.
+ordered() {
+	local x="$1" y
+	while :; do
+		y=$(printf '%s' "$x" | sed 's/([^()]*)//g')
+		[ "$y" = "$x" ] && break
+		x="$y"
+	done
+	printf '%s' "$x" | grep -qi 'order by'
+}
+comparable() {					# comparable <sql> <result>
+	if ordered "$1"; then printf '%s\n' "$2"; else printf '%s\n' "$2" | LC_ALL=C sort; fi
+}
+
 nq=0
 for s in $STORAGES; do
 	t="t_$s"
 	want="the slot path"
+	[ "$s" = heap ] && want="heap's pages"
 	for m in $SOURCES; do
 		[ "${m%%=*}" = "$s" ] && want="${m#*=}"
 	done
@@ -226,11 +294,39 @@ for s in $STORAGES; do
 			fail=1
 		fi
 	done
+	# V4: with workers, a parallel VecScan under a Gather, sharing the table
+	# through its source, under a partial VecAgg
+	plan=$(PGOPTIONS="$PARALLEL" q "$D" postgres "SET gp.optimizer = off; SET vexec.mode = force; EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*), sum(i4) FROM $t")
+	if echo "$plan" | grep -q "Gather" && echo "$plan" | grep -q "Parallel Vec Seq Scan" &&
+		echo "$plan" | grep -q "Vec Partial Aggregate" && echo "$plan" | grep -q "Source: $want"; then
+		echo "  ok $s: with workers a parallel VecScan under a Gather reads through $want"
+	else
+		echo "  FAILED $s: with workers no parallel VecScan reading through $want under a Gather:"
+		echo "$plan" | sed 's/^/      /'
+		fail=1
+	fi
+	# V4: under each planner a VecSort over the VecScan's batches, bounded by
+	# the LIMIT -- under ORCA by the Limit of its plan
+	for o in off on; do
+		route="under $( [ $o = on ] && echo ORCA || echo "the planner")"
+		plan=$(q "$D" postgres "SET gp.optimizer = $o; SET vexec.mode = force; EXPLAIN (VERBOSE, COSTS OFF) SELECT id, t FROM $t ORDER BY t, id LIMIT 10")
+		if echo "$plan" | grep -q "Vec Sort" && echo "$plan" | grep -q "Bound: 10" &&
+			echo "$plan" | grep -q "Input: batches" && echo "$plan" | grep -q "Source: $want"; then
+			echo "  ok $s: $route a bounded VecSort reads its VecScan's batches"
+		else
+			echo "  FAILED $s: $route no bounded VecSort over a VecScan reading through $want:"
+			echo "$plan" | sed 's/^/      /'
+			fail=1
+		fi
+	done
 	for qt in "${QUERIES[@]}"; do
 		sql="${qt//%t/$t}"
 		ref=""
 		for sess in "${SESSIONS[@]}"; do
-			res=$(PGOPTIONS="$(session_opts "$sess")" q "$D" postgres "$sql")
+			# a query that prints its scans' sources reads heap's otherwise
+			# through the slot path, as it means to
+			[ "$sess" = force-slots ] && [[ "$sql" == *Source:* ]] && continue
+			res=$(comparable "$sql" "$(PGOPTIONS="$(session_opts "$sess")" q "$D" postgres "$sql")")
 			if [ "$sess" = off ] || [ "$sess" = orca-off ]; then
 				ref="$res"
 				case "$qt" in "/* error */"*) meant=1 ;; *) meant=0 ;; esac
@@ -249,6 +345,25 @@ for s in $STORAGES; do
 		done
 	done
 done
+# V4: each storage's tables scanned in parallel: off with workers, then
+# force with workers, against off serial
+for s in $STORAGES; do
+	t="t_$s"
+	for qt in "${PARALLEL_QUERIES[@]}"; do
+		sql="${qt//%t/$t}"
+		ref=$(comparable "$sql" "$(PGOPTIONS="$(session_opts off)" q "$D" postgres "$sql")")
+		for sess in off-parallel force-parallel; do
+			res=$(comparable "$sql" "$(PGOPTIONS="$(session_opts "$sess")" q "$D" postgres "$sql")")
+			if [ "$res" != "$ref" ]; then
+				echo "  FAILED $s, $sess differs from off: $sql"
+				diff <(echo "$ref") <(echo "$res") | head -8 | sed 's/^/      /'
+				fail=1
+			fi
+			nq=$((nq + 1))
+		done
+	done
+done
+
 # H2: PAX's statistics.  h2_<storage>, in files of groups of 1,000 rows,
 # then 102 rows deleted, from two of them; h2a_<storage>, a column added
 # between its files, which no DELETE touches: PAX's own DELETE fails on a
@@ -263,10 +378,11 @@ H2_QUERIES=(
 	"SELECT min(i4), max(i4), count(*) FROM %t WHERE i2 > 0"
 	"SELECT count(later), min(later), max(later), sum(later), count(*), min(i4), sum(i2) FROM %a"
 )
-H2_SESSIONS=("off" "force-postgres" "force-arrow" "nostats" "orca-postgres")
+H2_SESSIONS=("off" "force-postgres" "force-arrow" "nostats" "force-parallel" "orca-postgres")
+# a parallel session sums floats in another order: those queries skip it
 h2_opts() {
 	case "$1" in
-		nostats) echo "-c vexec.mode=force -c vexec.aggregate_statistics=off" ;;
+		nostats) echo "-c gp.optimizer=off -c vexec.mode=force -c vexec.aggregate_statistics=off" ;;
 		*) session_opts "$1" ;;
 	esac
 }
@@ -334,6 +450,7 @@ for s in $STORAGES; do
 			sql="${sql//%a/$a}"
 			ref=""
 			for sess in "${H2_SESSIONS[@]}"; do
+				[ "$sess" = force-parallel ] && [[ "$sql" == *f8* ]] && continue
 				res=$(PGOPTIONS="$(h2_opts "$sess")" q "$D" postgres "$sql")
 				if [ "$sess" = off ]; then
 					ref="$res"
@@ -345,6 +462,77 @@ for s in $STORAGES; do
 				fi
 				nq=$((nq + 1))
 			done
+		done
+	done
+done
+
+# H6: the running bound.  h6_<storage>, its key k ascending with the rows,
+# a NULL key every 997th row, in groups of 1,000 rows; PAX keeps k's minimum
+# and maximum.
+H6_QUERIES=(
+	"SELECT id, k, t FROM %t ORDER BY k LIMIT 10"
+	"SELECT id, k FROM %t ORDER BY k DESC NULLS LAST, id LIMIT 7"
+	"SELECT id, k FROM %t ORDER BY k NULLS FIRST, id LIMIT 5"
+	"SELECT id, k, t FROM %t WHERE t LIKE '%5%' ORDER BY k, id LIMIT 12"
+	"SELECT k, count(*) OVER () FROM (SELECT k FROM %t ORDER BY k / 1000 LIMIT 20) s ORDER BY k"
+	"/* error */ SELECT id, k FROM %t WHERE 100 / ($ROWS - id) <> 0 ORDER BY k LIMIT 3"
+)
+H6_SESSIONS=("off" "force-postgres" "force-arrow" "force-slots" "orca-off" "orca-postgres")
+# h6_rows <table> <orca on|off>: "<rows its source handed the scan> <rows
+# it dropped by the bound>", or nothing where the plan has no vector scan
+h6_rows() {
+	local plan kept removed
+	plan=$(q "$D" postgres "SET gp.optimizer = $2; SET vexec.mode = force; EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT id, k, t FROM $1 ORDER BY k LIMIT 10")
+	kept=$(echo "$plan" | grep -E "Vec Seq Scan" | sed -n 's/.*actual rows=\([0-9]*\).*/\1/p' | head -1)
+	removed=$(echo "$plan" | sed -n 's/^ *Rows Removed by Bound: //p' | head -1)
+	[ -n "$kept" ] && echo "$(( kept + ${removed:-0} )) ${removed:-0}"
+}
+for s in $STORAGES; do
+	t="h6_$s"
+	clause="$(storage_clause "$s")"
+	case "$s" in pax|pax_porc_vec) clause="${clause%)}, minmax_columns='k')" ;; esac
+	out=$(q "$D" postgres "SET client_min_messages = warning;
+		CREATE TABLE $t (id int, k int, t text) $clause;
+		SET pax.max_tuples_per_group = 1000;
+		INSERT INTO $t SELECT g, CASE WHEN g % 997 = 0 THEN NULL ELSE g END, 'v' || (g % 1009)
+			FROM generate_series(1, $ROWS) g;
+		ANALYZE $t;")
+	case "$out" in *ERROR*) echo "the H6 table in $s: $out"; fail=1; continue ;; esac
+	for orca in off on; do
+		read -r handed removed <<< "$(h6_rows "$t" $orca)"
+		planner="$([ $orca = on ] && echo ORCA || echo the planner)"
+		case "$s" in
+			pax|pax_porc_vec)
+				if [ -n "$handed" ] && [ "$handed" -lt 2000 ]; then
+					echo "  ok $t: under $planner the bound passed PAX's groups over: $handed rows handed the scan, $removed dropped by it"
+				else
+					echo "  FAILED $t: under $planner the bound passed no PAX group over: ${handed:-no} rows handed the scan"
+					fail=1
+				fi ;;
+			*)
+				if [ -n "$removed" ] && [ "$removed" -gt $(( ROWS / 2 )) ]; then
+					echo "  ok $t: under $planner $handed rows handed the scan, $removed dropped by the bound"
+				else
+					echo "  FAILED $t: under $planner the scan dropped ${removed:-no} rows by the bound"
+					fail=1
+				fi ;;
+		esac
+	done
+	for qt in "${H6_QUERIES[@]}"; do
+		sql="${qt//%t/$t}"
+		ref=""
+		for sess in "${H6_SESSIONS[@]}"; do
+			[ "$sess" = orca-off ] && ref=""
+			res=$(PGOPTIONS="$(session_opts "$sess")" q "$D" postgres "$sql" 2>&1)
+			if [ "$sess" = off ] || [ "$sess" = orca-off ]; then
+				ref="$res"
+				case "$res" in *ERROR:*) [[ "$sql" == "/* error */"* ]] || { echo "  FAILED $s, $sess raised an error: $sql"; fail=1; } ;; esac
+			elif [ "$res" != "$ref" ]; then
+				echo "  FAILED $s, $sess differs from the reference: $sql"
+				diff <(echo "$ref") <(echo "$res") | head -8 | sed 's/^/      /'
+				fail=1
+			fi
+			nq=$((nq + 1))
 		done
 	done
 done

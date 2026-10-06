@@ -325,6 +325,7 @@ extern VEXEC_API int vexec_numeric_dscale(Datum num);
 extern VEXEC_API void vexec_batch_begin_rows(VexecBatch *batch);
 extern VEXEC_API void vexec_batch_add_values(VexecBatch *batch, const Datum *values,
 												  const bool *isnull);
+extern VEXEC_API void vexec_vec_set_null(VexecBatch *batch, VexecVec *v, int row);
 extern VEXEC_API void vexec_batch_add_slot(VexecBatch *batch, TupleTableSlot *slot,
 												const AttrNumber *attnums);
 extern VEXEC_API Datum vexec_vec_datum(VexecBatch *batch, const VexecVec *v, int row,

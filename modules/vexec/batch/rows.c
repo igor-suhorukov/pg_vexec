@@ -154,9 +154,13 @@ vexec_varlena_copy(VexecBatch *batch, const VexecType *type, Datum value)
 	}
 }
 
-/* Mark row `row` of a column NULL, making its validity bitmap on the first. */
-static void
-set_null(VexecBatch *batch, VexecVec *v, int row)
+/*
+ * Mark row `row` of a column being filled NULL, making its validity bitmap
+ * on the first: the rows before it valid, and each row after it valid as
+ * it is written (vexec_bit_set).
+ */
+void
+vexec_vec_set_null(VexecBatch *batch, VexecVec *v, int row)
 {
 	if (v->validity == NULL)
 	{
@@ -190,7 +194,7 @@ vexec_batch_add_values(VexecBatch *batch, const Datum *values, const bool *isnul
 
 		if (isnull[i])
 		{
-			set_null(batch, v, row);
+			vexec_vec_set_null(batch, v, row);
 			if (v->shape.layout == VEXEC_DATUM)
 				((Datum *) v->values)[row] = (Datum) 0;
 		}

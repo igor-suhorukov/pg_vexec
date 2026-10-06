@@ -194,6 +194,74 @@ vexec_node_load_input(VexecNode *node, int row)
 	node->loaded_row = row;
 }
 
+/*
+ * A VecSort's running bound over the rows of `active` (H6, vecsort.c): a
+ * row whose bound key is strictly past the bound is one the sort would
+ * discard, and leaves `active`; a row PostgreSQL's evaluator is to decide,
+ * in `redo`, stays.  How many left.
+ */
+static int
+apply_bound(VexecNode *node, uint64 *active, const uint64 *redo, int n)
+{
+	VexecSortBound *b = node->bound;
+	const VexecVec *v = &node->in->cols[node->bound_col];
+	MemoryContext old;
+	int			removed = 0;
+	int			row;
+
+	if (!b->active)
+		return 0;
+	old = MemoryContextSwitchTo(b->tmpcxt);
+	for (row = 0; row < n; row++)
+	{
+		bool		isnull;
+		Datum		d;
+
+		if (!vexec_bit(active, row) || (redo != NULL && vexec_bit(redo, row)))
+			continue;
+		d = vexec_vec_datum(node->in, v, row, &isnull);
+		if (ApplySortComparator(d, isnull, b->value, b->isnull, &b->ssup) > 0)
+		{
+			vexec_bit_clear(active, row);
+			removed++;
+		}
+	}
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(b->tmpcxt);
+	b->removed += removed;
+	return removed;
+}
+
+/* Whether one row is past the running bound, after the lazy quals (H6). */
+static bool
+row_past_bound(VexecNode *node, int row)
+{
+	VexecSortBound *b = node->bound;
+	MemoryContext old;
+	bool		isnull;
+	Datum		d;
+	bool		past;
+
+	if (!b->active)
+		return false;
+	old = MemoryContextSwitchTo(b->tmpcxt);
+	d = vexec_vec_datum(node->in, &node->in->cols[node->bound_col], row, &isnull);
+	past = ApplySortComparator(d, isnull, b->value, b->isnull, &b->ssup) > 0;
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(b->tmpcxt);
+	if (past)
+		b->removed++;
+	return past;
+}
+
+/* The rows past the quals so far: those they passed, and those to redo. */
+static int
+rows_kept(VexecNode *node, uint64 *active, uint64 *redo, int n)
+{
+	return vexec_bits_count(vexec_bits_andnot(node->work, active, redo, n), n) +
+		vexec_bits_count(redo, n);
+}
+
 /* The eager parts of the batch now in `in` (above, part 2). */
 static void
 eval_batch(VexecNode *node)
@@ -203,6 +271,9 @@ eval_batch(VexecNode *node)
 	uint64	   *active;
 	int			i;
 	int			selected;
+	int			rechecked;
+	int			nrecheck = Min(node->nrecheck, node->first_lazy);
+	int			bounded = 0;
 
 	memset(&ev, 0, sizeof(ev));
 	ev.node = node;
@@ -218,11 +289,29 @@ eval_batch(VexecNode *node)
 	active = vexec_bits_copy(node->work, node->in->selection, n);
 	if (node->child_redo != NULL)
 		active = vexec_bits_andnot(node->work, active, node->child_redo, n);
+	/* a VecSort's running bound before the quals, where no source checked it */
+	if (node->bound != NULL && node->bound->before_quals && !node->bound_in_source)
+		(void) apply_bound(node, active, NULL, n);
 	selected = vexec_bits_count(active, n);
 
-	/* the eager prefix of the quals: each over the rows the ones before passed */
+	/*
+	 * the eager prefix of the quals: each over the rows the ones before
+	 * passed; the rows a bitmap's conditions keep, counted
+	 */
+	rechecked = selected;
 	for (i = 0; i < node->first_lazy; i++)
+	{
 		active = vexec_eval_qual(&ev, node->quals[i].eager, active);
+		if (i + 1 == nrecheck && node->css.ss.ps.instrument)
+			rechecked = rows_kept(node, active, ev.redo, n);
+	}
+
+	/*
+	 * or after them, where every qual is eager; with a lazy one, a row is
+	 * checked once the lazy quals have passed it (vexec_node_exec())
+	 */
+	if (node->bound != NULL && !node->bound->before_quals && node->first_lazy == node->nquals)
+		bounded = apply_bound(node, active, ev.redo, n);
 
 	/* the eager quals after the first lazy one, over the same rows */
 	ev.exact = false;
@@ -250,7 +339,8 @@ eval_batch(VexecNode *node)
 	{
 		int			kept = vexec_bits_count(node->candidates, n) + vexec_bits_count(ev.redo, n);
 
-		InstrCountFiltered1(node, Max(selected - kept, 0));
+		InstrCountFiltered2(node, Max(selected - rechecked, 0));
+		InstrCountFiltered1(node, Max(rechecked - kept - bounded, 0));
 	}
 	node->stats.redo_rows += vexec_bits_count(ev.redo, n);
 }
@@ -308,20 +398,28 @@ vexec_node_unprojected(VexecNode *node, TupleTableSlot *input)
 	return ExecCopySlot(result, input);
 }
 
+/* Why row_by_postgres() gave no row. */
+typedef enum RowGone
+{
+	ROW_BY_QUAL,				/* the plan's quals rejected it */
+	ROW_BY_RECHECK,				/* a bitmap's conditions did */
+	ROW_BY_INPUT				/* resolving its input gave none */
+} RowGone;
+
 /*
  * A row through PostgreSQL's evaluator alone: every qual, then the
  * projection, from the node's own ExprStates.  NULL when a qual rejects
  * it.  A row of child_redo is resolved first -- by the vector child, or by
- * the node's resolve_input -- and *by_input says when that gave no row.
+ * the node's resolve_input.  *gone says why it gave no row.
  */
 static TupleTableSlot *
-row_by_postgres(VexecNode *node, int row, bool *by_input)
+row_by_postgres(VexecNode *node, int row, RowGone *gone)
 {
 	ExprContext *econtext = node->css.ss.ps.ps_ExprContext;
 	ProjectionInfo *proj = node->css.ss.ps.ps_ProjInfo;
 	TupleTableSlot *input;
 
-	*by_input = false;
+	*gone = ROW_BY_INPUT;
 	if (node->child_redo != NULL && vexec_bit(node->child_redo, row))
 	{
 		if (node->resolve_input != NULL)
@@ -329,19 +427,13 @@ row_by_postgres(VexecNode *node, int row, bool *by_input)
 			/* the node's own: its input row, loaded, or none */
 			input = node->resolve_input(node, row);
 			if (input == NULL)
-			{
-				*by_input = true;
 				return NULL;
-			}
 		}
 		else
 		{
 			input = vexec_resolve_row(node->vec_child, row);
 			if (input == NULL)
-			{
-				*by_input = true;
 				return NULL;
-			}
 			node->loaded_row = -1;
 		}
 	}
@@ -351,6 +443,10 @@ row_by_postgres(VexecNode *node, int row, bool *by_input)
 		input = node->input_slot;
 	}
 	set_input_slot(node, econtext, input);
+	*gone = ROW_BY_RECHECK;
+	if (node->recheck_qual != NULL && !ExecQual(node->recheck_qual, econtext))
+		return NULL;
+	*gone = ROW_BY_QUAL;
 	if (node->css.ss.ps.qual != NULL && !ExecQual(node->css.ss.ps.qual, econtext))
 		return NULL;
 	if (proj != NULL)
@@ -360,10 +456,11 @@ row_by_postgres(VexecNode *node, int row, bool *by_input)
 
 /*
  * The quals from the first lazy one on, in order, for one row: the eager
- * ones' results read, the lazy ones evaluated by PostgreSQL.
+ * ones' results read, the lazy ones evaluated by PostgreSQL.  The first
+ * that rejects the row, or -1.
  */
-static bool
-lazy_quals_pass(VexecNode *node, int row)
+static int
+lazy_qual_rejecting(VexecNode *node, int row)
 {
 	ExprContext *econtext = node->css.ss.ps.ps_ExprContext;
 	int			i;
@@ -373,16 +470,16 @@ lazy_quals_pass(VexecNode *node, int row)
 		if (node->quals[i].eager != NULL)
 		{
 			if (!vexec_bit(node->qual_pass[i], row))
-				return false;
+				return i;
 			continue;
 		}
 		vexec_node_load_input(node, row);
 		set_input_slot(node, econtext, node->input_slot);
 		node->stats.lazy_rows++;
 		if (!ExecQual(node->quals[i].state, econtext))
-			return false;
+			return i;
 	}
-	return true;
+	return -1;
 }
 
 /* The target list for one row: the eager entries read, the lazy evaluated. */
@@ -460,22 +557,38 @@ vexec_node_exec(VexecNode *node)
 		if ((node->redo != NULL && vexec_bit(node->redo, row)) ||
 			(node->child_redo != NULL && vexec_bit(node->child_redo, row)))
 		{
-			bool		by_input;
+			RowGone		gone;
 
-			slot = row_by_postgres(node, row, &by_input);
+			slot = row_by_postgres(node, row, &gone);
 			if (slot == NULL)
 			{
-				/* a join row its join quals decided against is no filter's */
-				if (!by_input || node->resolve_input == NULL)
+				/*
+				 * A row its input gave none for is no filter's here: the
+				 * vector child counted it (vexec_resolve_row()), and a join
+				 * row its join quals decided against is no filter's.
+				 */
+				if (gone == ROW_BY_RECHECK)
+					InstrCountFiltered2(node, 1);
+				else if (gone == ROW_BY_QUAL)
 					InstrCountFiltered1(node, 1);
 				continue;
 			}
 			return slot;
 		}
-		if (node->first_lazy < node->nquals && !lazy_quals_pass(node, row))
+		if (node->first_lazy < node->nquals)
 		{
-			InstrCountFiltered1(node, 1);
-			continue;
+			int			rejecting = lazy_qual_rejecting(node, row);
+
+			if (rejecting >= 0)
+			{
+				if (rejecting < node->nrecheck)
+					InstrCountFiltered2(node, 1);
+				else
+					InstrCountFiltered1(node, 1);
+				continue;
+			}
+			if (node->bound != NULL && !node->bound->before_quals && row_past_bound(node, row))
+				continue;
 		}
 		return project_row(node, row);
 	}
@@ -553,19 +666,27 @@ vexec_next_batch(PlanState *ps)
 
 /*
  * A row of the batch the node last handed up, through PostgreSQL's
- * evaluator: its output row, or NULL when its quals reject it.  For a
- * parent that reached one of the node's redo rows.
+ * evaluator: its output row, or NULL when its quals reject it, which the
+ * node counts as its own.  For a parent that reached one of the node's
+ * redo rows.
  */
 TupleTableSlot *
 vexec_resolve_row(VexecNode *node, int row)
 {
 	TupleTableSlot *slot;
-	bool		by_input;
+	RowGone		gone;
 
 	ResetExprContext(node->css.ss.ps.ps_ExprContext);
-	slot = row_by_postgres(node, row, &by_input);
-	if (slot != NULL && node->css.ss.ps.instrument)
-		InstrUpdateTupleCount(node->css.ss.ps.instrument, 1);
+	slot = row_by_postgres(node, row, &gone);
+	if (slot != NULL)
+	{
+		if (node->css.ss.ps.instrument)
+			InstrUpdateTupleCount(node->css.ss.ps.instrument, 1);
+	}
+	else if (gone == ROW_BY_RECHECK)
+		InstrCountFiltered2(node, 1);
+	else if (gone == ROW_BY_QUAL)
+		InstrCountFiltered1(node, 1);
 	return slot;
 }
 

@@ -134,13 +134,13 @@ EXPLAIN (COSTS OFF, VERBOSE) SELECT jo.id, ji.t FROM jo JOIN ji ON jo.k = ji.k A
          Batch Format: postgres
          Kernel Steps: 0
          Fallback Steps: 0
-         Source: the slot path
+         Source: heap's pages
    ->  Vec Seq Scan on public.ji
          Output: ji.t, ji.k, ji.id
          Batch Format: postgres
          Kernel Steps: 0
          Fallback Steps: 0
-         Source: the slot path
+         Source: heap's pages
 (23 rows)
 
 SELECT join_check('SELECT jo.id, jo.t, ji.id, ji.t FROM jo JOIN ji ON jo.id = ji.id');
@@ -900,18 +900,18 @@ SELECT join_explain('SELECT jo.id FROM jo JOIN ji ON jo.k = ji.k AND jo.id < ji.
 
 -- refused: a full join, a hash join disabled; explain mode costs and records
 EXPLAIN (VEXEC, COSTS OFF) SELECT jo.id, ji.id FROM jo FULL JOIN ji ON jo.id = ji.id;
-                                                  QUERY PLAN                                                  
---------------------------------------------------------------------------------------------------------------
+                                                 QUERY PLAN                                                  
+-------------------------------------------------------------------------------------------------------------
  Hash Full Join
    Hash Cond: (jo.id = ji.id)
    ->  Vec Seq Scan on jo
    ->  Hash
          ->  Vec Seq Scan on ji
  Vexec: mode force, format postgres
-   VecScan on jo: added (forced: the relation's scan, beside its partial paths)
-     source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
-   VecScan on ji: added (forced: the relation's scan, beside its partial paths)
-     source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
+   VecScan on jo: added (forced: the relation's scans, partial ones too)
+     source: heap's pages; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
+   VecScan on ji: added (forced: the relation's scans, partial ones too)
+     source: heap's pages; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecHashJoin on jo, ji: not possible (a full join)
 (11 rows)
 

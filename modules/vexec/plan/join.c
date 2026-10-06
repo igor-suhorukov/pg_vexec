@@ -257,9 +257,9 @@ order_quals(PlannerInfo *root, List *clauses)
  * relation it groups, extension state and all (relnode.c,
  * build_grouped_rel()), and reads the same state.
  */
-typedef struct ForceJoin
+typedef struct ForceJoinPath
 {
-	RelOptInfo *rel;
+	bool		valid;
 	Path	   *outer;
 	Path	   *inner;
 	JoinType	jointype;
@@ -268,6 +268,13 @@ typedef struct ForceJoin
 	List	   *restrictlist;
 	double		rows;
 	VexecCost	cost;
+} ForceJoinPath;
+
+typedef struct ForceJoin
+{
+	RelOptInfo *rel;
+	ForceJoinPath full;			/* the cheapest VecHashJoin */
+	ForceJoinPath partial;		/* the cheapest partial one (V4) */
 } ForceJoin;
 
 static ForceJoin *
@@ -306,10 +313,80 @@ hashjoin_path(RelOptInfo *joinrel, JoinType jointype, bool inner_unique, List *r
 }
 
 /*
+ * PostgreSQL's own hash join for these inputs, a partial one where the
+ * outer side is.  final_cost_hashjoin() caches each hash clause's bucket
+ * size and MCV frequency in its RestrictInfo, computed for the pair it
+ * costs (costsize.c:4510-4541), and core reads them back for every later
+ * pair.  Core may never have costed this pair -- add_path_precheck()
+ * turned it down -- so the cache is put back as it was, and pricing an
+ * alternative changes no later cost and no plan.
+ */
+static HashPath *
+row_hashjoin(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype, List *clauses,
+			 Path *outer, Path *inner, JoinPathExtraData *extra)
+{
+	JoinCostWorkspace workspace;
+	HashPath   *rowpath;
+	int			n = list_length(clauses);
+	Selectivity *saved = palloc(sizeof(Selectivity) * 4 * Max(n, 1));
+	int			i = 0;
+	ListCell   *lc;
+
+	initial_cost_hashjoin(root, &workspace, jointype, clauses, outer, inner, extra, false);
+	foreach(lc, clauses)
+	{
+		RestrictInfo *rinfo = lfirst(lc);
+
+		saved[i++] = rinfo->left_bucketsize;
+		saved[i++] = rinfo->right_bucketsize;
+		saved[i++] = rinfo->left_mcvfreq;
+		saved[i++] = rinfo->right_mcvfreq;
+	}
+	rowpath = create_hashjoin_path(root, joinrel, jointype, &workspace, extra,
+								   outer, inner, false, extra->restrictlist, NULL, clauses);
+	i = 0;
+	foreach(lc, clauses)
+	{
+		RestrictInfo *rinfo = lfirst(lc);
+
+		rinfo->left_bucketsize = saved[i++];
+		rinfo->right_bucketsize = saved[i++];
+		rinfo->left_mcvfreq = saved[i++];
+		rinfo->right_mcvfreq = saved[i++];
+	}
+	pfree(saved);
+	return rowpath;
+}
+
+/*
+ * Force mode, after each pair of a join relation's inputs, for its partial
+ * paths: a relation for which some pair gave a partial VecHashJoin has the
+ * cheapest of them as its one partial path, whatever add_partial_path()
+ * made of later pairs' partial row paths.
+ */
+static void
+force_vector_partial_paths(RelOptInfo *joinrel)
+{
+	ForceJoin  *fj = force_join_of(joinrel);
+	ForceJoinPath *fp;
+	Path	   *path;
+
+	if (fj == NULL || !fj->partial.valid)
+		return;
+	fp = &fj->partial;
+	path = hashjoin_path(joinrel, fp->jointype, fp->inner_unique, fp->restrictlist,
+						 fp->outer, fp->inner, fp->hashrinfos, fp->rows, &fp->cost);
+	path->parallel_safe = true;
+	path->parallel_workers = fp->outer->parallel_workers;
+	joinrel->partial_pathlist = NIL;
+	add_partial_path(joinrel, path);
+}
+
+/*
  * Force mode, after each pair of a join relation's inputs: a relation for
  * which some pair gave a VecHashJoin keeps only vector paths -- the cheapest
  * one again where a later pair's row path made add_path() drop it -- its
- * partial paths aside (V4 gives VecHashJoin partial paths).
+ * partial paths aside (force_vector_partial_paths()).
  */
 static void
 force_vector_paths(RelOptInfo *joinrel, Path *added)
@@ -327,39 +404,46 @@ force_vector_paths(RelOptInfo *joinrel, Path *added)
 			any = true;
 		}
 	}
-	if (fj == NULL && added == NULL && !any)
+	if ((fj == NULL || !fj->full.valid) && added == NULL && !any)
 		return;
 	joinrel->pathlist = keep;
 	if (added != NULL)
 		add_path(joinrel, added);
-	else if (!any && fj != NULL)
-		add_path(joinrel, hashjoin_path(joinrel, fj->jointype, fj->inner_unique, fj->restrictlist,
-										fj->outer, fj->inner, fj->hashrinfos, fj->rows, &fj->cost));
+	else if (!any && fj != NULL && fj->full.valid)
+		add_path(joinrel, hashjoin_path(joinrel, fj->full.jointype, fj->full.inner_unique,
+										fj->full.restrictlist, fj->full.outer, fj->full.inner,
+										fj->full.hashrinfos, fj->full.rows, &fj->full.cost));
 }
 
-/* Force mode: the relation's cheapest VecHashJoin so far, kept on it. */
+/*
+ * Force mode: the relation's cheapest VecHashJoin so far, or partial
+ * VecHashJoin, kept on it.
+ */
 static void
-force_keep(RelOptInfo *joinrel, JoinType jointype, JoinPathExtraData *extra, Path *outer,
-		   Path *inner, List *hashrinfos, double rows, const VexecCost *cost)
+force_keep(RelOptInfo *joinrel, bool partial, JoinType jointype, JoinPathExtraData *extra,
+		   Path *outer, Path *inner, List *hashrinfos, double rows, const VexecCost *cost)
 {
 	ForceJoin  *fj = force_join_of(joinrel);
+	ForceJoinPath *fp;
 
-	if (fj != NULL && fj->cost.total <= cost->total)
-		return;
 	if (fj == NULL)
 	{
 		fj = palloc0(sizeof(ForceJoin));
 		fj->rel = joinrel;
 		SetRelOptInfoExtensionState(joinrel, vexec_planner_extension_id(), fj);
 	}
-	fj->outer = outer;
-	fj->inner = inner;
-	fj->jointype = jointype;
-	fj->inner_unique = extra->inner_unique;
-	fj->hashrinfos = list_copy(hashrinfos);
-	fj->restrictlist = list_copy(extra->restrictlist);
-	fj->rows = rows;
-	fj->cost = *cost;
+	fp = partial ? &fj->partial : &fj->full;
+	if (fp->valid && fp->cost.total <= cost->total)
+		return;
+	fp->valid = true;
+	fp->outer = outer;
+	fp->inner = inner;
+	fp->jointype = jointype;
+	fp->inner_unique = extra->inner_unique;
+	fp->hashrinfos = list_copy(hashrinfos);
+	fp->restrictlist = list_copy(extra->restrictlist);
+	fp->rows = rows;
+	fp->cost = *cost;
 }
 
 /*
@@ -398,7 +482,7 @@ vexec_consider_hashjoin(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *oute
 	List	   *clauses;
 	Path	   *outer = outerrel->cheapest_total_path;
 	Path	   *inner = innerrel->cheapest_total_path;
-	JoinCostWorkspace workspace;
+	JoinType	orig_jointype = jointype;
 	HashPath   *rowpath;
 	VexecCost	cost;
 	VexecSteps	steps;
@@ -479,44 +563,7 @@ vexec_consider_hashjoin(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *oute
 		goto done;
 	}
 
-	/*
-	 * PostgreSQL's own hash join for these inputs.  final_cost_hashjoin()
-	 * caches each hash clause's bucket size and MCV frequency in its
-	 * RestrictInfo, computed for the pair it costs (costsize.c:4510-4541),
-	 * and core reads them back for every later pair.  Core may never have
-	 * costed this pair -- add_path_precheck() turned it down -- so the
-	 * cache is put back as it was, and pricing an alternative changes no
-	 * later cost and no plan.
-	 */
-	initial_cost_hashjoin(root, &workspace, jointype, clauses, outer, inner, extra, false);
-	{
-		int			n = list_length(clauses);
-		Selectivity *saved = palloc(sizeof(Selectivity) * 4 * Max(n, 1));
-		int			i = 0;
-
-		foreach(lc, clauses)
-		{
-			RestrictInfo *rinfo = lfirst(lc);
-
-			saved[i++] = rinfo->left_bucketsize;
-			saved[i++] = rinfo->right_bucketsize;
-			saved[i++] = rinfo->left_mcvfreq;
-			saved[i++] = rinfo->right_mcvfreq;
-		}
-		rowpath = create_hashjoin_path(root, joinrel, jointype, &workspace, extra,
-									   outer, inner, false, extra->restrictlist, NULL, clauses);
-		i = 0;
-		foreach(lc, clauses)
-		{
-			RestrictInfo *rinfo = lfirst(lc);
-
-			rinfo->left_bucketsize = saved[i++];
-			rinfo->right_bucketsize = saved[i++];
-			rinfo->left_mcvfreq = saved[i++];
-			rinfo->right_mcvfreq = saved[i++];
-		}
-		pfree(saved);
-	}
+	rowpath = row_hashjoin(root, joinrel, jointype, clauses, outer, inner, extra);
 	foreach(lc, clauses)
 	{
 		RestrictInfo *rinfo = lfirst(lc);
@@ -540,16 +587,59 @@ vexec_consider_hashjoin(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *oute
 		added = hashjoin_path(joinrel, jointype, extra->inner_unique, extra->restrictlist,
 							  outer, inner, clauses, rowpath->jpath.path.rows, &cost);
 		if (ps->mode == VEXEC_MODE_FORCE)
-			force_keep(joinrel, jointype, extra, outer, inner, clauses,
+			force_keep(joinrel, false, jointype, extra, outer, inner, clauses,
 					   rowpath->jpath.path.rows, &cost);
 		else
 			add_path(joinrel, added);
 		ps->npossible++;
+
+		/*
+		 * A partial path too (V4), as hash_inner_and_outer() makes a
+		 * parallel-oblivious one (joinpath.c): the outer side's cheapest
+		 * partial path, which the Gather's participants share, and the
+		 * inner side whole in each, its cheapest parallel-safe path, each
+		 * participant building its own table.  Not a right join, whose
+		 * unmatched inner rows each participant would return; not a join
+		 * made unique on one side.
+		 */
+		if (joinrel->consider_parallel && outerrel->partial_pathlist != NIL &&
+			(orig_jointype == JOIN_INNER || orig_jointype == JOIN_LEFT ||
+			 orig_jointype == JOIN_SEMI || orig_jointype == JOIN_ANTI))
+		{
+			Path	   *pouter = linitial(outerrel->partial_pathlist);
+			Path	   *pinner = inner->parallel_safe ? inner :
+				get_cheapest_parallel_safe_total_inner(innerrel->pathlist);
+
+			if (pinner != NULL && PATH_REQ_OUTER(pinner) == NULL && pouter->parallel_workers > 0)
+			{
+				HashPath   *prowpath = row_hashjoin(root, joinrel, jointype, clauses,
+													pouter, pinner, extra);
+				VexecCost	pcost;
+				Path	   *ppath;
+
+				vexec_cost_hashjoin(root, &prowpath->jpath.path, pouter, pinner,
+									list_length(clauses), nkernel,
+									vexec_is_vector_path(pouter), vexec_is_vector_path(pinner),
+									&pcost);
+				ppath = hashjoin_path(joinrel, jointype, extra->inner_unique, extra->restrictlist,
+									  pouter, pinner, clauses, prowpath->jpath.path.rows, &pcost);
+				ppath->parallel_safe = true;
+				ppath->parallel_workers = pouter->parallel_workers;
+				if (ps->mode == VEXEC_MODE_FORCE)
+					force_keep(joinrel, true, jointype, extra, pouter, pinner, clauses,
+							   prowpath->jpath.path.rows, &pcost);
+				else
+					add_partial_path(joinrel, ppath);
+			}
+		}
 	}
 
 done:
 	if (ps->mode == VEXEC_MODE_FORCE)
+	{
 		force_vector_paths(joinrel, added);
+		force_vector_partial_paths(joinrel);
+	}
 }
 
 /* ---------------------------------------------------------------------
@@ -905,6 +995,29 @@ finish_walker(Plan *plan)
 					scan_tlist = side_entries(scan_tlist, plan->lefttree->targetlist, OUTER_VAR);
 					scan_tlist = side_entries(scan_tlist, plan->righttree->targetlist, INNER_VAR);
 					if (list_length(scan_tlist) == list_length(cscan->custom_scan_tlist))
+						cscan->custom_scan_tlist = scan_tlist;
+				}
+				else if (cscan->methods == vexec_repart_methods() && plan->lefttree != NULL)
+				{
+					/* VecRepartition's: its child's row (agg.c, H5) */
+					List	   *scan_tlist = side_entries(NIL, plan->lefttree->targetlist, OUTER_VAR);
+
+					if (list_length(scan_tlist) == list_length(cscan->custom_scan_tlist))
+						cscan->custom_scan_tlist = scan_tlist;
+				}
+				else if (cscan->methods == vexec_sort_methods() && plan->lefttree != NULL)
+				{
+					/*
+					 * VecSort's: its child's row (sort.c) -- but where its
+					 * columns are fetched late, by TID, the relation's own
+					 * columns, which the executor computes them from
+					 */
+					List	   *scan_tlist = side_entries(NIL, plan->lefttree->targetlist, OUTER_VAR);
+					VexecSortPlan sp;
+
+					vexec_sort_plan_decode(cscan, &sp);
+					if (sp.late_tidcol == 0 &&
+						list_length(scan_tlist) == list_length(cscan->custom_scan_tlist))
 						cscan->custom_scan_tlist = scan_tlist;
 				}
 				foreach(lc, cscan->custom_plans)

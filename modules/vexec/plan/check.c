@@ -37,10 +37,12 @@ typedef struct CheckContext
 /*
  * Whether a CustomScan is one of vexec's vector nodes, and that it is in
  * its canonical form (build.c, agg.c): a VecScan scans a relation with no
- * custom_scan_tlist; a VecResult has its child in lefttree and no
+ * custom_scan_tlist, a VecBitmapHeapScan too with its bitmap's tree in
+ * lefttree; a VecResult has its child in lefttree and no
  * relation; a VecAgg too, with a scan tuple of its plan's columns; a
  * VecHashJoin its sides in lefttree and righttree, its scan tuple their
- * columns, and its keys its operators'.
+ * columns, and its keys its operators'; a VecSort its child in lefttree,
+ * its scan tuple the child's row, and its keys the child's columns.
  */
 static bool
 is_vector_node(CustomScan *cscan)
@@ -52,6 +54,15 @@ is_vector_node(CustomScan *cscan)
 		if (cscan->scan.scanrelid == 0 || cscan->custom_scan_tlist != NIL ||
 			cscan->scan.plan.lefttree != NULL)
 			elog(ERROR, "vexec plan check: a VecScan not in its canonical form");
+	}
+	else if (cscan->methods == vexec_bitmapscan_methods())
+	{
+		Plan	   *bitmap = cscan->scan.plan.lefttree;
+
+		if (cscan->scan.scanrelid == 0 || cscan->custom_scan_tlist != NIL || bitmap == NULL ||
+			cscan->scan.plan.righttree != NULL ||
+			(!IsA(bitmap, BitmapIndexScan) && !IsA(bitmap, BitmapAnd) && !IsA(bitmap, BitmapOr)))
+			elog(ERROR, "vexec plan check: a VecBitmapHeapScan not in its canonical form");
 	}
 	else if (cscan->methods == vexec_agg_methods())
 	{
@@ -85,6 +96,41 @@ is_vector_node(CustomScan *cscan)
 			list_length(plan.hashoperators) !=
 			list_length(list_nth(cscan->custom_exprs, VEXEC_JOIN_INNERKEYS)))
 			elog(ERROR, "vexec plan check: a VecHashJoin whose keys are not its operators'");
+	}
+	else if (cscan->methods == vexec_sort_methods())
+	{
+		VexecSortPlan plan;
+		Plan	   *child = cscan->scan.plan.lefttree;
+		ListCell   *lc;
+
+		if (cscan->scan.scanrelid != 0 || child == NULL || cscan->custom_plans != NIL ||
+			cscan->scan.plan.righttree != NULL)
+			elog(ERROR, "vexec plan check: a VecSort not in its canonical form");
+		vexec_sort_plan_decode(cscan, &plan);
+		if (plan.late_tidcol > 0)
+		{
+			/* late columns: the child, a VecScan, gives the keys and the TID */
+			if (!vexec_is_vector_node(child) || ((Scan *) child)->scanrelid == 0 ||
+				plan.late_tidcol != list_length(child->targetlist))
+				elog(ERROR, "vexec plan check: a VecSort of late columns not over its scan's keys and TIDs");
+		}
+		else if (list_length(cscan->custom_scan_tlist) != list_length(child->targetlist))
+			elog(ERROR, "vexec plan check: a VecSort whose scan tuple is not its child's row");
+		foreach(lc, plan.keycols)
+			if (lfirst_int(lc) < 1 || lfirst_int(lc) > list_length(child->targetlist))
+				elog(ERROR, "vexec plan check: a VecSort's key is not a column of its child");
+	}
+	else if (cscan->methods == vexec_repart_methods())
+	{
+		VexecRepartPlan plan;
+		Plan	   *child = cscan->scan.plan.lefttree;
+
+		if (cscan->scan.scanrelid != 0 || child == NULL || cscan->custom_plans != NIL ||
+			!cscan->scan.plan.parallel_aware)
+			elog(ERROR, "vexec plan check: a VecRepartition not in its canonical form");
+		vexec_repart_plan_decode(cscan, &plan);
+		if (list_length(cscan->custom_scan_tlist) != list_length(child->targetlist))
+			elog(ERROR, "vexec plan check: a VecRepartition whose scan tuple is not its child's row");
 	}
 	else if (cscan->scan.scanrelid != 0 || cscan->scan.plan.lefttree == NULL)
 		elog(ERROR, "vexec plan check: a VecResult not in its canonical form");

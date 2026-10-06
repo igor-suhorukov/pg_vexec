@@ -36,6 +36,7 @@
 #include "access/tableam.h"
 #include "nodes/execnodes.h"
 #include "nodes/extensible.h"
+#include "utils/sortsupport.h"
 
 #include "vexec_source.h"
 
@@ -47,13 +48,18 @@
 #define VEXEC_RESULT_NAME	"VecResult"
 #define VEXEC_AGG_NAME		"VecAgg"
 #define VEXEC_HASHJOIN_NAME	"VecHashJoin"
+#define VEXEC_SORT_NAME		"VecSort"
+#define VEXEC_BITMAPSCAN_NAME	"VecBitmapHeapScan"
+#define VEXEC_REPART_NAME	"VecRepartition"
 
 typedef enum VexecNodeKind
 {
 	VEXEC_NODE_SCAN,
 	VEXEC_NODE_RESULT,
 	VEXEC_NODE_AGG,
-	VEXEC_NODE_HASHJOIN
+	VEXEC_NODE_HASHJOIN,
+	VEXEC_NODE_SORT,
+	VEXEC_NODE_REPART
 } VexecNodeKind;
 
 /*
@@ -108,6 +114,77 @@ typedef struct VexecJoinPlan
 	double		inner_rows;		/* the planner's estimate of the build side */
 } VexecJoinPlan;
 
+/*
+ * VecSort's plan (vecsort.c encodes and decodes custom_private): its keys,
+ * columns of its child's rows from 1, with their operators, collations and
+ * NULLS FIRST flags, as a Sort's; and the bound the planner gave it, 0 for
+ * none.  Its scan tuple, which custom_scan_tlist describes, is the child's
+ * row, which its target list reads as INDEX_VAR.
+ */
+typedef struct VexecSortPlan
+{
+	List	   *keycols;
+	List	   *operators;
+	List	   *collations;
+	List	   *nullsfirst;
+	int64		bound;
+
+	/*
+	 * Late columns (H6): the child, a VecScan of the relation late_relid,
+	 * gives the keys and each row's TID, in column late_tidcol, and the
+	 * scan tuple -- custom_scan_tlist, its columns over the relation's Vars
+	 * -- is computed over each kept row, fetched by its TID.  0: the child
+	 * gives the scan tuple.
+	 */
+	int			late_tidcol;
+	Index		late_relid;
+
+	/*
+	 * The running bound (H6): the child, a vector scan, checks its rows
+	 * against the first key of the sort's N-th row, column bound_attno of
+	 * the scan's relation, before the scan's quals where none of them may
+	 * raise an error, else after them.  0: none.
+	 */
+	AttrNumber	bound_attno;
+	bool		bound_before_quals;
+} VexecSortPlan;
+
+/*
+ * A bounded VecSort's running bound (H6, §3.14): the first sort key of the
+ * N-th of the rows it holds, once tuplesort keeps them in its bounded heap.
+ * A row whose first key is strictly past it is one tuplesort would discard
+ * as it came, and the sort's vector scan drops it -- in heap's page reader
+ * before its other columns are deformed, or among a batch's rows.  The
+ * sort's, lent to the scan below it in the same process.
+ */
+typedef struct VexecSortBound
+{
+	AttrNumber	attno;			/* the scan's relation's column */
+	bool		before_quals;	/* checked before the scan's quals */
+	Oid			sortop;			/* the first key's ordering operator */
+	SortSupportData ssup;		/* the first key's order */
+	bool		active;			/* a bound is set */
+	Datum		value;
+	bool		isnull;
+	uint64		version;		/* bumped as the bound moves */
+	int64		removed;		/* rows the scan dropped, EXPLAIN ANALYZE's */
+	MemoryContext tmpcxt;		/* the comparisons' detoasted values */
+} VexecSortBound;
+
+/*
+ * VecRepartition's plan (vecrepart.c): the keys its child's rows are dealt
+ * out by among a Gather's participants, columns of the child's rows from 1,
+ * with the grouping's equality operators, whose hash functions deal them,
+ * and the keys' collations (H5).  Its scan tuple is the child's row, as
+ * VecSort's.
+ */
+typedef struct VexecRepartPlan
+{
+	List	   *keycols;
+	List	   *eqops;
+	List	   *collations;
+} VexecRepartPlan;
+
 typedef struct VexecNode VexecNode;
 
 /* What the node's EXPLAIN ANALYZE counts. */
@@ -156,6 +233,16 @@ struct VexecNode
 	int			nfallbacks;
 	ExprContext *eager_econtext;	/* the fallback's and parameters' */
 
+	/*
+	 * A bitmap's conditions to recheck, the first nrecheck quals: the rows
+	 * they remove are counted apart (EXPLAIN's "Rows Removed by Index
+	 * Recheck"), and PostgreSQL's evaluator runs them, recheck_qual, before
+	 * the plan's own quals, which core gives ss.ps.qual alone
+	 * (ExecInitCustomScan()).
+	 */
+	int			nrecheck;
+	ExprState  *recheck_qual;
+
 	/* the current batch */
 	VexecBatch *work;			/* registers */
 	uint64	   *candidates;		/* rows past the eager quals */
@@ -183,6 +270,15 @@ struct VexecNode
 	const char *label;			/* EXPLAIN's name in text: NULL, the kind's */
 
 	/*
+	 * A VecSort's running bound over this node's rows (H6): a scan's input
+	 * column bound_col holds its key; NULL: none.  bound_in_source: heap's
+	 * page reader checks it, before the quals.
+	 */
+	VexecSortBound *bound;
+	int			bound_col;
+	bool		bound_in_source;
+
+	/*
 	 * The node read its input in this process.  On a cluster the node a
 	 * segment ran is, on the coordinator, a node that never ran: gp_core
 	 * brings its Instrumentation from the segments, and nothing of a custom
@@ -202,6 +298,9 @@ extern const CustomScanMethods *vexec_scan_methods(void);
 extern const CustomScanMethods *vexec_result_methods(void);
 extern const CustomScanMethods *vexec_agg_methods(void);
 extern const CustomScanMethods *vexec_hashjoin_methods(void);
+extern const CustomScanMethods *vexec_sort_methods(void);
+extern const CustomScanMethods *vexec_bitmapscan_methods(void);
+extern const CustomScanMethods *vexec_repart_methods(void);
 
 /* node.c: what every node shares */
 extern void vexec_node_begin(VexecNode *node, EState *estate);
@@ -223,6 +322,7 @@ extern bool vexec_node_next_input(VexecNode *node);
 
 /* vecscan.c, vecresult.c, vecagg.c */
 extern Node *vexec_create_scan_state(CustomScan *cscan);
+extern Node *vexec_create_bitmapscan_state(CustomScan *cscan);
 extern bool vexec_scan_can_aggregate(VexecNode *node);
 extern bool vexec_scan_aggregate(VexecNode *node, int nreqs, const VexecSourceAgg *reqs,
 								 VexecSourceAggAnswer *answers, int64 *nrows);
@@ -231,6 +331,20 @@ extern Node *vexec_create_result_state(CustomScan *cscan);
 extern Node *vexec_create_agg_state(CustomScan *cscan);
 extern List *vexec_agg_plan_encode(const VexecAggPlan *plan);
 extern void vexec_agg_plan_decode(CustomScan *cscan, VexecAggPlan *plan);
+
+/* vecsort.c */
+extern Node *vexec_create_sort_state(CustomScan *cscan);
+extern List *vexec_sort_plan_encode(const VexecSortPlan *plan);
+extern void vexec_sort_plan_decode(CustomScan *cscan, VexecSortPlan *plan);
+extern void vexec_sort_set_bound(CustomScan *cscan, int64 bound);
+extern bool vexec_sort_make_late(CustomScan *cscan);
+extern bool vexec_sort_plan_running_bound(CustomScan *cscan);
+extern bool vexec_scan_set_bound(PlanState *ps, VexecSortBound *bound);
+
+/* vecrepart.c */
+extern Node *vexec_create_repart_state(CustomScan *cscan);
+extern List *vexec_repart_plan_encode(const VexecRepartPlan *plan);
+extern void vexec_repart_plan_decode(CustomScan *cscan, VexecRepartPlan *plan);
 
 /* vechashjoin.c */
 extern Node *vexec_create_hashjoin_state(CustomScan *cscan);

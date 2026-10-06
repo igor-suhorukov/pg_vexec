@@ -97,7 +97,11 @@ vexec_alt_refuse(VexecPlanState *ps, VexecAlt *alt, const char *reason)
  *					its paths (force); in ORCA's plans built, or not chosen
  *	VecHashJoin		added, as a path of the join relation (auto), or as its
  *					paths (force); in ORCA's plans built, or not chosen
- *	VecSort			not built: its node comes in V4
+ *	VecSort			added, as a path of the ordered relation (auto), or as
+ *					its paths (force); in ORCA's plans built, or not chosen
+ *
+ * VecScan's and VecHashJoin's partial paths (V4) go with their own, into
+ * the relation's partial paths.
  */
 void
 vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const char *detail)
@@ -112,7 +116,8 @@ vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const
 	alt->cost = *cost;
 	alt->detail = detail ? MemoryContextStrdup(ps->mcxt, detail) : NULL;
 	built_now = strcmp(alt->node, "VecScan") == 0 || strcmp(alt->node, "VecResult") == 0 ||
-		strcmp(alt->node, "VecAgg") == 0 || strcmp(alt->node, "VecHashJoin") == 0;
+		strcmp(alt->node, "VecAgg") == 0 || strcmp(alt->node, "VecHashJoin") == 0 ||
+		strcmp(alt->node, "VecSort") == 0 || strcmp(alt->node, "VecBitmapHeapScan") == 0;
 	if (ps->mode == VEXEC_MODE_EXPLAIN)
 	{
 		alt->status = "not chosen";
@@ -121,7 +126,7 @@ vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const
 	else if (!built_now)
 	{
 		alt->status = "not built";
-		alt->reason = "VecSort is built from V4";
+		alt->reason = "no vector node of its kind";
 	}
 	else if (alt->root != NULL)
 	{
@@ -130,9 +135,11 @@ vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const
 		if (ps->mode != VEXEC_MODE_FORCE)
 			alt->reason = "to be chosen by cost";
 		else if (strcmp(alt->node, "VecScan") == 0)
-			alt->reason = "forced: the relation's scan, beside its partial paths";
+			alt->reason = "forced: the relation's scans, partial ones too";
 		else if (strcmp(alt->node, "VecHashJoin") == 0)
-			alt->reason = "forced: the join's paths, beside its partial paths";
+			alt->reason = "forced: the join's paths, partial ones too";
+		else if (strcmp(alt->node, "VecSort") == 0)
+			alt->reason = "forced: the ordered relation's paths";
 		else
 			alt->reason = "forced: the aggregation's paths";
 	}

@@ -42,6 +42,21 @@ static const CustomScanMethods hashjoin_methods = {
 	.CreateCustomScanState = vexec_create_hashjoin_state,
 };
 
+static const CustomScanMethods bitmapscan_methods = {
+	.CustomName = VEXEC_BITMAPSCAN_NAME,
+	.CreateCustomScanState = vexec_create_bitmapscan_state,
+};
+
+static const CustomScanMethods repart_methods = {
+	.CustomName = VEXEC_REPART_NAME,
+	.CreateCustomScanState = vexec_create_repart_state,
+};
+
+static const CustomScanMethods sort_methods = {
+	.CustomName = VEXEC_SORT_NAME,
+	.CreateCustomScanState = vexec_create_sort_state,
+};
+
 void
 vexec_exec_install(void)
 {
@@ -49,6 +64,9 @@ vexec_exec_install(void)
 	RegisterCustomScanMethods(&result_methods);
 	RegisterCustomScanMethods(&agg_methods);
 	RegisterCustomScanMethods(&hashjoin_methods);
+	RegisterCustomScanMethods(&sort_methods);
+	RegisterCustomScanMethods(&bitmapscan_methods);
+	RegisterCustomScanMethods(&repart_methods);
 }
 
 const CustomScanMethods *
@@ -75,6 +93,24 @@ vexec_hashjoin_methods(void)
 	return &hashjoin_methods;
 }
 
+const CustomScanMethods *
+vexec_sort_methods(void)
+{
+	return &sort_methods;
+}
+
+const CustomScanMethods *
+vexec_bitmapscan_methods(void)
+{
+	return &bitmapscan_methods;
+}
+
+const CustomScanMethods *
+vexec_repart_methods(void)
+{
+	return &repart_methods;
+}
+
 /* Whether a plan node is one of vexec's vector nodes. */
 bool
 vexec_is_vector_node(Plan *plan)
@@ -85,7 +121,9 @@ vexec_is_vector_node(Plan *plan)
 		return false;
 	cscan = (CustomScan *) plan;
 	return cscan->methods == &scan_methods || cscan->methods == &result_methods ||
-		cscan->methods == &agg_methods || cscan->methods == &hashjoin_methods;
+		cscan->methods == &agg_methods || cscan->methods == &hashjoin_methods ||
+		cscan->methods == &sort_methods || cscan->methods == &bitmapscan_methods ||
+		cscan->methods == &repart_methods;
 }
 
 /* Whether a plan state is one of vexec's vector nodes'. */

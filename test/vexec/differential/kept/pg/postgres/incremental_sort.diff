@@ -1,16 +1,140 @@
 --- reference
 +++ session
-@@ -452,5 +452,5 @@
-                                         explain_analyze_without_memory                                         
- ---------------------------------------------------------------------------------------------------------------
+@@ -450,21 +450,21 @@
+ -- Test EXPLAIN ANALYZE with only a fullsort group.
+ select explain_analyze_without_memory('select * from (select * from t order by a) s order by a, b limit 55');
+-                                        explain_analyze_without_memory                                         
+----------------------------------------------------------------------------------------------------------------
 -               ->  Seq Scan on t (actual rows=1000.00 loops=1)
+-               Sort Key: t.a
++                  explain_analyze_without_memory                   
++-------------------------------------------------------------------
 +               ->  Vec Seq Scan on t (actual rows=1000.00 loops=1)
-                Sort Key: t.a
++               Sort Key: a
                 Sort Method: quicksort  Memory: NNkB
-@@ -597,5 +597,5 @@
-                                          explain_analyze_without_memory                                         
- ----------------------------------------------------------------------------------------------------------------
+-         ->  Sort (actual rows=101.00 loops=1)
+-         Full-sort Groups: 2  Sort Methods: top-N heapsort, quicksort  Average Memory: NNkB  Peak Memory: NNkB
+-         Presorted Key: t.a
+-         Sort Key: t.a, t.b
+-   ->  Incremental Sort (actual rows=55.00 loops=1)
++         ->  Vec Sort (actual rows=1000.00 loops=1)
++         Bound: 55
++         Sort Key: a, b
++         Sort Method: top-N heapsort  Memory: NNkB
++   ->  Vec Sort (actual rows=55.00 loops=1)
+  Limit (actual rows=55.00 loops=1)
+ (9 rows)
+ 
+ select jsonb_pretty(explain_analyze_inc_sort_nodes_without_memory('select * from (select * from t order by a) s order by a, b limit 55'));
+-                  jsonb_pretty                   
+--------------------------------------------------
+- [                                              +
+     {                                          +
+         "Disabled": false,                     +
+         "Sort Key": [                          +
+             "t.a",                             +
+             "t.b"                              +
+         ],                                     +
+         "Node Type": "Incremental Sort",       +
+         "Actual Rows": 55.00,                  +
+         "Actual Loops": 1,                     +
+         "Async Capable": false,                +
+         "Presorted Key": [                     +
+             "t.a"                              +
+         ],                                     +
+         "Parallel Aware": false,               +
+         "Full-sort Groups": {                  +
+             "Group Count": 2,                  +
+             "Sort Methods Used": [             +
+                 "top-N heapsort",              +
+                 "quicksort"                    +
+             ],                                 +
+             "Sort Space Memory": {             +
+                 "Peak Sort Space Used": "NN",  +
+                 "Average Sort Space Used": "NN"+
+             }                                  +
+         },                                     +
+         "Parent Relationship": "Outer"         +
+     }                                          +
+ ]
++ jsonb_pretty 
++--------------
++ [           +
+ ]
+ (1 row)
+ 
+@@ -595,22 +595,21 @@
+ -- Test EXPLAIN ANALYZE with both fullsort and presorted groups.
+ select explain_analyze_without_memory('select * from (select * from t order by a) s order by a, b limit 70');
+-                                         explain_analyze_without_memory                                         
+-----------------------------------------------------------------------------------------------------------------
 -               ->  Seq Scan on t (actual rows=1000.00 loops=1)
+-               Sort Key: t.a
++                  explain_analyze_without_memory                   
++-------------------------------------------------------------------
 +               ->  Vec Seq Scan on t (actual rows=1000.00 loops=1)
-                Sort Key: t.a
++               Sort Key: a
                 Sort Method: quicksort  Memory: NNkB
+-         ->  Sort (actual rows=1000.00 loops=1)
+-         Full-sort Groups: 1  Sort Method: quicksort  Average Memory: NNkB  Peak Memory: NNkB
+-         Pre-sorted Groups: 5  Sort Methods: top-N heapsort, quicksort  Average Memory: NNkB  Peak Memory: NNkB
+-         Presorted Key: t.a
+-         Sort Key: t.a, t.b
+-   ->  Incremental Sort (actual rows=70.00 loops=1)
++         ->  Vec Sort (actual rows=1000.00 loops=1)
++         Bound: 70
++         Sort Key: a, b
++         Sort Method: top-N heapsort  Memory: NNkB
++   ->  Vec Sort (actual rows=70.00 loops=1)
+  Limit (actual rows=70.00 loops=1)
+-(10 rows)
++(9 rows)
+ 
+ select jsonb_pretty(explain_analyze_inc_sort_nodes_without_memory('select * from (select * from t order by a) s order by a, b limit 70'));
+-                  jsonb_pretty                   
+--------------------------------------------------
+- [                                              +
+     {                                          +
+         "Disabled": false,                     +
+         "Sort Key": [                          +
+             "t.a",                             +
+             "t.b"                              +
+         ],                                     +
+         "Node Type": "Incremental Sort",       +
+         "Actual Rows": 70.00,                  +
+         "Actual Loops": 1,                     +
+         "Async Capable": false,                +
+         "Presorted Key": [                     +
+             "t.a"                              +
+         ],                                     +
+         "Parallel Aware": false,               +
+         "Full-sort Groups": {                  +
+             "Group Count": 1,                  +
+             "Sort Methods Used": [             +
+                 "quicksort"                    +
+             ],                                 +
+             "Sort Space Memory": {             +
+                 "Peak Sort Space Used": "NN",  +
+                 "Average Sort Space Used": "NN"+
+             }                                  +
+         },                                     +
+         "Pre-sorted Groups": {                 +
+             "Group Count": 5,                  +
+             "Sort Methods Used": [             +
+                 "top-N heapsort",              +
+                 "quicksort"                    +
+             ],                                 +
+             "Sort Space Memory": {             +
+                 "Peak Sort Space Used": "NN",  +
+                 "Average Sort Space Used": "NN"+
+             }                                  +
+         },                                     +
+         "Parent Relationship": "Outer"         +
+     }                                          +
+ ]
++ jsonb_pretty 
++--------------
++ [           +
+ ]
+ (1 row)
+ 

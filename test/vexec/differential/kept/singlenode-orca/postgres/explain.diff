@@ -1,6 +1,6 @@
 --- reference
 +++ session
-@@ -59,43 +59,48 @@
+@@ -59,43 +59,49 @@
  
  select explain_filter('explain select * from int8_tbl i8');
 -                     explain_filter                      
@@ -36,6 +36,7 @@
 +   Batch Format: postgres
 +   Batches: N
 +   Fallback Steps: N
++   Heap Pages: N
 +   Kernel Steps: N
     Output: i8.q1, i8.q2
 - Execution Time: N.N ms
@@ -43,12 +44,12 @@
 - Planning Time: N.N ms
 - Seq Scan on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
 -(5 rows)
-+   Source: the slot path
++   Source: heap's pages
 + Execution Time: N.N ms
 + Optimizer: GPORCA
 + Planning Time: N.N ms
 + Vec Seq Scan on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
-+(10 rows)
++(11 rows)
  
  select explain_filter('explain (analyze, buffers, format text) select * from int8_tbl i8');
 -                                         explain_filter                                          
@@ -76,7 +77,7 @@
 + Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
  (2 rows)
  
-@@ -106,5 +111,6 @@
+@@ -106,5 +112,6 @@
    <Query>
      <Plan>
 -      <Node-Type>Seq Scan</Node-Type>
@@ -84,7 +85,7 @@
 +      <Custom-Plan-Provider>VecScan</Custom-Plan-Provider>
        <Parallel-Aware>false</Parallel-Aware>
        <Async-Capable>false</Async-Capable>
-@@ -120,11 +126,4 @@
+@@ -120,11 +127,4 @@
        <Actual-Loops>N</Actual-Loops>
        <Disabled>false</Disabled>
 -      <Average-Prefetch-Distance>N.N</Average-Prefetch-Distance>
@@ -96,7 +97,7 @@
 -      <Average-I-Os-In-Progress>N.N</Average-I-Os-In-Progress>
        <Shared-Hit-Blocks>N</Shared-Hit-Blocks>
        <Shared-Read-Blocks>N</Shared-Read-Blocks>
-@@ -160,5 +159,6 @@
+@@ -160,5 +160,6 @@
  explain_filter
  - Plan: 
 -    Node Type: "Seq Scan"
@@ -104,7 +105,7 @@
 +    Custom Plan Provider: "VecScan"
      Parallel Aware: false
      Async Capable: false
-@@ -174,11 +174,4 @@
+@@ -174,11 +175,4 @@
      Actual Loops: N
      Disabled: false
 -    Average Prefetch Distance: N.N
@@ -116,7 +117,7 @@
 -    Average I/Os In Progress: N.N
      Shared Hit Blocks: N
      Shared Read Blocks: N
-@@ -225,5 +218,6 @@
+@@ -225,5 +219,6 @@
    {
      "Plan": {
 -      "Node Type": "Seq Scan",
@@ -124,7 +125,7 @@
 +      "Custom Plan Provider": "VecScan",
        "Parallel Aware": false,
        "Async Capable": false,
-@@ -266,6 +260,10 @@
+@@ -266,35 +261,59 @@
                                                    explain_filter                                                   
  -------------------------------------------------------------------------------------------------------------------
 +                           Batch Format: postgres
@@ -132,15 +133,33 @@
 +                           Kernel Steps: N
                             Output: tenk1.unique1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
 -                     ->  Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
-+                           Source: the slot path
++                           Source: heap's pages
 +                     ->  Vec Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
++                     Batch Format: postgres
++                     Fallback Steps: N
++                     Input: batches
++                     Kernel Steps: N
                       Output: tenk1.unique1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
                       Sort Key: tenk1.ten
-@@ -281,11 +279,15 @@
+-               ->  Sort  (cost=N.N..N.N rows=N width=N)
++               ->  Vec Sort  (cost=N.N..N.N rows=N width=N)
+                Output: sum(tenk1.unique1) OVER w1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+                Window: w1 AS (PARTITION BY tenk1.ten RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+          ->  WindowAgg  (cost=N.N..N.N rows=N width=N)
++         Batch Format: postgres
++         Fallback Steps: N
++         Input: rows
++         Kernel Steps: N
+          Output: (sum(tenk1.unique1) OVER w1), tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+          Sort Key: tenk1.ten, tenk1.hundred
+-   ->  Sort  (cost=N.N..N.N rows=N width=N)
++   ->  Vec Sort  (cost=N.N..N.N rows=N width=N)
+    Output: (sum(tenk1.unique1) OVER w1), sum(tenk1.unique2) OVER w1, sum(tenk1.tenthous) OVER w1
+    Window: w1 AS (PARTITION BY tenk1.ten ORDER BY tenk1.hundred RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
   Optimizer: GPORCA
   WindowAgg  (cost=N.N..N.N rows=N width=N)
 -(15 rows)
-+(19 rows)
++(27 rows)
  
  select explain_filter('explain verbose select sum(unique1) over w1, sum(unique2) over (w1 order by hundred), sum(tenthous) over (w1 order by hundred rows 10 preceding) from tenk1 window w1 as (partition by ten)');
                                                       explain_filter                                                      
@@ -150,18 +169,37 @@
 +                                 Kernel Steps: N
                                   Output: tenk1.unique1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
 -                           ->  Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
-+                                 Source: the slot path
++                                 Source: heap's pages
 +                           ->  Vec Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
++                           Batch Format: postgres
++                           Fallback Steps: N
++                           Input: batches
++                           Kernel Steps: N
                             Output: tenk1.unique1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
                             Sort Key: tenk1.ten
-@@ -304,5 +306,5 @@
+-                     ->  Sort  (cost=N.N..N.N rows=N width=N)
++                     ->  Vec Sort  (cost=N.N..N.N rows=N width=N)
+                      Output: sum(tenk1.unique1) OVER w1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+                      Window: w1 AS (PARTITION BY tenk1.ten RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                ->  WindowAgg  (cost=N.N..N.N rows=N width=N)
++               Batch Format: postgres
++               Fallback Steps: N
++               Input: rows
++               Kernel Steps: N
+                Output: (sum(tenk1.unique1) OVER w1), tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+                Sort Key: tenk1.ten, tenk1.hundred
+-         ->  Sort  (cost=N.N..N.N rows=N width=N)
++         ->  Vec Sort  (cost=N.N..N.N rows=N width=N)
+          Output: sum(tenk1.unique2) OVER w1, tenk1.ten, tenk1.hundred, tenk1.tenthous, (sum(tenk1.unique1) OVER w1)
+          Window: w1 AS (PARTITION BY tenk1.ten ORDER BY tenk1.hundred RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+@@ -304,5 +323,5 @@
   Optimizer: GPORCA
   WindowAgg  (cost=N.N..N.N rows=N width=N)
 -(18 rows)
-+(22 rows)
++(30 rows)
  
  -- Check output including I/O timings.  These fields are conditional
-@@ -310,7 +312,7 @@
+@@ -310,7 +329,7 @@
  set track_io_timing = on;
  select explain_filter('explain (analyze, buffers, format json) select * from int8_tbl i8');
 -           explain_filter            
@@ -287,7 +325,7 @@
  ]
  (1 row)
  
-@@ -351,40 +353,40 @@
+@@ -351,40 +370,40 @@
  -- MEMORY option
  select explain_filter('explain (memory) select * from int8_tbl i8');
 -                     explain_filter                      
@@ -467,7 +505,7 @@
 + Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
  (3 rows)
  
-@@ -407,10 +409,10 @@
+@@ -407,10 +426,10 @@
  -- should scan gen_part_1_1 and gen_part_1_2, but not gen_part_2
  select explain_filter('explain (generic_plan) select key1, key2 from gen_part where key1 = 1 and key2 = $1');
 -                              explain_filter                               
@@ -482,7 +520,7 @@
 +   ->  Vec Seq Scan on gen_part_1_2 gen_part_2  (cost=N.N..N.N rows=N width=N)
   Append  (cost=N.N..N.N rows=N width=N)
   Optimizer: Postgres query optimizer
-@@ -442,7 +444,7 @@
+@@ -442,7 +461,7 @@
    #- '{0,Plan,Plans,0,Sort Space Type}'
  );
 -                    jsonb_pretty                     
@@ -608,6 +646,7 @@
 + [                                                     +
      {                                                 +
          "Plan": {                                     +
+             "Input": "batches",                       +
              "Plans": [                                +
                  {                                     +
                      "Alias": "tenk1",                 +
@@ -630,11 +669,12 @@
                          "tenk1.string4"               +
                      ],                                +
                      "Schema": "public",               +
-                     "Source": "the slot path",        +
+                     "Source": "heap's pages",         +
                      "Batches": 0,                     +
                      "Disabled": false,                +
                      "Node Type": "Custom Scan",       +
                      "Plan Rows": 0,                   +
+                     "Heap Pages": 0,                  +
                      "Plan Width": 0,                  +
                      "Total Cost": 0.0,                +
                      "Actual Rows": 0.0,               +
@@ -680,19 +720,24 @@
                  "tenk1.stringu2",                     +
                  "tenk1.string4"                       +
              ],                                        +
+             "Batches": 0,                             +
              "Disabled": false,                        +
              "Sort Key": [                             +
                  "tenk1.tenthous"                      +
              ],                                        +
-             "Node Type": "Sort",                      +
+             "Node Type": "Custom Scan",               +
              "Plan Rows": 0,                           +
              "Plan Width": 0,                          +
              "Total Cost": 0.0,                        +
              "Actual Rows": 0.0,                       +
+             "Rows Sorted": 0,                         +
              "Sort Method": "quicksort",               +
              "Actual Loops": 0,                        +
+             "Batch Format": "postgres",               +
+             "Kernel Steps": 0,                        +
              "Startup Cost": 0.0,                      +
              "Async Capable": false,                   +
+             "Fallback Steps": 0,                      +
              "Parallel Aware": false,                  +
              "Sort Space Type": "Memory",              +
              "Sort Space Used": 0,                     +
@@ -704,6 +749,7 @@
              "Shared Read Blocks": 0,                  +
              "Actual Startup Time": 0.0,               +
              "Temp Written Blocks": 0,                 +
+             "Custom Plan Provider": "VecSort",        +
              "Local Dirtied Blocks": 0,                +
              "Local Written Blocks": 0,                +
              "Shared Dirtied Blocks": 0,               +
@@ -729,7 +775,7 @@
  ]
  (1 row)
  
-@@ -455,20 +457,30 @@
+@@ -455,20 +474,30 @@
                         explain_filter                       
  ------------------------------------------------------------
 +   Batch Format: postgres
@@ -741,7 +787,7 @@
 - Seq Scan on pg_temp.t1  (cost=N.N..N.N rows=N width=N)
 -(4 rows)
 +   Row-by-Row Qual: mysin(), which may raise
-+   Source: the slot path
++   Source: heap's pages
 +   Vector Quals: N of N
 + Optimizer: GPORCA
 + Vec Seq Scan on pg_temp.t1  (cost=N.N..N.N rows=N width=N)
@@ -758,7 +804,7 @@
 +   Fallback Steps: N
 +   Kernel Steps: N
     Output: i8.q1, i8.q2
-+   Source: the slot path
++   Source: heap's pages
   Optimizer: GPORCA
   Query Identifier: N
 - Seq Scan on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N)
@@ -767,7 +813,7 @@
 +(8 rows)
  
  -- Test compute_query_id with utility statements containing plannable query
-@@ -493,42 +505,42 @@
+@@ -493,42 +522,42 @@
  -- Test SERIALIZE option
  select explain_filter('explain (analyze,buffers off,serialize) select * from int8_tbl i8');
 -                                         explain_filter                                          
@@ -834,3 +880,10 @@
 + Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
  (5 rows)
  
+@@ -567,5 +596,5 @@
+          Sort Key: ((generate_series < N))
+          Sort Method: external merge  Disk: NkB
+-   ->  Sort (actual time=N.N..N.N rows=N.N loops=N)
++   ->  Vec Sort (actual time=N.N..N.N rows=N.N loops=N)
+    Storage: Disk  Maximum Storage: NkB
+    Window: w1 AS (PARTITION BY ((generate_series < N)) RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)

@@ -50,12 +50,35 @@
 #include "plan/plan.h"
 
 /*
+ * The share of a partial path's work each participant does, as
+ * get_parallel_divisor() (PG19:src/backend/optimizer/path/costsize.c)
+ * computes it, which is static there: the workers, and the leader's part
+ * where it takes one.
+ */
+static double
+parallel_divisor(Path *path)
+{
+	double		divisor = path->parallel_workers;
+
+	if (parallel_leader_participation)
+	{
+		double		leader = 1.0 - (0.3 * path->parallel_workers);
+
+		if (leader > 0)
+			divisor += leader;
+	}
+	return divisor;
+}
+
+/*
  * A sequential scan's vector alternative.  rowpath is PostgreSQL's
  * sequential scan of the relation (create_seqscan_path), whose terms are
  * those of cost_seqscan (PG19:src/backend/optimizer/path/costsize.c): a
  * page term, cpu_tuple_cost and the quals a tuple, the target an output
  * row.  source_bytes, when a registered source gave it, replaces the page
- * term with the needed columns' bytes.
+ * term with the needed columns' bytes.  For a partial path (V4) the CPU
+ * terms are divided among the participants as cost_seqscan divides them,
+ * and the page term is not, and its rows are each participant's.
  */
 void
 vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
@@ -65,6 +88,7 @@ vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 {
 	double		tuples = rel->tuples;
 	double		rows = rowpath->rows;
+	double		divisor = rowpath->parallel_workers > 0 ? parallel_divisor(rowpath) : 1.0;
 	Cost		qual_total = rel->baserestrictcost.per_tuple;
 	Cost		qual_kernel = Min(quals->kernel_cost, qual_total);
 	Cost		target_total = rowpath->pathtarget->cost.per_tuple;
@@ -78,7 +102,7 @@ vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 	cost->row_total = rowpath->total_cost;
 	cost->rows = rows;
 
-	row_cpu = (cpu_tuple_cost + qual_total) * tuples + target_total * rows;
+	row_cpu = (cpu_tuple_cost + qual_total) * tuples / divisor + target_total * rows;
 	disk = Max(rowpath->total_cost - rowpath->startup_cost - row_cpu, 0);
 	if (source_bytes >= 0)
 	{
@@ -88,15 +112,51 @@ vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 		disk = spc_seq_page_cost * ceil(source_bytes / BLCKSZ);
 	}
 
-	cpu = cpu_tuple_cost * vexec_cpu_tuple_factor * tuples +
-		(qual_kernel * vexec_cpu_operator_factor + (qual_total - qual_kernel)) * tuples +
+	cpu = (cpu_tuple_cost * vexec_cpu_tuple_factor +
+		   qual_kernel * vexec_cpu_operator_factor + (qual_total - qual_kernel)) * tuples / divisor +
 		(target_kernel * vexec_cpu_operator_factor + (target_total - target_kernel)) * rows;
 
 	/* the slot path and heap: each needed column of each row, transposed */
-	cost->convert_in = source_bytes >= 0 ? 0 : vexec_convert_cost * ncols_in * tuples;
+	cost->convert_in = source_bytes >= 0 ? 0 : vexec_convert_cost * ncols_in * tuples / divisor;
 	cost->rowout = vexec_convert_cost * ncols_out * rows;
 	cost->startup = rowpath->startup_cost + vexec_batch_setup_cost;
 	cost->total = cost->startup + disk + cpu + cost->convert_in + cost->rowout;
+}
+
+/*
+ * A bitmap heap scan's vector alternative (H9).  rowpath is PostgreSQL's
+ * bitmap heap path (cost_bitmap_heap_scan): the bitmap's index scans, the
+ * pages it fetches, cpu_tuple_cost and the quals a fetched tuple, the
+ * target an output row.  The vector alternative fetches the same pages;
+ * its rows' tuple cost and its kernels' share of the quals and the target
+ * take the vector factors, each fetched row's columns are transposed, and
+ * its rows are handed out.  The tuples fetched are not on the path, so the
+ * output rows stand for them: an estimate until measured.
+ */
+void
+vexec_cost_bitmapscan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
+					  const VexecSteps *quals, const VexecSteps *target, VexecCost *cost)
+{
+	double		rows = rowpath->rows;
+	Cost		qual_total = rel->baserestrictcost.per_tuple;
+	Cost		qual_kernel = Min(quals->kernel_cost, qual_total);
+	Cost		target_total = rowpath->pathtarget->cost.per_tuple;
+	Cost		target_kernel = Min(target->kernel_cost, target_total);
+	Cost		save;
+
+	(void) root;
+	memset(cost, 0, sizeof(VexecCost));
+	cost->row_startup = rowpath->startup_cost;
+	cost->row_total = rowpath->total_cost;
+	cost->rows = rows;
+	save = ((1.0 - vexec_cpu_tuple_factor) * cpu_tuple_cost +
+			(1.0 - vexec_cpu_operator_factor) * qual_kernel +
+			(1.0 - vexec_cpu_operator_factor) * target_kernel) * rows;
+	cost->convert_in = vexec_convert_cost * Max(list_length(rel->reltarget->exprs), 1) * rows;
+	cost->rowout = vexec_convert_cost * Max(list_length(rel->reltarget->exprs), 1) * rows;
+	cost->startup = rowpath->startup_cost + vexec_batch_setup_cost;
+	cost->total = Max(rowpath->total_cost - save, rowpath->startup_cost) +
+		vexec_batch_setup_cost + cost->convert_in + cost->rowout;
 }
 
 /* Columns a path hands its parent. */
@@ -192,11 +252,16 @@ vexec_cost_agg(PlannerInfo *root, Path *rowpath, Path *input, bool input_vector,
 
 /*
  * A sort's vector alternative.  It sorts through PostgreSQL's tuplesort,
- * as the row Sort does; its gain is the island it keeps whole (§3.8), which
- * shows as the crossings its parent and its child no longer pay.
+ * as the row Sort does, so rowpath -- PostgreSQL's SortPath over the same
+ * input, bounded as the VecSort is (cost_sort) -- gives its sorting; its
+ * gain is the island it keeps whole (§3.8), which shows as the crossings
+ * its parent and its child no longer pay: a vector input's batches are read
+ * as they are, and the handing out of its rows that its cost carries is
+ * saved.
  */
 void
-vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, VexecCost *cost)
+vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, bool input_vector,
+				VexecCost *cost)
 {
 	(void) root;
 	memset(cost, 0, sizeof(VexecCost));
@@ -205,9 +270,37 @@ vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, VexecCost *cost)
 	cost->rows = rowpath->rows;
 
 	cost->convert_in = vexec_convert_cost * path_width_cols(input) * input->rows;
+	if (input_vector)
+		cost->convert_in = -cost->convert_in;
 	cost->rowout = vexec_convert_cost * path_width_cols(rowpath) * rowpath->rows;
 	cost->startup = rowpath->startup_cost + vexec_batch_setup_cost + cost->convert_in;
 	cost->total = rowpath->total_cost + vexec_batch_setup_cost + cost->convert_in + cost->rowout;
+}
+
+/*
+ * A Sort ORCA's translator built, priced as a row Sort and as VecSort in
+ * PostgreSQL's units: the same sort, its rows transposed in from a row
+ * child, read as they are from a vector one, and handed out.  ORCA's
+ * choices are its own until V5; in auto mode its Sort becomes VecSort where
+ * this prices it lower: over a vector child.
+ */
+void
+vexec_cost_plan_sort(Plan *sort, bool input_vector, VexecCost *cost)
+{
+	Plan	   *input = sort->lefttree;
+	double		in_rows = input ? Max(input->plan_rows, 1) : 1;
+	double		rows = Max(sort->plan_rows, 1);
+	int			in_cols = input ? Max(list_length(input->targetlist), 1) : 1;
+	Cost		sorting = Max(sort->total_cost - (input ? input->total_cost : 0), 0);
+
+	memset(cost, 0, sizeof(VexecCost));
+	cost->rows = rows;
+	cost->row_startup = sorting;
+	cost->row_total = sorting;
+	cost->convert_in = vexec_convert_cost * in_cols * in_rows * (input_vector ? -1 : 1);
+	cost->rowout = vexec_convert_cost * Max(list_length(sort->targetlist), 1) * rows;
+	cost->startup = vexec_batch_setup_cost + sorting + cost->convert_in;
+	cost->total = cost->startup + cost->rowout;
 }
 
 /*

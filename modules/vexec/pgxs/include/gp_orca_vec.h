@@ -42,6 +42,20 @@
  *	end_statement		once ORCA's plan is made: the engine's check of it,
  *						and what it records in PlannedStmt.extension_state
  *
+ * and, from minor version 1, at one more:
+ *
+ *	describe_node		a node of the engine's, asked by a pass over the
+ *						finished plan that looks at nodes by their kind --
+ *						M8's parallel.c, which puts Gathers in a segment's
+ *						fragments over the scans a Gather's participants can
+ *						share, and gp_core's bound_gathers() (gp_scan.c),
+ *						which sends a nearest-neighbour search's ORDER BY and
+ *						LIMIT to the segments through the sort below a Limit
+ *						-- for what it stands for: a sequential scan, a
+ *						projection, a hash join, an aggregation or a sort, or
+ *						none of them.  It is asked of the plans PostgreSQL's
+ *						planner makes too
+ *
  * A node built so is the engine's CustomScan, found by name where the
  * plan is read back, a segment's fragment among them.  Without a
  * registration gp_orca calls nothing, and its plans are as they were.
@@ -71,10 +85,57 @@
 #define GP_ORCA_VEC_RENDEZVOUS	"Cloudberry/gp_orca_vec_v1"	/* the major
 															 * version is in
 															 * the name */
-#define GP_ORCA_VEC_MINOR		0
+#define GP_ORCA_VEC_MINOR		1	/* 1: describe_node */
 #define GP_ORCA_VEC_MAGIC		0x47564331	/* "GVC1" */
 
 struct ExplainState;
+
+/*
+ * What a node of the engine's stands for (describe_node, from minor
+ * version 1), and what a pass needs of it to treat it as that node: its
+ * children are where PostgreSQL's node has them -- lefttree, and a hash
+ * join's inner side in righttree, which the join reads whole and hashes
+ * itself, with no Hash node -- its qual and target list are the node's own.
+ */
+typedef enum GpOrcaVecKind
+{
+	GP_ORCA_VEC_OTHER = 0,		/* none of these: a pass leaves it alone */
+	GP_ORCA_VEC_SEQSCAN,		/* a sequential scan of scanrelid; the
+								 * engine's node shares its table among a
+								 * Gather's participants where the plan
+								 * makes it parallel-aware, as a SeqScan does */
+	GP_ORCA_VEC_RESULT,			/* a projection or filter over lefttree,
+								 * which passes its rows on as they come */
+	GP_ORCA_VEC_HASHJOIN,		/* a hash join of lefttree, the outer side,
+								 * and righttree, the inner side */
+	GP_ORCA_VEC_AGG,			/* an aggregation of lefttree */
+	GP_ORCA_VEC_SORT			/* a sort of lefttree */
+} GpOrcaVecKind;
+
+typedef struct GpOrcaVecNode
+{
+	int			kind;			/* GpOrcaVecKind */
+	JoinType	jointype;		/* HASHJOIN: inner, left, semi, anti, right */
+	int			nhashclauses;	/* HASHJOIN */
+	List	   *exprs;			/* every expression the node evaluates beyond
+								 * its qual and target list: a join's
+								 * clauses and keys, a sort's keys */
+	Agg		   *agg;			/* AGG: the Agg it stands for, a copy -- its
+								 * strategy, split, grouping and number of
+								 * groups, its target list and qual over
+								 * lefttree as OUTER_VAR, with the
+								 * aggregates in it, in the node's resnos and
+								 * types -- which a pass reads and never
+								 * puts in the plan */
+	Sort	   *sort;			/* SORT: the Sort it stands for, a copy -- its
+								 * keys, their operators, collations and
+								 * NULLS FIRST flags, its target list
+								 * lefttree's row, a column an OUTER_VAR Var,
+								 * which the keys index -- whose lefttree is
+								 * the node's own child, not a copy, through
+								 * which a pass may change the child; a pass
+								 * reads it and never puts it in the plan */
+} GpOrcaVecNode;
 
 typedef struct GpOrcaVecRoutine
 {
@@ -101,6 +162,13 @@ typedef struct GpOrcaVecRoutine
 
 	/* ORCA's plan is made: the engine's check, and what it records. */
 	void		(*end_statement) (void *state, PlannedStmt *stmt);
+
+	/*
+	 * From minor version 1: what a plan node stands for, filled in *node,
+	 * and true; false for a node that is not the engine's.  Any time while
+	 * the plan is planned, in any memory context; it reads the node alone.
+	 */
+	bool		(*describe_node) (Plan *plan, GpOrcaVecNode *node);
 } GpOrcaVecRoutine;
 
 typedef struct GpOrcaVecRegistry

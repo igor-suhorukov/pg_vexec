@@ -10,17 +10,19 @@
  *							global extension state
  *	set_rel_pathlist_hook	VecScan, for a table's sequential scan
  *	set_join_pathlist_hook	VecHashJoin, for a hash-joinable join (join.c)
- *	create_upper_paths_hook	VecAgg (GROUP_AGG, agg.c), VecSort (ORDERED)
+ *	create_upper_paths_hook	VecAgg (GROUP_AGG, agg.c), VecSort (ORDERED,
+ *							sort.c)
  *	planner_shutdown_hook	the plan check, and the reasons into the plan
  *
  * With vexec.mode = off, every hook calls the one it took the place of and
  * adds nothing, so plans are PostgreSQL's (§1.2).  In explain mode the
  * alternatives are costed and recorded but never added, so plans are
- * PostgreSQL's still.  In auto mode a VecScan path, VecHashJoin's path of a
- * join relation (join.c) and VecAgg's paths of a grouped relation (agg.c)
- * compete with the relation's other paths in add_path, by cost; in force
- * mode they replace them, wherever the oracle accepts them.  The sort
- * alternative is still only costed and recorded: its node comes in V4.
+ * PostgreSQL's still.  In auto mode a VecScan path -- and its partial path,
+ * for a parallel plan (V4) -- VecHashJoin's paths of a join relation
+ * (join.c), VecAgg's paths of a grouped relation (agg.c) and VecSort's
+ * path of the ordered relation (sort.c) compete with the relation's other
+ * paths in add_path, by cost; in force mode they replace them, wherever
+ * the oracle accepts them.
  *
  * The scan hook works before it calls the hook it took the place of, so
  * that on a cluster's coordinator gp_core's hook, which empties the path
@@ -202,8 +204,11 @@ vexec_planner_shutdown(PlannerGlobal *glob, Query *parse, const char *query_stri
 	VexecPlanState *ps = planner_id >= 0 ? GetPlannerGlobalExtensionState(glob, planner_id) : NULL;
 	int			nodes = -1;
 
-	/* VecHashJoin's scan tuple, in the form ORCA's plans have it (join.c) */
-	if (ps != NULL && ps->joins_built)
+	/*
+	 * VecHashJoin's and VecSort's scan tuples, in the form ORCA's plans have
+	 * them (join.c)
+	 */
+	if (ps != NULL && (ps->joins_built || ps->sorts_built))
 		vexec_join_finish_plan(pstmt);
 
 	if (vexec_debug_check_plans || vexec_debug_require_vector)
@@ -284,6 +289,8 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 	Relids		required_outer;
 	bool		add = ps->mode == VEXEC_MODE_AUTO || ps->mode == VEXEC_MODE_FORCE;
 	const char *refusal = NULL;
+	List	   *bitmap_paths = NIL;
+	ListCell   *lc;
 
 	if (rte->rtekind != RTE_RELATION || rte->inh)
 		return;					/* not a table's own scan */
@@ -304,10 +311,6 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 		refusal = "TABLESAMPLE";
 	else if (root->rowMarks != NIL)
 		refusal = "row marks at its query level: FOR UPDATE or FOR SHARE";
-	else if (!vexec_enable_scan)
-		refusal = "vexec.enable_scan is off";
-	else if ((rel->pgs_mask & PGS_SEQSCAN) == 0)
-		refusal = "sequential scans are disabled";
 	else if (ps->mode != VEXEC_MODE_FORCE && rel->tuples < vexec_min_rows)
 		refusal = psprintf("%.0f rows, fewer than vexec.min_rows", rel->tuples);
 	else if (reads_other_system_column(attrs))
@@ -336,7 +339,58 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 		vexec_alt_refuse(ps, alt, how);
 		return;
 	}
+	if (src == NULL && vexec_heap_page_reader && vexec_heap_reader_possible(relation))
+		how = "heap's pages";
 	table_close(relation, NoLock);
+
+	/*
+	 * H9: beside each of the relation's bitmap heap paths, a
+	 * VecBitmapHeapScan over the same bitmap, parameterized as it is -- not
+	 * a parallel one, whose shared iterator stays PostgreSQL's.  Made before
+	 * force mode empties the relation's paths.
+	 */
+	if (add && vexec_enable_bitmapscan)
+	{
+		foreach(lc, rel->pathlist)
+		{
+			Path	   *bp = lfirst(lc);
+
+			if (IsA(bp, BitmapHeapPath) && !bp->parallel_aware)
+				bitmap_paths = lappend(bitmap_paths,
+									   vexec_bitmapscan_path(root, rel, (BitmapHeapPath *) bp,
+															 &quals, &target));
+		}
+	}
+
+	/*
+	 * The sequential scan's own gates.  A bitmap heap scan's are its own,
+	 * which core's bitmap heap paths passed: they stand beside it as their
+	 * twins stand, in force mode in their place.
+	 */
+	if (!vexec_enable_scan)
+		refusal = "vexec.enable_scan is off";
+	else if ((rel->pgs_mask & PGS_SEQSCAN) == 0)
+		refusal = "sequential scans are disabled";
+	if (refusal != NULL)
+	{
+		vexec_alt_refuse(ps, alt, refusal);
+		if (bitmap_paths != NIL)
+		{
+			if (ps->mode == VEXEC_MODE_FORCE)
+			{
+				List	   *keep = NIL;
+
+				foreach(lc, rel->pathlist)
+					if (!IsA(lfirst(lc), BitmapHeapPath) || ((Path *) lfirst(lc))->parallel_aware)
+						keep = lappend(keep, lfirst(lc));
+				rel->pathlist = keep;
+			}
+			foreach(lc, bitmap_paths)
+				add_path(rel, lfirst(lc));
+			ps->npossible++;
+		}
+		return;
+	}
 
 	/*
 	 * A relation with lateral references has only paths parameterized by
@@ -357,17 +411,62 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 	if (add)
 	{
 		Path	   *path = vexec_scan_path(root, rel, rowpath, &cost);
+		bool		index_kept = false;
 
 		/*
 		 * Force mode: wherever the oracle accepts it, the vector scan is the
-		 * relation's scan.  Its partial paths stay, since V1 has no
-		 * parallel-aware vector scan (V4): where the planner makes a
-		 * parallel plan, as the tests that force one ask, it keeps it.
+		 * relation's scan -- but for the paths an index orders by a distance
+		 * (indexorderbys), a nearest-neighbour search's, which stay for cost
+		 * to choose between them and a VecSort over the vector scan
+		 * (plan/sort.c): a segment planning the search gp_core sends it keeps
+		 * its HNSW, IVFFlat or GiST index.  Where one stays the plan may hold
+		 * no vector node, and the vector scan is not counted possible
+		 * (vexec.debug_require_vector).
 		 */
 		if (ps->mode == VEXEC_MODE_FORCE)
-			rel->pathlist = NIL;
+		{
+			List	   *keep = NIL;
+
+			foreach(lc, rel->pathlist)
+				if (IsA(lfirst(lc), IndexPath) &&
+					((IndexPath *) lfirst(lc))->indexorderbys != NIL)
+					keep = lappend(keep, lfirst(lc));
+			rel->pathlist = keep;
+			index_kept = keep != NIL;
+		}
 		add_path(rel, path);
-		ps->npossible++;
+		foreach(lc, bitmap_paths)
+			add_path(rel, lfirst(lc));
+		if (!index_kept)
+			ps->npossible++;
+
+		/*
+		 * And a partial path, where the relation may be scanned in parallel
+		 * (V4): a parallel-aware VecScan, of the workers
+		 * create_plain_partial_paths() gives the parallel sequential scan
+		 * (PG19:src/backend/optimizer/path/allpaths.c), for a Gather, a
+		 * Gather Merge or a partial VecAgg above it.  In force mode it is the
+		 * relation's only partial path, so that a plan the planner makes
+		 * parallel -- as tests that force one ask -- stays parallel.
+		 */
+		if (rel->consider_parallel && required_outer == NULL)
+		{
+			int			workers = compute_parallel_worker(rel, rel->pages, -1,
+														  max_parallel_workers_per_gather);
+
+			if (workers > 0)
+			{
+				Path	   *prowpath = create_seqscan_path(root, rel, NULL, workers);
+				VexecCost	pcost;
+
+				vexec_cost_scan(root, rel, prowpath, &quals, &target,
+								bms_num_members(attrs), list_length(rel->reltarget->exprs),
+								source_bytes, &pcost);
+				if (ps->mode == VEXEC_MODE_FORCE)
+					rel->partial_pathlist = NIL;
+				add_partial_path(rel, vexec_scan_path(root, rel, prowpath, &pcost));
+			}
+		}
 	}
 }
 
@@ -403,44 +502,6 @@ upper_target(PlannerInfo *root, const char *stage)
 	return root->plan_name ? psprintf("%s (%s)", stage, root->plan_name) : stage;
 }
 
-/* A sort's vector alternative (§3.3.3, UPPERREL_ORDERED): V4's node. */
-static void
-consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
-			  VexecPlanState *ps)
-{
-	VexecAlt   *alt;
-	Path	   *input = input_rel->cheapest_total_path;
-	SortPath   *rowpath;
-	VexecCost	cost;
-
-	if (root->sort_pathkeys == NIL)
-		return;
-	alt = vexec_alt_record(ps, "VecSort", upper_target(root, "ORDER BY"), root, NULL);
-	if (alt == NULL)
-		return;
-	if (!vexec_enable_sort)
-	{
-		vexec_alt_refuse(ps, alt, "vexec.enable_sort is off");
-		return;
-	}
-	if (input == NULL || PATH_REQ_OUTER(input) != NULL)
-	{
-		vexec_alt_refuse(ps, alt, "a parameterized input");
-		return;
-	}
-	if (ps->mode != VEXEC_MODE_FORCE && input->rows < vexec_min_rows)
-	{
-		vexec_alt_refuse(ps, alt, psprintf("%.0f input rows, fewer than vexec.min_rows", input->rows));
-		return;
-	}
-	rowpath = create_sort_path(root, output_rel, input, root->sort_pathkeys, root->limit_tuples);
-	vexec_cost_sort(root, &rowpath->path, input, &cost);
-	vexec_alt_costed(ps, alt, &cost,
-					 psprintf("%s%s",
-							  count_of(list_length(root->sort_pathkeys), "sort key", "sort keys"),
-							  root->limit_tuples > 0 ? ", bounded" : ""));
-}
-
 static void
 vexec_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 						 RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra)
@@ -450,8 +511,8 @@ vexec_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	if (ps != NULL && stage == UPPERREL_GROUP_AGG)
 		vexec_consider_agg(root, input_rel, output_rel, (GroupPathExtraData *) extra, ps,
 						   upper_target(root, root->processed_groupClause ? "GROUP BY" : "aggregates"));
-	else if (ps != NULL && ps->record && stage == UPPERREL_ORDERED)
-		consider_sort(root, input_rel, output_rel, ps);
+	else if (ps != NULL && stage == UPPERREL_ORDERED)
+		vexec_consider_sort(root, input_rel, output_rel, ps, upper_target(root, "ORDER BY"));
 
 	if (prev_create_upper_paths)
 		prev_create_upper_paths(root, stage, input_rel, output_rel, extra);

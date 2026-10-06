@@ -93,7 +93,7 @@ FROM at;
          Batch Format: postgres
          Kernel Steps: 0
          Fallback Steps: 0
-         Source: the slot path
+         Source: heap's pages
 (14 rows)
 
 SELECT agg_check($$SELECT count(*), count(t), sum(k), sum(s), sum(b), sum(n), sum(f), sum(r),
@@ -339,7 +339,7 @@ EXPLAIN (COSTS OFF, VERBOSE) SELECT sum(s), sum(s + 1), sum(1 + s), sum(s - 3) F
          Batch Format: postgres
          Kernel Steps: 0
          Fallback Steps: 0
-         Source: the slot path
+         Source: heap's pages
 (14 rows)
 
 SELECT agg_check($$SELECT sum(s), sum(s + 1), sum(s + 2), sum(1 + s), sum(s - 3),
@@ -399,7 +399,7 @@ EXPLAIN (COSTS OFF, VERBOSE) SELECT length(x), date_trunc('minute', y) FROM ak;
    Batch Format: postgres
    Kernel Steps: 2
    Fallback Steps: 0
-   Source: the slot path
+   Source: heap's pages
 (6 rows)
 
 SELECT agg_check($$SELECT x, length(x), char_length(x), character_length(x), octet_length(x),
@@ -682,15 +682,15 @@ SET parallel_tuple_cost = 0;
 SET min_parallel_table_scan_size = 0;
 SET max_parallel_workers_per_gather = 2;
 EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n), avg(f) FROM at GROUP BY k;
-                QUERY PLAN                 
--------------------------------------------
+                  QUERY PLAN                   
+-----------------------------------------------
  Vec Finalize HashAggregate
    Group Key: k
    ->  Gather
          Workers Planned: 2
          ->  Vec Partial HashAggregate
                Group Key: k
-               ->  Parallel Seq Scan on at
+               ->  Parallel Vec Seq Scan on at
 (7 rows)
 
 SELECT agg_check('SELECT k, count(*), sum(b), avg(b), sum(n), avg(n), min(t), max(d), bool_or(bo) FROM at GROUP BY k');
@@ -706,6 +706,178 @@ SELECT agg_check($$SELECT count(*), sum(n), round(avg(f)::numeric, 10), round(va
  same, VecAgg
 (1 row)
 
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+-- H5: the final stage in each participant too, below the Gather, over a
+-- VecRepartition that deals the partial groups out by their keys' hash
+-- (exec/vecrepart.c): the Gather receives final groups only.  A group's
+-- partial states all meet in one partition, whichever participants made
+-- them: sums of integers and numerics are the same bits.
+CREATE TABLE ah AS
+  SELECT g AS id, (g::int8 * 7919 % 40000)::int AS k, (g % 13)::numeric(10,2) / 4 AS n,
+         'v' || (g % 25000) AS t, date '2020-01-01' + (g % 100) AS d
+  FROM generate_series(1, 120000) g;
+ANALYZE ah;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0.01;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM ah GROUP BY k;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Gather
+   Workers Planned: 2
+   ->  Vec Finalize HashAggregate
+         Group Key: k
+         ->  Parallel Vec Repartition
+               Partition Key: k
+               ->  Vec Partial HashAggregate
+                     Group Key: k
+                     ->  Parallel Vec Seq Scan on ah
+(9 rows)
+
+SELECT agg_check('SELECT k, count(*), sum(id), sum(n), max(t), min(d) FROM ah GROUP BY k');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT t, k % 3, count(*), sum(n) FROM ah GROUP BY 1, 2 HAVING count(*) > 1');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'Repartition|^ *Partitions:');
+                          agg_explain                           
+----------------------------------------------------------------
+         ->  Parallel Vec Repartition (actual rows=N.N loops=N)
+               Partitions: N
+(2 rows)
+
+-- ordered: sorted in each participant too, under a Gather Merge
+EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM ah GROUP BY k ORDER BY 3 DESC, 1;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Gather Merge
+   Workers Planned: 2
+   ->  Vec Sort
+         Sort Key: (sum(n)) DESC, k
+         ->  Vec Finalize HashAggregate
+               Group Key: k
+               ->  Parallel Vec Repartition
+                     Partition Key: k
+                     ->  Vec Partial HashAggregate
+                           Group Key: k
+                           ->  Parallel Vec Seq Scan on ah
+(11 rows)
+
+SELECT agg_check('SELECT k, count(*), sum(n) FROM ah GROUP BY k ORDER BY 3 DESC, 1 LIMIT 7 OFFSET 3');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+-- no worker launched: the leader writes every group, and reads them
+SET max_parallel_workers = 0;
+SELECT agg_check('SELECT k, count(*), sum(id), sum(n) FROM ah GROUP BY k');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET max_parallel_workers;
+-- the plan run serially, as a SQL function's last query runs a row at a
+-- time (functions.c): no DSM, and the node passes its child's groups on.
+-- The function's plan is cached at its first call, in force mode.
+CREATE FUNCTION ah_total() RETURNS numeric LANGUAGE sql
+  AS 'SELECT sum(c * s) FROM (SELECT k, count(*) c, sum(n) s FROM ah GROUP BY k) x';
+EXPLAIN (COSTS OFF) SELECT sum(c * s) FROM (SELECT k, count(*) c, sum(n) s FROM ah GROUP BY k) x;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Vec Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Vec Partial Aggregate
+               ->  Subquery Scan on x
+                     ->  Vec Finalize HashAggregate
+                           Group Key: k
+                           ->  Parallel Vec Repartition
+                                 Partition Key: k
+                                 ->  Vec Partial HashAggregate
+                                       Group Key: k
+                                       ->  Parallel Vec Seq Scan on ah
+(12 rows)
+
+SELECT ah_total();
+          ah_total           
+-----------------------------
+ 539996.25000000000000000000
+(1 row)
+
+SET vexec.mode = off;
+SELECT sum(c * s) FROM (SELECT k, count(*) c, sum(n) s FROM ah GROUP BY k) x;
+             sum             
+-----------------------------
+ 539996.25000000000000000000
+(1 row)
+
+SET vexec.mode = force;
+DROP FUNCTION ah_total();
+-- rescanned: the Gather a nested loop's inner, the partitions made again
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+SET enable_memoize = off;
+EXPLAIN (COSTS OFF) WITH o AS MATERIALIZED (SELECT i FROM generate_series(0, 3) i)
+SELECT o.i, count(x.k), sum(x.s) FROM o LEFT JOIN (SELECT k, count(*) c, sum(n) s FROM ah GROUP BY k) x
+  ON x.c >= o.i + 2 GROUP BY o.i;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Vec HashAggregate
+   Group Key: i
+   CTE o
+     ->  Function Scan on generate_series i
+   ->  Nested Loop Left Join
+         Join Filter: (x.c >= (o.i + 2))
+         ->  CTE Scan on o
+         ->  Gather
+               Workers Planned: 2
+               ->  Subquery Scan on x
+                     ->  Vec Finalize HashAggregate
+                           Group Key: k
+                           ->  Parallel Vec Repartition
+                                 Partition Key: k
+                                 ->  Vec Partial HashAggregate
+                                       Group Key: k
+                                       ->  Parallel Vec Seq Scan on ah
+(17 rows)
+
+SELECT agg_check($$WITH o AS MATERIALIZED (SELECT i FROM generate_series(0, 3) i)
+SELECT o.i, count(x.k), sum(x.s) FROM o LEFT JOIN (SELECT k, count(*) c, sum(n) s FROM ah GROUP BY k) x
+  ON x.c >= o.i + 2 GROUP BY o.i$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
+RESET enable_memoize;
+-- vexec.enable_repartition off: the plans without it
+SET vexec.enable_repartition = off;
+EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM ah GROUP BY k;
+        QUERY PLAN        
+--------------------------
+ Vec HashAggregate
+   Group Key: k
+   ->  Vec Seq Scan on ah
+(3 rows)
+
+RESET vexec.enable_repartition;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
@@ -828,8 +1000,8 @@ EXPLAIN (VEXEC, COSTS OFF) SELECT k, count(DISTINCT s), avg(f) FROM at GROUP BY 
          Sort Key: k, s
          ->  Vec Seq Scan on at
  Vexec: mode force, format postgres
-   VecScan on at: added (forced: the relation's scan, beside its partial paths)
-     source: the slot path; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
+   VecScan on at: added (forced: the relation's scans, partial ones too)
+     source: heap's pages; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
    VecAgg on GROUP BY: not possible (a float aggregate beside the DISTINCT one, whose sums a second stage would add in another order)
 (9 rows)
 
@@ -864,5 +1036,5 @@ EXPLAIN (COSTS OFF) SELECT k, count(*) FROM at GROUP BY k;
 DROP FUNCTION agg_check(text);
 DROP FUNCTION agg_error(text);
 DROP FUNCTION agg_explain(text, text);
-DROP TABLE at, ae, an, ak;
+DROP TABLE at, ae, an, ak, ah;
 DROP SEQUENCE aseq;

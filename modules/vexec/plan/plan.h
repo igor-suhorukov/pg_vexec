@@ -13,8 +13,8 @@
  * EXPLAIN's vexec option.
  *
  * In V1 the scan is vectorized: VecScan, and ORCA's Results over it as
- * VecResult; in V2 aggregation, VecAgg; in V3 hash joins, VecHashJoin.
- * Sorts are still only costed and recorded (§5).
+ * VecResult; in V2 aggregation, VecAgg; in V3 hash joins, VecHashJoin; in
+ * V4 sorts, VecSort, and scans in parallel (§5).
  *
  *-------------------------------------------------------------------------
  */
@@ -91,6 +91,7 @@ typedef struct VexecPlanState
 								 * added as paths: what
 								 * vexec.debug_require_vector asks of a plan */
 	bool		joins_built;	/* a VecHashJoin's plan was made */
+	bool		sorts_built;	/* a VecSort's path was added */
 } VexecPlanState;
 
 /* The most alternatives one statement records. */
@@ -117,7 +118,12 @@ extern void vexec_cost_agg(PlannerInfo *root, Path *rowpath, Path *input,
 						   int naggs_kernel, double numgroups, VexecCost *cost);
 extern void vexec_cost_plan_agg(Plan *agg, int ngroupcols, int naggs, int naggs_kernel,
 								bool input_vector, VexecCost *cost);
-extern void vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, VexecCost *cost);
+extern void vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, bool input_vector,
+							VexecCost *cost);
+extern void vexec_cost_plan_sort(Plan *sort, bool input_vector, VexecCost *cost);
+extern void vexec_cost_bitmapscan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
+								  const VexecSteps *quals, const VexecSteps *target,
+								  VexecCost *cost);
 extern void vexec_cost_plan_scan(Relation rel, const VexecSteps *quals,
 								 const VexecSteps *target, int ncols_in, int ncols_out,
 								 double rows, VexecCost *cost);
@@ -145,6 +151,7 @@ extern void vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel,
 							   VexecPlanState *ps, const char *target_name);
 extern const char *vexec_orca_agg_refusal(Agg *agg);
 extern Plan *vexec_build_agg_from_agg(Agg *agg);
+extern Agg *vexec_agg_describe(CustomScan *cscan);
 
 /* join.c */
 extern bool vexec_is_vector_path(Path *path);
@@ -156,9 +163,22 @@ extern const char *vexec_orca_hashjoin_refusal(HashJoin *hj);
 extern void vexec_join_finish_plan(PlannedStmt *pstmt);
 extern Plan *vexec_build_hashjoin_from_hashjoin(HashJoin *hj);
 
+/* sort.c */
+extern void vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel,
+								RelOptInfo *output_rel, VexecPlanState *ps,
+								const char *target_name);
+extern const char *vexec_orca_sort_refusal(Sort *sort);
+extern Plan *vexec_build_sort_from_sort(Sort *sort);
+extern Plan *vexec_unbuild_sort(CustomScan *cscan);
+extern Sort *vexec_sort_describe(CustomScan *cscan);
+extern void vexec_orca_limit_bound(Limit *limit);
+
 /* build.c */
 extern Path *vexec_scan_path(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 							 const VexecCost *cost);
+extern Path *vexec_bitmapscan_path(PlannerInfo *root, RelOptInfo *rel, BitmapHeapPath *bp,
+								   const VexecSteps *quals, const VexecSteps *target);
+extern Plan *vexec_build_bitmapscan_from_bitmapscan(BitmapHeapScan *bhs);
 extern Plan *vexec_build_scan_from_seqscan(SeqScan *seqscan);
 extern Plan *vexec_build_result_from_result(Result *result);
 

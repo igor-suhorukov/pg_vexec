@@ -14,14 +14,14 @@
 -                     Subplans Removed: 6
 -               ->  Parallel Append (actual rows=N loops=N)
 -         ->  Partial Aggregate (actual rows=N loops=N)
-+                           explain_parallel_append                            
-+------------------------------------------------------------------------------
++                             explain_parallel_append                              
++----------------------------------------------------------------------------------
 +                     Filter: ((a >= $1) AND (a <= $2) AND (b < 4))
 +                     Filter: ((a >= $1) AND (a <= $2) AND (b < 4))
 +                     Filter: ((a >= $1) AND (a <= $2) AND (b < 4))
-+               ->  Parallel Seq Scan on ab_a2_b1 ab_1 (actual rows=N loops=N)
-+               ->  Parallel Seq Scan on ab_a2_b2 ab_2 (actual rows=N loops=N)
-+               ->  Parallel Seq Scan on ab_a2_b3 ab_3 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a2_b1 ab_1 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a2_b2 ab_2 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a2_b3 ab_3 (actual rows=N loops=N)
 +               Subplans Removed: 6
 +         ->  Parallel Append (actual rows=N loops=N)
           Workers Launched: N
@@ -49,14 +49,14 @@
 -                     Subplans Removed: 6
 -               ->  Parallel Append (actual rows=N loops=N)
 -         ->  Partial Aggregate (actual rows=N loops=N)
-+                           explain_parallel_append                            
-+------------------------------------------------------------------------------
++                             explain_parallel_append                              
++----------------------------------------------------------------------------------
 +                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
 +                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
 +                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
-+               ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
-+               ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
-+               ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
 +               Subplans Removed: 6
 +         ->  Parallel Append (actual rows=N loops=N)
           Workers Launched: N
@@ -87,20 +87,20 @@
 -                     Subplans Removed: 3
 -               ->  Parallel Append (actual rows=N loops=N)
 -         ->  Partial Aggregate (actual rows=N loops=N)
-+                           explain_parallel_append                            
-+------------------------------------------------------------------------------
++                             explain_parallel_append                              
++----------------------------------------------------------------------------------
 +                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
 +                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
 +                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
 +                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
 +                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
 +                     Filter: ((b < 4) AND (a = ANY (ARRAY[$1, $2, $3])))
-+               ->  Parallel Seq Scan on ab_a2_b1 ab_1 (actual rows=N loops=N)
-+               ->  Parallel Seq Scan on ab_a2_b2 ab_2 (actual rows=N loops=N)
-+               ->  Parallel Seq Scan on ab_a2_b3 ab_3 (actual rows=N loops=N)
-+               ->  Parallel Seq Scan on ab_a3_b1 ab_4 (actual rows=N loops=N)
-+               ->  Parallel Seq Scan on ab_a3_b2 ab_5 (actual rows=N loops=N)
-+               ->  Parallel Seq Scan on ab_a3_b3 ab_6 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a2_b1 ab_1 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a2_b2 ab_2 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a2_b3 ab_3 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a3_b1 ab_4 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a3_b2 ab_5 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a3_b3 ab_6 (actual rows=N loops=N)
 +               Subplans Removed: 3
 +         ->  Parallel Append (actual rows=N loops=N)
           Workers Launched: N
@@ -135,6 +135,17 @@
 +(7 rows)
  
  -- Test Parallel Append with PARAM_EXEC Params
+@@ -1101,7 +1097,7 @@
+                      Filter: ((b = 2) AND ((a = (InitPlan expr_1).col1) OR (a = (InitPlan expr_2).col1)))
+                      Filter: ((b = 2) AND ((a = (InitPlan expr_1).col1) OR (a = (InitPlan expr_2).col1)))
+-               ->  Parallel Seq Scan on ab_a1_b2 ab_1 (actual rows=N loops=N)
+-               ->  Parallel Seq Scan on ab_a2_b2 ab_2 (never executed)
+-               ->  Parallel Seq Scan on ab_a3_b2 ab_3 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a1_b2 ab_1 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on ab_a2_b2 ab_2 (never executed)
++               ->  Parallel Vec Seq Scan on ab_a3_b2 ab_3 (actual rows=N loops=N)
+          ->  Parallel Append (actual rows=N loops=N)
+          Workers Launched: N
 @@ -1112,6 +1108,6 @@
     InitPlan expr_1
     InitPlan expr_2
@@ -167,8 +178,8 @@
 -                           ->  Index Scan using ab_a3_b1_a_idx on ab_a3_b1 ab_7 (never executed)
 -                           ->  Index Scan using ab_a3_b2_a_idx on ab_a3_b2 ab_8 (never executed)
 -                           ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
-+                              explain_parallel_append                               
-+------------------------------------------------------------------------------------
++                                explain_parallel_append                                 
++----------------------------------------------------------------------------------------
                             Filter: (a = ANY ('{0,0,1}'::integer[]))
 -                     ->  Append (actual rows=N loops=N)
 -                     ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
@@ -180,16 +191,16 @@
 - Finalize Aggregate (actual rows=N loops=N)
 - Optimizer: Postgres query optimizer
 -(28 rows)
-+                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on lprt_a a (never executed)
++                     ->  Parallel Vec Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on lprt_a a (never executed)
 +                     Workers Launched: N
 +                     Workers Planned: 1
 +               ->  Gather (never executed)
@@ -227,8 +238,8 @@
 -                           ->  Index Scan using ab_a3_b1_a_idx on ab_a3_b1 ab_7 (never executed)
 -                           ->  Index Scan using ab_a3_b2_a_idx on ab_a3_b2 ab_8 (never executed)
 -                           ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
-+                              explain_parallel_append                               
-+------------------------------------------------------------------------------------
++                                explain_parallel_append                                 
++----------------------------------------------------------------------------------------
                             Filter: (a = ANY ('{0,0,1}'::integer[]))
 -                     ->  Append (actual rows=N loops=N)
 -                     ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
@@ -240,16 +251,16 @@
 - Finalize Aggregate (actual rows=N loops=N)
 - Optimizer: Postgres query optimizer
 -(28 rows)
-+                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on lprt_a a (never executed)
++                     ->  Parallel Vec Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on lprt_a a (never executed)
 +                     Workers Launched: N
 +                     Workers Planned: 1
 +               ->  Gather (never executed)
@@ -286,8 +297,8 @@
 -                           ->  Index Scan using ab_a3_b1_a_idx on ab_a3_b1 ab_7 (actual rows=N loops=N)
 -                           ->  Index Scan using ab_a3_b2_a_idx on ab_a3_b2 ab_8 (actual rows=N loops=N)
 -                           ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (actual rows=N loops=N)
-+                              explain_parallel_append                               
-+------------------------------------------------------------------------------------
++                                explain_parallel_append                                 
++----------------------------------------------------------------------------------------
                             Filter: (a = ANY ('{1,0,3}'::integer[]))
 -                     ->  Append (actual rows=N loops=N)
 -                     ->  Parallel Seq Scan on lprt_a a (actual rows=N loops=N)
@@ -299,16 +310,16 @@
 - Finalize Aggregate (actual rows=N loops=N)
 - Optimizer: Postgres query optimizer
 -(28 rows)
-+                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on lprt_a a (never executed)
++                     ->  Parallel Vec Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on lprt_a a (never executed)
 +                     Workers Launched: N
 +                     Workers Planned: 1
 +               ->  Gather (never executed)
@@ -344,8 +355,8 @@
 -                           ->  Index Scan using ab_a3_b1_a_idx on ab_a3_b1 ab_7 (never executed)
 -                           ->  Index Scan using ab_a3_b2_a_idx on ab_a3_b2 ab_8 (never executed)
 -                           ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
-+                              explain_parallel_append                               
-+------------------------------------------------------------------------------------
++                                explain_parallel_append                                 
++----------------------------------------------------------------------------------------
                             Filter: (a = ANY ('{1,0,0}'::integer[]))
 -                           Rows Removed by Filter: N
 -                     ->  Append (actual rows=N loops=N)
@@ -358,16 +369,16 @@
 - Finalize Aggregate (actual rows=N loops=N)
 - Optimizer: Postgres query optimizer
 -(29 rows)
-+                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on lprt_a a (never executed)
++                     ->  Parallel Vec Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on lprt_a a (never executed)
 +                     Workers Launched: N
 +                     Workers Planned: 1
 +               ->  Gather (never executed)
@@ -404,8 +415,8 @@
 -                           ->  Index Scan using ab_a3_b1_a_idx on ab_a3_b1 ab_7 (never executed)
 -                           ->  Index Scan using ab_a3_b2_a_idx on ab_a3_b2 ab_8 (never executed)
 -                           ->  Index Scan using ab_a3_b3_a_idx on ab_a3_b3 ab_9 (never executed)
-+                              explain_parallel_append                               
-+------------------------------------------------------------------------------------
++                                explain_parallel_append                                 
++----------------------------------------------------------------------------------------
                             Filter: (a = ANY ('{1,0,0}'::integer[]))
 -                           Rows Removed by Filter: N
 -                     ->  Append (actual rows=N loops=N)
@@ -418,16 +429,16 @@
 - Finalize Aggregate (actual rows=N loops=N)
 - Optimizer: Postgres query optimizer
 -(29 rows)
-+                     ->  Parallel Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
-+                     ->  Parallel Seq Scan on lprt_a a (never executed)
++                     ->  Parallel Vec Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b1 ab_4 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b2 ab_5 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a2_b3 ab_6 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b1 ab_7 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
++                     ->  Parallel Vec Seq Scan on lprt_a a (never executed)
 +                     Workers Launched: N
 +                     Workers Planned: 1
 +               ->  Gather (never executed)
@@ -448,14 +459,14 @@
  select explain_parallel_append('select * from listp where a = (select 1);');
 -                       explain_parallel_append                        
 -----------------------------------------------------------------------
-+                        explain_parallel_append                         
-+------------------------------------------------------------------------
++                         explain_parallel_append                          
++--------------------------------------------------------------------------
                 Filter: (a = (InitPlan expr_1).col1)
                 Filter: (a = (InitPlan expr_1).col1)
 -         ->  Parallel Seq Scan on listp_12_2 listp_2 (never executed)
 -         ->  Seq Scan on listp_12_1 listp_1 (actual rows=N loops=N)
++         ->  Parallel Vec Seq Scan on listp_12_2 listp_2 (never executed)
 +         ->  Vec Seq Scan on listp_12_1 listp_1 (actual rows=N loops=N)
-+         ->  Vec Seq Scan on listp_12_2 listp_2 (never executed)
       ->  Result (actual rows=N loops=N)
     ->  Parallel Append (actual rows=N loops=N)
 @@ -2098,6 +2067,6 @@
@@ -463,8 +474,8 @@
  select * from listp where a = (select 2);');
 -                              explain_parallel_append                              
 ------------------------------------------------------------------------------------
-+                           explain_parallel_append                            
-+------------------------------------------------------------------------------
++                                explain_parallel_append                                
++---------------------------------------------------------------------------------------
                       Filter: (a = (InitPlan expr_1).col1)
                       Filter: (a = (InitPlan expr_1).col1)
 @@ -2106,8 +2075,8 @@
@@ -474,10 +485,10 @@
 -               ->  Parallel Seq Scan on listp_12_2 listp_5 (never executed)
 -               ->  Seq Scan on listp_12_1 listp_1 (never executed)
 -               ->  Seq Scan on listp_12_1 listp_4 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on listp_12_2 listp_2 (actual rows=N loops=N)
++               ->  Parallel Vec Seq Scan on listp_12_2 listp_5 (never executed)
 +               ->  Vec Seq Scan on listp_12_1 listp_1 (never executed)
 +               ->  Vec Seq Scan on listp_12_1 listp_4 (actual rows=N loops=N)
-+               ->  Vec Seq Scan on listp_12_2 listp_2 (actual rows=N loops=N)
-+               ->  Vec Seq Scan on listp_12_2 listp_5 (never executed)
                 InitPlan expr_1
                 InitPlan expr_2
 @@ -2250,80 +2219,80 @@

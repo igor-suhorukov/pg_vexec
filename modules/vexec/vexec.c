@@ -47,10 +47,14 @@ int			vexec_min_rows = 10000;
 
 /* per node kind */
 bool		vexec_enable_scan = true;
+bool		vexec_heap_page_reader = true;
+bool		vexec_enable_bitmapscan = true;
 bool		vexec_enable_agg = true;
+bool		vexec_enable_repartition = true;
 bool		vexec_aggregate_statistics = true;
 bool		vexec_enable_hashjoin = true;
 bool		vexec_enable_sort = true;
+bool		vexec_enable_running_bound = true;
 bool		vexec_enable_window = true;
 bool		vexec_enable_insert = true;
 bool		vexec_orca = true;
@@ -226,9 +230,26 @@ define_settings(void)
 							 "Enables vector scans.",
 							 NULL, &vexec_enable_scan, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.heap_page_reader",
+							 "Reads heap tables a page at a time into a vector scan's batches.",
+							 "Off, a vector scan of a heap table reads it a row at a time, "
+							 "through the table's slots, as it reads any other access method's.",
+							 &vexec_heap_page_reader, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_bitmapscan",
+							 "Enables vector bitmap heap scans.",
+							 "The pages a bitmap index scan selects, read a batch at a time.",
+							 &vexec_enable_bitmapscan, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_agg",
 							 "Enables vector aggregation.",
 							 NULL, &vexec_enable_agg, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_repartition",
+							 "Enables parallel vector aggregation that finalizes in every participant.",
+							 "Each participant's partial groups are dealt out among them by their keys' hash, "
+							 "and each finalizes its own; the Gather receives final groups.",
+							 &vexec_enable_repartition, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.aggregate_statistics",
 							 "Lets a batch source answer a vector aggregate from the statistics it keeps.",
@@ -243,6 +264,12 @@ define_settings(void)
 	DefineCustomBoolVariable("vexec.enable_sort",
 							 "Enables vector sorts.",
 							 NULL, &vexec_enable_sort, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_running_bound",
+							 "Lets a bounded vector sort bound the vector scan below it.",
+							 "Once the sort holds its rows, the scan drops a row whose first sort key "
+							 "is past the first key of the sort's last row, which the sort would drop.",
+							 &vexec_enable_running_bound, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_window",
 							 "Enables vector hashed window aggregation, which only ORCA plans.",

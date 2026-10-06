@@ -15,9 +15,11 @@
  *	build	each node of the translated plan, children first, before its
  *			Motions are checked and its slice table made: a SeqScan becomes
  *			a VecScan, a Result over a vector node a VecResult, a plain or
- *			hashed Agg of any split a VecAgg (agg.c), and a HashJoin with its
- *			Hash a VecHashJoin (join.c), where the oracle accepts them and
- *			the mode chooses them;
+ *			hashed Agg of any split a VecAgg (agg.c), a HashJoin with its
+ *			Hash a VecHashJoin (join.c), and a Sort a VecSort (sort.c),
+ *			where the oracle accepts them and the mode chooses them; a Limit
+ *			of constants over a VecSort bounds it, and a merge join keeps
+ *			its inner side's Sort, which it marks and restores;
  *	end		the plan check, the reasons for EXPLAIN (VEXEC), and
  *			vexec.debug_require_vector.
  *
@@ -57,6 +59,7 @@
 static void *orca_begin(Query *parse, int cursorOptions, struct ExplainState *es);
 static Plan *orca_build(void *state, Plan *plan, List *rtable);
 static void orca_end(void *state, PlannedStmt *stmt);
+static bool orca_describe(Plan *plan, GpOrcaVecNode *vn);
 
 static const GpOrcaVecRoutine orca_routine = {
 	.size = sizeof(GpOrcaVecRoutine),
@@ -65,6 +68,7 @@ static const GpOrcaVecRoutine orca_routine = {
 	.begin_statement = orca_begin,
 	.build_node = orca_build,
 	.end_statement = orca_end,
+	.describe_node = orca_describe,
 };
 
 void
@@ -175,7 +179,9 @@ orca_scan(VexecPlanState *ps, SeqScan *seq, List *rtable)
 	}
 
 	rel = table_open(rte->relid, NoLock);
-	(void) vexec_source_for(rel, &how);
+	if (vexec_source_for(rel, &how) == NULL && vexec_heap_page_reader &&
+		vexec_heap_reader_possible(rel))
+		how = "heap's pages";
 	if (ps->mode != VEXEC_MODE_FORCE && rel->rd_rel->reltuples < vexec_min_rows)
 	{
 		vexec_alt_refuse(ps, alt, psprintf("%.0f rows, fewer than vexec.min_rows",
@@ -193,6 +199,62 @@ orca_scan(VexecPlanState *ps, SeqScan *seq, List *rtable)
 	if (!chosen(ps, &cost))
 		return NULL;
 	return vexec_build_scan_from_seqscan(seq);
+}
+
+/*
+ * A BitmapHeapScan ORCA's translator built, and its VecBitmapHeapScan
+ * (H9): a heap table's pages through heap's page reader, any other
+ * access method's rows through its bitmap callback.
+ */
+static Plan *
+orca_bitmapscan(VexecPlanState *ps, BitmapHeapScan *bhs, List *rtable)
+{
+	Scan	   *scan = &bhs->scan;
+	RangeTblEntry *rte;
+	VexecAlt   *alt = NULL;
+	Bitmapset  *attrs = NULL;
+	VexecSteps	steps;
+	VexecCost	cost;
+	const char *refusal = NULL;
+
+	if (scan->scanrelid == 0 || scan->scanrelid > list_length(rtable))
+		return NULL;
+	rte = rt_fetch(scan->scanrelid, rtable);
+	if (ps->record)
+		alt = vexec_alt_record(ps, "VecBitmapHeapScan", rte->eref ? rte->eref->aliasname : "?",
+							   NULL, NULL);
+	pull_varattnos((Node *) scan->plan.targetlist, scan->scanrelid, &attrs);
+	pull_varattnos((Node *) scan->plan.qual, scan->scanrelid, &attrs);
+	pull_varattnos((Node *) bhs->bitmapqualorig, scan->scanrelid, &attrs);
+	if (!vexec_enable_bitmapscan)
+		refusal = "vexec.enable_bitmapscan is off";
+	else if (rte->rtekind != RTE_RELATION || get_rel_relkind(rte->relid) != RELKIND_RELATION)
+		refusal = "not a table";
+	else if (scan->plan.parallel_aware)
+		refusal = "a parallel bitmap heap scan";
+	else if (reads_other_system_column(attrs))
+		refusal = "a system column other than ctid and tableoid";
+	if (refusal != NULL)
+	{
+		vexec_alt_refuse(ps, alt, refusal);
+		return NULL;
+	}
+	memset(&steps, 0, sizeof(steps));
+	vexec_oracle_exprs(NULL, scan->plan.qual, &steps);
+	vexec_oracle_exprs(NULL, scan->plan.targetlist, &steps);
+	vexec_oracle_exprs(NULL, bhs->bitmapqualorig, &steps);
+	if (steps.refusal)
+	{
+		vexec_alt_refuse(ps, alt, steps.refusal);
+		return NULL;
+	}
+	memset(&cost, 0, sizeof(cost));
+	cost.rows = scan->plan.plan_rows;
+	vexec_alt_costed(ps, alt, &cost, "ORCA's bitmap heap scan");
+	ps->npossible++;
+	if (!chosen(ps, NULL))
+		return NULL;
+	return vexec_build_bitmapscan_from_bitmapscan(bhs);
 }
 
 /* A Result over a vector node, and its VecResult. */
@@ -372,6 +434,69 @@ orca_hashjoin(VexecPlanState *ps, HashJoin *hj)
 	return vexec_build_hashjoin_from_hashjoin(hj);
 }
 
+/* A Sort ORCA's translator built, and its VecSort (§3.8). */
+static Plan *
+orca_sort(VexecPlanState *ps, Sort *sort)
+{
+	VexecAlt   *alt = NULL;
+	VexecSteps	steps;
+	VexecCost	cost;
+	const char *refusal;
+	Plan	   *child = sort->plan.lefttree;
+	bool		child_batches;
+
+	if (ps->record)
+		alt = vexec_alt_record(ps, "VecSort", "ORCA's sort", NULL, NULL);
+	if (!vexec_enable_sort)
+	{
+		vexec_alt_refuse(ps, alt, "vexec.enable_sort is off");
+		return NULL;
+	}
+	if ((refusal = vexec_orca_sort_refusal(sort)) != NULL)
+	{
+		vexec_alt_refuse(ps, alt, refusal);
+		return NULL;
+	}
+	if (ps->mode != VEXEC_MODE_FORCE && child->plan_rows < vexec_min_rows)
+	{
+		vexec_alt_refuse(ps, alt, psprintf("%.0f input rows, fewer than vexec.min_rows",
+										   child->plan_rows));
+		return NULL;
+	}
+	memset(&steps, 0, sizeof(steps));
+	vexec_oracle_exprs(NULL, sort->plan.targetlist, &steps);
+	if (steps.refusal)
+	{
+		vexec_alt_refuse(ps, alt, steps.refusal);
+		return NULL;
+	}
+	child_batches = vexec_is_vector_node(child) &&
+		((CustomScan *) child)->methods != vexec_agg_methods();
+	vexec_cost_plan_sort(&sort->plan, child_batches, &cost);
+	vexec_alt_costed(ps, alt, &cost,
+					 psprintf("ORCA's sort; %d sort keys, over %s", sort->numCols,
+							  child_batches ? "a vector node's batches" : "rows"));
+	ps->npossible++;
+	if (!chosen(ps, &cost))
+		return NULL;
+	return vexec_build_sort_from_sort(sort);
+}
+
+/*
+ * A merge join marks and restores its inner side (nodeMergejoin.c), which a
+ * vector node does not do (§3.3.7): a VecSort the front end made of the
+ * Sort there is made the Sort again.
+ */
+static void
+orca_mergejoin(MergeJoin *mj)
+{
+	Plan	   *inner = mj->join.plan.righttree;
+
+	if (inner != NULL && IsA(inner, CustomScan) &&
+		((CustomScan *) inner)->methods == vexec_sort_methods())
+		mj->join.plan.righttree = vexec_unbuild_sort((CustomScan *) inner);
+}
+
 static Plan *
 orca_build(void *state, Plan *plan, List *rtable)
 {
@@ -389,9 +514,81 @@ orca_build(void *state, Plan *plan, List *rtable)
 			return orca_agg(ps, (Agg *) plan);
 		case T_HashJoin:
 			return orca_hashjoin(ps, (HashJoin *) plan);
+		case T_Sort:
+			return orca_sort(ps, (Sort *) plan);
+		case T_BitmapHeapScan:
+			return orca_bitmapscan(ps, (BitmapHeapScan *) plan, rtable);
+		case T_Limit:
+			vexec_orca_limit_bound((Limit *) plan);
+			return NULL;
+		case T_MergeJoin:
+			orca_mergejoin((MergeJoin *) plan);
+			return NULL;
 		default:
 			return NULL;
 	}
+}
+
+/*
+ * What a vector node stands for (gp_orca_vec.h, from its minor version 1),
+ * for the port's passes over the finished plan that look at nodes by their
+ * kind: M8's parallel.c, which puts Gathers over the scans a segment's
+ * fragment can split among its workers, and their aggregations in three
+ * stages (§3.10, V4); and gp_core's bound_gathers(), on PostgreSQL's
+ * planner's plans too, which sends a nearest-neighbour search's ORDER BY and
+ * LIMIT to the segments through the sort below a Limit.  A VecScan is a
+ * sequential scan, which shares its table among a Gather's participants
+ * once parallel-aware (exec/vecscan.c); a VecResult a projection; a
+ * VecHashJoin a hash join, its inner side read whole by each participant;
+ * a VecAgg the Agg it was made of; a VecSort the Sort of its keys over its
+ * child.
+ */
+static bool
+orca_describe(Plan *plan, GpOrcaVecNode *vn)
+{
+	CustomScan *cscan;
+
+	if (!vexec_is_vector_node(plan))
+		return false;
+	cscan = (CustomScan *) plan;
+	memset(vn, 0, sizeof(GpOrcaVecNode));
+	if (cscan->methods == vexec_scan_methods())
+		vn->kind = GP_ORCA_VEC_SEQSCAN;
+	else if (cscan->methods == vexec_bitmapscan_methods())
+		vn->kind = GP_ORCA_VEC_OTHER;	/* a scan of its bitmap's pages */
+	else if (cscan->methods == vexec_result_methods())
+		vn->kind = GP_ORCA_VEC_RESULT;
+	else if (cscan->methods == vexec_hashjoin_methods())
+	{
+		VexecJoinPlan jp;
+
+		vexec_join_plan_decode(cscan, &jp);
+		vn->kind = GP_ORCA_VEC_HASHJOIN;
+		vn->jointype = jp.jointype;
+		vn->nhashclauses = list_length(jp.hashoperators);
+		vn->exprs = cscan->custom_exprs;
+	}
+	else if (cscan->methods == vexec_agg_methods())
+	{
+		vn->kind = GP_ORCA_VEC_AGG;
+		vn->agg = vexec_agg_describe(cscan);
+	}
+	else if (cscan->methods == vexec_sort_methods())
+	{
+		ListCell   *lc;
+		int			i;
+
+		vn->kind = GP_ORCA_VEC_SORT;
+		vn->sort = vexec_sort_describe(cscan);
+		/* its keys, the expressions it evaluates beyond its own */
+		for (i = 0; i < vn->sort->numCols; i++)
+			foreach(lc, vn->sort->plan.targetlist)
+				if (lfirst_node(TargetEntry, lc)->resno == vn->sort->sortColIdx[i])
+					vn->exprs = lappend(vn->exprs, lfirst_node(TargetEntry, lc)->expr);
+	}
+	else
+		vn->kind = GP_ORCA_VEC_OTHER;
+	return true;
 }
 
 /* ORCA's plan is made: the plan check, the reasons, the debug requirement. */

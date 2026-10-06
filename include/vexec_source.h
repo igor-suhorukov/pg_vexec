@@ -46,7 +46,7 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		1	/* 1: aggregate */
+#define VEXEC_SOURCE_MINOR		2	/* 1: aggregate; 2: set_keys */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -235,6 +235,21 @@ typedef struct VexecSourceRoutine
 	 */
 	bool		(*aggregate) (void *state, int nreqs, const VexecSourceAgg *reqs,
 							  VexecSourceAggAnswer *answers, int64 *nrows);
+
+	/*
+	 * Optional, from minor version 2: keys the scan's rows are bounded by
+	 * as it runs, ANDed with VexecSourceSpec.keys and replacing the last
+	 * given -- a VecSort's running bound, "the first key at most the N-th
+	 * row's" (pg_vector_executor.md §3.14, H6), as a btree scan key of
+	 * BTLessEqualStrategyNumber or BTGreaterEqualStrategyNumber.  Pruning
+	 * only: from the next unit the source begins -- a file, a group -- it
+	 * may pass over one whose statistics show that none of its rows
+	 * satisfies them, and never a row of a unit it reads.  vexec gives them
+	 * only where passing a row over unread raises no error PostgreSQL would
+	 * raise, and only under a NULLS order a key's NULLs never satisfy.
+	 * Called between batches; the source copies what it keeps of them.
+	 */
+	void		(*set_keys) (void *state, int nkeys, const ScanKeyData *keys);
 } VexecSourceRoutine;
 
 /*

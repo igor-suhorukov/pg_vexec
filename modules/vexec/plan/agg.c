@@ -17,7 +17,15 @@
  *	the pair	a partial VecAgg (AGGSPLIT_INITIAL_SERIAL) over the input's
  *				cheapest partial path, into the partially grouped relation
  *				core made, under a Gather, and a final VecAgg
- *				(AGGSPLIT_FINAL_DESERIAL) over the Gather.
+ *				(AGGSPLIT_FINAL_DESERIAL) over the Gather;
+ *	partitioned	(H5, §3.14) the same pair with the final VecAgg in each
+ *				participant too, below the Gather, over a VecRepartition
+ *				that deals the partial groups out among the participants by
+ *				their keys' hash (exec/vecrepart.c): the Gather receives
+ *				final groups only, and each participant finalizes its own.
+ *				It is a partial path of the grouped relation as well, which
+ *				create_ordered_paths() sorts in each participant under a
+ *				Gather Merge, its LIMIT's bound too.
  *
  * In auto mode they compete in add_path by cost; in force mode they replace
  * the grouped relation's paths.  Explain mode records them.
@@ -38,6 +46,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#include <math.h>
 
 #include "catalog/pg_aggregate.h"
 #include "nodes/extensible.h"
@@ -83,6 +93,14 @@ static int	list_position_int(List *list, int value);
 static const CustomPathMethods vecagg_path_methods = {
 	.CustomName = VEXEC_AGG_NAME,
 	.PlanCustomPath = plan_vecagg,
+};
+
+static Plan *plan_vecrepart(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+							List *tlist, List *clauses, List *custom_plans);
+
+static const CustomPathMethods vecrepart_path_methods = {
+	.CustomName = VEXEC_REPART_NAME,
+	.PlanCustomPath = plan_vecrepart,
 };
 
 /* ---------------------------------------------------------------------
@@ -343,6 +361,87 @@ agg_path(PlannerInfo *root, RelOptInfo *rel, Path *input, PathTarget *target,
 								 makeInteger(info->distinct_ref));
 	cp->methods = &vecagg_path_methods;
 	return &cp->path;
+}
+
+/*
+ * A VecRepartition path over a partial VecAgg path (H5): parallel-aware,
+ * its rows each participant's share of the partial groups.  Each group is
+ * written once and read once (exec/vecrepart.c), at a tuple's cost each
+ * way and the pages it takes, after the whole input.
+ */
+static Path *
+repart_path(PlannerInfo *root, RelOptInfo *rel, Path *input, List *groupclause)
+{
+	CustomPath *cp = makeNode(CustomPath);
+	double		pages = ceil(input->rows * Max(input->pathtarget->width, 8) / BLCKSZ);
+	Cost		io = 2 * (cpu_tuple_cost * input->rows + seq_page_cost * pages);
+
+	(void) root;
+	cp->path.pathtype = T_CustomScan;
+	cp->path.parent = rel;
+	cp->path.pathtarget = input->pathtarget;
+	cp->path.param_info = NULL;
+	cp->path.parallel_aware = true;
+	cp->path.parallel_safe = true;
+	cp->path.parallel_workers = input->parallel_workers;
+	cp->path.rows = input->rows;
+	cp->path.disabled_nodes = input->disabled_nodes;
+	cp->path.startup_cost = input->total_cost + io + vexec_batch_setup_cost;
+	cp->path.total_cost = cp->path.startup_cost;
+	cp->path.pathkeys = NIL;
+	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+	cp->custom_paths = list_make1(input);
+	cp->custom_private = list_make1(groupclause);
+	cp->methods = &vecrepart_path_methods;
+	return &cp->path;
+}
+
+/*
+ * VecRepartition's plan: its keys the child's grouping columns, by their
+ * sortgrouprefs, with the grouping's equality operators; its scan tuple the
+ * child's row, which planner_shutdown_hook makes references to the child's
+ * columns (join.c).
+ */
+static Plan *
+plan_vecrepart(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+			   List *tlist, List *clauses, List *custom_plans)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	Plan	   *child = linitial(custom_plans);
+	List	   *groupclause = linitial(best_path->custom_private);
+	VexecRepartPlan plan;
+	List	   *scan_tlist = NIL;
+	ListCell   *lc;
+
+	(void) root;
+	(void) rel;
+	(void) clauses;
+	memset(&plan, 0, sizeof(plan));
+	foreach(lc, groupclause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle = get_sortgroupref_tle(sgc->tleSortGroupRef, child->targetlist);
+
+		plan.keycols = lappend_int(plan.keycols, tle->resno);
+		plan.eqops = lappend_oid(plan.eqops, sgc->eqop);
+		plan.collations = lappend_oid(plan.collations, exprCollation((Node *) tle->expr));
+	}
+	foreach(lc, child->targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		scan_tlist = lappend(scan_tlist, makeTargetEntry(copyObject(tle->expr),
+														 list_length(scan_tlist) + 1, NULL, false));
+	}
+	cscan->scan.plan.targetlist = tlist;
+	cscan->scan.plan.qual = NIL;
+	cscan->scan.plan.lefttree = child;
+	cscan->scan.scanrelid = 0;
+	cscan->flags = best_path->flags;
+	cscan->custom_scan_tlist = scan_tlist;
+	cscan->custom_private = vexec_repart_plan_encode(&plan);
+	cscan->methods = vexec_repart_methods();
+	return &cscan->scan.plan;
 }
 
 /* The partially grouped relation core made for this grouped one, if any. */
@@ -800,6 +899,36 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 			finfo.split = AGGSPLIT_FINAL_DESERIAL;
 			newpaths = lappend(newpaths, agg_path(root, output_rel, gather,
 												  output_rel->reltarget, &finfo, &fcost));
+
+			/*
+			 * H5: the final stage in each participant, over the partial
+			 * groups dealt out by their keys (above): a partial path of the
+			 * grouped relation, and the Gather of its final groups.
+			 */
+			if (strategy == AGG_HASHED && vexec_enable_repartition && groupclause != NIL)
+			{
+				Path	   *repart = repart_path(root, prel, partial, groupclause);
+				double		each = clamp_row_est(numgroups / Max(partial->parallel_workers, 1));
+				AggPath    *erow;
+				VexecCost	ecost;
+				Path	   *pfinal;
+				Path	   *gather2;
+				AggPathInfo einfo = finfo;
+
+				erow = create_agg_path(root, output_rel, repart, output_rel->reltarget, strategy,
+									   AGGSPLIT_FINAL_DESERIAL, groupclause, having, &fcosts, each);
+				vexec_cost_agg(root, &erow->path, repart, true, list_length(groupclause),
+							   nkeys_kernel, 0, each, &ecost);
+				einfo.numgroups = each;
+				pfinal = agg_path(root, output_rel, repart, output_rel->reltarget, &einfo, &ecost);
+				pfinal->parallel_safe = true;
+				pfinal->parallel_workers = partial->parallel_workers;
+				add_partial_path(output_rel, pfinal);
+				gather2 = (Path *) create_gather_path(root, output_rel, pfinal, output_rel->reltarget,
+													  NULL, &numgroups);
+				newpaths = lappend(newpaths, gather2);
+				ps->sorts_built = true; /* the scan tuple finished (join.c) */
+			}
 		}
 	}
 
@@ -1222,4 +1351,86 @@ vexec_build_agg_from_agg(Agg *agg)
 	cscan->custom_plans = NIL;
 	cscan->methods = vexec_agg_methods();
 	return &cscan->scan.plan;
+}
+
+/*
+ * The Agg a VecAgg of ORCA's plan stands for, for a pass over the finished
+ * plan that reads it (orca.c, describe_node): its strategy, split, keys and
+ * groups, and its target list and qual with each column of the scan tuple
+ * made what it is -- a key or a column the group keeps, of the child's
+ * output as OUTER_VAR, or an aggregate -- so that each entry keeps the
+ * VecAgg's resno and type.  A copy, never put in the plan.
+ */
+typedef struct DescribeContext
+{
+	VexecAggPlan *plan;
+	List	   *scan_tlist;
+} DescribeContext;
+
+static Node *
+describe_mutator(Node *node, DescribeContext *ctx)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var) && ((Var *) node)->varno == INDEX_VAR)
+	{
+		Var		   *var = (Var *) node;
+		int			col = var->varattno - 1;
+		int			kind;
+		int			src;
+
+		if (col < 0 || col >= list_length(ctx->plan->outkind))
+			elog(ERROR, "vexec: a VecAgg's column %d, of %d", var->varattno,
+				 list_length(ctx->plan->outkind));
+		kind = list_nth_int(ctx->plan->outkind, col);
+		src = list_nth_int(ctx->plan->outsrc, col);
+		if (kind == VEXEC_AGGCOL_AGG)
+			return copyObject(list_nth(ctx->plan->aggrefs, src));
+		else
+		{
+			Var		   *v = copyObject(var);
+
+			v->varno = OUTER_VAR;
+			v->varattno = kind == VEXEC_AGGCOL_KEY ?
+				list_nth_int(ctx->plan->keycols, src) : src;
+			return (Node *) v;
+		}
+	}
+	return expression_tree_mutator(node, describe_mutator, ctx);
+}
+
+Agg *
+vexec_agg_describe(CustomScan *cscan)
+{
+	Agg		   *agg = makeNode(Agg);
+	VexecAggPlan plan;
+	DescribeContext ctx;
+	int			i;
+
+	vexec_agg_plan_decode(cscan, &plan);
+	ctx.plan = &plan;
+	ctx.scan_tlist = cscan->custom_scan_tlist;
+
+	agg->plan = cscan->scan.plan;
+	agg->plan.type = T_Agg;
+	agg->plan.targetlist = (List *) describe_mutator((Node *) cscan->scan.plan.targetlist, &ctx);
+	agg->plan.qual = (List *) describe_mutator((Node *) cscan->scan.plan.qual, &ctx);
+	agg->aggstrategy = plan.strategy;
+	agg->aggsplit = plan.split;
+	agg->numCols = list_length(plan.keycols);
+	agg->grpColIdx = palloc(sizeof(AttrNumber) * Max(agg->numCols, 1));
+	agg->grpOperators = palloc(sizeof(Oid) * Max(agg->numCols, 1));
+	agg->grpCollations = palloc(sizeof(Oid) * Max(agg->numCols, 1));
+	for (i = 0; i < agg->numCols; i++)
+	{
+		agg->grpColIdx[i] = (AttrNumber) list_nth_int(plan.keycols, i);
+		agg->grpOperators[i] = list_nth_oid(plan.eqops, i);
+		agg->grpCollations[i] = list_nth_oid(plan.collations, i);
+	}
+	agg->numGroups = (long) plan.numgroups;
+	agg->transitionSpace = 0;
+	agg->aggParams = NULL;
+	agg->groupingSets = NIL;
+	agg->chain = NIL;
+	return agg;
 }

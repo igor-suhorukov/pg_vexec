@@ -27,8 +27,11 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.debug_layout_seed     | 0                         |      | superuser  | integer | 0       | 2147483647   |                             | f
  vexec.debug_require_vector  | off                       |      | superuser  | bool    |         |              |                             | f
  vexec.enable_agg            | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_bitmapscan     | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_hashjoin       | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_insert         | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_repartition    | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_running_bound  | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_scan           | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_sort           | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_window         | on                        |      | user       | bool    |         |              |                             | t
@@ -40,10 +43,11 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.gpu_segments          | off                       |      | sighup     | bool    |         |              |                             | f
  vexec.gpu_setup_cost        | 100                       |      | user       | real    | 0       | 1.79769e+308 |                             | t
  vexec.gpu_transfer_cost     | 1e-05                     |      | user       | real    | 0       | 1.79769e+308 |                             | t
+ vexec.heap_page_reader      | on                        |      | user       | bool    |         |              |                             | f
  vexec.min_rows              | 10000                     |      | user       | integer | 0       | 2147483647   |                             | t
  vexec.mode                  | off                       |      | user       | enum    |         |              | {off,explain,auto,force}    | t
  vexec.orca                  | on                        |      | user       | bool    |         |              |                             | t
-(32 rows)
+(36 rows)
 
 -- the modes
 SET vexec.mode = explain;

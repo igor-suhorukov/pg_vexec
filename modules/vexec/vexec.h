@@ -17,7 +17,7 @@
 
 #include "utils/guc.h"
 
-#define VEXEC_VERSION	"0.3.0"
+#define VEXEC_VERSION	"0.4.0"
 
 /*
  * What vexec exports to other modules of its own repository's tests
@@ -91,10 +91,14 @@ extern PGDLLIMPORT double vexec_convert_cost;
 extern PGDLLIMPORT double vexec_batch_setup_cost;
 extern PGDLLIMPORT int vexec_min_rows;
 extern PGDLLIMPORT bool vexec_enable_scan;
+extern PGDLLIMPORT bool vexec_heap_page_reader;
+extern PGDLLIMPORT bool vexec_enable_bitmapscan;
 extern PGDLLIMPORT bool vexec_enable_agg;
+extern PGDLLIMPORT bool vexec_enable_repartition;
 extern PGDLLIMPORT bool vexec_aggregate_statistics;
 extern PGDLLIMPORT bool vexec_enable_hashjoin;
 extern PGDLLIMPORT bool vexec_enable_sort;
+extern PGDLLIMPORT bool vexec_enable_running_bound;
 extern PGDLLIMPORT bool vexec_enable_window;
 extern PGDLLIMPORT bool vexec_enable_insert;
 extern PGDLLIMPORT bool vexec_orca;

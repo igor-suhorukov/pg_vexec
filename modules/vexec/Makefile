@@ -25,8 +25,10 @@ OBJS = \
 	exec/node.o \
 	exec/vecagg.o \
 	exec/vechashjoin.o \
+	exec/vecrepart.o \
 	exec/vecresult.o \
 	exec/vecscan.o \
+	exec/vecsort.o \
 	expr/compile.o \
 	expr/eval.o \
 	expr/k_arith.o \
@@ -45,6 +47,8 @@ OBJS = \
 	plan/orca.o \
 	plan/paths.o \
 	plan/reasons.o \
+	plan/sort.o \
+	source/heap.o \
 	source/registry.o
 PGFILEDESC = "vexec - a vectorized planner and executor for PostgreSQL 19"
 
@@ -55,7 +59,7 @@ DATA = vexec--1.0.sql
 # into the server's include directory, under extension/vexec/.
 HEADERS = ../../include/vexec_source.h
 
-REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_scan vexec_agg vexec_join
+REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_scan vexec_agg vexec_join vexec_heap vexec_sort
 
 PG_CPPFLAGS = -I$(srcdir) -I$(srcdir)/pgxs/include -I$(srcdir)/../../include
 

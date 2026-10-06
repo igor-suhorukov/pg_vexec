@@ -28,6 +28,12 @@
 #     side's Motions to their end, so that their senders stop waiting, and
 #     the statement ends -- under an Append too, whose next branch needs
 #     the same senders (§3.8, §6.5);
+#   - V4: under ORCA with gp.enable_parallel, M8's Gathers in each
+#     segment's fragments over vector nodes -- a partial VecAgg and a
+#     VecHashJoin over parallel-aware VecScans, which share each segment's
+#     share of the table among its workers -- and ORCA's sorts as VecSorts,
+#     bounded by the Limit above them, their columns fetched late by TID;
+#     and every query of the workload answered alike with workers;
 #   - the batch layer in a coordinator's backend over rows gathered from the
 #     segments: vexec_test's round trips and export check.
 #
@@ -97,6 +103,8 @@ for n in $NODES; do
 		echo "shared_buffers = 128MB"
 		echo "fsync = off"
 		echo "max_parallel_workers_per_gather = 0"
+		echo "max_worker_processes = 24"
+		echo "max_parallel_workers = 16"
 		[ "$n" -eq 0 ] && echo "gp.role = 'dispatch'"
 	} >> "$(datadir "$n")/postgresql.auto.conf"
 done
@@ -172,7 +180,11 @@ QUERIES=(
 # segments with its other settings
 SEED="${VEXEC_SEED:-$(( (RANDOM << 15 | RANDOM) % 2147483646 + 1 ))}"
 echo "  random session's seed: $SEED (VEXEC_SEED=$SEED reruns it)"
-SESSIONS=("off" "explain" "force-postgres" "force-arrow" "force-random")
+SESSIONS=("off" "explain" "force-postgres" "force-arrow" "force-random" "force-parallel")
+# with workers (V4): under ORCA M8's Gathers in the segments' fragments,
+# whose parallel.c weighs them in PostgreSQL's units; on the gather route
+# the segments' own plans
+PARALLEL_SETS="SET gp.enable_parallel = on; SET max_parallel_workers_per_gather = 2; SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET min_parallel_table_scan_size = 0;"
 session_sets() {
 	case "$1" in
 		off) echo "SET vexec.mode = off;" ;;
@@ -180,6 +192,7 @@ session_sets() {
 		force-postgres) echo "SET vexec.mode = force; SET vexec.batch_format = postgres;" ;;
 		force-arrow) echo "SET vexec.mode = force; SET vexec.batch_format = arrow;" ;;
 		force-random) echo "SET vexec.mode = force; SET vexec.debug_layout_seed = $SEED;" ;;
+		force-parallel) echo "SET vexec.mode = force; $PARALLEL_SETS" ;;
 	esac
 }
 nq=0
@@ -213,7 +226,7 @@ for t in t_heap t_aoco t_porc t_porc_vec; do
 	case "$t" in
 		t_aoco) want="gp_ao" ;;
 		t_porc|t_porc_vec) want="pax" ;;
-		*) want="the slot path" ;;
+		*) want="heap's pages" ;;
 	esac
 	plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT k, v FROM $t WHERE v > 1000")
 	if echo "$plan" | grep -q "Gather Motion" && echo "$plan" | grep -q "Vec Seq Scan on public.$t (actual rows=[1-9]" \
@@ -317,6 +330,63 @@ for t in t_heap t_aoco t_porc_vec; do
 	fi
 done
 
+# V4, M8: under ORCA with workers, each segment's writer runs its fragment's
+# split subtree in a Gather: the partial aggregation in three stages, the
+# partial VecAgg over a parallel VecScan in each participant, which reads its
+# share of the segment's table through the storage's source; a co-located
+# join, its inner side read whole by each participant, as a VecHashJoin --
+# in the fragment the Gather Motion to the coordinator receives, the
+# writer's: a fragment below a Redistribute is a reader's, which leads no
+# workers (pg19/orca/parallel.c)
+for t in t_heap t_aoco t_porc t_porc_vec; do
+	plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; $PARALLEL_SETS
+		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*), sum(v), sum(n) FROM $t")
+	if echo "$plan" | grep -q "GPORCA" && echo "$plan" | grep -q -E "Gather \(actual" &&
+		echo "$plan" | grep -q -E "Workers Launched: [1-9]" &&
+		echo "$plan" | grep -q -E "Vec Partial Aggregate \(actual rows=[1-9]" &&
+		echo "$plan" | grep -q -E "Parallel Vec Seq Scan on $t \(actual rows=[1-9]"; then
+		echo "  ok with workers, each segment aggregates $t below a Gather over a parallel VecScan"
+	else
+		echo "  FAILED with workers, ORCA's plan of $t has no Gather over a parallel VecScan:"
+		echo "$plan" | sed 's/^/    /'
+		fail=1
+	fi
+	plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; $PARALLEL_SETS
+		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*), sum(b.v) FROM $t a JOIN $t b ON a.id = b.id")
+	if echo "$plan" | grep -q "GPORCA" && echo "$plan" | grep -q -E "Workers Launched: [1-9]" &&
+		echo "$plan" | grep -q -E "Vec Hash Join \(actual rows=[1-9]" &&
+		echo "$plan" | grep -q -E "Parallel Vec Seq Scan on $t"; then
+		echo "  ok with workers, each segment joins $t in a VecHashJoin over a parallel VecScan, below a Gather"
+	else
+		echo "  FAILED with workers, ORCA's join of $t has no VecHashJoin over a parallel VecScan below a Gather:"
+		echo "$plan" | sed 's/^/    /'
+		fail=1
+	fi
+	for q in "SELECT count(*), sum(v), sum(n) FROM $t" "SELECT a.k, count(*), sum(b.v) FROM $t a JOIN $t b ON a.id = b.id GROUP BY a.k" \
+		"SELECT count(*), sum(b.v) FROM $t a JOIN $t b ON a.id = b.id"; do
+		want=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = off; $q" | sort)
+		got=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; $PARALLEL_SETS $q" | sort)
+		check "with workers, $(echo "$q" | cut -c1-48)... answers as off" "$got" "$want"
+	done
+done
+# V4: ORCA's sorts as VecSorts on the segments, bounded by the Limit above
+# them, the other columns of the rows each keeps fetched by TID
+for t in t_heap t_aoco t_porc t_porc_vec; do
+	q="SELECT id, v, s, d FROM $t WHERE k < 50 ORDER BY v DESC, id LIMIT 15"
+	plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF) $q")
+	if echo "$plan" | grep -q "GPORCA" && echo "$plan" | grep -q -E "Vec Sort \(actual rows=[1-9]" &&
+		echo "$plan" | grep -q "Bound: 15" && echo "$plan" | grep -q "fetched by TID"; then
+		echo "  ok ORCA sorts $t in a bounded VecSort on the segments, its columns fetched late"
+	else
+		echo "  FAILED ORCA's plan of $q has no bounded VecSort of late columns:"
+		echo "$plan" | sed 's/^/    /'
+		fail=1
+	fi
+	check "ORCA's bounded VecSort of $t answers as off" \
+		"$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; $q")" \
+		"$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = off; $q")"
+done
+
 # the gather route: the coordinator's VecHashJoin over the rows the segments send
 plan=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = force; EXPLAIN (COSTS OFF) SELECT a.k, count(*) FROM t_aoco a JOIN t_porc b ON a.id = b.v GROUP BY a.k")
 echo "$plan" | grep -q "Vec Hash Join" && echo "  ok on the gather route, the coordinator joins in a VecHashJoin" \
@@ -328,6 +398,31 @@ if echo "$plan" | grep -q " Hash Join" && ! echo "$plan" | grep -q -E "Vec Hash 
 else
 	echo "  FAILED with gp.enable_runtime_filter on, the gather route's plan:"; echo "$plan" | sed 's/^/    /'; fail=1
 fi
+# the gather route: a nearest-neighbour search, a LIMIT over a VecSort by a
+# distance GiST orders by, still sends the segments its ORDER BY and LIMIT
+# (gp_core's bound_gathers(), which sees the VecSort as the Sort it stands
+# for through gp_orca's API, describe_node), each segment's GiST index
+# answering it, and answers as off does
+out=$(cq 0 $DB "SET client_min_messages = warning;
+	CREATE TABLE t_pts AS SELECT g AS id, point(g % 997, g / 997) AS p FROM generate_series(1, 30000) g DISTRIBUTED BY (id);
+	CREATE INDEX t_pts_p ON t_pts USING gist (p); ANALYZE t_pts")
+case "$out" in *ERROR*) echo "  FAILED the points' table: $out"; fail=1 ;; esac
+q="SELECT id, p <-> point(500.3, 10.7) FROM t_pts ORDER BY p <-> point(500.3, 10.7) LIMIT 7"
+plan=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = force; EXPLAIN (VERBOSE, COSTS OFF) $q")
+if echo "$plan" | grep -q "Vec Sort" && echo "$plan" | grep -q "Remote SQL: .*ORDER BY .*LIMIT 7"; then
+	echo "  ok on the gather route, a nearest-neighbour search's VecSort sends the segments its ORDER BY and LIMIT"
+else
+	echo "  FAILED on the gather route, the nearest-neighbour search's plan:"; echo "$plan" | sed 's/^/    /'; fail=1
+fi
+check "on the gather route, the nearest-neighbour search answers as off" \
+	"$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = force; $q")" \
+	"$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = off; $q")"
+# and each segment plans what it is sent with its GiST index, force mode
+# keeping the index's order (plan/sort.c)
+out=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = force;
+	SELECT count(*) FROM gp.exec_on_segments('EXPLAIN (COSTS OFF, FORMAT JSON) SELECT id FROM t_pts ORDER BY p <-> point(500.3, 10.7) LIMIT 7')
+		WHERE result LIKE '%\"Index Scan\"%' AND result LIKE '%\"t_pts_p\"%'")
+check "on the gather route, every segment answers the search with its GiST index" "$out" "$SEGMENTS"
 # the gather route: the coordinator's VecAgg over the rows the segments send
 plan=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = force; EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM t_aoco GROUP BY k")
 echo "$plan" | grep -q "Vec HashAggregate" && echo "  ok on the gather route, the coordinator aggregates in a VecAgg" \

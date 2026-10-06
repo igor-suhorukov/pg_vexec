@@ -32,6 +32,14 @@ The plan's phases land here in order, each on a branch of its own:
   semi, anti and right, with its spill -- in place of PostgreSQL's HashJoin
   and its Hash; PostgreSQL's join paths and ORCA's HashJoin; on a cluster,
   a side with a receiving Motion drained where PostgreSQL leaves it unread.
+- **V4, heap pages, parallel paths, sorts** (`v4`; the plan's §5): heap's
+  page reader; partial vector paths under PostgreSQL's Gather and Gather
+  Merge, and vector nodes under M8's Gathers in a segment; `VecSort` with
+  its top-N bound, from the ordered paths and ORCA's Sort; and VH's H1 for
+  heap, H5's `VecRepartition`, H6's late columns and running bound, and
+  H9's `VecBitmapHeapScan`.  Its changes to the port -- gp_orca's API's
+  `describe_node`, M8's pass, the source contract's `set_keys` in PAX,
+  gp_core's settings -- are in a worktree of the port, under `pg19/` only.
 
 ## Layout
 
@@ -41,9 +49,9 @@ The plan's phases land here in order, each on a branch of its own:
 | `modules/vexec/` | the module, built by PGXS against vanilla PostgreSQL 19 or the port's server |
 | `modules/vexec/batch/` | the logical batch, its layouts, the PostgreSQL and Arrow formats, the conversions, rows in and out, scaled numerics, export through Arrow's C Data Interface |
 | `modules/vexec/plan/` | the vectorized planner: the oracle, the cost model, the path hooks, the node builders, ORCA's front end through gp_orca's API, the reasons, EXPLAIN's option, the plan check |
-| `modules/vexec/exec/` | the vector nodes, `VecScan`, `VecResult`, `VecAgg` and `VecHashJoin`, with their row and batch interfaces, and the aggregates' transitions |
+| `modules/vexec/exec/` | the vector nodes, `VecScan` and `VecBitmapHeapScan`, `VecResult`, `VecAgg`, `VecHashJoin`, `VecSort` and `VecRepartition`, with their row and batch interfaces, and the aggregates' transitions |
 | `modules/vexec/expr/` | the expression compiler and evaluator: kernels bound by function OID, the fallback, PostgreSQL's evaluator for what may raise |
-| `modules/vexec/source/` | `vexec`'s side of the source registry |
+| `modules/vexec/source/` | `vexec`'s side of the source registry, and heap's page reader |
 | `modules/vexec/pgxs/include/` | copies of the port's headers the PGXS build compiles against, kept equal to the originals |
 | `modules/vexec/sql`, `expected` | `vexec`'s own regression suite, and the layouts' semantics corpus |
 | `modules/vexec_test/` | a module of the tests alone: round trips through every layout, and the export check with nanoarrow, vendored there only |
@@ -75,7 +83,8 @@ From V1 the port's legs install the port's modules of V1's worktree over
 the image's own, from the stage `portbuild` makes
 (`~/.cache/pg_accel/vexec/portbuild/stage`); `VEXEC_PORT_STAGE=none` runs
 them on the image's own. `TPC_VEXEC_MODE` and `TPC_VEXEC_FORMAT` set the tpc
-leg's `vexec.mode` and format.
+leg's `vexec.mode` and format, and `TPC_WORKERS` its parallel workers a
+segment, each query run once with each of them ("0 4").
 
 Every leg runs in a container; nothing is installed on the host. The legs
 build `vexec` from the tree by PGXS into a copy, with warnings as errors.

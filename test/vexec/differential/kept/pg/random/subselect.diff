@@ -1,13 +1,19 @@
 --- reference
 +++ session
-@@ -1724,7 +1724,7 @@
+@@ -1724,10 +1724,10 @@
  $$;
  select * from explain_sq_limit();
 -                         explain_sq_limit                          
 --------------------------------------------------------------------
 -               ->  Seq Scan on sq_limit (actual rows=8.00 loops=1)
+-               Sort Key: sq_limit.c1, sq_limit.pk
+-               Sort Method: top-N heapsort  Memory: xxx
+-         ->  Sort (actual rows=3.00 loops=1)
 +                           explain_sq_limit                            
 +-----------------------------------------------------------------------
 +               ->  Vec Seq Scan on sq_limit (actual rows=8.00 loops=1)
-                Sort Key: sq_limit.c1, sq_limit.pk
-                Sort Method: top-N heapsort  Memory: xxx
++               Sort Key: c1, pk
++               Sort Method: quicksort  Memory: xxx
++         ->  Vec Sort (actual rows=3.00 loops=1)
+    ->  Subquery Scan on x (actual rows=3.00 loops=1)
+  Limit (actual rows=3.00 loops=1)
