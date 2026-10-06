@@ -1,0 +1,73 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- Binding by pgvector's version (pg_vector_executor.md §3.17, VK's "done
+-- when"): ALTER EXTENSION vector UPDATE to a version the pack does not name
+-- unbinds the declarations in every session that had them, and the queries
+-- give the same answers, row by row; back at a version it names, they bind
+-- again.  test/run.sh installs, beside pgvector's scripts, two empty update
+-- scripts: to the installed version with "-vk" after it, and back.
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS dblink;
+RESET client_min_messages;
+
+SELECT extversion AS pgvector_version FROM pg_extension WHERE extname = 'vector' \gset
+SELECT format('host=%s port=%s dbname=%s', current_setting('unix_socket_directories'),
+			  current_setting('port'), current_database()) AS other_session \gset
+
+CREATE TABLE items (id int, embedding vector(3));
+INSERT INTO items SELECT g, ARRAY[sin(g), cos(g), g % 5]::real[]::vector FROM generate_series(1, 3000) g;
+ANALYZE items;
+
+-- whether force mode's scan computes the distance as a declared call
+CREATE FUNCTION declared(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	PERFORM set_config('vexec.mode', 'force', true);
+	FOR l IN EXECUTE 'EXPLAIN (VERBOSE, COSTS OFF) ' || q LOOP
+		IF l ~ 'Declared Calls' THEN
+			RETURN regexp_replace(l, '^\s+', '');
+		END IF;
+	END LOOP;
+	RETURN 'no declared call';
+END
+$$;
+
+-- an answer, in force mode and off
+CREATE FUNCTION answer(q text, m text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+BEGIN
+	PERFORM set_config('vexec.mode', m, true);
+	EXECUTE format('SELECT md5(string_agg(x::text, %L ORDER BY x::text)) FROM (%s) x', ',', q) INTO r;
+	RETURN r;
+END
+$$;
+
+\set query 'SELECT id, embedding <-> ''[1,0,2]'' AS d FROM items WHERE embedding <=> ''[0,1,0]'' < 0.6'
+
+-- at the installed version, which the pack names
+SELECT declared(:'query');
+SELECT count(*) AS bound FROM vexec.declared_calls() WHERE extension = 'vector';
+
+-- another session updates pgvector to a version the pack does not name
+SELECT dblink_exec(:'other_session', format('ALTER EXTENSION vector UPDATE TO %L', :'pgvector_version' || '-vk'));
+SELECT extversion = :'pgvector_version' || '-vk' AS updated FROM pg_extension WHERE extname = 'vector';
+SELECT declared(:'query');
+SELECT count(*) AS bound FROM vexec.declared_calls() WHERE extension = 'vector';
+SELECT answer(:'query', 'force') = answer(:'query', 'off') AS same_answer;
+
+-- and back
+ALTER EXTENSION vector UPDATE TO :'pgvector_version';
+SELECT declared(:'query');
+SELECT count(*) AS bound FROM vexec.declared_calls() WHERE extension = 'vector';
+SELECT answer(:'query', 'force') = answer(:'query', 'off') AS same_answer;
+
+DROP TABLE items;
+DROP FUNCTION declared(text);
+DROP FUNCTION answer(text, text);
