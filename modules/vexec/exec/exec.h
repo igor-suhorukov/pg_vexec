@@ -46,12 +46,14 @@
 #define VEXEC_SCAN_NAME		"VecScan"
 #define VEXEC_RESULT_NAME	"VecResult"
 #define VEXEC_AGG_NAME		"VecAgg"
+#define VEXEC_HASHJOIN_NAME	"VecHashJoin"
 
 typedef enum VexecNodeKind
 {
 	VEXEC_NODE_SCAN,
 	VEXEC_NODE_RESULT,
-	VEXEC_NODE_AGG
+	VEXEC_NODE_AGG,
+	VEXEC_NODE_HASHJOIN
 } VexecNodeKind;
 
 /*
@@ -79,6 +81,32 @@ typedef struct VexecAggPlan
 	List	   *aggrefs;		/* each aggno once, in aggno order */
 	int			ntrans;			/* transition states: aggtransno's range */
 } VexecAggPlan;
+
+/*
+ * VecHashJoin's plan (vechashjoin.c encodes and decodes custom_private).
+ * Its scan tuple, which custom_scan_tlist describes, is a join row: the
+ * outer child's output columns, 1 to nouter, then the inner child's, from
+ * nouter + 1.  The node's target list and qual -- the join's other quals,
+ * a HashJoin's plan.qual -- read it as INDEX_VAR, and so does custom_exprs:
+ * the hash clauses, the join quals, and the outer and inner hash keys, a
+ * list each, at the positions below.
+ */
+#define VEXEC_JOIN_HASHCLAUSES	0
+#define VEXEC_JOIN_JOINQUAL		1
+#define VEXEC_JOIN_OUTERKEYS	2
+#define VEXEC_JOIN_INNERKEYS	3
+
+typedef struct VexecJoinPlan
+{
+	JoinType	jointype;		/* inner, left, semi, anti, right */
+	bool		inner_unique;	/* an outer row meets one inner row at most */
+	int			nouter;			/* the scan tuple's columns from the outer
+								 * child */
+	int			ninner;			/* and from the inner child */
+	List	   *hashoperators;	/* per hash key, its equality operator */
+	List	   *hashcollations;
+	double		inner_rows;		/* the planner's estimate of the build side */
+} VexecJoinPlan;
 
 typedef struct VexecNode VexecNode;
 
@@ -144,6 +172,25 @@ struct VexecNode
 	VexecNode  *vec_child;
 	uint64	   *child_redo;
 
+	/*
+	 * Who resolves a row of child_redo where the input is not a vector
+	 * child's batch: VecHashJoin, whose join rows still to be decided are
+	 * decided as they are reached.  The input row, in input_slot, or NULL
+	 * where it gives none.  NULL: the vector child, vexec_resolve_row().
+	 */
+	TupleTableSlot *(*resolve_input) (VexecNode *node, int row);
+
+	const char *label;			/* EXPLAIN's name in text: NULL, the kind's */
+
+	/*
+	 * The node read its input in this process.  On a cluster the node a
+	 * segment ran is, on the coordinator, a node that never ran: gp_core
+	 * brings its Instrumentation from the segments, and nothing of a custom
+	 * node's own, so EXPLAIN ANALYZE prints the node's own figures only
+	 * where it ran, as PostgreSQL's Hash prints its table's.
+	 */
+	bool		ran;
+
 	VexecNodeStats stats;
 };
 
@@ -154,6 +201,7 @@ extern bool vexec_is_vector_state(PlanState *ps);
 extern const CustomScanMethods *vexec_scan_methods(void);
 extern const CustomScanMethods *vexec_result_methods(void);
 extern const CustomScanMethods *vexec_agg_methods(void);
+extern const CustomScanMethods *vexec_hashjoin_methods(void);
 
 /* node.c: what every node shares */
 extern void vexec_node_begin(VexecNode *node, EState *estate);
@@ -162,6 +210,8 @@ extern TupleTableSlot *vexec_node_exec(VexecNode *node);
 extern void vexec_node_rescan(VexecNode *node);
 extern void vexec_node_end(VexecNode *node);
 extern void vexec_node_explain(VexecNode *node, List *ancestors, ExplainState *es);
+extern void vexec_node_relabel(VexecNode *node, ExplainState *es);
+extern void vexec_node_explain_properties(VexecNode *node, List *ancestors, ExplainState *es);
 extern void vexec_node_load_input(VexecNode *node, int row);
 extern void vexec_node_count_fallback(VexecNode *node, int rows);
 extern void vexec_node_count_kernel(VexecNode *node);
@@ -181,5 +231,11 @@ extern Node *vexec_create_result_state(CustomScan *cscan);
 extern Node *vexec_create_agg_state(CustomScan *cscan);
 extern List *vexec_agg_plan_encode(const VexecAggPlan *plan);
 extern void vexec_agg_plan_decode(CustomScan *cscan, VexecAggPlan *plan);
+
+/* vechashjoin.c */
+extern Node *vexec_create_hashjoin_state(CustomScan *cscan);
+extern List *vexec_join_plan_encode(const VexecJoinPlan *plan);
+extern void vexec_join_plan_decode(CustomScan *cscan, VexecJoinPlan *plan);
+extern bool vexec_plan_read_ahead_safe(Plan *plan);
 
 #endif							/* VEXEC_EXEC_H */

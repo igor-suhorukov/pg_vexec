@@ -1,0 +1,79 @@
+--- reference
++++ session
+@@ -106,5 +106,5 @@
+  initially_multibatch | increased_batches 
+ ----------------------+-------------------
+- f                    | f
++                      | 
+ (1 row)
+ 
+@@ -133,5 +133,5 @@
+  initially_multibatch | increased_batches 
+ ----------------------+-------------------
+- f                    | f
++                      | 
+ (1 row)
+ 
+@@ -189,5 +189,5 @@
+  initially_multibatch | increased_batches 
+ ----------------------+-------------------
+- t                    | f
++                      | 
+ (1 row)
+ 
+@@ -216,5 +216,5 @@
+  initially_multibatch | increased_batches 
+ ----------------------+-------------------
+- t                    | f
++                      | 
+ (1 row)
+ 
+@@ -280,5 +280,5 @@
+  initially_multibatch | increased_batches 
+ ----------------------+-------------------
+- f                    | t
++                      | 
+ (1 row)
+ 
+@@ -334,5 +334,5 @@
+  initially_multibatch | increased_batches 
+ ----------------------+-------------------
+- f                    | t
++                      | 
+ (1 row)
+ 
+@@ -364,5 +364,5 @@
+  original | final 
+ ----------+-------
+-        1 |     2
++          |      
+ (1 row)
+ 
+@@ -416,5 +416,5 @@
+  original | final 
+ ----------+-------
+-        1 |     4
++          |      
+ (1 row)
+ 
+@@ -433,5 +433,5 @@
+  original | final 
+ ----------+-------
+-        1 |     1
++          |      
+ (1 row)
+ 
+@@ -479,5 +479,5 @@
+  multibatch 
+ ------------
+- t
++ 
+ (1 row)
+ 
+@@ -518,5 +518,5 @@
+  multibatch 
+ ------------
+- f
++ 
+ (1 row)
+ 

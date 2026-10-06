@@ -266,6 +266,7 @@ next_batch(VexecNode *node)
 		node->redo = NULL;
 		node->child_redo = NULL;
 		node->loaded_row = -1;
+		node->ran = true;
 		if (!node->fetch(node))
 			return false;
 		if (node->in->nrows == 0)
@@ -310,21 +311,39 @@ vexec_node_unprojected(VexecNode *node, TupleTableSlot *input)
 /*
  * A row through PostgreSQL's evaluator alone: every qual, then the
  * projection, from the node's own ExprStates.  NULL when a qual rejects
- * it.  A vector child's row still to be resolved is resolved first.
+ * it.  A row of child_redo is resolved first -- by the vector child, or by
+ * the node's resolve_input -- and *by_input says when that gave no row.
  */
 static TupleTableSlot *
-row_by_postgres(VexecNode *node, int row)
+row_by_postgres(VexecNode *node, int row, bool *by_input)
 {
 	ExprContext *econtext = node->css.ss.ps.ps_ExprContext;
 	ProjectionInfo *proj = node->css.ss.ps.ps_ProjInfo;
 	TupleTableSlot *input;
 
+	*by_input = false;
 	if (node->child_redo != NULL && vexec_bit(node->child_redo, row))
 	{
-		input = vexec_resolve_row(node->vec_child, row);
-		if (input == NULL)
-			return NULL;
-		node->loaded_row = -1;
+		if (node->resolve_input != NULL)
+		{
+			/* the node's own: its input row, loaded, or none */
+			input = node->resolve_input(node, row);
+			if (input == NULL)
+			{
+				*by_input = true;
+				return NULL;
+			}
+		}
+		else
+		{
+			input = vexec_resolve_row(node->vec_child, row);
+			if (input == NULL)
+			{
+				*by_input = true;
+				return NULL;
+			}
+			node->loaded_row = -1;
+		}
 	}
 	else
 	{
@@ -441,10 +460,14 @@ vexec_node_exec(VexecNode *node)
 		if ((node->redo != NULL && vexec_bit(node->redo, row)) ||
 			(node->child_redo != NULL && vexec_bit(node->child_redo, row)))
 		{
-			slot = row_by_postgres(node, row);
+			bool		by_input;
+
+			slot = row_by_postgres(node, row, &by_input);
 			if (slot == NULL)
 			{
-				InstrCountFiltered1(node, 1);
+				/* a join row its join quals decided against is no filter's */
+				if (!by_input || node->resolve_input == NULL)
+					InstrCountFiltered1(node, 1);
 				continue;
 			}
 			return slot;
@@ -537,9 +560,10 @@ TupleTableSlot *
 vexec_resolve_row(VexecNode *node, int row)
 {
 	TupleTableSlot *slot;
+	bool		by_input;
 
 	ResetExprContext(node->css.ss.ps.ps_ExprContext);
-	slot = row_by_postgres(node, row);
+	slot = row_by_postgres(node, row, &by_input);
 	if (slot != NULL && node->css.ss.ps.instrument)
 		InstrUpdateTupleCount(node->css.ss.ps.instrument, 1);
 	return slot;
@@ -566,16 +590,32 @@ vexec_node_end(VexecNode *node)
 	node->eager_econtext = NULL;
 }
 
+/* EXPLAIN's name for a vector node, in text (§3.6). */
+void
+vexec_node_relabel(VexecNode *node, ExplainState *es)
+{
+	CbExplainRelabel(&node->css, es,
+					 node->label != NULL ? node->label :
+					 node->kind == VEXEC_NODE_SCAN ? "Vec Seq Scan" : "Vec Result", NULL);
+}
+
 /* EXPLAIN's lines for a vector node (§3.6, "Properties"). */
 void
 vexec_node_explain(VexecNode *node, List *ancestors, ExplainState *es)
+{
+	vexec_node_relabel(node, es);
+	vexec_node_explain_properties(node, ancestors, es);
+}
+
+/* The lines without the name, for a node that puts its own first. */
+void
+vexec_node_explain_properties(VexecNode *node, List *ancestors, ExplainState *es)
 {
 	int			eager = 0;
 	int			lazy_targets = 0;
 	int			i;
 
-	CbExplainRelabel(&node->css, es,
-					 node->kind == VEXEC_NODE_SCAN ? "Vec Seq Scan" : "Vec Result", NULL);
+	(void) ancestors;
 
 	for (i = 0; i < node->nquals; i++)
 		if (node->quals[i].eager)
@@ -602,7 +642,7 @@ vexec_node_explain(VexecNode *node, List *ancestors, ExplainState *es)
 				break;
 			}
 	}
-	if (es->analyze && es->verbose)
+	if (es->analyze && es->verbose && node->ran)
 	{
 		ExplainPropertyInteger("Batches", NULL, node->stats.batches, es);
 		if (node->stats.lazy_rows > 0)

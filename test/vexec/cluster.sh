@@ -22,6 +22,12 @@
 #   - on the gather route, each segment plans its own SQL with vexec's path
 #     hooks: a statement a segment runs builds vector scans there, with the
 #     session's settings, as vexec.debug_require_vector proves;
+#   - under ORCA, hash joins run on the segments as VecHashJoins, over the
+#     Motions that bring each segment its rows, each segment with rows of
+#     its own; a VecHashJoin whose build side is empty reads its probe
+#     side's Motions to their end, so that their senders stop waiting, and
+#     the statement ends -- under an Append too, whose next branch needs
+#     the same senders (§3.8, §6.5);
 #   - the batch layer in a coordinator's backend over rows gathered from the
 #     segments: vexec_test's round trips and export check.
 #
@@ -152,6 +158,12 @@ QUERIES=(
 	"SELECT k, count(*), sum(n), avg(v) FROM %t WHERE b GROUP BY k"
 	"SELECT s, count(DISTINCT k) FROM %t GROUP BY s HAVING count(*) > 90"
 	"SELECT a.k, count(*) FROM %t a JOIN %t b ON a.id = b.v WHERE b.k < 10 GROUP BY a.k"
+	# V3: hash joins of each type, on and off the distribution key
+	"SELECT a.id, b.id, b.s FROM %t a JOIN %t b ON a.k = b.k AND a.v < b.v WHERE a.id < 200 AND b.id < 300"
+	"SELECT a.k, count(b.id), sum(b.v) FROM %t a LEFT JOIN %t b ON a.v = b.id AND b.b WHERE a.id % 50 = 0 GROUP BY a.k"
+	"SELECT count(*), sum(a.v) FROM %t a WHERE EXISTS (SELECT 1 FROM %t b WHERE b.v = a.id AND b.k > a.k)"
+	"SELECT count(*), sum(a.v) FROM %t a WHERE NOT EXISTS (SELECT 1 FROM %t b WHERE b.id = a.v AND b.d > a.d)"
+	"SELECT b.id, a.id FROM %t a RIGHT JOIN %t b ON a.s = b.s AND a.id = b.k WHERE b.id < 120"
 	"SELECT d, sum(v) OVER (PARTITION BY k ORDER BY id) FROM %t WHERE id % 1000 = 7"
 	"SELECT id, v FROM %t WHERE v > 99990 ORDER BY v, id LIMIT 20"
 )
@@ -249,6 +261,73 @@ for t in t_heap t_aoco t_porc t_porc_vec; do
 				print c; exit }')
 	check "each of the $SEGMENTS segments ran the partial VecAgg of $t" "$out" "$SEGMENTS"
 done
+# under ORCA: hash joins as VecHashJoins on every segment, over the Motions
+# that bring each segment the rows of its keys (§3.10)
+for t in t_heap t_aoco t_porc t_porc_vec; do
+	q="SELECT a.k, count(*), sum(b.v) FROM $t a JOIN $t b ON a.v = b.id GROUP BY a.k"
+	plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET statement_timeout = '120s';
+		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) $q")
+	if echo "$plan" | grep -q "GPORCA" && echo "$plan" | grep -q -E "Vec Hash Join \(actual rows=[1-9]" \
+		&& echo "$plan" | grep -q "Motion"; then
+		echo "  ok ORCA joins $t with itself in a VecHashJoin on the segments, over a Motion"
+	else
+		echo "  FAILED ORCA's plan of $q has no VecHashJoin executed over a Motion:"
+		echo "$plan" | sed 's/^/    /'
+		fail=1
+	fi
+	# allstat lists the segments where a node first started, which gp_core
+	# learns from the node's ExecProcNode: a node whose rows a parent reads,
+	# not one a vector parent reads by batches
+	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.enable_explain_allstat = on;
+		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT a.k, b.v FROM $t a JOIN $t b ON a.v = b.id" |
+		awk '/Vec Hash Join/ { found = 1 }
+			found && /allstat:/ { sub(/.*allstat: /, ""); n = split($0, e, "/"); c = 0
+				for (i = 2; i <= n; i++) { k = split(e[i], f, "_"); if (f[k] + 0 > 0) c++ }
+				print c; exit }')
+	check "each of the $SEGMENTS segments ran the VecHashJoin of $t, with rows of its own" "$out" "$SEGMENTS"
+done
+# an empty build side: the probe side's Motions read to their end, and the
+# statement ends, under an Append whose next branch needs the same senders.
+# Broadcasts off, both sides are redistributed: the probe side receives a
+# Motion that its VecHashJoin, its build side empty, never reads for rows.
+# The coordinator sees what the segments' Instrumentation says -- the
+# probe side's Motion read past the batch read before the build, to its
+# end -- and none of a VecHashJoin's own figures, its drained Motions among
+# them, which gp_core does not bring back: the coordinator, where the node
+# never ran, prints none of them rather than its own zeros.
+for t in t_heap t_aoco t_porc_vec; do
+	q="SELECT count(*) FROM (SELECT a.k FROM $t a JOIN (SELECT * FROM t_heap WHERE v < 0) e ON a.v = e.k
+		UNION ALL SELECT k FROM $t WHERE v > 99000) u"
+	sets="SET gp.optimizer = on; SET gp.optimizer_enable_motion_broadcast = off; SET statement_timeout = '120s';"
+	want=$(cq 0 $DB "$sets SET vexec.mode = off; $q")
+	got=$(cq 0 $DB "$sets SET vexec.mode = force; $q")
+	check "an empty build side over a Motion of $t, under an Append: the statement ends, answering as off" "$got" "$want"
+	plan=$(cq 0 $DB "$sets SET vexec.mode = force;
+		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*) FROM $t a JOIN (SELECT * FROM t_heap WHERE v < 0) e ON a.v = e.k")
+	probe=$(echo "$plan" | awk '/Vec Hash Join/ { found = 1 }
+		found && /Motion/ { sub(/.*actual rows=/, ""); sub(/[.].*/, ""); print; exit }')
+	if echo "$plan" | grep -q "Vec Hash Join (actual rows=0" && [ "${probe:-0}" -gt 1024 ] &&
+		! echo "$plan" | grep -q "Inner Rows:"; then
+		echo "  ok an empty build side's VecHashJoin reads its probe side's Motion of $t to its end;"
+		echo "     the coordinator, which never ran it, prints none of its own figures"
+	else
+		echo "  FAILED the empty build side's plan of $t drains no Motion:"
+		echo "$plan" | sed 's/^/    /'
+		fail=1
+	fi
+done
+
+# the gather route: the coordinator's VecHashJoin over the rows the segments send
+plan=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = force; EXPLAIN (COSTS OFF) SELECT a.k, count(*) FROM t_aoco a JOIN t_porc b ON a.id = b.v GROUP BY a.k")
+echo "$plan" | grep -q "Vec Hash Join" && echo "  ok on the gather route, the coordinator joins in a VecHashJoin" \
+	|| { echo "  FAILED the gather route's plan has no VecHashJoin:"; echo "$plan" | sed 's/^/    /'; fail=1; }
+# gp_core's runtime filter on: an inner join it may take stays a Hash Join (§3.8)
+plan=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = force; SET gp.enable_runtime_filter = on; EXPLAIN (COSTS OFF) SELECT a.k, count(*) FROM t_aoco a JOIN t_porc b ON a.id = b.v GROUP BY a.k")
+if echo "$plan" | grep -q " Hash Join" && ! echo "$plan" | grep -q -E "Vec Hash [A-Za-z ]*Join"; then
+	echo "  ok with gp.enable_runtime_filter on, the gather route's join stays a Hash Join$(echo "$plan" | grep -q "RuntimeFilter" && echo ", under its RuntimeFilter")"
+else
+	echo "  FAILED with gp.enable_runtime_filter on, the gather route's plan:"; echo "$plan" | sed 's/^/    /'; fail=1
+fi
 # the gather route: the coordinator's VecAgg over the rows the segments send
 plan=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = force; EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM t_aoco GROUP BY k")
 echo "$plan" | grep -q "Vec HashAggregate" && echo "  ok on the gather route, the coordinator aggregates in a VecAgg" \

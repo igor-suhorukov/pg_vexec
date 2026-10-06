@@ -14,9 +14,10 @@
  *			PostgreSQL's planner (paths.c), with vexec.orca and vexec.mode;
  *	build	each node of the translated plan, children first, before its
  *			Motions are checked and its slice table made: a SeqScan becomes
- *			a VecScan, a Result over a vector node a VecResult, and a plain
- *			or hashed Agg of any split a VecAgg (agg.c), where the oracle
- *			accepts them and the mode chooses them;
+ *			a VecScan, a Result over a vector node a VecResult, a plain or
+ *			hashed Agg of any split a VecAgg (agg.c), and a HashJoin with its
+ *			Hash a VecHashJoin (join.c), where the oracle accepts them and
+ *			the mode chooses them;
  *	end		the plan check, the reasons for EXPLAIN (VEXEC), and
  *			vexec.debug_require_vector.
  *
@@ -302,6 +303,75 @@ orca_agg(VexecPlanState *ps, Agg *agg)
 	return vexec_build_agg_from_agg(agg);
 }
 
+/*
+ * A HashJoin ORCA's translator built, and its VecHashJoin (§3.8): the
+ * HashJoin and its Hash in one node, offered after the Hash, which stays
+ * ORCA's until the join takes it.
+ */
+static Plan *
+orca_hashjoin(VexecPlanState *ps, HashJoin *hj)
+{
+	VexecAlt   *alt = NULL;
+	VexecSteps	steps;
+	VexecCost	cost;
+	const char *refusal;
+	Plan	   *outer = hj->join.plan.lefttree;
+	Plan	   *inner;
+	int			nkernel = 0;
+	ListCell   *lc;
+
+	if (ps->record)
+		alt = vexec_alt_record(ps, "VecHashJoin", "ORCA's hash join", NULL, NULL);
+	if (!vexec_enable_hashjoin)
+	{
+		vexec_alt_refuse(ps, alt, "vexec.enable_hashjoin is off");
+		return NULL;
+	}
+	if ((refusal = vexec_orca_hashjoin_refusal(hj)) != NULL)
+	{
+		vexec_alt_refuse(ps, alt, refusal);
+		return NULL;
+	}
+	inner = hj->join.plan.righttree->lefttree;
+	if (ps->mode != VEXEC_MODE_FORCE && Max(outer->plan_rows, inner->plan_rows) < vexec_min_rows)
+	{
+		vexec_alt_refuse(ps, alt, psprintf("%.0f rows at most a side, fewer than vexec.min_rows",
+										   Max(outer->plan_rows, inner->plan_rows)));
+		return NULL;
+	}
+	memset(&steps, 0, sizeof(steps));
+	vexec_oracle_exprs(NULL, hj->join.plan.targetlist, &steps);
+	vexec_oracle_exprs(NULL, hj->join.plan.qual, &steps);
+	vexec_oracle_exprs(NULL, hj->join.joinqual, &steps);
+	vexec_oracle_exprs(NULL, hj->hashclauses, &steps);
+	vexec_oracle_exprs(NULL, hj->hashkeys, &steps);
+	vexec_oracle_exprs(NULL, ((Hash *) hj->join.plan.righttree)->hashkeys, &steps);
+	if (steps.refusal)
+	{
+		vexec_alt_refuse(ps, alt, steps.refusal);
+		return NULL;
+	}
+	foreach(lc, hj->hashclauses)
+	{
+		OpExpr	   *op = (OpExpr *) lfirst(lc);
+
+		if (!IsA(op, OpExpr) || list_length(op->args) != 2)
+			continue;
+		set_opfuncid(op);
+		if (vexec_kernel_bound(op->opfuncid, exprType(linitial(op->args)), op->inputcollid))
+			nkernel++;
+	}
+	vexec_cost_plan_hashjoin(&hj->join.plan, outer, inner, list_length(hj->hashclauses),
+							 nkernel, &cost);
+	vexec_alt_costed(ps, alt, &cost,
+					 psprintf("ORCA's hash join, join type %d; %d hash clauses, %d with kernels",
+							  (int) hj->join.jointype, list_length(hj->hashclauses), nkernel));
+	ps->npossible++;
+	if (!chosen(ps, &cost))
+		return NULL;
+	return vexec_build_hashjoin_from_hashjoin(hj);
+}
+
 static Plan *
 orca_build(void *state, Plan *plan, List *rtable)
 {
@@ -317,6 +387,8 @@ orca_build(void *state, Plan *plan, List *rtable)
 			return orca_result(ps, (Result *) plan);
 		case T_Agg:
 			return orca_agg(ps, (Agg *) plan);
+		case T_HashJoin:
+			return orca_hashjoin(ps, (HashJoin *) plan);
 		default:
 			return NULL;
 	}

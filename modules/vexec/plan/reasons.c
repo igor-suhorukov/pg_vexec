@@ -95,7 +95,9 @@ vexec_alt_refuse(VexecPlanState *ps, VexecAlt *alt, const char *reason)
  *	VecResult		built, in ORCA's plans
  *	VecAgg			added, as paths of the grouped relation (auto), or as
  *					its paths (force); in ORCA's plans built, or not chosen
- *	the others		not built: their nodes come in V3 and V4
+ *	VecHashJoin		added, as a path of the join relation (auto), or as its
+ *					paths (force); in ORCA's plans built, or not chosen
+ *	VecSort			not built: its node comes in V4
  */
 void
 vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const char *detail)
@@ -110,7 +112,7 @@ vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const
 	alt->cost = *cost;
 	alt->detail = detail ? MemoryContextStrdup(ps->mcxt, detail) : NULL;
 	built_now = strcmp(alt->node, "VecScan") == 0 || strcmp(alt->node, "VecResult") == 0 ||
-		strcmp(alt->node, "VecAgg") == 0;
+		strcmp(alt->node, "VecAgg") == 0 || strcmp(alt->node, "VecHashJoin") == 0;
 	if (ps->mode == VEXEC_MODE_EXPLAIN)
 	{
 		alt->status = "not chosen";
@@ -119,8 +121,7 @@ vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const
 	else if (!built_now)
 	{
 		alt->status = "not built";
-		alt->reason = strcmp(alt->node, "VecHashJoin") == 0 ? "VecHashJoin is built from V3" :
-			"VecSort is built from V4";
+		alt->reason = "VecSort is built from V4";
 	}
 	else if (alt->root != NULL)
 	{
@@ -130,6 +131,8 @@ vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const
 			alt->reason = "to be chosen by cost";
 		else if (strcmp(alt->node, "VecScan") == 0)
 			alt->reason = "forced: the relation's scan, beside its partial paths";
+		else if (strcmp(alt->node, "VecHashJoin") == 0)
+			alt->reason = "forced: the join's paths, beside its partial paths";
 		else
 			alt->reason = "forced: the aggregation's paths";
 	}

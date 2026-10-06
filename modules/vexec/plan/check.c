@@ -38,7 +38,9 @@ typedef struct CheckContext
  * Whether a CustomScan is one of vexec's vector nodes, and that it is in
  * its canonical form (build.c, agg.c): a VecScan scans a relation with no
  * custom_scan_tlist; a VecResult has its child in lefttree and no
- * relation; a VecAgg too, with a scan tuple of its plan's columns.
+ * relation; a VecAgg too, with a scan tuple of its plan's columns; a
+ * VecHashJoin its sides in lefttree and righttree, its scan tuple their
+ * columns, and its keys its operators'.
  */
 static bool
 is_vector_node(CustomScan *cscan)
@@ -62,6 +64,27 @@ is_vector_node(CustomScan *cscan)
 		if (list_length(plan.outkind) != list_length(cscan->custom_scan_tlist) ||
 			list_length(plan.keycols) != list_length(plan.eqops))
 			elog(ERROR, "vexec plan check: a VecAgg whose scan tuple is not its plan's");
+	}
+	else if (cscan->methods == vexec_hashjoin_methods())
+	{
+		VexecJoinPlan plan;
+		Plan	   *outer = cscan->scan.plan.lefttree;
+		Plan	   *inner = cscan->scan.plan.righttree;
+
+		if (cscan->scan.scanrelid != 0 || outer == NULL || inner == NULL ||
+			cscan->custom_plans != NIL || list_length(cscan->custom_exprs) != 4)
+			elog(ERROR, "vexec plan check: a VecHashJoin not in its canonical form");
+		vexec_join_plan_decode(cscan, &plan);
+		if (plan.nouter != list_length(outer->targetlist) ||
+			plan.ninner != list_length(inner->targetlist) ||
+			list_length(cscan->custom_scan_tlist) != plan.nouter + plan.ninner)
+			elog(ERROR, "vexec plan check: a VecHashJoin whose scan tuple is not its sides' columns");
+		if (list_length(plan.hashoperators) == 0 ||
+			list_length(plan.hashoperators) !=
+			list_length(list_nth(cscan->custom_exprs, VEXEC_JOIN_OUTERKEYS)) ||
+			list_length(plan.hashoperators) !=
+			list_length(list_nth(cscan->custom_exprs, VEXEC_JOIN_INNERKEYS)))
+			elog(ERROR, "vexec plan check: a VecHashJoin whose keys are not its operators'");
 	}
 	else if (cscan->scan.scanrelid != 0 || cscan->scan.plan.lefttree == NULL)
 		elog(ERROR, "vexec plan check: a VecResult not in its canonical form");

@@ -9,18 +9,18 @@
  *	planner_setup_hook		the statement's gates, into the planner's
  *							global extension state
  *	set_rel_pathlist_hook	VecScan, for a table's sequential scan
- *	set_join_pathlist_hook	VecHashJoin, for a hash-joinable join
- *	create_upper_paths_hook	VecAgg (GROUP_AGG), VecSort (ORDERED)
+ *	set_join_pathlist_hook	VecHashJoin, for a hash-joinable join (join.c)
+ *	create_upper_paths_hook	VecAgg (GROUP_AGG, agg.c), VecSort (ORDERED)
  *	planner_shutdown_hook	the plan check, and the reasons into the plan
  *
  * With vexec.mode = off, every hook calls the one it took the place of and
  * adds nothing, so plans are PostgreSQL's (§1.2).  In explain mode the
  * alternatives are costed and recorded but never added, so plans are
- * PostgreSQL's still.  In auto mode a VecScan path, and VecAgg's paths of a
- * grouped relation (agg.c), compete with the relation's other paths in
- * add_path, by cost; in force mode they replace them, wherever the oracle
- * accepts them.  The join and sort alternatives are still only costed and
- * recorded: their nodes come in V3 and V4.
+ * PostgreSQL's still.  In auto mode a VecScan path, VecHashJoin's path of a
+ * join relation (join.c) and VecAgg's paths of a grouped relation (agg.c)
+ * compete with the relation's other paths in add_path, by cost; in force
+ * mode they replace them, wherever the oracle accepts them.  The sort
+ * alternative is still only costed and recorded: its node comes in V4.
  *
  * The scan hook works before it calls the hook it took the place of, so
  * that on a cluster's coordinator gp_core's hook, which empties the path
@@ -110,6 +110,13 @@ vexec_planner_install(void)
 	create_upper_paths_hook = vexec_create_upper_paths;
 }
 
+/* vexec's planner extension id, for state kept beside the planner's. */
+int
+vexec_planner_extension_id(void)
+{
+	return planner_id;
+}
+
 /* The statement's state, or NULL: vexec is off, or the gates are closed. */
 VexecPlanState *
 vexec_plan_state(PlannerInfo *root)
@@ -194,6 +201,10 @@ vexec_planner_shutdown(PlannerGlobal *glob, Query *parse, const char *query_stri
 {
 	VexecPlanState *ps = planner_id >= 0 ? GetPlannerGlobalExtensionState(glob, planner_id) : NULL;
 	int			nodes = -1;
+
+	/* VecHashJoin's scan tuple, in the form ORCA's plans have it (join.c) */
+	if (ps != NULL && ps->joins_built)
+		vexec_join_finish_plan(pstmt);
 
 	if (vexec_debug_check_plans || vexec_debug_require_vector)
 		nodes = vexec_check_plan(pstmt, ps ? ps->mode : VEXEC_MODE_OFF);
@@ -372,210 +383,14 @@ vexec_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEn
 		prev_set_rel_pathlist(root, rel, rti, rte);
 }
 
-/*
- * The hash clauses of a join, chosen from its restrictlist by the test
- * core's static hash_inner_and_outer() applies
- * (PG19:src/backend/optimizer/path/joinpath.c:2185-2245).
- */
-static List *
-hash_clauses(RelOptInfo *joinrel, RelOptInfo *outerrel, RelOptInfo *innerrel,
-			 JoinType jointype, JoinPathExtraData *extra)
-{
-	bool		isouterjoin = IS_OUTER_JOIN(jointype);
-	List	   *clauses = NIL;
-	ListCell   *l;
-
-	foreach(l, extra->restrictlist)
-	{
-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
-
-		/* an outer join hashes on its own join clauses only */
-		if (isouterjoin && RINFO_IS_PUSHED_DOWN(rinfo, joinrel->relids))
-			continue;
-		if (!rinfo->can_join || rinfo->hashjoinoperator == InvalidOid)
-			continue;
-		if (!clause_sides_match_join(rinfo, outerrel->relids, innerrel->relids))
-			continue;
-		/* "inner op outer" is commuted when the plan is made */
-		if (!rinfo->outer_is_left &&
-			!OidIsValid(get_commutator(castNode(OpExpr, rinfo->clause)->opno)))
-			continue;
-		clauses = lappend(clauses, rinfo);
-	}
-	return clauses;
-}
-
-static const char *
-join_type_name(JoinType jointype)
-{
-	switch (jointype)
-	{
-		case JOIN_INNER:
-			return "inner";
-		case JOIN_LEFT:
-			return "left";
-		case JOIN_FULL:
-			return "full";
-		case JOIN_RIGHT:
-			return "right";
-		case JOIN_SEMI:
-			return "semi";
-		case JOIN_ANTI:
-			return "anti";
-		case JOIN_RIGHT_SEMI:
-			return "right semi";
-		case JOIN_RIGHT_ANTI:
-			return "right anti";
-		default:
-			return "unique";
-	}
-}
-
-/*
- * A hash join's vector alternative (§3.3.3, Hash joins): inner, left,
- * semi, anti and right joins with hash-joinable clauses, where the join's
- * strategy mask allows a hash join, over the cheapest unparameterized paths
- * of the two sides.  Nothing from extra is kept.
- */
-static void
-consider_hashjoin(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
-				  RelOptInfo *innerrel, JoinType jointype, JoinPathExtraData *extra,
-				  VexecPlanState *ps)
-{
-	VexecAlt   *alt;
-	List	   *clauses;
-	Path	   *outer = outerrel->cheapest_total_path;
-	Path	   *inner = innerrel->cheapest_total_path;
-	JoinCostWorkspace workspace;
-	HashPath   *rowpath;
-	VexecCost	cost;
-	VexecSteps	steps;
-	ListCell   *lc;
-
-	alt = vexec_alt_record(ps, "VecHashJoin", vexec_relids_names(root, joinrel->relids),
-						   root, joinrel->relids);
-	if (alt == NULL)
-		return;
-
-	switch (jointype)
-	{
-		case JOIN_INNER:
-		case JOIN_LEFT:
-		case JOIN_SEMI:
-		case JOIN_ANTI:
-		case JOIN_RIGHT:
-			break;
-		default:
-			vexec_alt_refuse(ps, alt, psprintf("a %s join", join_type_name(jointype)));
-			return;
-	}
-	if (!vexec_enable_hashjoin)
-	{
-		vexec_alt_refuse(ps, alt, "vexec.enable_hashjoin is off");
-		return;
-	}
-	if ((extra->pgs_mask & PGS_HASHJOIN) == 0)
-	{
-		vexec_alt_refuse(ps, alt, "hash joins are disabled");
-		return;
-	}
-	if (outer == NULL || inner == NULL ||
-		PATH_REQ_OUTER(outer) != NULL || PATH_REQ_OUTER(inner) != NULL)
-	{
-		vexec_alt_refuse(ps, alt, "a parameterized input");
-		return;
-	}
-	if (ps->mode != VEXEC_MODE_FORCE &&
-		Max(outer->rows, inner->rows) < vexec_min_rows)
-	{
-		vexec_alt_refuse(ps, alt, psprintf("%.0f rows at most a side, fewer than vexec.min_rows",
-										   Max(outer->rows, inner->rows)));
-		return;
-	}
-	clauses = hash_clauses(joinrel, outerrel, innerrel, jointype, extra);
-	if (clauses == NIL)
-	{
-		vexec_alt_refuse(ps, alt, "no hash-joinable clause");
-		return;
-	}
-	memset(&steps, 0, sizeof(steps));
-	vexec_oracle_exprs(root, extra->restrictlist, &steps);
-	if (steps.refusal)
-	{
-		vexec_alt_refuse(ps, alt, steps.refusal);
-		return;
-	}
-
-	/*
-	 * PostgreSQL's own hash join for these inputs.  final_cost_hashjoin()
-	 * caches each hash clause's bucket size and MCV frequency in its
-	 * RestrictInfo, computed for the pair it costs (costsize.c:4510-4541),
-	 * and core reads them back for every later pair.  Core may never have
-	 * costed this pair -- add_path_precheck() turned it down -- so the
-	 * cache is put back as it was, and recording an alternative changes no
-	 * later cost and no plan.
-	 */
-	initial_cost_hashjoin(root, &workspace, jointype, clauses, outer, inner, extra, false);
-	{
-		int			n = list_length(clauses);
-		Selectivity *saved = palloc(sizeof(Selectivity) * 4 * Max(n, 1));
-		int			i = 0;
-
-		foreach(lc, clauses)
-		{
-			RestrictInfo *rinfo = lfirst(lc);
-
-			saved[i++] = rinfo->left_bucketsize;
-			saved[i++] = rinfo->right_bucketsize;
-			saved[i++] = rinfo->left_mcvfreq;
-			saved[i++] = rinfo->right_mcvfreq;
-		}
-		rowpath = create_hashjoin_path(root, joinrel, jointype, &workspace, extra,
-									   outer, inner, false, extra->restrictlist, NULL, clauses);
-		i = 0;
-		foreach(lc, clauses)
-		{
-			RestrictInfo *rinfo = lfirst(lc);
-
-			rinfo->left_bucketsize = saved[i++];
-			rinfo->right_bucketsize = saved[i++];
-			rinfo->left_mcvfreq = saved[i++];
-			rinfo->right_mcvfreq = saved[i++];
-		}
-		pfree(saved);
-	}
-	{
-		int			nkernel = 0;
-
-		foreach(lc, clauses)
-		{
-			RestrictInfo *rinfo = lfirst(lc);
-			OpExpr	   *op = castNode(OpExpr, rinfo->clause);
-
-			set_opfuncid(op);
-			if (vexec_kernel_bound(op->opfuncid, exprType(linitial(op->args)), op->inputcollid))
-				nkernel++;
-		}
-		vexec_cost_hashjoin(root, &rowpath->jpath.path, outer, inner,
-							list_length(clauses), nkernel, &cost);
-		vexec_alt_costed(ps, alt, &cost,
-						 psprintf("%s join, outer %s, inner %s; %s, %d with kernels",
-								  join_type_name(jointype),
-								  vexec_relids_names(root, outerrel->relids),
-								  vexec_relids_names(root, innerrel->relids),
-								  count_of(list_length(clauses), "hash clause", "hash clauses"),
-								  nkernel));
-	}
-}
-
 static void
 vexec_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 						RelOptInfo *innerrel, JoinType jointype, JoinPathExtraData *extra)
 {
 	VexecPlanState *ps = vexec_plan_state(root);
 
-	if (ps != NULL && ps->record)
-		consider_hashjoin(root, joinrel, outerrel, innerrel, jointype, extra, ps);
+	if (ps != NULL)
+		vexec_consider_hashjoin(root, joinrel, outerrel, innerrel, jointype, extra, ps);
 
 	if (prev_set_join_pathlist)
 		prev_set_join_pathlist(root, joinrel, outerrel, innerrel, jointype, extra);

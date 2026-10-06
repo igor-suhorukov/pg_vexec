@@ -1,0 +1,126 @@
+--- reference
++++ session
+@@ -2989,4 +2989,19 @@
+ \gx
+ -[ RECORD 1 ]----------+----------------------
++expr                   | array_length(tags, 1)
++null_frac              | 0.25
++avg_width              | 4
++n_distinct             | -0.5
++most_common_vals       | {2}
++most_common_freqs      | {0.5}
++histogram_bounds       | 
++correlation            | 1
++most_common_elems      | 
++most_common_elem_freqs | 
++elem_count_histogram   | 
++range_length_histogram | 
++range_empty_frac       | 
++range_bounds_histogram | 
++-[ RECORD 2 ]----------+----------------------
+ expr                   | lower(arange)
+ null_frac              | 
+@@ -2997,19 +3012,4 @@
+ histogram_bounds       | 
+ correlation            | 
+-most_common_elems      | 
+-most_common_elem_freqs | 
+-elem_count_histogram   | 
+-range_length_histogram | 
+-range_empty_frac       | 
+-range_bounds_histogram | 
+--[ RECORD 2 ]----------+----------------------
+-expr                   | array_length(tags, 1)
+-null_frac              | 0.25
+-avg_width              | 4
+-n_distinct             | -0.5
+-most_common_vals       | {2}
+-most_common_freqs      | {0.5}
+-histogram_bounds       | 
+-correlation            | 1
+ most_common_elems      | 
+ most_common_elem_freqs | 
+@@ -3055,4 +3055,16 @@
+ \gx
+ -[ RECORD 1 ]----------+----------------------
++expr                   | array_length(tags, 1)
++null_frac              | 
++avg_width              | 
++n_distinct             | 
++most_common_vals       | 
++most_common_freqs      | 
++histogram_bounds       | 
++correlation            | 
++most_common_elems      | 
++most_common_elem_freqs | 
++elem_count_histogram   | 
++-[ RECORD 2 ]----------+----------------------
+ expr                   | lower(arange)
+ null_frac              | 0
+@@ -3063,16 +3075,4 @@
+ histogram_bounds       | {-1,0}
+ correlation            | -0.6
+-most_common_elems      | 
+-most_common_elem_freqs | 
+-elem_count_histogram   | 
+--[ RECORD 2 ]----------+----------------------
+-expr                   | array_length(tags, 1)
+-null_frac              | 
+-avg_width              | 
+-n_distinct             | 
+-most_common_vals       | 
+-most_common_freqs      | 
+-histogram_bounds       | 
+-correlation            | 
+ most_common_elems      | 
+ most_common_elem_freqs | 
+@@ -3126,4 +3126,16 @@
+ \gx
+ -[ RECORD 1 ]----------+----------------------
++expr                   | array_length(tags, 1)
++null_frac              | 0.25
++avg_width              | 4
++n_distinct             | -0.5
++most_common_vals       | {2}
++most_common_freqs      | {0.5}
++histogram_bounds       | 
++correlation            | 1
++most_common_elems      | 
++most_common_elem_freqs | 
++elem_count_histogram   | 
++-[ RECORD 2 ]----------+----------------------
+ expr                   | lower(arange)
+ null_frac              | 0
+@@ -3134,16 +3146,4 @@
+ histogram_bounds       | {-1,0}
+ correlation            | -0.6
+-most_common_elems      | 
+-most_common_elem_freqs | 
+-elem_count_histogram   | 
+--[ RECORD 2 ]----------+----------------------
+-expr                   | array_length(tags, 1)
+-null_frac              | 0.25
+-avg_width              | 4
+-n_distinct             | -0.5
+-most_common_vals       | {2}
+-most_common_freqs      | {0.5}
+-histogram_bounds       | 
+-correlation            | 1
+ most_common_elems      | 
+ most_common_elem_freqs | 
+@@ -3427,11 +3427,11 @@
+ \gx
+ -[ RECORD 1 ]----------+--------------------------------
++expr                   | to_tsvector(name)
++most_common_elems      | {one,tre,two,four}
++most_common_elem_freqs | {0.25,0.25,0.25,0.25,0.25,0.25}
++-[ RECORD 2 ]----------+--------------------------------
+ expr                   | length(name)
+ most_common_elems      | 
+ most_common_elem_freqs | 
+--[ RECORD 2 ]----------+--------------------------------
+-expr                   | to_tsvector(name)
+-most_common_elems      | {one,tre,two,four}
+-most_common_elem_freqs | {0.25,0.25,0.25,0.25,0.25,0.25}
+ 
+ -- Test the ability of pg_restore_extended_stats() to import all of the

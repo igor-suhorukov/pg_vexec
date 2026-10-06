@@ -1828,7 +1828,7 @@ agg_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 			ExplainPropertyText("From Statistics",
 								vexec_scan_source_name(node->vec_child), es);
 	}
-	if (es->analyze)
+	if (es->analyze && node->ran)
 	{
 		if (s->strategy == AGG_HASHED)
 		{

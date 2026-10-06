@@ -22,6 +22,16 @@ The plan's phases land here in order, each on a branch of its own:
   ORCA's, and on a cluster the fragments' vector scans on every segment.
   Its changes to the port -- gp_orca's API, gp_core's settings, gp_ao's and
   PAX's batch readers -- are in a worktree of the port, under `pg19/` only.
+- **V2, aggregation, and the first measurement** (`v2`; the plan's §5):
+  `VecAgg`, plain and hashed, with its spill and PostgreSQL's states at
+  stage boundaries; the aggregate kernels; PostgreSQL's grouping paths and
+  ORCA's Agg of every split; aggregates answered from a source's statistics
+  (the contract's `aggregate()`, PAX's in the port's worktree); and the tpc
+  suite timed.
+- **V3, hash joins** (`v3`; the plan's §5): `VecHashJoin` -- inner, left,
+  semi, anti and right, with its spill -- in place of PostgreSQL's HashJoin
+  and its Hash; PostgreSQL's join paths and ORCA's HashJoin; on a cluster,
+  a side with a receiving Motion drained where PostgreSQL leaves it unread.
 
 ## Layout
 
@@ -31,7 +41,7 @@ The plan's phases land here in order, each on a branch of its own:
 | `modules/vexec/` | the module, built by PGXS against vanilla PostgreSQL 19 or the port's server |
 | `modules/vexec/batch/` | the logical batch, its layouts, the PostgreSQL and Arrow formats, the conversions, rows in and out, scaled numerics, export through Arrow's C Data Interface |
 | `modules/vexec/plan/` | the vectorized planner: the oracle, the cost model, the path hooks, the node builders, ORCA's front end through gp_orca's API, the reasons, EXPLAIN's option, the plan check |
-| `modules/vexec/exec/` | the vector nodes, `VecScan` and `VecResult`, with their row and batch interfaces |
+| `modules/vexec/exec/` | the vector nodes, `VecScan`, `VecResult`, `VecAgg` and `VecHashJoin`, with their row and batch interfaces, and the aggregates' transitions |
 | `modules/vexec/expr/` | the expression compiler and evaluator: kernels bound by function OID, the fallback, PostgreSQL's evaluator for what may raise |
 | `modules/vexec/source/` | `vexec`'s side of the source registry |
 | `modules/vexec/pgxs/include/` | copies of the port's headers the PGXS build compiles against, kept equal to the originals |

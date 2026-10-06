@@ -317,13 +317,6 @@ count_kernel_keys(List *groupclause, List *groupexprs)
  * ---------------------------------------------------------------------
  */
 
-static bool
-is_vector_path(Path *path)
-{
-	return path != NULL && IsA(path, CustomPath) &&
-		strncmp(((CustomPath *) path)->methods->CustomName, "Vec", 3) == 0;
-}
-
 static Path *
 agg_path(PlannerInfo *root, RelOptInfo *rel, Path *input, PathTarget *target,
 		 AggPathInfo *info, const VexecCost *cost)
@@ -581,7 +574,7 @@ consider_distinct_pair(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *out
 	get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &fcosts);
 	lrow = create_agg_path(root, output_rel, input, lt, AGG_HASHED, AGGSPLIT_INITIAL_SERIAL,
 						   lgroupclause, NIL, &pcosts, lgroups);
-	vexec_cost_agg(root, &lrow->path, input, is_vector_path(input),
+	vexec_cost_agg(root, &lrow->path, input, vexec_is_vector_path(input),
 				   list_length(lgroupclause), 0, list_length(as->aggrefs), lgroups, &lcost);
 	memset(&linfo, 0, sizeof(linfo));
 	linfo.strategy = AGG_HASHED;
@@ -719,7 +712,7 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 							  strategy == AGG_PLAIN ? 1 : numgroups);
 	nvec = count_vector_aggs(as.aggrefs, AGGSPLIT_SIMPLE, &names);
 	nkeys_kernel = count_kernel_keys(groupclause, as.groupexprs);
-	vexec_cost_agg(root, &rowpath->path, input, is_vector_path(input),
+	vexec_cost_agg(root, &rowpath->path, input, vexec_is_vector_path(input),
 				   list_length(groupclause), nkeys_kernel, nvec,
 				   strategy == AGG_PLAIN ? 1 : numgroups, &cost);
 	{
@@ -785,7 +778,7 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 
 			prow = create_agg_path(root, prel, pinput, prel->reltarget, strategy,
 								   AGGSPLIT_INITIAL_SERIAL, groupclause, NIL, &pcosts, pgroups);
-			vexec_cost_agg(root, &prow->path, pinput, is_vector_path(pinput),
+			vexec_cost_agg(root, &prow->path, pinput, vexec_is_vector_path(pinput),
 						   list_length(groupclause), nkeys_kernel,
 						   count_vector_aggs(pas.aggrefs, AGGSPLIT_INITIAL_SERIAL, NULL),
 						   pgroups, &pcost);

@@ -1,0 +1,9 @@
+--- reference
++++ session
+@@ -1170,5 +1170,5 @@
+ WHERE e1.j = e2.j and
+ e1.i + 1 IN ( SELECT i from exttab_subq_1 WHERE i <= e1.i);
+-NOTICE:  found 4 data formatting errors (4 or more input rows), rejected related input data
++NOTICE:  found 6 data formatting errors (6 or more input rows), rejected related input data
+  i | j 
+ ---+---

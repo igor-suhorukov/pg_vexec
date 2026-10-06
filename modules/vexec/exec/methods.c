@@ -37,12 +37,18 @@ static const CustomScanMethods agg_methods = {
 	.CreateCustomScanState = vexec_create_agg_state,
 };
 
+static const CustomScanMethods hashjoin_methods = {
+	.CustomName = VEXEC_HASHJOIN_NAME,
+	.CreateCustomScanState = vexec_create_hashjoin_state,
+};
+
 void
 vexec_exec_install(void)
 {
 	RegisterCustomScanMethods(&scan_methods);
 	RegisterCustomScanMethods(&result_methods);
 	RegisterCustomScanMethods(&agg_methods);
+	RegisterCustomScanMethods(&hashjoin_methods);
 }
 
 const CustomScanMethods *
@@ -63,6 +69,12 @@ vexec_agg_methods(void)
 	return &agg_methods;
 }
 
+const CustomScanMethods *
+vexec_hashjoin_methods(void)
+{
+	return &hashjoin_methods;
+}
+
 /* Whether a plan node is one of vexec's vector nodes. */
 bool
 vexec_is_vector_node(Plan *plan)
@@ -73,7 +85,7 @@ vexec_is_vector_node(Plan *plan)
 		return false;
 	cscan = (CustomScan *) plan;
 	return cscan->methods == &scan_methods || cscan->methods == &result_methods ||
-		cscan->methods == &agg_methods;
+		cscan->methods == &agg_methods || cscan->methods == &hashjoin_methods;
 }
 
 /* Whether a plan state is one of vexec's vector nodes'. */

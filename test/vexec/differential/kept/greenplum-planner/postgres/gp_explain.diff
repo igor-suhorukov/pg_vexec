@@ -1,0 +1,9 @@
+--- reference
++++ session
+@@ -215,5 +215,5 @@
+                            et                           
+ --------------------------------------------------------
+- Hash Cond: ("*VALUES*".column1 = "*VALUES*_1".column1)
++ Hash Cond: ("*VALUES*_1".column1 = "*VALUES*".column1)
+ (1 row)
+ 

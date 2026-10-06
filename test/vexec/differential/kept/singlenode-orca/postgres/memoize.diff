@@ -1,14 +1,29 @@
 --- reference
 +++ session
-@@ -45,9 +45,9 @@
-                Buckets: 1024  Batches: 1  Memory Usage: NkB
-          ->  Hash (actual rows=1000.00 loops=N)
+@@ -38,16 +38,16 @@
+ INNER JOIN tenk1 t2 ON t1.unique1 = t2.twenty
+ WHERE t2.unique1 < 1000;', false);
+-                                      explain_memoize                                       
+---------------------------------------------------------------------------------------------
+-                     Index Cond: (unique1 < 1000)
+-                     Index Searches: N
+-               ->  Index Scan using tenk1_unique1 on tenk1 t2 (actual rows=1000.00 loops=N)
+-               Buckets: 1024  Batches: 1  Memory Usage: NkB
+-         ->  Hash (actual rows=1000.00 loops=N)
 -         ->  Seq Scan on tenk1 t1 (actual rows=10000.00 loops=N)
++                                   explain_memoize                                    
++--------------------------------------------------------------------------------------
++               Index Cond: (unique1 < 1000)
++               Index Searches: N
++         ->  Index Scan using tenk1_unique1 on tenk1 t2 (actual rows=1000.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=10000.00 loops=N)
           Hash Cond: (t1.unique1 = t2.twenty)
-    ->  Hash Join (actual rows=1000.00 loops=N)
+-   ->  Hash Join (actual rows=1000.00 loops=N)
 - Aggregate (actual rows=1.00 loops=N)
 - Optimizer: GPORCA
++         Inner Rows: 1000
++         Memory Usage: N kB
++   ->  Vec Hash Join (actual rows=1000.00 loops=N)
 + Optimizer: GPORCA
 + Vec Aggregate (actual rows=1.00 loops=N)
  (10 rows)
@@ -127,69 +142,106 @@
 +   ->  Vec Seq Scan on expr_key t1 (actual rows=40.00 loops=N)
     Join Filter: true
   Nested Loop (actual rows=80.00 loops=N)
-@@ -246,9 +243,9 @@
-                Buckets: 2048  Batches: 1  Memory Usage: NkB
-          ->  Hash (actual rows=1200.00 loops=N)
+@@ -239,17 +236,20 @@
+ INNER JOIN tenk1 t2 ON t1.unique1 = t2.thousand
+ WHERE t2.unique1 < 1200;', true);
+-                                      explain_memoize                                       
+---------------------------------------------------------------------------------------------
+-                     Index Cond: (unique1 < 1200)
+-                     Index Searches: N
+-               ->  Index Scan using tenk1_unique1 on tenk1 t2 (actual rows=1200.00 loops=N)
+-               Buckets: 2048  Batches: 1  Memory Usage: NkB
+-         ->  Hash (actual rows=1200.00 loops=N)
 -         ->  Seq Scan on tenk1 t1 (actual rows=10000.00 loops=N)
++                                   explain_memoize                                    
++--------------------------------------------------------------------------------------
++               Index Cond: (unique1 < 1200)
++               Index Searches: N
++         ->  Index Scan using tenk1_unique1 on tenk1 t2 (actual rows=1200.00 loops=N)
 +         ->  Vec Seq Scan on tenk1 t1 (actual rows=10000.00 loops=N)
           Hash Cond: (t1.unique1 = t2.thousand)
-    ->  Hash Join (actual rows=1200.00 loops=N)
+-   ->  Hash Join (actual rows=1200.00 loops=N)
 - Aggregate (actual rows=1.00 loops=N)
 - Optimizer: GPORCA
+-(10 rows)
++         Inner Rows: 1200
++         Memory Usage: N kB
++         Spill Depth: 1
++         Spilled Partitions: 32
++         Spilled Rows: 11200
++   ->  Vec Hash Join (actual rows=1200.00 loops=N)
 + Optimizer: GPORCA
 + Vec Aggregate (actual rows=1.00 loops=N)
- (10 rows)
++(13 rows)
  
-@@ -267,5 +264,5 @@
+ CREATE TABLE flt (f float);
+@@ -267,5 +267,5 @@
           Index Searches: N
     ->  Index Scan using flt_f_idx on flt f2 (actual rows=2.00 loops=N)
 -   ->  Seq Scan on flt f1 (actual rows=2.00 loops=N)
 +   ->  Vec Seq Scan on flt f1 (actual rows=2.00 loops=N)
     Join Filter: true
   Nested Loop (actual rows=4.00 loops=N)
-@@ -281,5 +278,5 @@
+@@ -281,5 +281,5 @@
           Index Searches: N
     ->  Index Scan using flt_f_idx on flt f2 (actual rows=2.00 loops=N)
 -   ->  Seq Scan on flt f1 (actual rows=2.00 loops=N)
 +   ->  Vec Seq Scan on flt f1 (actual rows=2.00 loops=N)
     Join Filter: true
   Nested Loop (actual rows=4.00 loops=N)
-@@ -305,5 +302,5 @@
+@@ -305,5 +305,5 @@
           Index Searches: N
     ->  Index Scan using strtest_n_idx on strtest s2 (actual rows=4.00 loops=N)
 -   ->  Seq Scan on strtest s1 (actual rows=6.00 loops=N)
 +   ->  Vec Seq Scan on strtest s1 (actual rows=6.00 loops=N)
     Join Filter: true
   Nested Loop (actual rows=24.00 loops=N)
-@@ -319,5 +316,5 @@
+@@ -319,5 +319,5 @@
           Index Searches: N
     ->  Index Scan using strtest_t_idx on strtest s2 (actual rows=4.00 loops=N)
 -   ->  Seq Scan on strtest s1 (actual rows=6.00 loops=N)
 +   ->  Vec Seq Scan on strtest s1 (actual rows=6.00 loops=N)
     Join Filter: true
   Nested Loop (actual rows=24.00 loops=N)
-@@ -338,14 +335,14 @@
+@@ -338,23 +338,23 @@
  SELECT explain_memoize('
  SELECT * FROM prt t1 INNER JOIN prt t2 ON t1.a = t2.a;', false);
 -                               explain_memoize                               
 ------------------------------------------------------------------------------
 -                     ->  Seq Scan on prt_p1 t2_1 (actual rows=4.00 loops=N)
 -                     ->  Seq Scan on prt_p2 t2_2 (actual rows=4.00 loops=N)
-+                                explain_memoize                                 
-+--------------------------------------------------------------------------------
-+                     ->  Vec Seq Scan on prt_p1 t2_1 (actual rows=4.00 loops=N)
-+                     ->  Vec Seq Scan on prt_p2 t2_2 (actual rows=4.00 loops=N)
-                      Number of partitions to scan: 2 (out of 2)
-                      Partitions Scanned: 2
-                ->  Dynamic Seq Scan on prt t2 (actual rows=8.00 loops=N)
-          ->  Partition Selector (selector id: $0) (actual rows=8.00 loops=N)
+-                     Number of partitions to scan: 2 (out of 2)
+-                     Partitions Scanned: 2
+-               ->  Dynamic Seq Scan on prt t2 (actual rows=8.00 loops=N)
+-         ->  Partition Selector (selector id: $0) (actual rows=8.00 loops=N)
 -         ->  Seq Scan on prt_p1 t1_1 (actual rows=4.00 loops=N)
 -         ->  Seq Scan on prt_p2 t1_2 (actual rows=4.00 loops=N)
+-         Buckets: 1024  Batches: 1  Memory Usage: NkB
++                             explain_memoize                              
++--------------------------------------------------------------------------
++               ->  Vec Seq Scan on prt_p1 t2_1 (actual rows=4.00 loops=N)
++               ->  Vec Seq Scan on prt_p2 t2_2 (actual rows=4.00 loops=N)
++               Number of partitions to scan: 2 (out of 2)
++               Partitions Scanned: 2
++         ->  Dynamic Seq Scan on prt t2 (actual rows=8.00 loops=N)
 +         ->  Vec Seq Scan on prt_p1 t1_1 (actual rows=4.00 loops=N)
 +         ->  Vec Seq Scan on prt_p2 t1_2 (actual rows=4.00 loops=N)
-          Buckets: 1024  Batches: 1  Memory Usage: NkB
           Number of partitions to scan: 2 (out of 2)
-@@ -367,6 +364,6 @@
+          Partition Selectors: $0
+          Partitions Scanned: 2
+    ->  Dynamic Seq Scan on prt t1 (actual rows=8.00 loops=N)
+-   ->  Hash (actual rows=8.00 loops=N)
++   ->  Partition Selector (selector id: $0) (actual rows=8.00 loops=N)
+    Hash Cond: (t1.a = t2.a)
+- Hash Join (actual rows=32.00 loops=N)
+- Optimizer: GPORCA
++   Inner Rows: 8
++   Memory Usage: N kB
++ Optimizer: GPORCA
++ Vec Hash Join (actual rows=32.00 loops=N)
+ (17 rows)
+ 
+@@ -367,6 +367,6 @@
                               explain_memoize                              
  --------------------------------------------------------------------------
 -         ->  Seq Scan on prt_p1 (actual rows=4.00 loops=N)
@@ -198,7 +250,7 @@
 +         ->  Vec Seq Scan on prt_p2 (actual rows=4.00 loops=N)
           Index Cond: (a = prt_p1.a)
           Index Searches: N
-@@ -446,7 +443,7 @@
+@@ -446,7 +446,7 @@
  ON t1.a+1 = t2.a
  WHERE t2.a IS NULL;', false);
 -                                      explain_memoize                                       
@@ -209,7 +261,7 @@
 +                                 ->  Vec Seq Scan on tab_anti t2_1 (actual rows=100.00 loops=N)
                                   Sort Key: t2_1.a
                                   Sort Method: quicksort  Memory: NkB
-@@ -460,8 +457,8 @@
+@@ -460,8 +460,8 @@
                 Hits: 97  Misses: 3  Evictions: Zero  Overflows: 0  Memory Usage: NkB
           ->  Memoize (actual rows=0.67 loops=N)
 -         ->  Seq Scan on tab_anti t1 (actual rows=100.00 loops=N)

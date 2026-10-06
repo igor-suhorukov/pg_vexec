@@ -13,8 +13,8 @@
  * EXPLAIN's vexec option.
  *
  * In V1 the scan is vectorized: VecScan, and ORCA's Results over it as
- * VecResult; in V2 aggregation, VecAgg.  Joins and sorts are still only
- * costed and recorded (§5).
+ * VecResult; in V2 aggregation, VecAgg; in V3 hash joins, VecHashJoin.
+ * Sorts are still only costed and recorded (§5).
  *
  *-------------------------------------------------------------------------
  */
@@ -90,6 +90,7 @@ typedef struct VexecPlanState
 	int			npossible;		/* vector nodes the oracle accepted, built or
 								 * added as paths: what
 								 * vexec.debug_require_vector asks of a plan */
+	bool		joins_built;	/* a VecHashJoin's plan was made */
 } VexecPlanState;
 
 /* The most alternatives one statement records. */
@@ -107,7 +108,10 @@ extern void vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 							VexecCost *cost);
 extern void vexec_cost_hashjoin(PlannerInfo *root, Path *rowpath,
 								Path *outer, Path *inner, int nclauses,
-								int nclauses_kernel, VexecCost *cost);
+								int nclauses_kernel, bool outer_vector,
+								bool inner_vector, VexecCost *cost);
+extern void vexec_cost_plan_hashjoin(Plan *join, Plan *outer, Plan *inner, int nclauses,
+									 int nclauses_kernel, VexecCost *cost);
 extern void vexec_cost_agg(PlannerInfo *root, Path *rowpath, Path *input,
 						   bool input_vector, int ngroupcols, int ngroupcols_kernel,
 						   int naggs_kernel, double numgroups, VexecCost *cost);
@@ -128,6 +132,7 @@ extern char *vexec_relids_names(PlannerInfo *root, Relids relids);
 extern Node *vexec_reasons_node(VexecPlanState *ps);
 
 /* paths.c */
+extern int	vexec_planner_extension_id(void);
 extern VexecPlanState *vexec_plan_state(PlannerInfo *root);
 extern const char *vexec_statement_gate(Query *parse, int cursorOptions);
 
@@ -140,6 +145,16 @@ extern void vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel,
 							   VexecPlanState *ps, const char *target_name);
 extern const char *vexec_orca_agg_refusal(Agg *agg);
 extern Plan *vexec_build_agg_from_agg(Agg *agg);
+
+/* join.c */
+extern bool vexec_is_vector_path(Path *path);
+extern void vexec_consider_hashjoin(PlannerInfo *root, RelOptInfo *joinrel,
+									RelOptInfo *outerrel, RelOptInfo *innerrel,
+									JoinType jointype, JoinPathExtraData *extra,
+									VexecPlanState *ps);
+extern const char *vexec_orca_hashjoin_refusal(HashJoin *hj);
+extern void vexec_join_finish_plan(PlannedStmt *pstmt);
+extern Plan *vexec_build_hashjoin_from_hashjoin(HashJoin *hj);
 
 /* build.c */
 extern Path *vexec_scan_path(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,

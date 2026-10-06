@@ -46,6 +46,7 @@
 #include "utils/spccache.h"
 
 #include "vexec.h"
+#include "exec/exec.h"
 #include "plan/plan.h"
 
 /*
@@ -111,14 +112,19 @@ path_width_cols(Path *path)
  * cpu_operator_cost a hash clause and a cpu_tuple_cost an inner row to
  * build, a cpu_operator_cost a hash clause an outer row to probe, and a
  * cpu_tuple_cost an output row.  The kernels' share of the hashing, and the
- * tuple costs, take the vector factors; the row inputs are transposed.
+ * tuple costs, take the vector factors.  A row input's rows are
+ * transposed; a vector input's batches are read as they are, and the
+ * handing out of its rows that its cost carries is saved.
  */
 void
 vexec_cost_hashjoin(PlannerInfo *root, Path *rowpath, Path *outer, Path *inner,
-					int nclauses, int nclauses_kernel, VexecCost *cost)
+					int nclauses, int nclauses_kernel, bool outer_vector, bool inner_vector,
+					VexecCost *cost)
 {
 	double		save_op = (1.0 - vexec_cpu_operator_factor) * cpu_operator_cost * nclauses_kernel;
 	double		save_tuple = (1.0 - vexec_cpu_tuple_factor) * cpu_tuple_cost;
+	double		conv_outer = vexec_convert_cost * path_width_cols(outer) * outer->rows;
+	double		conv_inner = vexec_convert_cost * path_width_cols(inner) * inner->rows;
 	Cost		save_startup;
 	Cost		save_run;
 
@@ -131,12 +137,14 @@ vexec_cost_hashjoin(PlannerInfo *root, Path *rowpath, Path *outer, Path *inner,
 
 	save_startup = (save_op + save_tuple) * inner->rows;
 	save_run = save_op * outer->rows + save_tuple * rowpath->rows;
+	if (outer_vector)
+		conv_outer = -conv_outer;
+	if (inner_vector)
+		conv_inner = -conv_inner;
 
-	cost->convert_in = vexec_convert_cost *
-		(path_width_cols(outer) * outer->rows + path_width_cols(inner) * inner->rows);
+	cost->convert_in = conv_outer + conv_inner;
 	cost->rowout = vexec_convert_cost * path_width_cols(rowpath) * rowpath->rows;
-	cost->startup = rowpath->startup_cost - save_startup + vexec_batch_setup_cost +
-		vexec_convert_cost * path_width_cols(inner) * inner->rows;
+	cost->startup = rowpath->startup_cost - save_startup + vexec_batch_setup_cost + conv_inner;
 	cost->total = rowpath->total_cost - save_startup - save_run + vexec_batch_setup_cost +
 		cost->convert_in + cost->rowout;
 }
@@ -267,6 +275,49 @@ vexec_cost_plan_agg(Plan *agg, int ngroupcols, int naggs, int naggs_kernel,
 	cost->row_total = row_cpu;
 	cost->convert_in = vexec_convert_cost * in_cols * in_rows * (input_vector ? -1 : 1);
 	cost->rowout = vexec_convert_cost * Max(list_length(agg->targetlist), 1) * groups;
+	cost->startup = vexec_batch_setup_cost + cpu + cost->convert_in;
+	cost->total = cost->startup + cost->rowout;
+}
+
+/*
+ * A HashJoin ORCA's translator built, priced as a row hash join and as
+ * VecHashJoin in PostgreSQL's units, as cost_hashjoin() would price its CPU
+ * (costsize.c): a cpu_operator_cost a hash clause and a cpu_tuple_cost an
+ * inner row to build, a cpu_operator_cost a hash clause an outer row to
+ * probe, a cpu_tuple_cost an output row; the kernels' share of the
+ * clauses at the operator factor, the tuples at the tuple factor.  ORCA's
+ * choices are its own until V5; in auto mode its HashJoin becomes
+ * VecHashJoin where this prices it lower.
+ */
+void
+vexec_cost_plan_hashjoin(Plan *join, Plan *outer, Plan *inner, int nclauses,
+						 int nclauses_kernel, VexecCost *cost)
+{
+	double		outer_rows = Max(outer->plan_rows, 1);
+	double		inner_rows = Max(inner->plan_rows, 1);
+	double		rows = Max(join->plan_rows, 1);
+	int			outer_cols = Max(list_length(outer->targetlist), 1);
+	int			inner_cols = Max(list_length(inner->targetlist), 1);
+	bool		outer_vector = vexec_is_vector_node(outer);
+	bool		inner_vector = vexec_is_vector_node(inner);
+	Cost		row_cpu;
+	Cost		cpu;
+
+	memset(cost, 0, sizeof(VexecCost));
+	row_cpu = (cpu_operator_cost * nclauses + cpu_tuple_cost) * inner_rows +
+		cpu_operator_cost * nclauses * outer_rows + cpu_tuple_cost * rows;
+	cpu = (cpu_operator_cost * (nclauses_kernel * vexec_cpu_operator_factor +
+								(nclauses - nclauses_kernel)) +
+		   cpu_tuple_cost * vexec_cpu_tuple_factor) * inner_rows +
+		cpu_operator_cost * (nclauses_kernel * vexec_cpu_operator_factor +
+							 (nclauses - nclauses_kernel)) * outer_rows +
+		cpu_tuple_cost * vexec_cpu_tuple_factor * rows;
+	cost->rows = rows;
+	cost->row_startup = row_cpu;
+	cost->row_total = row_cpu;
+	cost->convert_in = vexec_convert_cost * (outer_cols * outer_rows * (outer_vector ? -1 : 1) +
+											 inner_cols * inner_rows * (inner_vector ? -1 : 1));
+	cost->rowout = vexec_convert_cost * Max(list_length(join->targetlist), 1) * rows;
 	cost->startup = vexec_batch_setup_cost + cpu + cost->convert_in;
 	cost->total = cost->startup + cost->rowout;
 }

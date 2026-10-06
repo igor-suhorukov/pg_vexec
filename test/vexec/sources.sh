@@ -16,6 +16,9 @@
 # it means to: its text begins with "/* error */".  So a table a module's
 # queries never made fails, rather than an error every session repeats.
 #
+# V3: hash joins over each storage's batches, of each join type, keys of
+# each layout.
+#
 # The table holds every type class of §3.4 with NULLs at the bitmaps' word
 # edges, rows deleted, values long enough to be compressed and to be stored
 # out of line, a dropped column and one added after the rows were written.
@@ -145,6 +148,20 @@ QUERIES=(
 	# count(*) over a qual with a SubPlan: under ORCA a VecResult of no
 	# columns, reading its child's rows
 	"SELECT count(*) FROM %t t1 WHERE t1.id < 300 AND (t1.i4 % 1000 = 42 OR t1.i2 = (SELECT t2.i2 FROM %t t2 WHERE t2.id = t1.id + 1 LIMIT 1))"
+	# V3: hash joins over each storage's batches -- keys of each layout:
+	# integers of two widths, text in views and offsets, scaled numerics with
+	# dates, uuids, bpchar, a column added later, timestamps, "char" and oid
+	# -- over deleted rows and NULL keys, in each join type, and long and
+	# compressed values carried through the join
+	"SELECT count(*), sum(a.id), sum(b.id) FROM %t a JOIN %t b ON a.i2 = b.i4"
+	"SELECT count(*), sum(b.id) FROM %t a JOIN %t b ON a.t = b.t AND a.id < b.id WHERE a.id % 50 = 0"
+	"SELECT count(*), sum(a.id), sum(b.id) FROM %t a JOIN src b ON a.n = b.n AND a.d = b.d WHERE b.id % 5 = 0"
+	"SELECT count(*), count(b.id), sum(b.id) FROM %t a LEFT JOIN %t b ON a.u = b.u AND b.id % 3 = 0"
+	"SELECT count(*), sum(a.id) FROM %t a WHERE EXISTS (SELECT 1 FROM %t b WHERE b.bp = a.bp AND b.v > a.v)"
+	"SELECT count(*), sum(a.id) FROM %t a WHERE NOT EXISTS (SELECT 1 FROM %t b WHERE b.later = a.i4 AND b.id <> a.id)"
+	"SELECT count(*), count(a.id), sum(b.id) FROM %t a RIGHT JOIN %t b ON a.ts = b.ts + interval '1 minute' AND a.id = b.id + 1 WHERE b.id < 1500"
+	"SELECT a.ch, count(*), sum(b.id) FROM %t a JOIN %t b ON a.ch = b.ch AND a.o = b.o GROUP BY a.ch ORDER BY a.ch"
+	"SELECT md5(string_agg(a.id || ':' || coalesce(b.longt, '-'), ',' ORDER BY a.id, b.id)) FROM %t a LEFT JOIN %t b ON a.id = b.id + 25 WHERE a.id % 100 = 1"
 )
 # and each storage module's own, a query a line, from sources/*.queries
 for f in "$here"/sources/*.queries; do
@@ -194,6 +211,21 @@ for s in $STORAGES; do
 		echo "$plan" | sed 's/^/      /'
 		fail=1
 	fi
+	# V3: under each planner a hash join of the table with itself, a
+	# VecHashJoin reading both its VecScans' batches, from the source
+	for o in off on; do
+		route="under $( [ $o = on ] && echo ORCA || echo "the planner")"
+		plan=$(q "$D" postgres "SET gp.optimizer = $o; SET vexec.mode = force; EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*), sum(a.id), sum(b.id) FROM $t a JOIN $t b ON a.i2 = b.i4")
+		if echo "$plan" | grep -q "Vec Hash Join" && echo "$plan" | grep -q "Outer Input: batches" &&
+			echo "$plan" | grep -q "Inner Input: batches" &&
+			[ "$(echo "$plan" | grep -c "Source: $want")" -eq 2 ]; then
+			echo "  ok $s: $route a VecHashJoin reads both its VecScans' batches"
+		else
+			echo "  FAILED $s: $route no VecHashJoin over two VecScans reading through $want:"
+			echo "$plan" | sed 's/^/      /'
+			fail=1
+		fi
+	done
 	for qt in "${QUERIES[@]}"; do
 		sql="${qt//%t/$t}"
 		ref=""

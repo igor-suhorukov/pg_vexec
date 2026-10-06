@@ -82,6 +82,10 @@
 #                      vexec off and in auto mode, under both planners, the
 #                      least of three -- each query, a thousand one-row
 #                      lookups by key, a five-table join; planning.tsv
+#   TPC_PLANS          1: after the rounds, each query's EXPLAIN under ORCA,
+#                      and under the planner's route where the run times it:
+#                      its hash joins, those of them VecHashJoins, its other
+#                      joins (pg_vector_executor.md V3); plans.tsv
 #   TPC_PYTHON         /opt/duckdb/bin/python, the venv's
 #   TPC_DUCKDB_EXTENSIONS  /opt/duckdb/extensions, the extensions it loads
 #
@@ -165,6 +169,7 @@ cleanup() {
 	if [ -n "${RESULTS_DIR:-}" ]; then
 		cp "$ROOT/results.tsv" "$RESULTS_DIR/tpc-results.tsv" 2> /dev/null
 		cp "$ROOT/planning.tsv" "$RESULTS_DIR/tpc-planning.tsv" 2> /dev/null
+		cp "$ROOT/plans.tsv" "$RESULTS_DIR/tpc-plans.tsv" 2> /dev/null
 		[ -d "$ROOT/out" ] && cp -r "$ROOT/out" "$RESULTS_DIR/tpc-out"
 	fi
 	[ -n "${KEEP:-}" ] && echo "kept: $ROOT" || rm -rf "$ROOT"
@@ -391,6 +396,44 @@ WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey AND l_suppkey = s_suppke
 					printf "  planning, %s: a thousand lookups %.1f ms off, %.1f ms auto; the five-table join %.2f ms off, %.2f ms auto\n",
 						name, x["lookups1000 " a], x["lookups1000 " b], x["join5 " a], x["join5 " b] }
 		}' "$ROOT/planning.tsv"
+fi
+
+# The plans' joins (pg_vector_executor.md V3): each query's EXPLAIN under
+# ORCA, with the session's vexec settings, and under the planner's route
+# where the run times it -- its hash joins, those of them VecHashJoins, and
+# its other joins; plans.tsv
+if [ "${TPC_PLANS:-0}" = 1 ]; then
+	start=$(date +%s)
+	: > "$ROOT/plans.tsv"
+	opts="on"
+	[ "$MODE" = time ] && opts="on off"
+	for opt in $opts; do
+		for kind in $KINDS; do
+			for f in "$ROOT/$kind/q/"*.sql; do
+				name=$(basename "$f" .sql)
+				[ -n "${TPC_QUERIES:-}" ] && [[ " $TPC_QUERIES " != *" $name "* ]] && continue
+				counts=$("$TPC_PYTHON" -c '
+import sys
+text = "\n".join(l.split("--")[0] for l in open(sys.argv[1]).read().splitlines())
+for s in (x.strip() for x in text.split(";")):
+    if s:
+        print("EXPLAIN (COSTS OFF) " + " ".join(s.split()) + ";")
+' "$f" | PGOPTIONS="-c gp.optimizer=$opt -c statement_timeout=${TIMEOUT}s $VEXEC_OPTIONS -c vexec.debug_require_vector=off" \
+					"$PSQL" -X -h "$(sockdir 0)" -p "$(port 0)" -d "tpc$kind" -At 2> /dev/null |
+					awk '/Vec Hash [A-Za-z ]*Join/ { v++; next }
+						/Hash [A-Za-z ]*Join/ { r++; next }
+						/Nested Loop|Merge [A-Za-z ]*Join/ { o++ }
+						END { printf "%d\t%d\t%d", v, r, o }')
+				printf '%s\t%s\t%s\t%s\n' "$kind" "$name" "$opt" "$counts" >> "$ROOT/plans.tsv"
+			done
+		done
+	done
+	awk -F'\t' '{ k = ($3 == "on") ? "ORCA" : "the planner"; v[k] += $4; r[k] += $5; o[k] += $6; n[k]++
+			if ($4 + $5 > 0) q[k]++; if ($4 > 0 && $5 == 0) a[k]++ }
+		END { for (k in n)
+			printf "  plans, %s: %d hash joins in %d of %d queries, %d of them VecHashJoins; %d queries with every hash join one; %d other joins\n",
+				k, v[k] + r[k], q[k], n[k], v[k], a[k], o[k] }' "$ROOT/plans.tsv"
+	echo "  plans: read in $(( $(date +%s) - start )) s"
 fi
 
 "$TPC_PYTHON" "$here/tpc.py" report "$ROOT" "$MODE"

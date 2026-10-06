@@ -17,7 +17,7 @@
 
 #include "utils/guc.h"
 
-#define VEXEC_VERSION	"0.2.0"
+#define VEXEC_VERSION	"0.3.0"
 
 /*
  * What vexec exports to other modules of its own repository's tests
