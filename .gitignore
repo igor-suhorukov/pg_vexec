@@ -1,0 +1,8 @@
+# what a build makes (Makefile): the protocol's generated code, the objects, the library
+gen/
+*.o
+*.so
+*.bc
+# the tests' caches
+__pycache__/
+*.pyc
