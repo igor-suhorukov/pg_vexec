@@ -58,6 +58,8 @@ bool		vexec_enable_running_bound = true;
 bool		vexec_enable_window = true;
 bool		vexec_enable_insert = true;
 bool		vexec_orca = true;
+bool		vexec_orca_cost_model = true;
+char	   *vexec_orca_settings = NULL;
 double		vexec_compact_threshold = 0.25;
 
 /* the batch formats (§3.4.4) */
@@ -283,6 +285,22 @@ define_settings(void)
 							 "Uses ORCA's front end where gp_orca's API is present.",
 							 NULL, &vexec_orca, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.orca_cost_model",
+							 "Prices vexec's nodes in ORCA's search, and offers ORCA's hashed window.",
+							 "In auto and force mode, ORCA's cost model with vexec's nodes priced in "
+							 "chooses ORCA's plans, which then get vector nodes where it priced them; "
+							 "off, ORCA's own cost model, and vector nodes where vexec's own costs "
+							 "choose them.",
+							 &vexec_orca_cost_model, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomStringVariable("vexec.orca_settings",
+							   "ORCA's settings for the statements vexec takes, set for their planning alone.",
+							   "A comma-separated list of name=value, each a setting of gp_orca's "
+							   "(gp.optimizer_...), in auto and force mode.",
+							   &vexec_orca_settings,
+							   VEXEC_ORCA_SETTINGS_DEFAULT,
+							   PGC_USERSET, GUC_EXPLAIN | GUC_LIST_INPUT,
+							   vexec_orca_settings_check, NULL, NULL);
 	DefineCustomRealVariable("vexec.compact_threshold",
 							 "Below this share of selected rows, a batch is compacted.",
 							 NULL,

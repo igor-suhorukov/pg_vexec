@@ -603,7 +603,7 @@ vexec_node_exec(VexecNode *node)
 bool
 vexec_node_batchable(VexecNode *node)
 {
-	return node->kind != VEXEC_NODE_AGG &&
+	return node->kind != VEXEC_NODE_AGG && node->kind != VEXEC_NODE_WINDOW &&
 		node->first_lazy == node->nquals && !node->any_lazy_target &&
 		!node->row_input;
 }

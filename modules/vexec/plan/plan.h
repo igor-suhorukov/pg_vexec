@@ -14,7 +14,8 @@
  *
  * In V1 the scan is vectorized: VecScan, and ORCA's Results over it as
  * VecResult; in V2 aggregation, VecAgg; in V3 hash joins, VecHashJoin; in
- * V4 sorts, VecSort, and scans in parallel (§5).
+ * V4 sorts, VecSort, and scans in parallel; in V5 ORCA's hashed window,
+ * VecWindowHashAgg, and ORCA's search priced with vexec's nodes (§5).
  *
  *-------------------------------------------------------------------------
  */
@@ -92,6 +93,10 @@ typedef struct VexecPlanState
 								 * vexec.debug_require_vector asks of a plan */
 	bool		joins_built;	/* a VecHashJoin's plan was made */
 	bool		sorts_built;	/* a VecSort's path was added */
+	Query	   *parse;			/* ORCA's: the statement, while it is planned */
+	bool		orca_costed;	/* ORCA's search priced vexec's nodes
+								 * (CCostModelVec): translation builds them
+								 * where it priced them */
 } VexecPlanState;
 
 /* The most alternatives one statement records. */
@@ -172,6 +177,9 @@ extern Plan *vexec_build_sort_from_sort(Sort *sort);
 extern Plan *vexec_unbuild_sort(CustomScan *cscan);
 extern Sort *vexec_sort_describe(CustomScan *cscan);
 extern void vexec_orca_limit_bound(Limit *limit);
+
+/* window.c */
+extern Plan *vexec_build_window(VexecPlanState *ps, WindowAgg *window, List *rtable);
 
 /* build.c */
 extern Path *vexec_scan_path(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,

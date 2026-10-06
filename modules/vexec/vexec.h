@@ -102,6 +102,8 @@ extern PGDLLIMPORT bool vexec_enable_running_bound;
 extern PGDLLIMPORT bool vexec_enable_window;
 extern PGDLLIMPORT bool vexec_enable_insert;
 extern PGDLLIMPORT bool vexec_orca;
+extern PGDLLIMPORT bool vexec_orca_cost_model;
+extern PGDLLIMPORT char *vexec_orca_settings;
 extern PGDLLIMPORT double vexec_compact_threshold;
 extern PGDLLIMPORT int vexec_batch_format;
 extern PGDLLIMPORT int vexec_batch_varlena_layout;
@@ -125,6 +127,13 @@ extern const struct config_enum_entry vexec_mode_options[];
 
 /* vexec.c */
 extern const char *vexec_mode_name(int mode);
+
+/*
+ * plan/orca.c: vexec.orca_settings, ORCA's settings for the statements vexec
+ * takes (gp_orca_vec.h, set_options), as measured one by one (V5).
+ */
+#define VEXEC_ORCA_SETTINGS_DEFAULT ""
+extern bool vexec_orca_settings_check(char **newval, void **extra, GucSource source);
 
 /* plan/paths.c: the planner's hooks */
 extern void vexec_planner_install(void);

@@ -29,6 +29,7 @@ OBJS = \
 	exec/vecresult.o \
 	exec/vecscan.o \
 	exec/vecsort.o \
+	exec/vecwindow.o \
 	expr/compile.o \
 	expr/eval.o \
 	expr/k_arith.o \
@@ -48,6 +49,7 @@ OBJS = \
 	plan/paths.o \
 	plan/reasons.o \
 	plan/sort.o \
+	plan/window.o \
 	source/heap.o \
 	source/registry.o
 PGFILEDESC = "vexec - a vectorized planner and executor for PostgreSQL 19"

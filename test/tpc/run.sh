@@ -33,6 +33,13 @@
 #   TPC_VEXEC_MODE  each query's vexec.mode: off; TPC_VEXEC_FORMAT its
 #                 vexec.batch_format: postgres.  In force mode a query
 #                 planned without the vector nodes it could have fails
+#   TPC_PLANNER_ROUTE  timed: 1, each query timed under the planner's route
+#                 too; 0, under ORCA alone (V5's measurement, which changes
+#                 ORCA's plans and nothing of the planner's)
+#   TPC_VEXEC_SETTINGS  more of vexec's settings for each query, as -c
+#                 options: V5's measurement of ORCA's settings
+#                 (vexec.orca_settings) and its cost model
+#                 (vexec.orca_cost_model)
 #
 # and a cluster secret long enough for gp_core, which refuses one under 16
 # characters (pg19/modules/gp_core/gp_cluster.c:135): "tpc-" and three
@@ -85,7 +92,9 @@
 #   TPC_PLANS          1: after the rounds, each query's EXPLAIN under ORCA,
 #                      and under the planner's route where the run times it:
 #                      its hash joins, those of them VecHashJoins, its other
-#                      joins (pg_vector_executor.md V3); plans.tsv
+#                      joins (pg_vector_executor.md V3); plans.tsv, and each
+#                      plan's text in plans/, for comparing ORCA's plans
+#                      shape by shape (V5, §6.8)
 #   TPC_PYTHON         /opt/duckdb/bin/python, the venv's
 #   TPC_DUCKDB_EXTENSIONS  /opt/duckdb/extensions, the extensions it loads
 #
@@ -130,6 +139,7 @@ VEXEC_OPTIONS=""
 # TPC_VEXEC_NUMERIC: vexec.batch_numeric_layout, scaled or varlena, which
 # separates the scaled numeric's gain from batching's (§3.4.4, V2)
 [ -n "$VEXEC_PRELOAD" ] && [ -n "${TPC_VEXEC_NUMERIC:-}" ] && VEXEC_OPTIONS="$VEXEC_OPTIONS -c vexec.batch_numeric_layout=$TPC_VEXEC_NUMERIC"
+[ -n "$VEXEC_PRELOAD" ] && [ -n "${TPC_VEXEC_SETTINGS:-}" ] && VEXEC_OPTIONS="$VEXEC_OPTIONS $TPC_VEXEC_SETTINGS"
 # in force mode, checked, a statement planned without a vector node where
 # one could be built fails (vexec.debug_require_vector): every query's plan
 # is then known to carry its vector scans.  Timed, the check is left out of
@@ -170,6 +180,7 @@ cleanup() {
 		cp "$ROOT/results.tsv" "$RESULTS_DIR/tpc-results.tsv" 2> /dev/null
 		cp "$ROOT/planning.tsv" "$RESULTS_DIR/tpc-planning.tsv" 2> /dev/null
 		cp "$ROOT/plans.tsv" "$RESULTS_DIR/tpc-plans.tsv" 2> /dev/null
+		[ -d "$ROOT/plans" ] && cp -r "$ROOT/plans" "$RESULTS_DIR/tpc-plans"
 		[ -d "$ROOT/out" ] && cp -r "$ROOT/out" "$RESULTS_DIR/tpc-out"
 	fi
 	[ -n "${KEEP:-}" ] && echo "kept: $ROOT" || rm -rf "$ROOT"
@@ -316,7 +327,7 @@ for round in $(seq 1 "$ROUNDS"); do
 				else
 					planned=yes; reason=-
 				fi
-				if [ "$MODE" = time ]; then
+				if [ "$MODE" = time ] && [ "${TPC_PLANNER_ROUTE:-1}" = 1 ]; then
 					read -r pms pst <<< "$(one "tpc$kind" "$f" off "$out-planner.out" "$w")"
 				else
 					pms=0; pst=-
@@ -405,8 +416,9 @@ fi
 if [ "${TPC_PLANS:-0}" = 1 ]; then
 	start=$(date +%s)
 	: > "$ROOT/plans.tsv"
+	mkdir -p "$ROOT/plans"
 	opts="on"
-	[ "$MODE" = time ] && opts="on off"
+	[ "$MODE" = time ] && [ "${TPC_PLANNER_ROUTE:-1}" = 1 ] && opts="on off"
 	for opt in $opts; do
 		for kind in $KINDS; do
 			for f in "$ROOT/$kind/q/"*.sql; do
@@ -420,6 +432,7 @@ for s in (x.strip() for x in text.split(";")):
         print("EXPLAIN (COSTS OFF) " + " ".join(s.split()) + ";")
 ' "$f" | PGOPTIONS="-c gp.optimizer=$opt -c statement_timeout=${TIMEOUT}s $VEXEC_OPTIONS -c vexec.debug_require_vector=off" \
 					"$PSQL" -X -h "$(sockdir 0)" -p "$(port 0)" -d "tpc$kind" -At 2> /dev/null |
+					tee "$ROOT/plans/$kind-$name-$opt.txt" |
 					awk '/Vec Hash [A-Za-z ]*Join/ { v++; next }
 						/Hash [A-Za-z ]*Join/ { r++; next }
 						/Nested Loop|Merge [A-Za-z ]*Join/ { o++ }

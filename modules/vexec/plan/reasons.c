@@ -117,7 +117,8 @@ vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const
 	alt->detail = detail ? MemoryContextStrdup(ps->mcxt, detail) : NULL;
 	built_now = strcmp(alt->node, "VecScan") == 0 || strcmp(alt->node, "VecResult") == 0 ||
 		strcmp(alt->node, "VecAgg") == 0 || strcmp(alt->node, "VecHashJoin") == 0 ||
-		strcmp(alt->node, "VecSort") == 0 || strcmp(alt->node, "VecBitmapHeapScan") == 0;
+		strcmp(alt->node, "VecSort") == 0 || strcmp(alt->node, "VecBitmapHeapScan") == 0 ||
+		strcmp(alt->node, "VecWindowHashAgg") == 0;
 	if (ps->mode == VEXEC_MODE_EXPLAIN)
 	{
 		alt->status = "not chosen";
@@ -142,6 +143,12 @@ vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const
 			alt->reason = "forced: the ordered relation's paths";
 		else
 			alt->reason = "forced: the aggregation's paths";
+	}
+	else if (ps->mode == VEXEC_MODE_AUTO && ps->orca_costed)
+	{
+		/* ORCA's plans, which ORCA's search chose with this node's price */
+		alt->status = "built";
+		alt->reason = "priced in ORCA's search";
 	}
 	else if (ps->mode == VEXEC_MODE_AUTO && cost->row_total > 0 && cost->total >= cost->row_total)
 	{

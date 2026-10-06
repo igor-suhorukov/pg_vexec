@@ -51,6 +51,7 @@
 #define VEXEC_SORT_NAME		"VecSort"
 #define VEXEC_BITMAPSCAN_NAME	"VecBitmapHeapScan"
 #define VEXEC_REPART_NAME	"VecRepartition"
+#define VEXEC_WINDOW_NAME	"VecWindowHashAgg"
 
 typedef enum VexecNodeKind
 {
@@ -59,7 +60,8 @@ typedef enum VexecNodeKind
 	VEXEC_NODE_AGG,
 	VEXEC_NODE_HASHJOIN,
 	VEXEC_NODE_SORT,
-	VEXEC_NODE_REPART
+	VEXEC_NODE_REPART,
+	VEXEC_NODE_WINDOW
 } VexecNodeKind;
 
 /*
@@ -185,6 +187,31 @@ typedef struct VexecRepartPlan
 	List	   *collations;
 } VexecRepartPlan;
 
+/*
+ * VecWindowHashAgg's plan (vecwindow.c encodes and decodes custom_private):
+ * a hashed window's partition keys, columns of its child's rows from 1, with
+ * the window's equality operators and collations; the window's order within
+ * a partition, columns with their ordering operators, collations and NULLS
+ * FIRST flags; and the keys of the Sort it stands in place of -- the
+ * partition's columns, then the window's order -- by which it sorts the
+ * rows of a file past its last level.  Its scan tuple is its child's row,
+ * as VecSort's.
+ */
+typedef struct VexecWindowPlan
+{
+	List	   *partcols;
+	List	   *parteqops;
+	List	   *partcollations;
+	List	   *ordcols;
+	List	   *ordops;
+	List	   *ordcollations;
+	List	   *ordnullsfirst;
+	List	   *sortcols;
+	List	   *sortops;
+	List	   *sortcollations;
+	List	   *sortnullsfirst;
+} VexecWindowPlan;
+
 typedef struct VexecNode VexecNode;
 
 /* What the node's EXPLAIN ANALYZE counts. */
@@ -301,6 +328,7 @@ extern const CustomScanMethods *vexec_hashjoin_methods(void);
 extern const CustomScanMethods *vexec_sort_methods(void);
 extern const CustomScanMethods *vexec_bitmapscan_methods(void);
 extern const CustomScanMethods *vexec_repart_methods(void);
+extern const CustomScanMethods *vexec_window_methods(void);
 
 /* node.c: what every node shares */
 extern void vexec_node_begin(VexecNode *node, EState *estate);
@@ -345,6 +373,11 @@ extern bool vexec_scan_set_bound(PlanState *ps, VexecSortBound *bound);
 extern Node *vexec_create_repart_state(CustomScan *cscan);
 extern List *vexec_repart_plan_encode(const VexecRepartPlan *plan);
 extern void vexec_repart_plan_decode(CustomScan *cscan, VexecRepartPlan *plan);
+
+/* vecwindow.c */
+extern Node *vexec_create_window_state(CustomScan *cscan);
+extern List *vexec_window_plan_encode(const VexecWindowPlan *plan);
+extern void vexec_window_plan_decode(CustomScan *cscan, VexecWindowPlan *plan);
 
 /* vechashjoin.c */
 extern Node *vexec_create_hashjoin_state(CustomScan *cscan);

@@ -1,0 +1,9 @@
+--- reference
++++ session
+@@ -492,5 +492,5 @@
+  count_operator 
+ ----------------
+-              4
++              0
+ (1 row)
+ 

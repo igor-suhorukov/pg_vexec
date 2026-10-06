@@ -34,6 +34,14 @@
 #     share of the table among its workers -- and ORCA's sorts as VecSorts,
 #     bounded by the Limit above them, their columns fetched late by TID;
 #     and every query of the workload answered alike with workers;
+#   - V5: under ORCA, its hashed window as a VecWindowHashAgg on every
+#     segment, over the Redistribute Motion that brings each segment the
+#     partitions it computes, under PostgreSQL's WindowAgg, answering as
+#     ORCA's sorted window; and the workload in auto mode, ORCA's search
+#     priced with vexec's nodes (CCostModelVec), its plans' vector nodes
+#     built where it priced them, answering as off; and ORCA's two-stage
+#     aggregation over a filtered VecScan, which a lower bound of its
+#     partial plans too high had it prune;
 #   - the batch layer in a coordinator's backend over rows gathered from the
 #     segments: vexec_test's round trips and export check.
 #
@@ -173,6 +181,9 @@ QUERIES=(
 	"SELECT count(*), sum(a.v) FROM %t a WHERE NOT EXISTS (SELECT 1 FROM %t b WHERE b.id = a.v AND b.d > a.d)"
 	"SELECT b.id, a.id FROM %t a RIGHT JOIN %t b ON a.s = b.s AND a.id = b.k WHERE b.id < 120"
 	"SELECT d, sum(v) OVER (PARTITION BY k ORDER BY id) FROM %t WHERE id % 1000 = 7"
+	# V5: ORCA's hashed window, partitions on and off the distribution key
+	"SELECT id, k, rank() OVER (PARTITION BY k ORDER BY v DESC, id), count(*) OVER (PARTITION BY s) FROM %t WHERE id % 13 = 0"
+	"SELECT id, row_number() OVER (PARTITION BY id % 5 ORDER BY id), lag(v) OVER (PARTITION BY d ORDER BY id) FROM %t WHERE id % 17 = 0"
 	"SELECT id, v FROM %t WHERE v > 99990 ORDER BY v, id LIMIT 20"
 )
 # force-random: the per-structure layouts drawn at random each time a node
@@ -180,7 +191,7 @@ QUERIES=(
 # segments with its other settings
 SEED="${VEXEC_SEED:-$(( (RANDOM << 15 | RANDOM) % 2147483646 + 1 ))}"
 echo "  random session's seed: $SEED (VEXEC_SEED=$SEED reruns it)"
-SESSIONS=("off" "explain" "force-postgres" "force-arrow" "force-random" "force-parallel")
+SESSIONS=("off" "explain" "auto" "force-postgres" "force-arrow" "force-random" "force-parallel")
 # with workers (V4): under ORCA M8's Gathers in the segments' fragments,
 # whose parallel.c weighs them in PostgreSQL's units; on the gather route
 # the segments' own plans
@@ -189,6 +200,7 @@ session_sets() {
 	case "$1" in
 		off) echo "SET vexec.mode = off;" ;;
 		explain) echo "SET vexec.mode = explain;" ;;
+		auto) echo "SET vexec.mode = auto;" ;;
 		force-postgres) echo "SET vexec.mode = force; SET vexec.batch_format = postgres;" ;;
 		force-arrow) echo "SET vexec.mode = force; SET vexec.batch_format = arrow;" ;;
 		force-random) echo "SET vexec.mode = force; SET vexec.debug_layout_seed = $SEED;" ;;
@@ -385,6 +397,58 @@ for t in t_heap t_aoco t_porc t_porc_vec; do
 	check "ORCA's bounded VecSort of $t answers as off" \
 		"$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; $q")" \
 		"$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = off; $q")"
+done
+
+# V5: ORCA's hashed window as a VecWindowHashAgg on every segment, over the
+# Redistribute Motion that brings each its partitions, under PostgreSQL's
+# WindowAgg; in auto mode too, which ORCA's search chose with its price --
+# its input of 7,142 rows under vexec.min_rows otherwise, below which no
+# node of vexec's is priced or built
+for t in t_heap t_aoco t_porc t_porc_vec; do
+	q="SELECT id, k, rank() OVER (PARTITION BY k ORDER BY v DESC, id), sum(n) OVER (PARTITION BY k) FROM $t WHERE id % 7 = 0"
+	for mode in force auto; do
+		plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = $mode; SET vexec.min_rows = 1000; EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) $q")
+		if echo "$plan" | grep -q "GPORCA" && echo "$plan" | grep -q -E "Vec Window Hash Agg \(actual rows=[1-9]" &&
+			echo "$plan" | grep -q "Redistribute Motion" && echo "$plan" | grep -q "Gather Motion"; then
+			echo "  ok ORCA's hashed window over $t, $mode mode: a VecWindowHashAgg on the segments, over a Redistribute Motion"
+		else
+			echo "  FAILED ORCA's plan of $q, $mode mode, has no VecWindowHashAgg on the segments:"
+			echo "$plan" | sed 's/^/    /'
+			fail=1
+		fi
+	done
+	check "ORCA's hashed window over $t answers as its sorted window" \
+		"$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; $q" | sort)" \
+		"$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = off; $q" | sort)"
+done
+# V5: auto mode's vector nodes, built where ORCA's search priced them
+explain=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = auto; EXPLAIN (VEXEC, COSTS OFF) SELECT k, count(*) FROM t_aoco GROUP BY k")
+if echo "$explain" | grep -q "built (priced in ORCA's search)" && echo "$explain" | grep -q "GPORCA"; then
+	echo "  ok in auto mode ORCA's search prices vexec's nodes, which its plan has where it priced them"
+else
+	echo "  FAILED ORCA's EXPLAIN (VEXEC) in auto mode:"; echo "$explain" | sed 's/^/    /'; fail=1
+fi
+# V5: ORCA's partial plans -- an operator priced before its children have
+# plans, a lower bound by which ORCA prunes the alternatives it has not
+# priced -- price a filter over a VecScan at the lesser of its two prices.
+# Priced as a row node there, its bound passed its plan's price, and ORCA
+# pruned the two-stage aggregation over the scan: it gathered every row the
+# filter passed to the coordinator, or redistributed them at random below
+# the partial aggregation
+out=$(cq 0 $DB "CREATE TABLE t_lb (id int, q int, v numeric(7,2)) DISTRIBUTED BY (id);
+INSERT INTO t_lb SELECT g, 1 + (g * 7) % 100, (g % 1000) / 10.0 FROM generate_series(1, 2000000) g;
+ANALYZE t_lb")
+case "$out" in *ERROR*) echo "  FAILED t_lb: $out"; fail=1 ;; esac
+for q in "SELECT count(*) FROM t_lb WHERE q BETWEEN 1 AND 20" "SELECT count(*), avg(v) FROM t_lb WHERE q BETWEEN 1 AND 20"; do
+	for mode in auto force; do
+		plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = $mode; EXPLAIN (COSTS OFF) $q")
+		if echo "$plan" | grep -A1 "Vec Partial Aggregate" | grep -q "Vec Seq Scan on t_lb" &&
+			! echo "$plan" | grep -q "Redistribute Motion"; then
+			echo "  ok $mode mode: ORCA aggregates $q in two stages, the partial one over the VecScan"
+		else
+			echo "  FAILED ORCA's plan of $q in $mode mode:"; echo "$plan" | sed 's/^/    /'; fail=1
+		fi
+	done
 done
 
 # the gather route: the coordinator's VecHashJoin over the rows the segments send

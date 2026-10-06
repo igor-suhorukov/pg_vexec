@@ -23,11 +23,28 @@
  *	end		the plan check, the reasons for EXPLAIN (VEXEC), and
  *			vexec.debug_require_vector.
  *
- * In V1 ORCA's own search does not see vector prices: that is V5's
- * CCostModelVec.  Force mode builds a vector node wherever the oracle
- * accepts one; auto mode where vexec's cost model, in PostgreSQL's units,
- * prices the vector scan below the row scan (cost.c); explain mode records
- * them and builds none.
+ * From V5, through the API's minor version 2, at four more:
+ *
+ *	set_options	before ORCA is asked: create_vectorization_plan, which
+ *			offers ORCA's hashed window, where vexec builds windows and
+ *			prices ORCA's search; and vexec.orca_settings, ORCA's settings
+ *			for the statement alone;
+ *	cost_factors and the cost oracle, during ORCA's search: the factors
+ *			of vexec's cost model in ORCA's terms, and whether a call, an
+ *			aggregate, a relation's scan and a key are vexec's, which
+ *			CCostModelVec (the port's pg19/orca/cost/) prices ORCA's
+ *			operators with (vexec.orca_cost_model);
+ *	build_window	ORCA's hashed window, which the translator lowered to a
+ *			WindowAgg over a Sort: VecWindowHashAgg in the Sort's place
+ *			(window.c).
+ *
+ * Force mode builds a vector node wherever the oracle accepts one.  Auto
+ * mode, where ORCA's search priced vexec's nodes, builds one wherever it
+ * priced one: where the oracle accepts it, of vexec.min_rows rows at least.
+ * Without those prices -- vexec.orca_cost_model off -- auto mode builds one
+ * where vexec's own cost model, in PostgreSQL's units, prices it below the
+ * row node (cost.c).  Explain mode records them and builds none, and leaves
+ * ORCA's search its own prices, so that its plans stay the row plans.
  *
  * A Result with a constant qual stays a row node: it is a gating Result,
  * one of gp_core's squelch points (pg19/modules/gp_core/gp_motion.c:
@@ -40,7 +57,13 @@
 
 #include "access/sysattr.h"
 #include "access/table.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_collation.h"
+#include "commands/defrem.h"
+#include "optimizer/cost.h"
+#include "utils/builtins.h"
+#include "utils/varlena.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
@@ -60,6 +83,15 @@ static void *orca_begin(Query *parse, int cursorOptions, struct ExplainState *es
 static Plan *orca_build(void *state, Plan *plan, List *rtable);
 static void orca_end(void *state, PlannedStmt *stmt);
 static bool orca_describe(Plan *plan, GpOrcaVecNode *vn);
+static void orca_set_options(void *state, GpOrcaVecOptions *options);
+static bool orca_cost_factors(void *state, GpOrcaVecCosts *costs);
+static int	orca_cost_call(void *state, Oid funcid, Oid opno, int nargs,
+						   const Oid *argtypes, Oid collation);
+static int	orca_cost_aggregate(void *state, Oid aggfnoid, int nargs,
+								const Oid *argtypes, bool distinct, bool ordered);
+static int	orca_cost_relation(void *state, Oid relid);
+static bool orca_cost_hash_key(void *state, Oid eqop, Oid collation);
+static Plan *orca_build_window(void *state, WindowAgg *window, List *rtable);
 
 static const GpOrcaVecRoutine orca_routine = {
 	.size = sizeof(GpOrcaVecRoutine),
@@ -69,6 +101,13 @@ static const GpOrcaVecRoutine orca_routine = {
 	.build_node = orca_build,
 	.end_statement = orca_end,
 	.describe_node = orca_describe,
+	.set_options = orca_set_options,
+	.cost_factors = orca_cost_factors,
+	.cost_call = orca_cost_call,
+	.cost_aggregate = orca_cost_aggregate,
+	.cost_relation = orca_cost_relation,
+	.cost_hash_key = orca_cost_hash_key,
+	.build_window = orca_build_window,
 };
 
 void
@@ -91,10 +130,15 @@ orca_begin(Query *parse, int cursorOptions, struct ExplainState *es)
 	ps->gate_open = ps->gate_reason == NULL;
 	ps->record = vexec_mode == VEXEC_MODE_EXPLAIN || vexec_explain_requested(es);
 	ps->layout = vexec_layout_config();
+	ps->parse = parse;
 	return ps;
 }
 
-/* Whether ORCA's node may be built: the mode, after the oracle accepted it. */
+/*
+ * Whether ORCA's node may be built: the mode, after the oracle accepted it.
+ * In auto mode, where ORCA's search priced vexec's nodes, it chose its plan
+ * with this node priced as vexec's: it is built, as priced.
+ */
 static bool
 chosen(VexecPlanState *ps, const VexecCost *cost)
 {
@@ -103,10 +147,18 @@ chosen(VexecPlanState *ps, const VexecCost *cost)
 		case VEXEC_MODE_FORCE:
 			return true;
 		case VEXEC_MODE_AUTO:
-			return cost == NULL || cost->total < cost->row_total;
+			return ps->orca_costed || cost == NULL || cost->total < cost->row_total;
 		default:
 			return false;
 	}
+}
+
+/* Whether vexec runs the statement's nodes: auto or force mode, its gates open. */
+static bool
+takes(VexecPlanState *ps)
+{
+	return ps != NULL && ps->gate_open &&
+		(ps->mode == VEXEC_MODE_AUTO || ps->mode == VEXEC_MODE_FORCE);
 }
 
 /* A system column VecScan cannot give: other than ctid and tableoid. */
@@ -589,6 +641,317 @@ orca_describe(Plan *plan, GpOrcaVecNode *vn)
 	else
 		vn->kind = GP_ORCA_VEC_OTHER;
 	return true;
+}
+
+/* ---------------------------------------------------------------------
+ * ORCA's options for the statement (V5)
+ * ---------------------------------------------------------------------
+ */
+
+/* vexec.orca_settings, parsed: a list of DefElem, a setting's name and value. */
+static List *
+parse_orca_settings(const char *value, char **error)
+{
+	char	   *raw = pstrdup(value);
+	List	   *items = NIL;
+	List	   *settings = NIL;
+	ListCell   *lc;
+
+	*error = NULL;
+	if (!SplitGUCList(raw, ',', &items))
+	{
+		*error = "a list of name=value, separated by commas, was expected";
+		return NIL;
+	}
+	foreach(lc, items)
+	{
+		char	   *item = lfirst(lc);
+		char	   *eq = strchr(item, '=');
+		char	   *name;
+		char	   *val;
+
+		if (eq == NULL || eq == item || eq[1] == '\0')
+		{
+			*error = psprintf("\"%s\" is not name=value", item);
+			return NIL;
+		}
+		*eq = '\0';
+		name = pstrdup(item);
+		val = pstrdup(eq + 1);
+		/* the setting's spaces around "=" are not its own */
+		while (*name && name[strlen(name) - 1] == ' ')
+			name[strlen(name) - 1] = '\0';
+		while (*val == ' ')
+			val++;
+		if (strncmp(name, "gp.optimizer_", strlen("gp.optimizer_")) != 0)
+		{
+			*error = psprintf("\"%s\" is not one of ORCA's settings, gp.optimizer_...", name);
+			return NIL;
+		}
+		settings = lappend(settings, makeDefElem(name, (Node *) makeString(val), -1));
+	}
+	return settings;
+}
+
+bool
+vexec_orca_settings_check(char **newval, void **extra, GucSource source)
+{
+	char	   *error;
+
+	(void) extra;
+	(void) source;
+	if (*newval == NULL || **newval == '\0')
+		return true;
+	(void) parse_orca_settings(*newval, &error);
+	if (error != NULL)
+	{
+		GUC_check_errdetail("%s", error);
+		return false;
+	}
+	return true;
+}
+
+typedef struct OrderedAggContext
+{
+	bool		found;
+} OrderedAggContext;
+
+/* An aggregate a hashed aggregation cannot run: DISTINCT, ORDER BY, ordered-set. */
+static bool
+find_unhashable_agg(Node *node, OrderedAggContext *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *aggref = (Aggref *) node;
+
+		if (aggref->aggdistinct != NIL || aggref->aggorder != NIL ||
+			aggref->aggkind != AGGKIND_NORMAL)
+		{
+			ctx->found = true;
+			return true;
+		}
+	}
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, find_unhashable_agg, ctx, 0);
+	return expression_tree_walker(node, find_unhashable_agg, ctx);
+}
+
+/*
+ * Whether the statement may plan without sorted aggregation
+ * (gp.optimizer_enable_groupagg off): every aggregation of it can hash --
+ * no aggregate with DISTINCT or ORDER BY, no ordered-set aggregate, no
+ * grouping sets, and every grouping key hashable.  Otherwise ORCA would
+ * find no plan, and the planner would plan the statement (§3.3.4).
+ */
+static bool
+aggregations_hash(Query *parse)
+{
+	OrderedAggContext ctx = {false};
+	ListCell   *lc;
+
+	if (parse == NULL)
+		return false;
+	(void) query_tree_walker(parse, find_unhashable_agg, &ctx, 0);
+	if (ctx.found || parse->groupingSets != NIL)
+		return false;
+	foreach(lc, parse->groupClause)
+		if (!lfirst_node(SortGroupClause, lc)->hashable)
+			return false;
+	foreach(lc, parse->distinctClause)
+		if (!lfirst_node(SortGroupClause, lc)->hashable)
+			return false;
+	return true;
+}
+
+/*
+ * ORCA's options for a statement vexec takes: its hashed window, where
+ * vexec builds windows and ORCA's search sees their prices -- without
+ * them ORCA would choose a hashed window over input in an order, which the
+ * translator refuses -- and the settings of vexec.orca_settings, all but
+ * gp.optimizer_enable_groupagg = off for a statement one of whose
+ * aggregations cannot hash.
+ */
+static void
+orca_set_options(void *state, GpOrcaVecOptions *options)
+{
+	VexecPlanState *ps = state;
+	List	   *settings;
+	char	   *error;
+	ListCell   *lc;
+
+	if (!takes(ps))
+		return;
+	if (vexec_orca_cost_model && vexec_enable_window)
+		options->create_vectorization_plan = true;
+	if (vexec_orca_settings == NULL || *vexec_orca_settings == '\0')
+		return;
+	settings = parse_orca_settings(vexec_orca_settings, &error);
+	foreach(lc, settings)
+	{
+		DefElem    *d = lfirst_node(DefElem, lc);
+
+		if (strcmp(d->defname, "gp.optimizer_enable_groupagg") == 0)
+		{
+			bool		on;
+
+			if (parse_bool(strVal(d->arg), &on) && !on && !aggregations_hash(ps->parse))
+				continue;
+		}
+		options->settings = lappend(options->settings, d);
+	}
+}
+
+/* ---------------------------------------------------------------------
+ * The cost oracle, for ORCA's search (V5)
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * vexec's prices in ORCA's terms, for a statement vexec takes in auto or
+ * force mode with vexec.orca_cost_model on: the two factors are shares,
+ * whatever the units; a crossing between rows and batches and a node's
+ * setup, in PostgreSQL's units, become shares of a tuple's processing, as
+ * cpu_tuple_cost prices it there.
+ */
+static bool
+orca_cost_factors(void *state, GpOrcaVecCosts *costs)
+{
+	VexecPlanState *ps = state;
+	double		tuple = cpu_tuple_cost > 0 ? cpu_tuple_cost : DEFAULT_CPU_TUPLE_COST;
+
+	if (!takes(ps) || !vexec_orca_cost_model)
+		return false;
+	costs->tuple_factor = vexec_cpu_tuple_factor;
+	costs->operator_factor = vexec_cpu_operator_factor;
+	costs->convert_factor = vexec_convert_cost / tuple;
+	costs->setup_rows = vexec_batch_setup_cost / tuple;
+	costs->min_rows = ps->mode == VEXEC_MODE_FORCE ? 0 : vexec_min_rows;
+	costs->kinds = 1U << GP_ORCA_VEC_RESULT;
+	if (vexec_enable_scan)
+		costs->kinds |= 1U << GP_ORCA_VEC_SEQSCAN;
+	if (vexec_enable_hashjoin)
+		costs->kinds |= 1U << GP_ORCA_VEC_HASHJOIN;
+	if (vexec_enable_agg)
+		costs->kinds |= 1U << GP_ORCA_VEC_AGG;
+	if (vexec_enable_sort)
+		costs->kinds |= 1U << GP_ORCA_VEC_SORT;
+	if (vexec_enable_window)
+		costs->kinds |= 1U << GP_ORCA_VEC_WINDOW;
+	ps->orca_costed = true;
+	return true;
+}
+
+/*
+ * A call: a kernel where one is bound to the function for its first
+ * argument's type, as the oracle binds it (oracle.c), else the fallback; a
+ * set-returning function is in no vector node.  ORCA's metadata carries no
+ * collation: a collatable argument takes the database's, as the column's
+ * would.
+ */
+static int
+orca_cost_call(void *state, Oid funcid, Oid opno, int nargs, const Oid *argtypes,
+			   Oid collation)
+{
+	Oid			inputtype = nargs > 0 ? argtypes[0] : InvalidOid;
+
+	(void) state;
+	if (OidIsValid(opno))
+		funcid = get_opcode(opno);
+	if (!OidIsValid(funcid))
+		return GP_ORCA_VEC_STEP_FALLBACK;
+	if (get_func_retset(funcid))
+		return GP_ORCA_VEC_STEP_REFUSED;
+	if (!OidIsValid(inputtype))
+	{
+		Oid		   *declared;
+		int			ndeclared;
+
+		(void) get_func_signature(funcid, &declared, &ndeclared);
+		if (ndeclared > 0)
+			inputtype = declared[0];
+	}
+	if (!OidIsValid(collation) && OidIsValid(inputtype) && type_is_collatable(inputtype))
+		collation = DEFAULT_COLLATION_OID;
+	return vexec_kernel_bound(funcid, inputtype, collation) ?
+		GP_ORCA_VEC_STEP_KERNEL : GP_ORCA_VEC_STEP_FALLBACK;
+}
+
+/*
+ * An aggregate: VecAgg runs any but a DISTINCT, an ordered or an
+ * ordered-set one -- by a vector transition where it has one, else
+ * through its transition function, row by row (§3.8).
+ */
+static int
+orca_cost_aggregate(void *state, Oid aggfnoid, int nargs, const Oid *argtypes,
+					bool distinct, bool ordered)
+{
+	(void) state;
+	if (distinct || ordered)
+		return GP_ORCA_VEC_STEP_REFUSED;
+	return vexec_agg_vectorized(aggfnoid, AGGSPLIT_SIMPLE, nargs > 0 ? argtypes[0] : InvalidOid,
+								NULL) ?
+		GP_ORCA_VEC_STEP_KERNEL : GP_ORCA_VEC_STEP_FALLBACK;
+}
+
+/*
+ * What vexec's scan of a relation reads: none of a relation that is not a
+ * table; only its columns where its storage keeps them apart -- ao_column's
+ * and PAX's, whose batch sources read the columns asked for (§3.3.4) --
+ * else its rows, each transposed into batches: heap's through its page
+ * reader, any other through its source or the slot path.
+ */
+static int
+orca_cost_relation(void *state, Oid relid)
+{
+	Relation	rel;
+	char		relkind;
+	int			kind = GP_ORCA_VEC_REL_ROWS;
+
+	(void) state;
+	relkind = get_rel_relkind(relid);
+	if (relkind != RELKIND_RELATION && relkind != RELKIND_MATVIEW)
+		return GP_ORCA_VEC_REL_NONE;
+	/* the statement holds its relations' locks; one it does not is taken */
+	rel = table_open(relid, AccessShareLock);
+	if (rel->rd_tableam == NULL)
+		kind = GP_ORCA_VEC_REL_NONE;
+	else
+	{
+		const char *how;
+		char	   *amname = get_am_name(rel->rd_rel->relam);
+
+		if (vexec_source_for(rel, &how) != NULL && amname != NULL &&
+			(strcmp(amname, "ao_column") == 0 || strcmp(amname, "pax") == 0))
+			kind = GP_ORCA_VEC_REL_COLUMNS;
+	}
+	table_close(rel, NoLock);
+	return kind;
+}
+
+/* Whether vexec hashes a key compared by this operator: strict, with a hash function. */
+static bool
+orca_cost_hash_key(void *state, Oid eqop, Oid collation)
+{
+	Oid			lhash;
+	Oid			rhash;
+
+	(void) state;
+	(void) collation;
+	return OidIsValid(eqop) && op_strict(eqop) &&
+		get_op_hash_functions(eqop, &lhash, &rhash) && OidIsValid(lhash);
+}
+
+/* ORCA's hashed window, lowered: VecWindowHashAgg in its Sort's place (window.c). */
+static Plan *
+orca_build_window(void *state, WindowAgg *window, List *rtable)
+{
+	VexecPlanState *ps = state;
+
+	if (ps == NULL || !ps->gate_open)
+		return NULL;
+	return vexec_build_window(ps, window, rtable);
 }
 
 /* ORCA's plan is made: the plan check, the reasons, the debug requirement. */

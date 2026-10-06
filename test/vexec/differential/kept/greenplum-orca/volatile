@@ -1,0 +1,15 @@
+# What differs from run to run of the greenplum suite's ORCA pass with the
+# same settings (differential.py): a regular expression a line, its groups
+# replaced.
+#
+# a segment's next OID once a table is made and dropped: whatever else its
+# backends allocated meanwhile (seen with vexec off, in off-again)
+@oid_wraparound ^ +429000000(\d)$
+# covar_pop over filter_test's nine rows in one stage, on the coordinator,
+# where vexec's prices put it: the rows are summed as they arrive from the
+# segments, and the last digits vary from run to run -- as they do with
+# vexec off when ORCA plans that one stage -- with the header's padding and
+# the rule's width
+@filter ^ 2\.08163265306122(\d*)$
+@filter ^( +)covar_pop( +)$
+@filter ^(-{19,20})$

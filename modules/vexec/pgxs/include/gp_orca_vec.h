@@ -56,6 +56,31 @@
  *						none of them.  It is asked of the plans PostgreSQL's
  *						planner makes too
  *
+ * and, from minor version 2, at three more, so that ORCA's own search
+ * prices the engine's nodes and plans what only the engine can run:
+ *
+ *	set_options			before ORCA is asked, once begin_statement has
+ *						taken the statement: ORCA's options for it --
+ *						create_vectorization_plan, which offers ORCA's
+ *						hashed window, and the settings of ORCA's a vector
+ *						plan wants, which gp_orca sets for the statement
+ *						alone
+ *	cost_factors and	during ORCA's search: the engine's prices, and
+ *	the cost_* oracle	whether an operator's calls, aggregates, relation
+ *						and keys are the engine's, asked by PostgreSQL's
+ *						OIDs from ORCA's metadata ids.  With them gp_orca
+ *						prices the statement with CCostModelVec
+ *						(pg19/orca/cost/), ORCA's cost model with the
+ *						engine's nodes priced in, so that its choices of
+ *						join orders, join methods, aggregation stages,
+ *						Motions and windows are made with them
+ *	build_window		a hashed window the translator lowered -- a
+ *						WindowAgg over the Sort that brings its partitions
+ *						together, or over its input where it needs none --
+ *						offered once its input's nodes are offered: the
+ *						engine's node in the Sort's place, under the
+ *						WindowAgg, or NULL to keep the lowering
+ *
  * A node built so is the engine's CustomScan, found by name where the
  * plan is read back, a segment's fragment among them.  Without a
  * registration gp_orca calls nothing, and its plans are as they were.
@@ -85,7 +110,8 @@
 #define GP_ORCA_VEC_RENDEZVOUS	"Cloudberry/gp_orca_vec_v1"	/* the major
 															 * version is in
 															 * the name */
-#define GP_ORCA_VEC_MINOR		1	/* 1: describe_node */
+#define GP_ORCA_VEC_MINOR		2	/* 1: describe_node; 2: set_options,
+									 * the cost oracle, build_window */
 #define GP_ORCA_VEC_MAGIC		0x47564331	/* "GVC1" */
 
 struct ExplainState;
@@ -109,7 +135,12 @@ typedef enum GpOrcaVecKind
 	GP_ORCA_VEC_HASHJOIN,		/* a hash join of lefttree, the outer side,
 								 * and righttree, the inner side */
 	GP_ORCA_VEC_AGG,			/* an aggregation of lefttree */
-	GP_ORCA_VEC_SORT			/* a sort of lefttree */
+	GP_ORCA_VEC_SORT,			/* a sort of lefttree */
+	GP_ORCA_VEC_WINDOW			/* from minor version 2, in
+								 * GpOrcaVecCosts.kinds alone: a hashed
+								 * window's partitions, brought together
+								 * under its WindowAgg (build_window), which
+								 * describe_node reports as OTHER */
 } GpOrcaVecKind;
 
 typedef struct GpOrcaVecNode
@@ -136,6 +167,73 @@ typedef struct GpOrcaVecNode
 								 * which a pass may change the child; a pass
 								 * reads it and never puts it in the plan */
 } GpOrcaVecNode;
+
+/*
+ * ORCA's options for a statement the engine takes (set_options, from minor
+ * version 2).  gp_orca fills it with what it uses without the engine, and
+ * the engine changes what its plans want.
+ */
+typedef struct GpOrcaVecOptions
+{
+	/*
+	 * OptimizerOptions.create_vectorization_plan: ORCA offers its hashed
+	 * window (EopttraceEnableWindowHashAgg), whose lowering gp_orca's
+	 * translator then offers to build_window.  Asked for only where the
+	 * engine builds windows: elsewhere the lowering sorts what ORCA priced
+	 * unsorted.
+	 */
+	bool		create_vectorization_plan;
+
+	/*
+	 * Settings of ORCA's, for the statement alone: a list of DefElem, each
+	 * a setting of gp_orca's by name ("gp.optimizer_...") and its value as
+	 * a String.  gp_orca sets them for ORCA's planning of the statement
+	 * and puts the session's back after it, as a SET LOCAL there would; a
+	 * name that is not one of gp_orca's "gp.optimizer" settings is an
+	 * error.
+	 */
+	List	   *settings;
+} GpOrcaVecOptions;
+
+/*
+ * The engine's prices for a statement, as shares of ORCA's own units
+ * (cost_factors, from minor version 2), for CCostModelVec: an operator one
+ * of the engine's nodes runs costs what ORCA's cost model prices it at,
+ * with the units of its per-tuple and per-byte work scaled by tuple_factor
+ * and those of its per-column and per-call work by operator_factor, for
+ * the share of its expressions' steps the engine's kernels take; and each
+ * crossing between rows and batches is charged where it happens.
+ */
+typedef struct GpOrcaVecCosts
+{
+	double		tuple_factor;	/* the vector share of ORCA's per-tuple and
+								 * per-byte units */
+	double		operator_factor;	/* of its per-column and per-call units,
+									 * for a kernel's steps */
+	double		convert_factor; /* a crossing between rows and batches, a row
+								 * of width w: convert_factor * w times
+								 * ORCA's unit of a tuple's processing */
+	double		setup_rows;		/* a node's setup, as the processing of this
+								 * many of its rows */
+	double		min_rows;		/* an operator of fewer rows -- its input's,
+								 * a scan's table's -- stays a row
+								 * operator; 0: none does */
+	uint32		kinds;			/* the kinds of node the engine builds, a bit
+								 * (1 << GpOrcaVecKind) each */
+} GpOrcaVecCosts;
+
+/* What the engine makes of a call or an aggregate (cost_call, cost_aggregate). */
+#define GP_ORCA_VEC_STEP_KERNEL		0	/* a kernel, a batch at a time */
+#define GP_ORCA_VEC_STEP_FALLBACK	1	/* PostgreSQL's evaluator, a row at a
+										 * time, inside the engine's node */
+#define GP_ORCA_VEC_STEP_REFUSED	2	/* in none of the engine's nodes */
+
+/* What the engine's scan of a relation reads (cost_relation). */
+#define GP_ORCA_VEC_REL_NONE		0	/* the engine has no scan of it */
+#define GP_ORCA_VEC_REL_ROWS		1	/* its rows, each transposed into
+										 * batches: heap, the slot path */
+#define GP_ORCA_VEC_REL_COLUMNS		2	/* only the columns asked for, which
+										 * its storage keeps apart */
 
 typedef struct GpOrcaVecRoutine
 {
@@ -169,6 +267,55 @@ typedef struct GpOrcaVecRoutine
 	 * the plan is planned, in any memory context; it reads the node alone.
 	 */
 	bool		(*describe_node) (Plan *plan, GpOrcaVecNode *node);
+
+	/*
+	 * From minor version 2: ORCA's options for the statement, once
+	 * begin_statement has returned state for it.  *options holds what
+	 * gp_orca uses without the engine; the engine changes what its plans
+	 * want.  In the planner_hook's memory context.
+	 */
+	void		(*set_options) (void *state, GpOrcaVecOptions *options);
+
+	/*
+	 * From minor version 2: the engine's prices for the statement in
+	 * *costs, and true, so that ORCA's search prices its nodes
+	 * (CCostModelVec); false, ORCA's own cost model.  Once a statement,
+	 * before ORCA's search.
+	 */
+	bool		(*cost_factors) (void *state, GpOrcaVecCosts *costs);
+
+	/*
+	 * From minor version 2, the oracle CCostModelVec asks during ORCA's
+	 * search, many times a statement, so they are cheap: what the engine
+	 * makes of a call -- of a function, funcid, or of an operator, opno,
+	 * the other InvalidOid -- its arguments of these types and its
+	 * collation, GP_ORCA_VEC_STEP_*; of an aggregate, the same; what its
+	 * scan of a relation reads, GP_ORCA_VEC_REL_*; and whether it hashes a
+	 * key compared by this equality operator, a hash join's, a grouping's
+	 * or a window partition's.  They read the catalog, which may raise an
+	 * error, and then ORCA declines the statement; they raise none of
+	 * their own.
+	 */
+	int			(*cost_call) (void *state, Oid funcid, Oid opno, int nargs,
+							  const Oid *argtypes, Oid collation);
+	int			(*cost_aggregate) (void *state, Oid aggfnoid, int nargs,
+								   const Oid *argtypes, bool distinct,
+								   bool ordered);
+	int			(*cost_relation) (void *state, Oid relid);
+	bool		(*cost_hash_key) (void *state, Oid eqop, Oid collation);
+
+	/*
+	 * From minor version 2: a hashed window the translator lowered, offered
+	 * once its input's nodes have been offered.  window is the WindowAgg,
+	 * over the Sort that brings each of the window's partitions together in
+	 * its order -- by its partition columns, then by its window's order --
+	 * whose own input the Sort's lefttree is.  The engine's plan in the
+	 * WindowAgg's place, its nodes in the Sort's or the WindowAgg's, or
+	 * NULL to keep the lowering, whose Sort and WindowAgg are then offered
+	 * as other nodes are.  ORCA takes the window to keep its input's
+	 * order, which it takes to be none (the translator lowers no other).
+	 */
+	Plan	   *(*build_window) (void *state, WindowAgg *window, List *rtable);
 } GpOrcaVecRoutine;
 
 typedef struct GpOrcaVecRegistry

@@ -1,0 +1,20 @@
+--- reference
++++ session
+@@ -433,6 +433,8 @@
+ select * from dispatch_test_t1, dispatch_test_t2, dispatch_test_t3
+ where dispatch_test_t1.c2 = dispatch_test_t2.c2 and dispatch_test_t2.c3 = dispatch_test_t3.c3;
+-ERROR:  failed to acquire resources on one or more segments: fault injector
+-^DETAIL:  connection to server at XX, port XX failed: FATAL:  fault triggered, fault name:'send_qe_details_init_backend' fault type:'error'
++ c1 | c2 | c3 | c1 | c2 | c3 | c1 | c2 | c3 
++----+----+----+----+----+----+----+----+----
++  1 |  1 |  2 |  2 |  1 |  2 |  3 |  1 |  2
++(1 row)
+ 
+ -- expect resuable gang exist
+@@ -447,5 +449,5 @@
+  hasbackends 
+ -------------
+- t
++ f
+ (1 row)
+ 

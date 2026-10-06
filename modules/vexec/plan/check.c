@@ -42,7 +42,8 @@ typedef struct CheckContext
  * relation; a VecAgg too, with a scan tuple of its plan's columns; a
  * VecHashJoin its sides in lefttree and righttree, its scan tuple their
  * columns, and its keys its operators'; a VecSort its child in lefttree,
- * its scan tuple the child's row, and its keys the child's columns.
+ * its scan tuple the child's row, and its keys the child's columns; a
+ * VecWindowHashAgg too, with no qual.
  */
 static bool
 is_vector_node(CustomScan *cscan)
@@ -119,6 +120,22 @@ is_vector_node(CustomScan *cscan)
 		foreach(lc, plan.keycols)
 			if (lfirst_int(lc) < 1 || lfirst_int(lc) > list_length(child->targetlist))
 				elog(ERROR, "vexec plan check: a VecSort's key is not a column of its child");
+	}
+	else if (cscan->methods == vexec_window_methods())
+	{
+		VexecWindowPlan plan;
+		Plan	   *child = cscan->scan.plan.lefttree;
+		ListCell   *lc;
+
+		if (cscan->scan.scanrelid != 0 || child == NULL || cscan->custom_plans != NIL ||
+			cscan->scan.plan.righttree != NULL || cscan->scan.plan.qual != NIL)
+			elog(ERROR, "vexec plan check: a VecWindowHashAgg not in its canonical form");
+		vexec_window_plan_decode(cscan, &plan);
+		if (list_length(cscan->custom_scan_tlist) != list_length(child->targetlist))
+			elog(ERROR, "vexec plan check: a VecWindowHashAgg whose scan tuple is not its child's row");
+		foreach(lc, list_concat_copy(list_concat_copy(plan.partcols, plan.ordcols), plan.sortcols))
+			if (lfirst_int(lc) < 1 || lfirst_int(lc) > list_length(child->targetlist))
+				elog(ERROR, "vexec plan check: a VecWindowHashAgg's key is not a column of its child");
 	}
 	else if (cscan->methods == vexec_repart_methods())
 	{

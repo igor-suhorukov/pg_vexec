@@ -1,0 +1,10 @@
+--- reference
++++ session
+@@ -394,6 +394,6 @@
+ 
+ SELECT a.* FROM MPP_22019_a a  WHERE a.j NOT IN (SELECT j FROM MPP_22019_a a2 where a2.j = a.j) and a.i = 1;
+-INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
+ INFO:  (slice 2) Dispatch command to ALL contents: 0 1 2
++INFO:  (slice 1) Dispatch command to ALL contents: 0 1 2
+  i | j 
+ ---+---
