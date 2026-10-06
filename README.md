@@ -55,6 +55,12 @@ The plan's phases land here in order, each on a branch of its own:
   and reads with its own code for the flatbuffer tables of Arrow's
   `Message.fbs` and `Schema.fbs` -- a message's body going out as pieces
   where its arrays lie, a message coming in checked as a client's input.
+- **V10, the Flight SQL endpoint's half in `vexec`** (`v10`; the plan's §5
+  and §3.15): the egress API, `vexec/egress_v1`, by which an extension of
+  its own, `vexec_flight` (`github/vexec_flight`), serves Arrow to clients
+  only while the vector executor is active -- a statement's result as IPC
+  messages, from a vector node's batches where one is at the top of the
+  plan, and a client's parameter batches read as values.
 
 ## Layout
 
@@ -62,6 +68,7 @@ The plan's phases land here in order, each on a branch of its own:
 |---|---|
 | `include/vexec_source.h` | the batch-source contract (§3.5.1): storage modules register batch readers by a rendezvous variable; installed with `vexec` |
 | `include/vexec_kernels.h` | the kernel packs' registry (§3.17): a pack declares which of an extension's functions never raise, checks the rows on which the others may, or prefilters them, by a rendezvous variable, with no kernel ABI -- only fmgr's functions; installed with `vexec` |
+| `include/vexec_egress.h` | the egress API (§3.15): a statement's result as Arrow IPC messages, and a client's parameter batches as values, for an extension that serves Arrow to clients; installed with `vexec` |
 | `modules/vexec/` | the module, built by PGXS against vanilla PostgreSQL 19 or the port's server |
 | `modules/vexec/batch/` | the logical batch, its layouts, the PostgreSQL and Arrow formats, the conversions, rows in and out, scaled numerics, export through Arrow's C Data Interface |
 | `modules/vexec/plan/` | the vectorized planner: the oracle, the cost model, the path hooks, the node builders, ORCA's front end through gp_orca's API, the reasons, EXPLAIN's option, the plan check |
@@ -69,14 +76,15 @@ The plan's phases land here in order, each on a branch of its own:
 | `modules/vexec/expr/` | the expression compiler and evaluator: kernels bound by function OID, the fallback, PostgreSQL's evaluator for what may raise; calls bound to kernel packs' declarations (`packs.c`), kept per backend and dropped by syscache callbacks |
 | `modules/vexec/source/` | `vexec`'s side of the source registry, and heap's page reader |
 | `modules/vexec/ipc/` | Arrow IPC messages, written and read by `vexec`'s own code (V7_0) |
+| `modules/vexec/egress/` | the egress API: its routine, its receiver, the batches of a vector node at the top of a plan, a client's parameters (V10) |
 | `modules/vexec/pgxs/include/` | copies of the port's headers the PGXS build compiles against, kept equal to the originals |
 | `modules/vexec/sql`, `expected` | `vexec`'s own regression suite, and the layouts' semantics corpus |
-| `modules/vexec_test/` | a module of the tests alone: round trips through every layout, the export check with nanoarrow, vendored there only, and the IPC codec's checks |
+| `modules/vexec_test/` | a module of the tests alone: round trips through every layout, the export check with nanoarrow, vendored there only, the IPC codec's checks, and a query through the egress's receiver |
 | `modules/vexec_testpack/` | a kernel pack of the tests alone: an extension's functions and a pack's declarations of them in one library, preloaded before `vexec` by the suite (`vexec_packs`) |
 | `test/vexec/` | `vexec`'s legs: `run.sh` on the host, the scripts each leg runs in a container, the differential runner, the checks |
 | `test/tpc/` | the port's tpc suite, with `TPC_STORAGE` (heap, `ao_column`, PAX porc and porc_vec) and `vexec` preloaded |
 | `docker/vexec.yml`, `docker/Dockerfile.vexec` | `vexec`'s images and containers: a server image with a C toolchain, vanilla or the port's |
-| `docker/Dockerfile.arrow` | pyarrow on those images, against which the IPC codec is checked |
+| `docker/Dockerfile.arrow` | pyarrow on those images, against which the IPC codec and the egress are checked |
 | `docker/compose.yml`, `docker/Dockerfile.clickbench` | ClickBench's images and containers (VB) |
 | `test/clickbench/` | ClickBench's suite and its baseline (VB) |
 

@@ -88,3 +88,23 @@ CREATE FUNCTION raw(value anyelement)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'vexec_test_raw'
 LANGUAGE C STRICT IMMUTABLE;
+
+-- The egress (V10, vexec_egress.h): a query through vexec's receiver, as a
+-- Flight session's statement goes, and the stream of IPC messages it wrote
+-- -- its schema, its batches, the end-of-stream marker -- with what the
+-- receiver counted: rows, batches, and the batches that went out from a
+-- vector node's own buffers; and the schema's fields, "name format", an
+-- extension's name after the format.
+CREATE FUNCTION egress(query text, OUT rows int8, OUT batches int8,
+                       OUT vector_batches int8, OUT fields text[], OUT stream bytea)
+RETURNS record
+AS 'MODULE_PATHNAME', 'vexec_test_egress'
+LANGUAGE C STRICT VOLATILE;
+
+-- A stream of parameter batches -- the egress's own, or pyarrow's -- read by
+-- the egress's parameter reader as values of the given types: a row of
+-- their text each, " | " between them.
+CREATE FUNCTION egress_params(stream bytea, types regtype[], OUT rownum int8, OUT "row" text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_test_egress_params'
+LANGUAGE C STRICT VOLATILE;

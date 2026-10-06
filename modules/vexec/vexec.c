@@ -28,6 +28,7 @@
 #include "utils/guc.h"
 
 #include "vexec.h"
+#include "egress/egress.h"
 #include "plan/plan.h"
 
 PG_MODULE_MAGIC_EXT(
@@ -169,6 +170,7 @@ _PG_init(void)
 	vexec_planner_install();
 	vexec_orca_install();
 	vexec_explain_install();
+	vexec_egress_install();
 
 	/*
 	 * This build has no GPU tier (V8): with vexec.gpu_devices set anyway it

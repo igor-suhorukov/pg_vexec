@@ -1,0 +1,336 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- vexec's egress (pg_vector_executor.md §3.15; §5 V10; vexec_egress.h): a
+-- query's result as Arrow IPC messages, for an extension that serves Arrow
+-- to clients, vexec_flight.  vexec_test.egress() runs a query into the
+-- egress's receiver as a Flight session's statement goes, and
+-- vexec_test.egress_params() reads a stream back through the egress's
+-- parameter reader.  The clients' own checks -- every corpus type's Arrow
+-- type and values, against adbc_driver_postgresql and psql -- are
+-- vexec_flight's (its test/test_flight.py).
+\i sql/vexec_corpus_setup.sql
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- The layouts' semantics corpus (pg_vector_executor.md §6.2, "Layouts"): a
+-- table of every kind of type vexec holds, with the values at each layout's
+-- edges, over 2,600 rows -- three batches, the last short -- with NULLs at
+-- the edges of the bitmaps' words and of the batches.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+CREATE EXTENSION IF NOT EXISTS vexec_test;
+RESET client_min_messages;
+CREATE TABLE corpus (
+	id int4,
+	b bool, i2 int2, i4 int4, i8 int8, f4 float4, f8 float8,
+	o oid, m money, ch "char",
+	d date, t time, ts timestamp, tstz timestamptz, iv interval, tz timetz,
+	n numeric, n10_2 numeric(10,2), n18_0 numeric(18,0), n38_5 numeric(38,5),
+	n5_m2 numeric(5,-2), n3_10 numeric(3,10), n40_2 numeric(40,2),
+	tx text, vc varchar(200), bp char(5), bt bytea, js json, jb jsonb,
+	u uuid, nm name, mac macaddr, mac8 macaddr8, ip inet, pt point,
+	a4 int4[], at text[], k int4, big text
+);
+-- big's long values are stored out of line, uncompressed
+ALTER TABLE corpus ALTER COLUMN big SET STORAGE EXTERNAL;
+-- a row's value is NULL where its id is at a word's edge, or every 7th
+CREATE FUNCTION corpus_null(id int4, col int4) RETURNS bool
+LANGUAGE sql IMMUTABLE AS
+$$ SELECT (id - 1) % 64 IN (0, 63) OR (id + col) % 7 = 0 OR id IN (1024, 1025, 2048) $$;
+INSERT INTO corpus
+SELECT g,
+	CASE WHEN corpus_null(g, 1) THEN NULL ELSE g % 3 = 0 END,
+	CASE WHEN corpus_null(g, 2) THEN NULL
+		 WHEN g % 50 = 1 THEN 32767 WHEN g % 50 = 2 THEN -32768 ELSE (g * 7) % 30000 - 15000 END,
+	CASE WHEN corpus_null(g, 3) THEN NULL
+		 WHEN g % 50 = 3 THEN 2147483647 WHEN g % 50 = 4 THEN -2147483648 ELSE (g::int8 * 1000003 % 1000000007)::int4 END,
+	CASE WHEN corpus_null(g, 4) THEN NULL
+		 WHEN g % 50 = 5 THEN 9223372036854775807 WHEN g % 50 = 6 THEN -9223372036854775808
+		 ELSE g::int8 * 1000000007 * 97 END,
+	CASE WHEN corpus_null(g, 5) THEN NULL
+		 WHEN g % 50 = 7 THEN 'NaN' WHEN g % 50 = 8 THEN '-0' WHEN g % 50 = 9 THEN '-Infinity'
+		 ELSE g / 7.0 END,
+	CASE WHEN corpus_null(g, 6) THEN NULL
+		 WHEN g % 50 = 10 THEN 'NaN' WHEN g % 50 = 11 THEN '-0' WHEN g % 50 = 12 THEN 'Infinity'
+		 WHEN g % 50 = 13 THEN 1e308 ELSE g / 3.0 END,
+	CASE WHEN corpus_null(g, 7) THEN NULL WHEN g % 50 = 14 THEN 4294967295 ELSE g END,
+	CASE WHEN corpus_null(g, 8) THEN NULL ELSE (g * 1.25)::money END,
+	CASE WHEN corpus_null(g, 9) THEN NULL ELSE chr(33 + g % 90)::"char" END,
+	-- dates: the infinities, PostgreSQL's limits
+	CASE WHEN corpus_null(g, 10) THEN NULL
+		 WHEN g % 50 = 15 THEN 'infinity' WHEN g % 50 = 16 THEN '-infinity'
+		 WHEN g % 50 = 17 THEN '4714-11-24 BC' WHEN g % 50 = 18 THEN '5874897-12-31'
+		 ELSE '2000-01-01'::date + (g * 37 - 40000) END,
+	-- time, 24:00:00 included
+	CASE WHEN corpus_null(g, 11) THEN NULL WHEN g % 50 = 19 THEN '24:00:00'
+		 ELSE '00:00:00'::time + g * interval '17 seconds' END,
+	-- timestamps: the infinities, the limits, and from 294247-01-10 on
+	CASE WHEN corpus_null(g, 12) THEN NULL
+		 WHEN g % 50 = 20 THEN 'infinity' WHEN g % 50 = 21 THEN '-infinity'
+		 WHEN g % 50 = 22 THEN '4714-11-24 00:00:00 BC'
+		 WHEN g % 50 = 23 AND g > 2000 THEN '294276-12-31 23:59:59.999999'
+		 WHEN g % 50 = 24 AND g > 2000 THEN '294247-01-10 04:00:54.775808'
+		 WHEN g % 50 = 25 THEN '294247-01-10 04:00:54.775807'
+		 ELSE '2000-01-01'::timestamp + g * interval '1 day 3 hours 7 minutes 11.123456 seconds' END,
+	CASE WHEN corpus_null(g, 13) THEN NULL
+		 WHEN g % 50 = 20 THEN 'infinity' WHEN g % 50 = 21 THEN '-infinity'
+		 WHEN g % 50 = 23 AND g > 2000 THEN '294276-12-30 23:59:59.999999+00'
+		 ELSE '1999-12-31 00:00:00+00'::timestamptz - g * interval '13 days 5 hours 0.5 seconds' END,
+	-- intervals: the infinities, and time parts on both sides of 292 years in ns
+	CASE WHEN corpus_null(g, 14) THEN NULL
+		 WHEN g % 50 = 26 THEN 'infinity' WHEN g % 50 = 27 AND g > 2000 THEN '-infinity'
+		 WHEN g % 50 = 28 AND g > 1000 THEN '2562048 hours'
+		 WHEN g % 50 = 29 THEN '2562047 hours 47 minutes 16.854775 seconds'
+		 ELSE make_interval(months => g % 13, days => g % 31, secs => g * 1.000001) END,
+	CASE WHEN corpus_null(g, 15) THEN NULL ELSE ('10:11:12.13'::time + g * interval '1 second')::timetz END,
+	-- numerics: NaN and the infinities, and each typmod's edges
+	CASE WHEN corpus_null(g, 16) THEN NULL
+		 WHEN g % 50 = 30 THEN 'NaN' WHEN g % 50 = 31 THEN 'Infinity' WHEN g % 50 = 32 THEN '-Infinity'
+		 WHEN g % 50 = 33 THEN 1.000 ELSE g / 7.0::numeric END,
+	CASE WHEN corpus_null(g, 17) THEN NULL
+		 WHEN g % 50 = 34 THEN 99999999.99 WHEN g % 50 = 35 THEN -99999999.99 WHEN g % 50 = 36 THEN 0
+		 ELSE g * 1.07 - 1000 END,
+	CASE WHEN corpus_null(g, 18) THEN NULL
+		 WHEN g % 50 = 34 THEN 999999999999999999 WHEN g % 50 = 35 THEN -999999999999999999
+		 ELSE g::int8 * 123456789 END,
+	CASE WHEN corpus_null(g, 19) THEN NULL
+		 WHEN g % 50 = 34 THEN 999999999999999999999999999999999.99999
+		 WHEN g % 50 = 35 THEN -999999999999999999999999999999999.99999
+		 WHEN g % 50 = 36 AND g > 1000 THEN 'NaN'
+		 ELSE g * 1234567890123456789.12345 END,
+	CASE WHEN corpus_null(g, 20) THEN NULL WHEN g % 50 = 34 THEN 9999900 ELSE g * 100 END,
+	CASE WHEN corpus_null(g, 21) THEN NULL ELSE g * 0.0000000001 / 1000 END,
+	CASE WHEN corpus_null(g, 22) THEN NULL ELSE g * 1.5 END,
+	-- strings: 12 and 13 bytes (a view's inline edge), 126 and 127 (the short
+	-- header's), compressed inline, and external
+	CASE WHEN corpus_null(g, 23) THEN NULL
+		 WHEN g % 50 = 37 THEN repeat('x', 12) WHEN g % 50 = 38 THEN repeat('y', 13)
+		 WHEN g % 50 = 39 THEN repeat('z', 126) WHEN g % 50 = 40 THEN repeat('w', 127)
+		 WHEN g % 50 = 41 THEN repeat('compressible ', 400)
+		 WHEN g % 50 = 42 THEN (SELECT string_agg(md5((g * 1000 + s)::text), '') FROM generate_series(1, 300) s)
+		 WHEN g % 50 = 43 THEN '' WHEN g % 50 = 44 THEN 'äöü €'
+		 ELSE 'row ' || g END,
+	CASE WHEN corpus_null(g, 24) THEN NULL ELSE repeat(chr(97 + g % 26), g % 200) END,
+	CASE WHEN corpus_null(g, 25) THEN NULL WHEN g % 50 = 45 THEN '' ELSE substr('abcdefgh', 1 + g % 5, g % 4) END,
+	CASE WHEN corpus_null(g, 26) THEN NULL
+		 WHEN g % 50 = 46 THEN '\x00ff00'::bytea WHEN g % 50 = 47 THEN decode(repeat('ab', 70), 'hex')
+		 ELSE int4send(g) END,
+	CASE WHEN corpus_null(g, 27) THEN NULL ELSE ('{"g": ' || g || ', "s": "' || repeat('j', g % 20) || '"}')::json END,
+	CASE WHEN corpus_null(g, 28) THEN NULL ELSE ('{"g": ' || g || ', "a": [1, 2, ' || g % 10 || ']}')::jsonb END,
+	CASE WHEN corpus_null(g, 29) THEN NULL ELSE md5(g::text)::uuid END,
+	CASE WHEN corpus_null(g, 30) THEN NULL ELSE ('name_' || g)::name END,
+	CASE WHEN corpus_null(g, 31) THEN NULL ELSE ('08:00:2b:01:02:' || lpad(to_hex(g % 256), 2, '0'))::macaddr END,
+	CASE WHEN corpus_null(g, 32) THEN NULL ELSE ('08:00:2b:01:02:03:04:' || lpad(to_hex(g % 256), 2, '0'))::macaddr8 END,
+	CASE WHEN corpus_null(g, 33) THEN NULL ELSE ('10.' || g % 256 || '.' || g / 256 % 256 || '.1/24')::inet END,
+	CASE WHEN corpus_null(g, 34) THEN NULL ELSE point(g, -g / 3.0) END,
+	CASE WHEN corpus_null(g, 35) THEN NULL ELSE ARRAY[g, g + 1, NULL, g % 5] END,
+	CASE WHEN corpus_null(g, 36) THEN NULL ELSE ARRAY['a' || g, NULL, repeat('t', g % 30)] END,
+	42,
+	CASE WHEN corpus_null(g, 37) THEN NULL WHEN g % 10 = 1 THEN repeat('external ' || g, 400)
+		 ELSE 'short ' || g END
+FROM generate_series(1, 2600) g;
+ANALYZE corpus;
+-- the rows of the corpus whose values Arrow holds in every column
+CREATE TEMP VIEW egress_corpus AS
+  SELECT * FROM corpus WHERE id % 50 NOT IN (15, 16, 19, 20, 21, 23, 24, 26, 27, 28, 36);
+SET vexec.mode = force;
+-- every column's Arrow type: "name format", an extension's name after it
+SELECT unnest(fields) AS field FROM vexec_test.egress('SELECT * FROM egress_corpus');
+       field       
+-------------------
+ id i
+ b b
+ i2 s
+ i4 i
+ i8 l
+ f4 f
+ f8 g
+ o I
+ m u
+ ch c
+ d tdD
+ t ttu
+ ts tsu:
+ tstz tsu:UTC
+ iv tin
+ tz u
+ n u
+ n10_2 d:10,2
+ n18_0 d:18,0
+ n38_5 d:38,5
+ n5_m2 d:7,0
+ n3_10 d:10,10
+ n40_2 u
+ tx u
+ vc u
+ bp u
+ bt z
+ js u arrow.json
+ jb u arrow.json
+ u w:16 arrow.uuid
+ nm u
+ mac u
+ mac8 u
+ ip u
+ pt u
+ a4 u
+ at u
+ k i
+ big u
+(39 rows)
+
+-- a vector node at the top, whose batches go out from its own buffers; a
+-- row node at the top, a CTE Scan, whose rows the receiver gathers
+CREATE TEMP TABLE egress_streams AS
+  SELECT 'vector' AS path, * FROM vexec_test.egress('SELECT * FROM egress_corpus')
+  UNION ALL
+  SELECT 'row', * FROM vexec_test.egress(
+    'WITH c AS MATERIALIZED (SELECT * FROM egress_corpus) SELECT * FROM c');
+SELECT path, rows, batches, vector_batches > 0 AS from_vectors
+FROM egress_streams ORDER BY path;
+  path  | rows | batches | from_vectors 
+--------+------+---------+--------------
+ row    | 2028 |       2 | f
+ vector | 2028 |       3 | t
+(2 rows)
+
+-- each stream is Arrow's IPC: a schema, its batches, the end; vexec's
+-- reader reads it, and its writer writes it back as it was
+SELECT s.path, m.n, m.kind FROM egress_streams s, LATERAL vexec_test.ipc_messages(s.stream) m
+ORDER BY 1, 2;
+  path  | n |     kind     
+--------+---+--------------
+ row    | 1 | schema
+ row    | 2 | record batch
+ row    | 3 | record batch
+ row    | 4 | end
+ vector | 1 | schema
+ vector | 2 | record batch
+ vector | 3 | record batch
+ vector | 4 | record batch
+ vector | 5 | end
+(9 rows)
+
+SELECT path, vexec_test.ipc_reencode(stream) = stream AS rewritten,
+       vexec_test.ipc_reencode(stream, false) = stream AS rewritten_unaligned
+FROM egress_streams ORDER BY path;
+  path  | rewritten | rewritten_unaligned 
+--------+-----------+---------------------
+ row    | t         | t
+ vector | t         | t
+(2 rows)
+
+-- each column, through each path and read back by the parameter reader as
+-- its own type: its values, as its output function writes them
+CREATE FUNCTION pg_temp.read_back(path text, col name)
+RETURNS TABLE (extra int8, missing int8)
+LANGUAGE plpgsql AS $$
+DECLARE
+	q text := format('SELECT %I FROM egress_corpus', col);
+	t regtype;
+BEGIN
+	IF path = 'row' THEN
+		q := format('WITH c AS MATERIALIZED (%s) SELECT * FROM c', q);
+	END IF;
+	SELECT a.atttypid::regtype INTO t
+	FROM pg_attribute a WHERE a.attrelid = 'corpus'::regclass AND a.attname = col;
+	CREATE TEMP TABLE IF NOT EXISTS egress_got (v text);
+	CREATE TEMP TABLE IF NOT EXISTS egress_want (v text);
+	TRUNCATE egress_got, egress_want;
+	INSERT INTO egress_got
+	  SELECT p.row FROM vexec_test.egress(q) e, LATERAL vexec_test.egress_params(e.stream, ARRAY[t]) p;
+	EXECUTE format('INSERT INTO egress_want SELECT CASE WHEN %1$I IS NULL THEN ''NULL'' '
+				   'ELSE format(''%%s'', %1$I) END FROM egress_corpus', col);
+	RETURN QUERY
+	  SELECT (SELECT count(*) FROM (TABLE egress_got EXCEPT ALL TABLE egress_want) x),
+			 (SELECT count(*) FROM (TABLE egress_want EXCEPT ALL TABLE egress_got) x);
+END $$;
+SET client_min_messages = warning;
+SELECT p.path, a.attname, r.extra, r.missing
+FROM (VALUES ('vector'), ('row')) p(path), pg_attribute a,
+     LATERAL pg_temp.read_back(p.path, a.attname) r
+WHERE a.attrelid = 'corpus'::regclass AND a.attnum > 0 AND (r.extra > 0 OR r.missing > 0);
+ path | attname | extra | missing 
+------+---------+-------+---------
+(0 rows)
+
+RESET client_min_messages;
+-- a value its column's Arrow type cannot hold fails the statement, naming
+-- the column, the type and the value's kind
+SELECT rows FROM vexec_test.egress('SELECT d FROM corpus WHERE id % 50 = 15 AND d IS NOT NULL');
+ERROR:  value of column "d" cannot be sent as Arrow type date32
+DETAIL:  The column holds an infinite date, which a stream of Arrow cannot carry in that type.
+CONTEXT:  SQL statement "SELECT d FROM corpus WHERE id % 50 = 15 AND d IS NOT NULL"
+SELECT rows FROM vexec_test.egress('SELECT t FROM corpus WHERE id % 50 = 19 AND t IS NOT NULL');
+ERROR:  value of column "t" cannot be sent as Arrow type time64[us]
+DETAIL:  The column holds 24:00:00, which a stream of Arrow cannot carry in that type.
+CONTEXT:  SQL statement "SELECT t FROM corpus WHERE id % 50 = 19 AND t IS NOT NULL"
+SELECT rows FROM vexec_test.egress('SELECT ts FROM corpus WHERE id % 50 = 20 AND ts IS NOT NULL');
+ERROR:  value of column "ts" cannot be sent as Arrow type timestamp[us]
+DETAIL:  The column holds an infinite timestamp, which a stream of Arrow cannot carry in that type.
+CONTEXT:  SQL statement "SELECT ts FROM corpus WHERE id % 50 = 20 AND ts IS NOT NULL"
+SELECT rows FROM vexec_test.egress('SELECT ts FROM corpus WHERE id % 50 = 24 AND ts IS NOT NULL');
+ERROR:  value of column "ts" cannot be sent as Arrow type timestamp[us]
+DETAIL:  The column holds a timestamp past Arrow's last microsecond, 294247-01-10 04:00:54.775807, which a stream of Arrow cannot carry in that type.
+CONTEXT:  SQL statement "SELECT ts FROM corpus WHERE id % 50 = 24 AND ts IS NOT NULL"
+SELECT rows FROM vexec_test.egress('SELECT iv FROM corpus WHERE id % 50 = 26 AND iv IS NOT NULL');
+ERROR:  value of column "iv" cannot be sent as Arrow type month_day_nano_interval
+DETAIL:  The column holds an infinite interval, which a stream of Arrow cannot carry in that type.
+CONTEXT:  SQL statement "SELECT iv FROM corpus WHERE id % 50 = 26 AND iv IS NOT NULL"
+SELECT rows FROM vexec_test.egress('SELECT iv FROM corpus WHERE id % 50 = 28 AND iv IS NOT NULL');
+ERROR:  value of column "iv" cannot be sent as Arrow type month_day_nano_interval
+DETAIL:  The column holds an interval whose time part leaves int64 in nanoseconds, which a stream of Arrow cannot carry in that type.
+CONTEXT:  SQL statement "SELECT iv FROM corpus WHERE id % 50 = 28 AND iv IS NOT NULL"
+SELECT rows FROM vexec_test.egress('SELECT n38_5 FROM corpus WHERE id % 50 = 36 AND n38_5 IS NOT NULL');
+ERROR:  value of column "n38_5" cannot be sent as Arrow type decimal128(38, 5)
+DETAIL:  The column holds NaN, an infinity, or a value beyond its precision, which a stream of Arrow cannot carry in that type.
+CONTEXT:  SQL statement "SELECT n38_5 FROM corpus WHERE id % 50 = 36 AND n38_5 IS NOT NULL"
+-- the last microsecond Arrow's timestamp holds goes out
+SELECT rows FROM vexec_test.egress('SELECT ts FROM corpus WHERE id % 50 = 25');
+ rows 
+------
+   52
+(1 row)
+
+-- an empty result: its schema, and the end
+SELECT rows, batches, cardinality(fields) AS fields,
+       (SELECT array_agg(kind ORDER BY n) FROM vexec_test.ipc_messages(stream)) AS messages
+FROM vexec_test.egress('SELECT * FROM egress_corpus WHERE false');
+ rows | batches | fields |   messages   
+------+---------+--------+--------------
+    0 |       0 |     39 | {schema,end}
+(1 row)
+
+-- parameters: a stream of the egress's, read as other types -- by
+-- assignment, utf8 by the type's input function -- and refused where
+-- neither applies
+SELECT * FROM vexec_test.egress_params(
+  (SELECT stream FROM vexec_test.egress('SELECT i2, i4, f4, n10_2, ''2026-10-06''::text FROM egress_corpus WHERE id BETWEEN 2 AND 4 ORDER BY id')),
+  '{int8,numeric,float8,float8,date}');
+ rownum |                               row                               
+--------+-----------------------------------------------------------------
+      0 | -32768 | 2000006 | NULL | -997.86 | 10-06-2026
+      1 | -14979 | 2147483647 | 0.4285714328289032 | -996.79 | 10-06-2026
+      2 | -14972 | NULL | 0.5714285969734192 | NULL | 10-06-2026
+(3 rows)
+
+SELECT * FROM vexec_test.egress_params(
+  (SELECT stream FROM vexec_test.egress('SELECT tx FROM egress_corpus WHERE id = 2')), '{date}');
+ERROR:  invalid input syntax for type date: "row 2"
+SELECT * FROM vexec_test.egress_params(
+  (SELECT stream FROM vexec_test.egress('SELECT d FROM egress_corpus WHERE id = 2')), '{int4}');
+ERROR:  parameter $1 is of type integer, and its Arrow values are of type date
+HINT:  Send it as a type that can be assigned to integer, or as utf8.
+SELECT * FROM vexec_test.egress_params(
+  (SELECT stream FROM vexec_test.egress('SELECT d FROM egress_corpus WHERE id = 2')), '{int4,int4}');
+ERROR:  the parameters' batches supply 1 columns, but the statement requires 2
+-- the egress serves only while the vector executor is active
+SET vexec.mode = off;
+SELECT rows FROM vexec_test.egress('SELECT 1');
+ERROR:  the vector executor is not active in this session
+DETAIL:  "vexec.mode" is "off".
+HINT:  Set "vexec.mode" to "auto" or "force".
+RESET vexec.mode;
+DROP TABLE egress_streams;
+DROP VIEW egress_corpus;
+DROP TABLE corpus;
+DROP FUNCTION corpus_null(int4, int4);

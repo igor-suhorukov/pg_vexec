@@ -22,6 +22,10 @@ OBJS = \
 	batch/numeric.o \
 	batch/rows.o \
 	batch/types.o \
+	egress/params.o \
+	egress/receiver.o \
+	egress/routine.o \
+	egress/run.o \
 	exec/aggtrans.o \
 	exec/methods.o \
 	exec/node.o \
@@ -63,12 +67,13 @@ PGFILEDESC = "vexec - a vectorized planner and executor for PostgreSQL 19"
 EXTENSION = vexec
 DATA = vexec--1.0.sql
 
-# The batch-source contract, for storage modules built elsewhere, and the
-# kernel packs' registry, for packs built elsewhere: installed into the
+# The batch-source contract, for storage modules built elsewhere, the
+# kernel packs' registry, for packs built elsewhere, and the egress API, for
+# an extension that serves Arrow to clients (V10): installed into the
 # server's include directory, under extension/vexec/.
-HEADERS = ../../include/vexec_source.h ../../include/vexec_kernels.h
+HEADERS = ../../include/vexec_source.h ../../include/vexec_kernels.h ../../include/vexec_egress.h
 
-REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs
+REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs
 
 PG_CPPFLAGS = -I$(srcdir) -I$(srcdir)/pgxs/include -I$(srcdir)/../../include
 
