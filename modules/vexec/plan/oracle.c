@@ -23,7 +23,9 @@
  *
  * The kernels are expr/'s, bound by function OID (expr/kernels.c); a call
  * without one is a fallback step, priced at PostgreSQL's full
- * cpu_operator_cost.
+ * cpu_operator_cost.  A call a kernel pack declares (expr/packs.c, §3.17)
+ * is a declared step, priced as PostgreSQL prices the call: the work is the
+ * extension's function's own, called through fmgr.
  *
  *-------------------------------------------------------------------------
  */
@@ -65,9 +67,10 @@ typedef struct OracleContext
 } OracleContext;
 
 /*
- * A call: a kernel step where one is bound, else a fallback step.  A
- * kernel's share is priced as PostgreSQL prices the call
- * (add_function_cost), so the cost model can scale it.
+ * A call: a kernel step where one is bound, a declared step where a kernel
+ * pack declares the function, else a fallback step.  A kernel's share is
+ * priced as PostgreSQL prices the call (add_function_cost), so the cost
+ * model can scale it; a declared step's and a fallback step's are not.
  */
 static void
 oracle_call(OracleContext *ctx, Oid funcid, Node *node, List *args, Oid collation)
@@ -84,6 +87,9 @@ oracle_call(OracleContext *ctx, Oid funcid, Node *node, List *args, Oid collatio
 		ctx->steps->kernel++;
 		ctx->steps->kernel_cost += qc.per_tuple;
 	}
+	else if ((IsA(node, FuncExpr) || IsA(node, OpExpr)) &&
+			 list_length(args) <= VEXEC_KERNEL_MAXARGS && vexec_declared_find(funcid, NULL))
+		ctx->steps->declared++;
 	else
 		ctx->steps->fallback++;
 }
@@ -199,6 +205,7 @@ vexec_oracle_expr(PlannerInfo *root, Node *expr, VexecSteps *steps)
 
 	steps->kernel += one.kernel;
 	steps->fallback += one.fallback;
+	steps->declared += one.declared;
 	steps->kernel_cost += one.kernel_cost;
 	steps->fallback_cost += one.fallback_cost;
 	steps->startup += one.startup;

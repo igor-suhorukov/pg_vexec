@@ -10,6 +10,11 @@
  *	- a call with a kernel, whose arguments compile in turn: the kernel never
  *	  raises, and defers a row PostgreSQL's function would raise on to
  *	  PostgreSQL's evaluator (expr.h);
+ *	- a call of another extension's function that a kernel pack declares
+ *	  (vexec_kernels.h, packs.c): the function itself, through fmgr, a
+ *	  batch's rows at a time, where its declaration says it cannot raise,
+ *	  and the other rows deferred to PostgreSQL's evaluator (eval.c's
+ *	  call_rows());
  *	- boolean logic, NULL and boolean tests, a relabelling, a column of the
  *	  node's input, a constant, a parameter;
  *	- the fallback, for a subtree whose root has none of these forms:
@@ -20,11 +25,12 @@
  * fallback subtree must be pure: it can neither raise an error that depends
  * on its rows nor have a side effect.  Every function in it is not volatile
  * and is leakproof, which by PostgreSQL's definition reveals nothing of its
- * arguments through errors (CREATE FUNCTION's LEAKPROOF); and it holds
- * nothing PostgreSQL's evaluator may raise on of its own accord: a SubPlan,
- * a coercion through I/O, a domain's check, an array built of arrays.  Its
- * calls with kernels count for nothing there, since the fallback runs them
- * through PostgreSQL's evaluator.
+ * arguments through errors (CREATE FUNCTION's LEAKPROOF), or is declared
+ * never to raise by a kernel pack; and it holds nothing PostgreSQL's
+ * evaluator may raise on of its own accord: a SubPlan, a coercion through
+ * I/O, a domain's check, an array built of arrays.  Its calls with kernels
+ * count for nothing there, since the fallback runs them through
+ * PostgreSQL's evaluator, and so do a pack's checks and prefilters.
  *
  * A qual or target that does not compile is lazy: PostgreSQL's evaluator
  * runs it a row at a time, in row order, for the rows the node's consumer
@@ -57,12 +63,15 @@
 
 /*
  * Whether a function may be called ahead of PostgreSQL's order through
- * PostgreSQL's evaluator: not volatile, and leakproof.
+ * PostgreSQL's evaluator: not volatile, and leakproof -- or declared never
+ * to raise by a kernel pack (packs.c), which holds for vexec's own
+ * evaluation alone, where LEAKPROOF would hold for the planner's too.
  */
 static bool
 func_pure(Oid funcid)
 {
-	return func_volatile(funcid) != PROVOLATILE_VOLATILE && get_func_leakproof(funcid);
+	return func_volatile(funcid) != PROVOLATILE_VOLATILE &&
+		(get_func_leakproof(funcid) || vexec_declared_never_raises(funcid));
 }
 
 /* The argument types of a call, for binding. */
@@ -347,8 +356,9 @@ compile_saop_array(VexecCompileContext *cc, Const *arr)
 }
 
 /*
- * A call with a kernel, its arguments compiled; NULL when it has no kernel
- * or an argument does not compile.
+ * A call with a kernel, or a plain call bound to a kernel pack's
+ * declaration, its arguments compiled; NULL when it has neither or an
+ * argument does not compile.
  */
 static VexecExpr *
 compile_call(VexecCompileContext *cc, Expr *expr, VexecExprKind kind, Oid funcid,
@@ -356,14 +366,19 @@ compile_call(VexecCompileContext *cc, Expr *expr, VexecExprKind kind, Oid funcid
 {
 	void	   *extra = NULL;
 	const VexecKernelEntry *ke = usable_kernel(expr, funcid, args, inputcollid, &extra);
+	VexecDeclared declared = {NULL, NULL};
 	VexecExpr  *e;
 	ListCell   *lc;
 	int			i = 0;
 
-	if (ke == NULL)
+	if (ke == NULL &&
+		(kind != VE_CALL || list_length(args) > VEXEC_KERNEL_MAXARGS ||
+		 !vexec_declared_find(funcid, &declared)))
 		return NULL;
 	e = new_expr(cc, kind, expr, list_length(args));
-	e->kernel = ke->def;
+	e->kernel = ke != NULL ? ke->def : &vexec_declared_kernel;
+	e->pack = declared.pack;
+	e->decl = declared.decl;
 	e->funcid = funcid;
 	e->collation = inputcollid;
 	e->strict = func_strict(funcid);
@@ -386,9 +401,12 @@ compile_call(VexecCompileContext *cc, Expr *expr, VexecExprKind kind, Oid funcid
 		e->finfo = palloc0(sizeof(FmgrInfo));
 		fmgr_info(funcid, e->finfo);
 		fmgr_info_set_expr((Node *) expr, e->finfo);
+		if (e->decl != NULL)
+			cc->declared = lappend(cc->declared, e);
 		MemoryContextSwitchTo(old);
 	}
-	cc->nkernels++;
+	if (e->decl == NULL)
+		cc->nkernels++;
 	return e;
 }
 
@@ -547,6 +565,7 @@ vexec_compile_expr(VexecCompileContext *cc, Expr *expr)
 	VexecExpr  *e;
 	int			nkernels = cc->nkernels;
 	int			nfallbacks = cc->nfallbacks;
+	int			ndeclared = list_length(cc->declared);
 
 	e = compile_vector(cc, expr);
 	if (e != NULL)
@@ -554,6 +573,7 @@ vexec_compile_expr(VexecCompileContext *cc, Expr *expr)
 	/* what a failed vector form counted is not in the program */
 	cc->nkernels = nkernels;
 	cc->nfallbacks = nfallbacks;
+	cc->declared = list_truncate(cc->declared, ndeclared);
 	return compile_fallback(cc, expr);
 }
 
@@ -568,6 +588,7 @@ vexec_compile_top(VexecCompileContext *cc, Expr *expr, bool is_qual, VexecTop *t
 	MemoryContext old = MemoryContextSwitchTo(cc->mcxt);
 	int			nkernels = cc->nkernels;
 	int			nfallbacks = cc->nfallbacks;
+	int			ndeclared = list_length(cc->declared);
 
 	memset(top, 0, sizeof(VexecTop));
 	top->expr = expr;
@@ -586,5 +607,6 @@ vexec_compile_top(VexecCompileContext *cc, Expr *expr, bool is_qual, VexecTop *t
 		top->why_lazy = cc->why ? cc->why : "no vector form";
 		cc->nkernels = nkernels;
 		cc->nfallbacks = nfallbacks;
+		cc->declared = list_truncate(cc->declared, ndeclared);
 	}
 }

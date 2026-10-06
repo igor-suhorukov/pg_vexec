@@ -32,14 +32,19 @@
 /*
  * What the oracle makes of an expression (§3.3.2): its kernel steps, its
  * fallback steps -- PostgreSQL's evaluator, row by row, inside the vector
- * node -- or that it cannot be in a vector node at all.  The costs are per
- * row, at PostgreSQL's own prices (cost_qual_eval_node); the cost model
- * applies the vector factor to the kernels' share only.
+ * node -- its calls bound to kernel packs' declarations (§3.17), or that it
+ * cannot be in a vector node at all.  The costs are per row, at
+ * PostgreSQL's own prices (cost_qual_eval_node); the cost model applies the
+ * vector factor to the kernels' share only: a declared call is the
+ * extension's own function through fmgr, whose work is all its own, and is
+ * priced as PostgreSQL prices the call -- a prefiltered one as the whole
+ * function, until the share of rows its prefilter decides is known.
  */
 typedef struct VexecSteps
 {
 	int			kernel;
 	int			fallback;
+	int			declared;
 	Cost		kernel_cost;
 	Cost		fallback_cost;
 	Cost		startup;

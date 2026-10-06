@@ -245,8 +245,9 @@ orca_scan(VexecPlanState *ps, SeqScan *seq, List *rtable)
 						 list_length(scan->plan.targetlist), scan->plan.plan_rows, &cost);
 	table_close(rel, NoLock);
 	vexec_alt_costed(ps, alt, &cost,
-					 psprintf("ORCA's scan; source: %s; quals: %d kernel, %d fallback steps",
-							  how, quals.kernel, quals.fallback));
+					 psprintf("ORCA's scan; source: %s; quals: %d kernel, %d fallback steps%s",
+							  how, quals.kernel, quals.fallback,
+							  quals.declared > 0 ? psprintf(", %d declared calls", quals.declared) : ""));
 	ps->npossible++;
 	if (!chosen(ps, &cost))
 		return NULL;

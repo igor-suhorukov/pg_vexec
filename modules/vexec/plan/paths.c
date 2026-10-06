@@ -75,6 +75,13 @@ count_of(int n, const char *one, const char *many)
 	return psprintf("%d %s", n, n == 1 ? one : many);
 }
 
+/* ", 1 declared call": kernel packs' declarations (§3.17), where there are */
+static const char *
+declared_of(int n)
+{
+	return n == 0 ? "" : psprintf(", %s", count_of(n, "declared call", "declared calls"));
+}
+
 static planner_setup_hook_type prev_planner_setup = NULL;
 static planner_shutdown_hook_type prev_planner_shutdown = NULL;
 static set_rel_pathlist_hook_type prev_set_rel_pathlist = NULL;
@@ -402,12 +409,14 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 					bms_num_members(attrs), list_length(rel->reltarget->exprs),
 					source_bytes, &cost);
 	vexec_alt_costed(ps, alt, &cost,
-					 psprintf("source: %s; quals: %s, %s; target: %s, %s",
+					 psprintf("source: %s; quals: %s, %s%s; target: %s, %s%s",
 							  how,
 							  count_of(quals.kernel, "kernel step", "kernel steps"),
 							  count_of(quals.fallback, "fallback step", "fallback steps"),
+							  declared_of(quals.declared),
 							  count_of(target.kernel, "kernel step", "kernel steps"),
-							  count_of(target.fallback, "fallback step", "fallback steps")));
+							  count_of(target.fallback, "fallback step", "fallback steps"),
+							  declared_of(target.declared)));
 	if (add)
 	{
 		Path	   *path = vexec_scan_path(root, rel, rowpath, &cost);

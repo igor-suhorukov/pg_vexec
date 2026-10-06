@@ -4,9 +4,13 @@
 # vexec's own regression suite (modules/vexec/sql, expected), against a
 # server of the container's PostgreSQL with vexec preloaded: built, a
 # server made, the suite run by PGXS's installcheck, and the server's log
-# and the diffs kept in RESULTS_DIR when it is set.
+# and the diffs kept in RESULTS_DIR when it is set.  vexec_testpack, the
+# kernel pack of the tests (modules/vexec_testpack), is preloaded before
+# vexec, which the packs' registry allows (vexec_kernels.h): vexec_packs
+# binds its declarations.
 #
-#   VEXEC_PRELOAD   the server's shared_preload_libraries: vexec
+#   VEXEC_PRELOAD   the server's shared_preload_libraries:
+#                   vexec_testpack,vexec
 #   VEXEC_SETTINGS  more settings for it, one a line
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,7 +18,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
 
 D="$(mktemp -d "${TMPDIR:-/tmp}/vexec-suite-XXXXXX")"
-settings=("shared_preload_libraries = '${VEXEC_PRELOAD:-vexec}'")
+settings=("shared_preload_libraries = '${VEXEC_PRELOAD:-vexec_testpack,vexec}'")
 while IFS= read -r line; do [ -n "$line" ] && settings+=("$line"); done <<< "${VEXEC_SETTINGS:-}"
 server_init "$D" "${settings[@]}" || exit 1
 server_start "$D" || { echo "the server did not start"; tail -20 "$D/log"; exit 1; }

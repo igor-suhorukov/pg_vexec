@@ -306,7 +306,8 @@ vexec_cost_plan_sort(Plan *sort, bool input_vector, VexecCost *cost)
 /*
  * A scan ORCA's translator built, priced as a row scan and as a vector scan
  * in PostgreSQL's units: the table's pages, its tuples, and the oracle's
- * counts of the quals' and the target's steps, at cpu_operator_cost a step.
+ * counts of the quals' and the target's steps, at cpu_operator_cost a step,
+ * a kernel step's scaled by vexec.cpu_operator_factor.
  * ORCA's own costs are in its units, and its choices in V1 are its own; in
  * auto mode its scan becomes a vector scan where this prices it lower (V5's
  * CCostModelVec prices vector operators inside ORCA's search).
@@ -318,8 +319,8 @@ vexec_cost_plan_scan(Relation rel, const VexecSteps *quals, const VexecSteps *ta
 	double		tuples = Max(rel->rd_rel->reltuples, rows);
 	double		pages = Max(rel->rd_rel->relpages, 0);
 	double		disk = seq_page_cost * pages;
-	double		qual_ops = quals->kernel + quals->fallback;
-	double		target_ops = target->kernel + target->fallback;
+	double		qual_ops = quals->kernel + quals->fallback + quals->declared;
+	double		target_ops = target->kernel + target->fallback + target->declared;
 	Cost		row_cpu;
 	Cost		cpu;
 
@@ -327,8 +328,10 @@ vexec_cost_plan_scan(Relation rel, const VexecSteps *quals, const VexecSteps *ta
 	row_cpu = (cpu_tuple_cost + cpu_operator_cost * qual_ops) * tuples +
 		cpu_operator_cost * target_ops * rows;
 	cpu = cpu_tuple_cost * vexec_cpu_tuple_factor * tuples +
-		cpu_operator_cost * (quals->kernel * vexec_cpu_operator_factor + quals->fallback) * tuples +
-		cpu_operator_cost * (target->kernel * vexec_cpu_operator_factor + target->fallback) * rows;
+		cpu_operator_cost * (quals->kernel * vexec_cpu_operator_factor +
+							 quals->fallback + quals->declared) * tuples +
+		cpu_operator_cost * (target->kernel * vexec_cpu_operator_factor +
+							 target->fallback + target->declared) * rows;
 	cost->rows = rows;
 	cost->row_startup = 0;
 	cost->row_total = disk + row_cpu;

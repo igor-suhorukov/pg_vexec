@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# vexec_testpack: a kernel pack of vexec's tests (pg_accel's tests only)
+comment = 'A kernel pack of vexec''s tests: functions of its own, and their declarations'
+default_version = '1.0'
+module_pathname = '$libdir/vexec_testpack'
+relocatable = false
+schema = vexec_testpack
+superuser = true

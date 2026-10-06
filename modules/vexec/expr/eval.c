@@ -19,7 +19,11 @@
  *	- a kernel that meets a row PostgreSQL's function would raise on marks
  *	  it in the batch's redo rows, and the rows evaluated after it leave it
  *	  out: the node evaluates it with PostgreSQL's evaluator, in row order,
- *	  when it is asked for (exec/node.c).
+ *	  when it is asked for (exec/node.c);
+ *	- a call bound to a kernel pack's declaration (vexec_kernels.h) calls
+ *	  the extension's own function through fmgr only where its declaration
+ *	  says it cannot raise, and sends the other rows to redo in the same
+ *	  way (call_declared()).
  *
  * A parameter is read once a batch.  A PARAM_EXEC whose InitPlan has not
  * run yet (ParamExecData.execPlan) is read only where the rows evaluated
@@ -37,10 +41,13 @@
 
 #include "access/tupmacs.h"
 #include "executor/executor.h"
+#include "nodes/miscnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "port/pg_bitutils.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
+
+#include "vexec_kernels.h"
 
 #include "vexec.h"
 #include "batch/batch.h"
@@ -561,9 +568,165 @@ strict_rows(VexecEval *ev, VexecVec **args, int nargs, const uint64 *live, uint6
 	return vexec_bits_and(ev->work, live, valid, ev->nrows);
 }
 
+/* A declared call's kernel: no variant, so call_rows() runs it. */
+static bool
+declared_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
+{
+	(void) kc;
+	(void) args;
+	(void) v;
+	return false;
+}
+
+const VexecKernelDef vexec_declared_kernel = {"declared", false, NULL, declared_variant};
+
+/*
+ * A call bound to a kernel pack's declaration (vexec_kernels.h, packs.c):
+ * the extension's own function through fmgr, a row at a time over the rows
+ * it computes, with one prepared call frame, where its declaration lets it
+ * run ahead of PostgreSQL's order:
+ *
+ *	never raises	the function, on every row;
+ *	check			the pack's check, then the function where the check
+ *					passes; the call's varlena arguments detoasted once a
+ *					row first -- a constant once a batch -- and handed to
+ *					both, so that neither reads a toasted value again;
+ *	prefilter		the pack's prefilter, under an ErrorSaveContext: its
+ *					answer where it gives one; the function is never called.
+ *
+ * A row the check fails or the prefilter leaves undecided goes to redo:
+ * PostgreSQL's evaluator calls the function there, in row order, when the
+ * row is asked for, and raises its error, if any, where PostgreSQL would.
+ * The pack's function has a call frame of its own, its flinfo fn_extra NULL
+ * at every row: it keeps nothing from row to row.  Each row's memory -- the
+ * detoasted values, what the functions allocate -- is reset after it.
+ */
+static VexecVec *
+call_declared(VexecEval *ev, VexecExpr *e, VexecVec **args, const uint64 *compute,
+			  uint64 *validity)
+{
+	const VexecKernelDecl *decl = e->decl;
+	MemoryContext rowcxt = ev->econtext->ecxt_per_tuple_memory;
+	VexecVec   *v = new_register(ev, e->type, NULL);
+	LOCAL_FCINFO(fcinfo, VEXEC_KERNEL_MAXARGS);
+	LOCAL_FCINFO(pfcinfo, VEXEC_KERNEL_MAXARGS);
+	FmgrInfo	pflinfo;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+	bool		detoast[VEXEC_KERNEL_MAXARGS];
+	NullableDatum constargs[VEXEC_KERNEL_MAXARGS];
+	int			computed = 0;
+	int			r,
+				i;
+
+	if (validity)
+		v->validity = vexec_bits_copy(ev->work, validity, ev->nrows);
+	InitFunctionCallInfoData(*fcinfo, e->finfo, e->nargs, e->collation, NULL, NULL);
+	/* the pack's function's frame: no catalog entry, no state */
+	MemSet(&pflinfo, 0, sizeof(pflinfo));
+	pflinfo.fn_addr = decl->fn;
+	pflinfo.fn_oid = InvalidOid;
+	pflinfo.fn_nargs = e->nargs;
+	pflinfo.fn_mcxt = rowcxt;
+	InitFunctionCallInfoData(*pfcinfo, &pflinfo, e->nargs, e->collation,
+							 decl->kind == VEXEC_DECL_PREFILTER ? (Node *) &escontext : NULL,
+							 NULL);
+
+	/* a check's varlena arguments are detoasted; a constant's, once */
+	for (i = 0; i < e->nargs; i++)
+	{
+		detoast[i] = decl->kind == VEXEC_DECL_CHECK && args[i]->type->typlen == -1;
+		if (args[i]->encoding != VEXEC_CONST)
+			continue;
+		constargs[i].value = vexec_vec_datum(ev->work, args[i], 0, &constargs[i].isnull);
+		if (detoast[i] && !constargs[i].isnull)
+		{
+			MemoryContext old = MemoryContextSwitchTo(ev->work->mcxt);
+
+			constargs[i].value = PointerGetDatum(PG_DETOAST_DATUM(constargs[i].value));
+			MemoryContextSwitchTo(old);
+		}
+	}
+
+	for (r = vexec_bits_next(compute, ev->nrows, 0); r >= 0;
+		 r = vexec_bits_next(compute, ev->nrows, r + 1))
+	{
+		MemoryContext old = MemoryContextSwitchTo(rowcxt);
+		Datum		result = (Datum) 0;
+		bool		isnull = true;
+		bool		decided = true;
+
+		for (i = 0; i < e->nargs; i++)
+		{
+			if (args[i]->encoding == VEXEC_CONST)
+				fcinfo->args[i] = constargs[i];
+			else
+			{
+				fcinfo->args[i].value = vexec_vec_datum(ev->work, args[i], r,
+														&fcinfo->args[i].isnull);
+				if (detoast[i] && !fcinfo->args[i].isnull)
+					fcinfo->args[i].value = PointerGetDatum(PG_DETOAST_DATUM(fcinfo->args[i].value));
+			}
+		}
+		switch (decl->kind)
+		{
+			case VEXEC_DECL_NEVER_RAISES:
+				fcinfo->isnull = false;
+				result = FunctionCallInvoke(fcinfo);
+				isnull = fcinfo->isnull;
+				break;
+			case VEXEC_DECL_CHECK:
+				{
+					Datum		ok;
+
+					for (i = 0; i < e->nargs; i++)
+						pfcinfo->args[i] = fcinfo->args[i];
+					pflinfo.fn_extra = NULL;
+					pfcinfo->isnull = false;
+					ok = FunctionCallInvoke(pfcinfo);
+					decided = !pfcinfo->isnull && DatumGetBool(ok);
+					if (decided)
+					{
+						fcinfo->isnull = false;
+						result = FunctionCallInvoke(fcinfo);
+						isnull = fcinfo->isnull;
+					}
+					break;
+				}
+			case VEXEC_DECL_PREFILTER:
+				for (i = 0; i < e->nargs; i++)
+					pfcinfo->args[i] = fcinfo->args[i];
+				pflinfo.fn_extra = NULL;
+				pfcinfo->isnull = false;
+				escontext.error_occurred = false;
+				result = FunctionCallInvoke(pfcinfo);
+				decided = !SOFT_ERROR_OCCURRED(&escontext);
+				isnull = pfcinfo->isnull;
+				break;
+			default:
+				elog(ERROR, "vexec: unknown declaration %d of pack \"%s\"",
+					 decl->kind, e->pack->name);
+		}
+		MemoryContextSwitchTo(old);
+		if (decided)
+		{
+			register_store(ev, v, r, result, isnull);
+			computed++;
+		}
+		else
+		{
+			vexec_bit_set(ev->redo, r);
+			register_store(ev, v, r, (Datum) 0, true);
+		}
+		ResetExprContext(ev->econtext);
+	}
+	vexec_node_count_declared(ev->node, computed);
+	return v;
+}
+
 /*
  * The row-by-row variant: the function through fmgr, for one that cannot
- * raise; for one that can, its rows go to PostgreSQL's evaluator.
+ * raise; for one that can, its rows go to PostgreSQL's evaluator.  A call
+ * bound to a kernel pack's declaration has its own (call_declared()).
  */
 static VexecVec *
 call_rows(VexecEval *ev, VexecExpr *e, VexecVec **args, const uint64 *compute,
@@ -573,6 +736,8 @@ call_rows(VexecEval *ev, VexecExpr *e, VexecVec **args, const uint64 *compute,
 	LOCAL_FCINFO(fcinfo, VEXEC_KERNEL_MAXARGS);
 	int			r;
 
+	if (e->decl != NULL)
+		return call_declared(ev, e, args, compute, validity);
 	if (e->kernel->can_fail)
 	{
 		vexec_bits_or_into(ev->redo, compute, ev->nrows);

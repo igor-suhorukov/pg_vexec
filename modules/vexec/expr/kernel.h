@@ -10,8 +10,9 @@
  * or through search_path.  The tables are the built-in functions of
  * pg_catalog, whose OIDs are fixed below FirstGenbkiObjectId and named by
  * utils/fmgroids.h.  An extension's function has no kernel: it runs in the
- * fallback (§3.17's kernel packs come later).  What ExecInitFunc does for a
- * call site, binding does too: the EXECUTE permission check and
+ * fallback, or, where a kernel pack declares it (§3.17, packs.c), through
+ * fmgr a batch's rows at a time (eval.c's call_rows()).  What ExecInitFunc
+ * does for a call site, binding does too: the EXECUTE permission check and
  * InvokeFunctionExecuteHook (PG19:src/backend/executor/execExpr.c:2708-2711);
  * a security-definer function, one with proconfig, and one a plugin claims
  * through needs_fmgr_hook are left to fmgr.
@@ -99,6 +100,25 @@ extern const VexecKernelEntry *vexec_kernel_find(Oid funcid, int nargs, const Oi
 extern bool vexec_kernel_permitted(Oid funcid);
 extern int	vexec_kernel_count(void);
 extern Datum vexec_kernel_list(PG_FUNCTION_ARGS);
+
+/*
+ * packs.c: a call bound to a kernel pack's declaration (vexec_kernels.h):
+ * the pack's and the declaration's static data, valid for the process.
+ */
+typedef struct VexecDeclared
+{
+	const struct VexecKernelPack *pack;
+	const struct VexecKernelDecl *decl;
+} VexecDeclared;
+
+extern bool vexec_declared_find(Oid funcid, VexecDeclared *out);
+extern bool vexec_declared_never_raises(Oid funcid);
+extern const char *vexec_decl_kind_name(int kind);
+extern Datum vexec_kernel_packs(PG_FUNCTION_ARGS);
+extern Datum vexec_declared_calls(PG_FUNCTION_ARGS);
+
+/* eval.c: a declared call's kernel, which has no variant (call_rows()) */
+extern const VexecKernelDef vexec_declared_kernel;
 
 /* The families, each its own file. */
 extern void vexec_kernels_compare(void (*add) (Oid, const VexecKernelDef *, const void *));

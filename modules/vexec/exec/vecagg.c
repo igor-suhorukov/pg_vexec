@@ -1823,6 +1823,7 @@ agg_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 			ExplainPropertyText("Transitions", buf.data, es);
 		ExplainPropertyInteger("Kernel Steps", NULL, node->nkernels, es);
 		ExplainPropertyInteger("Fallback Steps", NULL, node->nfallbacks, es);
+		vexec_node_explain_declared(node, es);
 		ExplainPropertyText("Input", s->child_batches ? "batches" : "rows", es);
 		if (s->nstats >= 0)
 			ExplainPropertyText("From Statistics",

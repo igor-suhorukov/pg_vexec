@@ -22,12 +22,15 @@
  * An expression is eager when evaluating it ahead of PostgreSQL's order can
  * neither change an answer nor raise an error PostgreSQL would not: every
  * call in it has a kernel, or is of a leakproof function, which reveals
- * nothing of its arguments through errors, and nothing in it is volatile
- * or a SubPlan.  PostgreSQL evaluates a row's quals in order, a row at a
- * time, stops at the first that fails, and evaluates nothing for rows its
- * consumer never asks for; an expression that may raise, or has side
- * effects, is therefore lazy, so that its errors, its call counts and its
- * order stay PostgreSQL's (§3.7, "SubPlans and volatile functions").
+ * nothing of its arguments through errors, or is bound to a kernel pack's
+ * declaration (vexec_kernels.h: of a function that never raises, called
+ * only where its pack's check passes, or answered by its pack's prefilter),
+ * and nothing in it is volatile or a SubPlan.  PostgreSQL evaluates a row's
+ * quals in order, a row at a time, stops at the first that fails, and
+ * evaluates nothing for rows its consumer never asks for; an expression
+ * that may raise, or has side effects, is therefore lazy, so that its
+ * errors, its call counts and its order stay PostgreSQL's (§3.7,
+ * "SubPlans and volatile functions").
  *
  * Kernels never raise.  A kernel that meets a row on which the PostgreSQL
  * function would raise -- an overflow, a division by zero -- marks the row
@@ -36,7 +39,8 @@
  * exactly the error the row executor would have raised, SQLSTATE, message
  * and all, or none where PostgreSQL would not have evaluated the failing
  * call for that row (§3.7, "Errors are PostgreSQL's own").  Such rows are
- * the batch's redo rows.
+ * the batch's redo rows, and so are a declared call's rows its pack's check
+ * fails or its prefilter leaves undecided.
  *
  *-------------------------------------------------------------------------
  */
@@ -104,6 +108,9 @@ typedef struct VexecExpr
 	void	   *extra;			/* the kernel's own data for this call */
 	bool		strict;
 	FmgrInfo   *finfo;			/* for the row-by-row variant */
+	/* VE_CALL bound to a kernel pack's declaration (packs.c), else NULL */
+	const struct VexecKernelPack *pack;
+	const struct VexecKernelDecl *decl;
 	bool		useOr;			/* VE_SAOP: ANY */
 	VexecSaop  *saop;			/* VE_SAOP: the array's elements */
 	/* VE_NULLTEST, VE_BOOLTEST */
@@ -136,6 +143,8 @@ typedef struct VexecCompileContext
 	MemoryContext mcxt;			/* the node's */
 	int			nkernels;		/* compiled: kernel steps */
 	int			nfallbacks;		/* fallback steps */
+	List	   *declared;		/* compiled: the declared calls' steps,
+								 * VexecExpr *, for EXPLAIN */
 	const char *why;			/* why the last top-level one is lazy */
 } VexecCompileContext;
 

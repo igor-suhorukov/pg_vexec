@@ -153,10 +153,10 @@ _PG_init(void)
 {
 	/*
 	 * vexec installs the planner's hooks, which every backend's plans go
-	 * through, and registers the batch sources' registry for storage modules
-	 * to find while the postmaster loads them (§3.5.1): neither can be done
-	 * once the postmaster is running.  It does not need gp_core, so it never
-	 * asks for it (§3.2).
+	 * through, and registers the batch sources' registry and the kernel
+	 * packs' for storage modules and packs to find while the postmaster
+	 * loads them (§3.5.1, §3.17): neither can be done once the postmaster is
+	 * running.  It does not need gp_core, so it never asks for it (§3.2).
 	 */
 	CB_REQUIRE_PRELOAD("vexec");
 
@@ -164,6 +164,7 @@ _PG_init(void)
 	MarkGUCPrefixReserved("vexec");
 
 	vexec_source_registry_install();
+	vexec_kernel_packs_install();
 	vexec_exec_install();
 	vexec_planner_install();
 	vexec_orca_install();

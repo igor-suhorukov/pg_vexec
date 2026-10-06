@@ -9,7 +9,9 @@
 #
 #   make PG_CONFIG=/usr/local/pgsql/bin/pg_config
 #   make PG_CONFIG=... install
-#   make PG_CONFIG=... installcheck    (against a server with vexec preloaded)
+#   make PG_CONFIG=... installcheck    (against a server with vexec preloaded,
+#                                       and vexec_testpack, the kernel pack of
+#                                       the tests, before it: vexec_packs)
 
 MODULE_big = vexec
 OBJS = \
@@ -38,6 +40,7 @@ OBJS = \
 	expr/k_numeric.o \
 	expr/k_text.o \
 	expr/kernels.o \
+	expr/packs.o \
 	plan/agg.o \
 	plan/build.o \
 	plan/check.o \
@@ -57,11 +60,12 @@ PGFILEDESC = "vexec - a vectorized planner and executor for PostgreSQL 19"
 EXTENSION = vexec
 DATA = vexec--1.0.sql
 
-# The batch-source contract, for storage modules built elsewhere: installed
-# into the server's include directory, under extension/vexec/.
-HEADERS = ../../include/vexec_source.h
+# The batch-source contract, for storage modules built elsewhere, and the
+# kernel packs' registry, for packs built elsewhere: installed into the
+# server's include directory, under extension/vexec/.
+HEADERS = ../../include/vexec_source.h ../../include/vexec_kernels.h
 
-REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_scan vexec_agg vexec_join vexec_heap vexec_sort
+REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs
 
 PG_CPPFLAGS = -I$(srcdir) -I$(srcdir)/pgxs/include -I$(srcdir)/../../include
 

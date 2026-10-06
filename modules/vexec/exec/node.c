@@ -43,13 +43,16 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 
 #include "cb_explain.h"
+#include "vexec_kernels.h"
 
 #include "vexec.h"
 #include "batch/batch.h"
 #include "exec/exec.h"
 #include "expr/expr.h"
+#include "expr/kernel.h"
 
 void
 vexec_node_begin(VexecNode *node, EState *estate)
@@ -124,6 +127,7 @@ vexec_node_compile(VexecNode *node, List *quals, List *tlist)
 	}
 	node->nkernels = cc.nkernels;
 	node->nfallbacks = cc.nfallbacks;
+	node->declared = list_concat(node->declared, cc.declared);
 
 	/* the output batch, its columns the targets' */
 	{
@@ -145,6 +149,12 @@ void
 vexec_node_count_kernel(VexecNode *node)
 {
 	node->stats.kernel_steps++;
+}
+
+void
+vexec_node_count_declared(VexecNode *node, int rows)
+{
+	node->stats.declared_rows += rows;
 }
 
 /* Point both expression contexts at the input slot. */
@@ -482,7 +492,14 @@ lazy_qual_rejecting(VexecNode *node, int row)
 	return -1;
 }
 
-/* The target list for one row: the eager entries read, the lazy evaluated. */
+/*
+ * The target list for one row: the eager entries read, the lazy evaluated
+ * in the row's memory, as ExecProject evaluates a target.  Never in the
+ * query's: a function's fn_mcxt is the query's memory, and a function that
+ * keeps state in fn_extra may take what is allocated there for its own --
+ * PostGIS's caches keep a geometry allocated there by reference, and free
+ * it later.
+ */
 static TupleTableSlot *
 project_row(VexecNode *node, int row)
 {
@@ -500,8 +517,8 @@ project_row(VexecNode *node, int row)
 		{
 			vexec_node_load_input(node, row);
 			set_input_slot(node, econtext, node->input_slot);
-			slot->tts_values[i] = ExecEvalExpr(node->targets[i].state, econtext,
-											   &slot->tts_isnull[i]);
+			slot->tts_values[i] = ExecEvalExprSwitchContext(node->targets[i].state, econtext,
+															&slot->tts_isnull[i]);
 		}
 	}
 	return ExecStoreVirtualTuple(slot);
@@ -754,6 +771,7 @@ vexec_node_explain_properties(VexecNode *node, List *ancestors, ExplainState *es
 								psprintf("%d of %d", eager, node->nquals), es);
 		ExplainPropertyInteger("Kernel Steps", NULL, node->nkernels, es);
 		ExplainPropertyInteger("Fallback Steps", NULL, node->nfallbacks, es);
+		vexec_node_explain_declared(node, es);
 		if (lazy_targets > 0)
 			ExplainPropertyInteger("Row-by-Row Targets", NULL, lazy_targets, es);
 		for (i = 0; i < node->nquals; i++)
@@ -770,5 +788,35 @@ vexec_node_explain_properties(VexecNode *node, List *ancestors, ExplainState *es
 			ExplainPropertyInteger("Rows Evaluated Row by Row", NULL, node->stats.lazy_rows, es);
 		if (node->stats.redo_rows > 0)
 			ExplainPropertyInteger("Rows Sent to PostgreSQL", NULL, node->stats.redo_rows, es);
+		if (node->stats.declared_rows > 0)
+			ExplainPropertyInteger("Rows Through Declared Calls", NULL,
+								   node->stats.declared_rows, es);
 	}
+}
+
+/*
+ * EXPLAIN VERBOSE's names of the calls bound to kernel packs' declarations
+ * (§3.17): each function once, with its pack and its declaration, in the
+ * order the node's programs call them.
+ */
+void
+vexec_node_explain_declared(VexecNode *node, ExplainState *es)
+{
+	List	   *names = NIL;
+	List	   *seen = NIL;
+	ListCell   *lc;
+
+	if (!es->verbose || node->declared == NIL)
+		return;
+	foreach(lc, node->declared)
+	{
+		VexecExpr  *e = lfirst(lc);
+
+		if (list_member_oid(seen, e->funcid))
+			continue;
+		seen = lappend_oid(seen, e->funcid);
+		names = lappend(names, psprintf("%s [%s: %s]", format_procedure(e->funcid),
+										e->pack->name, vexec_decl_kind_name(e->decl->kind)));
+	}
+	ExplainPropertyList("Declared Calls", names, es);
 }

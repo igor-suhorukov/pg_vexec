@@ -2973,6 +2973,7 @@ compile_over(HjState *s, VexecNode *helper, List *exprs, bool is_qual, VexecTop 
 		vexec_compile_top(&cc, lfirst(lc), is_qual, &tops[i++]);
 	helper->nkernels += cc.nkernels;
 	helper->nfallbacks += cc.nfallbacks;
+	helper->declared = list_concat(helper->declared, cc.declared);
 }
 
 /* A node of the helper kind: a batch's columns, and a slot of the scan tuple. */
@@ -3255,6 +3256,9 @@ hj_begin(CustomScanState *css, EState *estate, int eflags)
 	node->nkernels += s->match->nkernels + s->side[0].eval->nkernels + s->side[1].eval->nkernels;
 	node->nfallbacks += s->match->nfallbacks + s->side[0].eval->nfallbacks +
 		s->side[1].eval->nfallbacks;
+	node->declared = list_concat(list_concat(list_concat(node->declared, s->match->declared),
+											 s->side[0].eval->declared),
+								 s->side[1].eval->declared);
 	{
 		VexecType **types = palloc(sizeof(VexecType *) * Max(s->match->ninput, 1));
 

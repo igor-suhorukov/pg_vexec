@@ -38,7 +38,7 @@ if [ -d /orcastage/usr/local/pgsql ] && [ ! -d /cb/pg19 ] && [ ! -f /tmp/.vexec-
 fi
 
 echo "building against $("$PG_CONFIG" --version) at $(cat "$("$PG_CONFIG" --bindir)/../.pg_ref_commit" 2>/dev/null || echo '?')"
-for m in vexec vexec_test; do
+for m in vexec vexec_test vexec_testpack; do
 	[ -f "$BUILD/modules/$m/Makefile" ] || continue
 	make -s -C "$BUILD/modules/$m" PG_CONFIG="$PG_CONFIG" COPT=-Werror -j"${MAKE_JOBS:-1}"
 	make -s -C "$BUILD/modules/$m" PG_CONFIG="$PG_CONFIG" install > /dev/null

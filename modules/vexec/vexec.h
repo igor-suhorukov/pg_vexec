@@ -7,8 +7,10 @@
  * vexec is the vectorized planner and executor of pg_vector_executor.md, as
  * one extension on the hooks PostgreSQL 19 already has.  Its parts are the
  * vectorized planner (plan/), the batch layer (batch/), the batch sources
- * (source/), the executor's nodes (exec/) and their expressions (expr/).  This header holds the settings of §3.12 and the few things more
- * than one part reads.
+ * (source/), the executor's nodes (exec/) and their expressions (expr/),
+ * with the kernel packs' declarations of other extensions' functions
+ * (expr/packs.c).  This header holds the settings of §3.12 and the few
+ * things more than one part reads.
  *
  *-------------------------------------------------------------------------
  */
@@ -143,6 +145,9 @@ extern void vexec_explain_install(void);
 
 /* source/registry.c */
 extern void vexec_source_registry_install(void);
+
+/* expr/packs.c: the kernel packs' registry (vexec_kernels.h) */
+extern void vexec_kernel_packs_install(void);
 
 /* exec/methods.c: the vector nodes' methods, registered by name */
 extern void vexec_exec_install(void);

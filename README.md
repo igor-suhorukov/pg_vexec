@@ -40,21 +40,33 @@ The plan's phases land here in order, each on a branch of its own:
   H9's `VecBitmapHeapScan`.  Its changes to the port -- gp_orca's API's
   `describe_node`, M8's pass, the source contract's `set_keys` in PAX,
   gp_core's settings -- are in a worktree of the port, under `pg19/` only.
+- **VK, kernel packs** (`vk`, made from `v4`; the plan's §3.17 and §5): the
+  registry of the packs' declarations, `vexec/kernels_v1`, and its header,
+  `vexec_kernels.h`; a call of another extension's function bound to a
+  pack's declaration -- by the extension, its version, the function's name,
+  signature and C symbol -- and run through fmgr a batch's rows at a time:
+  the function itself where it never raises or where the pack's check
+  passes, the pack's prefilter's answer where it decides; and the test pack
+  `vexec_testpack`.  The packs themselves, `vexec_pgvector` and
+  `vexec_postgis`, are repositories of their own beside this one.  Nothing
+  of the port changes.
 
 ## Layout
 
 | Path | What it is |
 |---|---|
 | `include/vexec_source.h` | the batch-source contract (§3.5.1): storage modules register batch readers by a rendezvous variable; installed with `vexec` |
+| `include/vexec_kernels.h` | the kernel packs' registry (§3.17): a pack declares which of an extension's functions never raise, checks the rows on which the others may, or prefilters them, by a rendezvous variable, with no kernel ABI -- only fmgr's functions; installed with `vexec` |
 | `modules/vexec/` | the module, built by PGXS against vanilla PostgreSQL 19 or the port's server |
 | `modules/vexec/batch/` | the logical batch, its layouts, the PostgreSQL and Arrow formats, the conversions, rows in and out, scaled numerics, export through Arrow's C Data Interface |
 | `modules/vexec/plan/` | the vectorized planner: the oracle, the cost model, the path hooks, the node builders, ORCA's front end through gp_orca's API, the reasons, EXPLAIN's option, the plan check |
 | `modules/vexec/exec/` | the vector nodes, `VecScan` and `VecBitmapHeapScan`, `VecResult`, `VecAgg`, `VecHashJoin`, `VecSort` and `VecRepartition`, with their row and batch interfaces, and the aggregates' transitions |
-| `modules/vexec/expr/` | the expression compiler and evaluator: kernels bound by function OID, the fallback, PostgreSQL's evaluator for what may raise |
+| `modules/vexec/expr/` | the expression compiler and evaluator: kernels bound by function OID, the fallback, PostgreSQL's evaluator for what may raise; calls bound to kernel packs' declarations (`packs.c`), kept per backend and dropped by syscache callbacks |
 | `modules/vexec/source/` | `vexec`'s side of the source registry, and heap's page reader |
 | `modules/vexec/pgxs/include/` | copies of the port's headers the PGXS build compiles against, kept equal to the originals |
 | `modules/vexec/sql`, `expected` | `vexec`'s own regression suite, and the layouts' semantics corpus |
 | `modules/vexec_test/` | a module of the tests alone: round trips through every layout, and the export check with nanoarrow, vendored there only |
+| `modules/vexec_testpack/` | a kernel pack of the tests alone: an extension's functions and a pack's declarations of them in one library, preloaded before `vexec` by the suite (`vexec_packs`) |
 | `test/vexec/` | `vexec`'s legs: `run.sh` on the host, the scripts each leg runs in a container, the differential runner, the checks |
 | `test/tpc/` | the port's tpc suite, with `TPC_STORAGE` (heap, `ao_column`, PAX porc and porc_vec) and `vexec` preloaded |
 | `docker/vexec.yml`, `docker/Dockerfile.vexec` | `vexec`'s images and containers: a server image with a C toolchain, vanilla or the port's |
@@ -93,6 +105,12 @@ Their results go to a run of the cache, `~/.cache/pg_accel/vexec/runs`.
 `fullrun` want the whole machine. `fullrun`'s container joins the network
 `pg_accel_default`, which VB's containers make (`docker/compose.yml`);
 the other legs' servers listen on sockets only, with no network.
+
+The suite preloads `vexec_testpack` before `vexec`; the packs' own legs are
+their repositories' (`test/run.sh test|corpus|cluster` in
+`github/vexec_pgvector` and `github/vexec_postgis`), and the differential
+runner takes pgvector's own tests as a corpus (`VEXEC_CORPORA=pgvector`), its
+`postgres-packs` and `arrow-packs` sessions preloading `VEXEC_PACKS`.
 
 `vexec` is preloaded (`shared_preload_libraries = 'vexec'`), and with
 `vexec.mode = off`, its default, every hook adds nothing.

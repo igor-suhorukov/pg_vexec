@@ -223,6 +223,7 @@ typedef struct VexecNodeStats
 	int64		fallback_rows;	/* rows the fallback evaluated */
 	int64		lazy_rows;		/* rows PostgreSQL's evaluator ran lazily */
 	int64		redo_rows;		/* rows a kernel sent to it */
+	int64		declared_rows;	/* rows declared calls answered */
 	int64		batches_out;	/* handed to a vector parent */
 } VexecNodeStats;
 
@@ -258,6 +259,8 @@ struct VexecNode
 								 * an aggregate's argument under a FILTER */
 	int			nkernels;		/* compiled */
 	int			nfallbacks;
+	List	   *declared;		/* compiled calls bound to kernel packs'
+								 * declarations, VexecExpr *, for EXPLAIN */
 	ExprContext *eager_econtext;	/* the fallback's and parameters' */
 
 	/*
@@ -342,6 +345,8 @@ extern void vexec_node_explain_properties(VexecNode *node, List *ancestors, Expl
 extern void vexec_node_load_input(VexecNode *node, int row);
 extern void vexec_node_count_fallback(VexecNode *node, int rows);
 extern void vexec_node_count_kernel(VexecNode *node);
+extern void vexec_node_count_declared(VexecNode *node, int rows);
+extern void vexec_node_explain_declared(VexecNode *node, ExplainState *es);
 extern VexecBatch *vexec_next_batch(PlanState *ps);
 extern bool vexec_node_batchable(VexecNode *node);
 extern TupleTableSlot *vexec_resolve_row(VexecNode *node, int row);

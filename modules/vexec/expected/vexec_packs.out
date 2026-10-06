@@ -1,0 +1,623 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- Kernel packs (pg_vector_executor.md §3.17, VK).  A call of another
+-- extension's function that a pack declares binds to the declaration -- by
+-- the extension, its version, the function's name and signature, and its C
+-- symbol -- and runs a batch's rows at a time, so that a qual or a target
+-- over it compiles eager, where it was lazy, row by row, before: the
+-- function itself through fmgr where it never raises or where its pack's
+-- check passes, the prefilter's answer where it decides.  The other rows go
+-- to PostgreSQL's evaluator, which raises the function's error where
+-- PostgreSQL would.
+--
+-- vexec_testpack, a pack of pg_accel's tests preloaded before vexec,
+-- declares functions of its own extension (modules/vexec_testpack): tp_mix
+-- never raises; tp_div and tp_bytes have checks; tp_le has a prefilter;
+-- tp_alias's declaration names a C symbol it is not created with.  Each
+-- query's answer is PostgreSQL's in force mode in both formats
+-- (vexec_check), errors included; EXPLAIN VERBOSE names the declared calls.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+CREATE EXTENSION vexec_testpack;
+CREATE EXTENSION IF NOT EXISTS dblink;
+RESET client_min_messages;
+SET search_path = public, vexec_testpack;
+-- the packs registered in this server
+SELECT pack, extension, versions, declarations FROM vexec.kernel_packs();
+      pack      |   extension    | versions | declarations 
+----------------+----------------+----------+--------------
+ vexec_testpack | vexec_testpack | {1.0}    |            5
+(1 row)
+
+-- what binds here: not tp_alias, created under a symbol of its own, nor
+-- tp_mix(int4), whose signature no declaration has, nor tp_lazy
+SELECT function, extension, version, pack, declaration
+FROM vexec.declared_calls() ORDER BY function;
+       function        |   extension    | version |      pack      | declaration  
+-----------------------+----------------+---------+----------------+--------------
+ tp_bytes(bytea)       | vexec_testpack | 1.0     | vexec_testpack | check
+ tp_div(bigint,bigint) | vexec_testpack | 1.0     | vexec_testpack | check
+ tp_le(bigint,bigint)  | vexec_testpack | 1.0     | vexec_testpack | prefilter
+ tp_mix(bigint)        | vexec_testpack | 1.0     | vexec_testpack | never raises
+(4 rows)
+
+-- a query's answer in one configuration: its rows as text, sorted -- a
+-- long one as its count and md5 -- or its error
+CREATE OR REPLACE FUNCTION vexec_run(q text, m text, f text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+	n int8;
+BEGIN
+	PERFORM set_config('vexec.mode', m, true);
+	PERFORM set_config('vexec.batch_format', f, true);
+	BEGIN
+		EXECUTE format('SELECT coalesce(string_agg(x::text, %L ORDER BY x::text COLLATE "C"), %L), count(*) FROM (%s) x',
+					   ' | ', '(none)', q) INTO r, n;
+		IF length(r) > 200 THEN
+			r := format('%s rows, md5 %s', n, md5(r));
+		END IF;
+	EXCEPTION WHEN OTHERS THEN
+		r := 'ERROR ' || SQLSTATE || ': ' || SQLERRM;
+	END;
+	RETURN r;
+END
+$$;
+-- PostgreSQL's answer, where force mode in both formats gives it
+CREATE OR REPLACE FUNCTION vexec_check(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ref text := vexec_run(q, 'off', 'postgres');
+	got text;
+	f text;
+BEGIN
+	FOREACH f IN ARRAY ARRAY['postgres', 'arrow'] LOOP
+		got := vexec_run(q, 'force', f);
+		IF got IS DISTINCT FROM ref THEN
+			RETURN format('DIFFERS in the %s format: off gives [%s], force gives [%s]', f, ref, got);
+		END IF;
+	END LOOP;
+	RETURN ref;
+END
+$$;
+-- how force mode's vector node runs a query: its kind, its quals and
+-- targets eager or row by row, its steps, its declared calls; with ANALYZE,
+-- the rows sent to PostgreSQL's evaluator and those declared calls answered
+CREATE FUNCTION vexec_how(q text, with_analyze bool DEFAULT false) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	PERFORM set_config('vexec.mode', 'force', true);
+	FOR l IN EXECUTE format('EXPLAIN (VERBOSE, COSTS OFF%s) %s',
+							CASE WHEN with_analyze THEN ', ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF' ELSE '' END, q) LOOP
+		IF l ~ '^\s*(->\s+)?Vec ' OR
+		   l ~ '(Vector Quals|Row-by-Row|Kernel Steps|Fallback Steps|Declared Calls|Rows Sent to PostgreSQL|Rows Through Declared Calls|Input:)' THEN
+			RETURN NEXT regexp_replace(l, '^\s+(->\s+)?', '');
+		END IF;
+	END LOOP;
+END
+$$;
+-- 3000 rows over three batches: NULLs; b of 0, of -1 under a of INT64_MIN,
+-- and negative, where tp_div and tp_le raise; empty bytea values, where
+-- tp_bytes raises, and values stored out of line
+CREATE TABLE tp (id int8, a int8, b int8, x bytea);
+ALTER TABLE tp ALTER COLUMN x SET STORAGE EXTERNAL;
+INSERT INTO tp
+SELECT g,
+	   CASE WHEN g % 1000 = 500 THEN -9223372036854775808 ELSE g * 7919 % 20011 - 10005 END,
+	   CASE WHEN g % 97 = 0 THEN 0 WHEN g % 1000 = 500 THEN -1 WHEN g % 211 = 3 THEN -g
+			ELSE g * 104729 % 9973 END,
+	   CASE WHEN g % 503 = 7 THEN ''::bytea WHEN g % 100 = 1 THEN convert_to(repeat(chr(65 + g % 26), 3000), 'UTF8')
+			ELSE convert_to('v' || g, 'UTF8') END
+FROM generate_series(1, 3000) g;
+UPDATE tp SET a = NULL WHERE id % 64 = 0;
+UPDATE tp SET b = NULL WHERE id % 64 = 1;
+UPDATE tp SET x = NULL WHERE id % 64 = 2;
+ANALYZE tp;
+SELECT count(*) AS out_of_line FROM tp WHERE pg_column_toast_chunk_id(x) IS NOT NULL;
+ out_of_line 
+-------------
+          30
+(1 row)
+
+-- never raises: eager, and a batch at a time
+SELECT * FROM vexec_how('SELECT id, tp_mix(a) FROM tp WHERE tp_mix(a) % 5 = 0');
+                           vexec_how                           
+---------------------------------------------------------------
+ Vec Seq Scan on public.tp
+ Vector Quals: 1 of 1
+ Kernel Steps: 2
+ Fallback Steps: 0
+ Declared Calls: tp_mix(bigint) [vexec_testpack: never raises]
+(5 rows)
+
+SELECT vexec_check('SELECT id, tp_mix(a) FROM tp WHERE tp_mix(a) % 5 = 0');
+                  vexec_check                   
+------------------------------------------------
+ 572 rows, md5 4ccf027925970ebd3de6fcc6411ca1a9
+(1 row)
+
+-- a check: the function on the rows it passes ...
+SELECT * FROM vexec_how('SELECT id, tp_div(a, b) FROM tp WHERE b > 0 AND tp_div(a, b) > 2');
+                           vexec_how                           
+---------------------------------------------------------------
+ Vec Seq Scan on public.tp
+ Vector Quals: 2 of 2
+ Kernel Steps: 2
+ Fallback Steps: 0
+ Declared Calls: tp_div(bigint,bigint) [vexec_testpack: check]
+(5 rows)
+
+SELECT vexec_check('SELECT id, tp_div(a, b) FROM tp WHERE b > 0 AND tp_div(a, b) > 2');
+                  vexec_check                   
+------------------------------------------------
+ 255 rows, md5 d1f24315332bab1af6cd84d3645de3de
+(1 row)
+
+SELECT vexec_check('SELECT id, a #/# b FROM tp WHERE b <> 0 AND id % 1000 <> 500');
+                   vexec_check                   
+-------------------------------------------------
+ 2920 rows, md5 c18abfb84178c23f04e2ca9324b0b65e
+(1 row)
+
+-- ... and PostgreSQL's evaluator on the others, which raises its error
+-- where PostgreSQL does: in row order, at the first row it reaches
+SELECT vexec_check('SELECT count(*) FROM tp WHERE tp_div(a, b) > 0');
+          vexec_check          
+-------------------------------
+ ERROR 22012: division by zero
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM tp WHERE b <> 0 AND tp_div(a, b) > 0');
+           vexec_check            
+----------------------------------
+ ERROR 22003: bigint out of range
+(1 row)
+
+SELECT vexec_check('SELECT id, tp_div(a, b) FROM tp ORDER BY id');
+          vexec_check          
+-------------------------------
+ ERROR 22012: division by zero
+(1 row)
+
+-- and nowhere PostgreSQL does not: rows a qual before it removed, rows past
+-- a LIMIT, NULLs of a strict function
+SELECT vexec_check('SELECT id FROM tp WHERE id < 90 AND tp_div(a, b) > 0');
+                  vexec_check                  
+-----------------------------------------------
+ 32 rows, md5 f24a28b50413f40cfe6af54271b4c288
+(1 row)
+
+SELECT vexec_check('SELECT id, tp_div(a, b) FROM tp WHERE id < 200 LIMIT 90');
+                  vexec_check                  
+-----------------------------------------------
+ 90 rows, md5 91eccb4abda1e11091ae075741090115
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM tp WHERE tp_div(a, b) IS NULL AND b IS NULL');
+ vexec_check 
+-------------
+ (47)
+(1 row)
+
+-- a lazy qual PostgreSQL evaluates before the call -- tp_div's cost puts it
+-- last -- rejects the rows the check failed, which reach PostgreSQL's
+-- evaluator, and raise nothing there
+ALTER FUNCTION tp_div(int8, int8) COST 1000;
+SELECT * FROM vexec_how('SELECT id FROM tp WHERE id % 1000 <> 500 AND tp_lazy(b * b) > 1 AND tp_div(a, b) > 0', true);
+                           vexec_how                           
+---------------------------------------------------------------
+ Vec Seq Scan on public.tp (actual rows=733.00 loops=1)
+ Vector Quals: 2 of 3
+ Kernel Steps: 3
+ Fallback Steps: 0
+ Declared Calls: tp_div(bigint,bigint) [vexec_testpack: check]
+ Row-by-Row Qual: tp_lazy(), which may raise
+ Rows Sent to PostgreSQL: 30
+ Rows Through Declared Calls: 2874
+(8 rows)
+
+SELECT vexec_check('SELECT id FROM tp WHERE id % 1000 <> 500 AND tp_lazy(b * b) > 1 AND tp_div(a, b) > 0');
+                  vexec_check                   
+------------------------------------------------
+ 733 rows, md5 48b815902da78abfd8fb47e969d9b5c7
+(1 row)
+
+ALTER FUNCTION tp_div(int8, int8) COST 1;
+-- a check's varlena arguments are detoasted before it: of tp_bytes's rows,
+-- those stored out of line and those whose short headers the heap page
+-- holds, none goes to PostgreSQL's evaluator -- tp_bytes's check fails a
+-- value handed to it toasted
+SELECT vexec_check('SELECT id, tp_bytes(x) FROM tp WHERE x <> ''''::bytea');
+                   vexec_check                   
+-------------------------------------------------
+ 2947 rows, md5 209455b92a65220bbeda6cac5ca6eea5
+(1 row)
+
+SELECT * FROM vexec_how('SELECT id, tp_bytes(x) FROM tp WHERE x <> ''''::bytea', true);
+                        vexec_how                        
+---------------------------------------------------------
+ Vec Seq Scan on public.tp (actual rows=2947.00 loops=1)
+ Vector Quals: 1 of 1
+ Kernel Steps: 0
+ Fallback Steps: 1
+ Declared Calls: tp_bytes(bytea) [vexec_testpack: check]
+ Rows Through Declared Calls: 2947
+(6 rows)
+
+SELECT vexec_check('SELECT sum(tp_bytes(x)) FROM tp');
+              vexec_check              
+---------------------------------------
+ ERROR 22023: tp_bytes: an empty value
+(1 row)
+
+-- a prefilter: its answers where it decides, PostgreSQL's evaluator
+-- elsewhere, which raises on a negative bound in row order
+SELECT * FROM vexec_how('SELECT id FROM tp WHERE b >= 0 AND tp_le(a, b)', true);
+                            vexec_how                             
+------------------------------------------------------------------
+ Vec Seq Scan on public.tp (actual rows=2150.00 loops=1)
+ Vector Quals: 2 of 2
+ Kernel Steps: 1
+ Fallback Steps: 0
+ Declared Calls: tp_le(bigint,bigint) [vexec_testpack: prefilter]
+ Rows Sent to PostgreSQL: 836
+ Rows Through Declared Calls: 2054
+(7 rows)
+
+SELECT vexec_check('SELECT id FROM tp WHERE b >= 0 AND tp_le(a, b)');
+                   vexec_check                   
+-------------------------------------------------
+ 2150 rows, md5 71114bbdfd623ffa3f5a68f906065dc3
+(1 row)
+
+SELECT vexec_check('SELECT id, a #<=# b FROM tp WHERE b >= 0');
+                   vexec_check                   
+-------------------------------------------------
+ 2936 rows, md5 7a20dd65a485888d20b451841ff3279f
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM tp WHERE tp_le(a, b)');
+               vexec_check                
+------------------------------------------
+ ERROR 22023: tp_le: a negative bound, -3
+(1 row)
+
+SELECT vexec_check('SELECT id FROM tp WHERE id < 3 AND tp_le(a, b)');
+ vexec_check 
+-------------
+ (none)
+(1 row)
+
+-- calls of several declarations in one node, each named once
+SELECT * FROM vexec_how('SELECT tp_mix(a), tp_div(a, b), tp_mix(b) FROM tp WHERE b > 0 AND tp_le(a, b)');
+                                                                           vexec_how                                                                            
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Vec Seq Scan on public.tp
+ Vector Quals: 2 of 2
+ Kernel Steps: 1
+ Fallback Steps: 0
+ Declared Calls: tp_le(bigint,bigint) [vexec_testpack: prefilter], tp_mix(bigint) [vexec_testpack: never raises], tp_div(bigint,bigint) [vexec_testpack: check]
+(5 rows)
+
+SELECT vexec_check('SELECT tp_mix(a), tp_div(a, b), tp_mix(b) FROM tp WHERE b > 0 AND tp_le(a, b)');
+                   vexec_check                   
+-------------------------------------------------
+ 2134 rows, md5 1b26762760bcd285fa3756c77dddb4f0
+(1 row)
+
+-- declared calls over batches: a vector sort's keys, an aggregate's
+-- arguments, each read from the scan's batches
+SELECT * FROM vexec_how('SELECT id FROM tp WHERE b > 0 ORDER BY tp_div(a, b), id LIMIT 5');
+                           vexec_how                           
+---------------------------------------------------------------
+ Vec Sort
+ Kernel Steps: 0
+ Fallback Steps: 0
+ Input: batches
+ Vec Seq Scan on public.tp
+ Vector Quals: 1 of 1
+ Kernel Steps: 1
+ Fallback Steps: 0
+ Declared Calls: tp_div(bigint,bigint) [vexec_testpack: check]
+(9 rows)
+
+SELECT vexec_check('SELECT id FROM tp WHERE b > 0 ORDER BY tp_div(a, b), id LIMIT 5');
+                vexec_check                 
+--------------------------------------------
+ (1999) | (2394) | (2396) | (2793) | (2795)
+(1 row)
+
+SELECT * FROM vexec_how('SELECT b % 7, sum(tp_mix(a) % 1000), count(tp_div(a, b)) FROM tp WHERE b > 0 GROUP BY 1');
+                                                  vexec_how                                                   
+--------------------------------------------------------------------------------------------------------------
+ Vec HashAggregate
+ Kernel Steps: 1
+ Fallback Steps: 0
+ Declared Calls: tp_mix(bigint) [vexec_testpack: never raises], tp_div(bigint,bigint) [vexec_testpack: check]
+ Input: batches
+ Vec Seq Scan on public.tp
+ Vector Quals: 1 of 1
+ Kernel Steps: 2
+ Fallback Steps: 0
+(9 rows)
+
+SELECT vexec_check('SELECT b % 7, sum(tp_mix(a) % 1000), count(tp_div(a, b)) FROM tp WHERE b > 0 GROUP BY 1');
+                                                     vexec_check                                                      
+----------------------------------------------------------------------------------------------------------------------
+ (0,206059,407) | (1,193024,408) | (2,206477,411) | (3,210011,410) | (4,191819,407) | (5,189823,407) | (6,217609,410)
+(1 row)
+
+-- a call that never raises may run in PostgreSQL's evaluator ahead of its
+-- order too, in a fallback step; one with a check may not
+SELECT * FROM vexec_how('SELECT CASE WHEN a > 0 THEN tp_mix(a) ELSE 0 END FROM tp');
+         vexec_how         
+---------------------------
+ Vec Seq Scan on public.tp
+ Kernel Steps: 0
+ Fallback Steps: 1
+(3 rows)
+
+SELECT * FROM vexec_how('SELECT CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END FROM tp');
+         vexec_how         
+---------------------------
+ Vec Seq Scan on public.tp
+ Kernel Steps: 0
+ Fallback Steps: 0
+ Row-by-Row Targets: 1
+(4 rows)
+
+SELECT vexec_check('SELECT CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END FROM tp');
+                   vexec_check                   
+-------------------------------------------------
+ 3000 rows, md5 0ffd095dcfbc56e00a034b371fe10aa0
+(1 row)
+
+-- what binds to nothing stays row by row: a function declared nowhere, a
+-- declaration whose C symbol is another, an overload no declaration has
+SELECT * FROM vexec_how('SELECT id FROM tp WHERE tp_lazy(a) > 100');
+                  vexec_how                  
+---------------------------------------------
+ Vec Seq Scan on public.tp
+ Vector Quals: 0 of 1
+ Kernel Steps: 0
+ Fallback Steps: 0
+ Row-by-Row Qual: tp_lazy(), which may raise
+(5 rows)
+
+SELECT vexec_check('SELECT id FROM tp WHERE tp_lazy(a) > 100');
+                  vexec_check                  
+-----------------------------------------------
+ ERROR 22023: tp_lazy: a negative value, -6259
+(1 row)
+
+SELECT * FROM vexec_how('SELECT tp_alias(a), tp_mix(id::int4) FROM tp');
+         vexec_how         
+---------------------------
+ Vec Seq Scan on public.tp
+ Kernel Steps: 0
+ Fallback Steps: 0
+ Row-by-Row Targets: 2
+(4 rows)
+
+SELECT vexec_check('SELECT tp_alias(a) = tp_mix(a), tp_mix(id::int4) FROM tp');
+                   vexec_check                   
+-------------------------------------------------
+ 3000 rows, md5 44ac12e0be91c6e5446644f174bd9cb4
+(1 row)
+
+-- a function called row by row is called in the row's memory, as
+-- PostgreSQL's evaluator calls it, never in its own fn_mcxt, the query's:
+-- in a lazy qual, a lazy target, and an aggregate's lazy argument
+SELECT vexec_check('SELECT id FROM tp WHERE tp_context(id) % 7 = 0 AND tp_context(a) IS NOT NULL');
+                  vexec_check                   
+------------------------------------------------
+ 422 rows, md5 9c4bc7bea5c55c46ad6479fc5310b8d4
+(1 row)
+
+SELECT vexec_check('SELECT tp_context(a) FROM tp');
+                   vexec_check                   
+-------------------------------------------------
+ 3000 rows, md5 10f75ee091f7892c135030461d273e0f
+(1 row)
+
+SELECT vexec_check('SELECT b % 5, sum(tp_context(a)) FROM tp GROUP BY 1');
+                                                              vexec_check                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ (,8951) | (-1,-27670116110564326418) | (-2,-9028) | (-3,-2560) | (-4,1063) | (0,-57119) | (1,5863) | (2,-9494) | (3,12055) | (4,21096)
+(1 row)
+
+-- the oracle counts a declared call as it will run
+SET vexec.mode = explain;
+SET vexec.min_rows = 0;
+EXPLAIN (VEXEC, COSTS OFF) SELECT id, tp_mix(a) FROM tp WHERE tp_div(a, b) > 0 AND b > 0;
+                                                          QUERY PLAN                                                          
+------------------------------------------------------------------------------------------------------------------------------
+ Seq Scan on tp
+   Filter: ((b > 0) AND (tp_div(a, b) > 0))
+ Vexec: mode explain, format postgres
+   VecScan on tp: not chosen (explain mode)
+     source: heap's pages; quals: 2 kernel steps, 0 fallback steps, 1 declared call; target: 0 kernel steps, 0 fallback steps
+(5 rows)
+
+RESET vexec.min_rows;
+RESET vexec.mode;
+-- a declaration holds only for vexec's own evaluation: tp_mix is no more
+-- leakproof than it was
+SELECT proleakproof FROM pg_proc WHERE oid = 'tp_mix(int8)'::regprocedure;
+ proleakproof 
+--------------
+ f
+(1 row)
+
+-- a function fmgr calls in a way of its own binds to nothing: security
+-- definer, with settings of its own; altered back, it binds again
+ALTER FUNCTION tp_mix(int8) SECURITY DEFINER;
+SELECT function FROM vexec.declared_calls() ORDER BY 1;
+       function        
+-----------------------
+ tp_bytes(bytea)
+ tp_div(bigint,bigint)
+ tp_le(bigint,bigint)
+(3 rows)
+
+SELECT * FROM vexec_how('SELECT tp_mix(a) FROM tp');
+         vexec_how         
+---------------------------
+ Vec Seq Scan on public.tp
+ Kernel Steps: 0
+ Fallback Steps: 0
+ Row-by-Row Targets: 1
+(4 rows)
+
+ALTER FUNCTION tp_mix(int8) SECURITY INVOKER;
+ALTER FUNCTION tp_mix(int8) SET work_mem = '4MB';
+SELECT function FROM vexec.declared_calls() ORDER BY 1;
+       function        
+-----------------------
+ tp_bytes(bytea)
+ tp_div(bigint,bigint)
+ tp_le(bigint,bigint)
+(3 rows)
+
+ALTER FUNCTION tp_mix(int8) RESET ALL;
+SELECT function FROM vexec.declared_calls() ORDER BY 1;
+       function        
+-----------------------
+ tp_bytes(bytea)
+ tp_div(bigint,bigint)
+ tp_le(bigint,bigint)
+ tp_mix(bigint)
+(4 rows)
+
+-- another version of the extension, which the pack does not name, binds
+-- nothing -- updated by another session, in this one too -- and gives the
+-- same answers; back at the pack's version, the calls bind again
+SELECT * FROM vexec_how('SELECT id, tp_div(a, b) FROM tp WHERE b > 0 AND tp_le(a, b)');
+                                                    vexec_how                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Vec Seq Scan on public.tp
+ Vector Quals: 2 of 2
+ Kernel Steps: 1
+ Fallback Steps: 0
+ Declared Calls: tp_le(bigint,bigint) [vexec_testpack: prefilter], tp_div(bigint,bigint) [vexec_testpack: check]
+(5 rows)
+
+SELECT dblink_exec(format('host=%s port=%s dbname=%s',
+						  current_setting('unix_socket_directories'), current_setting('port'),
+						  current_database()),
+				   'ALTER EXTENSION vexec_testpack UPDATE TO ''1.1''');
+   dblink_exec   
+-----------------
+ ALTER EXTENSION
+(1 row)
+
+SELECT extversion FROM pg_extension WHERE extname = 'vexec_testpack';
+ extversion 
+------------
+ 1.1
+(1 row)
+
+SELECT count(*) AS bound FROM vexec.declared_calls();
+ bound 
+-------
+     0
+(1 row)
+
+SELECT * FROM vexec_how('SELECT id, tp_div(a, b) FROM tp WHERE b > 0 AND tp_le(a, b)');
+                 vexec_how                 
+-------------------------------------------
+ Vec Seq Scan on public.tp
+ Vector Quals: 1 of 2
+ Kernel Steps: 1
+ Fallback Steps: 0
+ Row-by-Row Targets: 1
+ Row-by-Row Qual: tp_le(), which may raise
+(6 rows)
+
+SELECT vexec_check('SELECT id, tp_div(a, b) FROM tp WHERE b > 0 AND tp_le(a, b)');
+                   vexec_check                   
+-------------------------------------------------
+ 2134 rows, md5 2930d29827a3e672cfe4fff21b7111ab
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM tp WHERE tp_div(a, b) > 0');
+          vexec_check          
+-------------------------------
+ ERROR 22012: division by zero
+(1 row)
+
+ALTER EXTENSION vexec_testpack UPDATE TO '1.0';
+SELECT count(*) AS bound FROM vexec.declared_calls();
+ bound 
+-------
+     4
+(1 row)
+
+SELECT * FROM vexec_how('SELECT id, tp_div(a, b) FROM tp WHERE b > 0 AND tp_le(a, b)');
+                                                    vexec_how                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Vec Seq Scan on public.tp
+ Vector Quals: 2 of 2
+ Kernel Steps: 1
+ Fallback Steps: 0
+ Declared Calls: tp_le(bigint,bigint) [vexec_testpack: prefilter], tp_div(bigint,bigint) [vexec_testpack: check]
+(5 rows)
+
+-- dropped and made again, the extension's functions have new OIDs, which
+-- bind as the old ones did
+DROP EXTENSION vexec_testpack CASCADE;
+SELECT count(*) AS bound FROM vexec.declared_calls();
+ bound 
+-------
+     0
+(1 row)
+
+CREATE EXTENSION vexec_testpack;
+SELECT function, declaration FROM vexec.declared_calls() ORDER BY 1;
+       function        | declaration  
+-----------------------+--------------
+ tp_bytes(bytea)       | check
+ tp_div(bigint,bigint) | check
+ tp_le(bigint,bigint)  | prefilter
+ tp_mix(bigint)        | never raises
+(4 rows)
+
+-- a function of the same name, signature and symbol that is not the
+-- extension's member binds to nothing.  Made a member, it is the
+-- extension's C function, and binds -- in a session that binds anew: ADD
+-- FUNCTION changes pg_depend alone, which no syscache callback hears of, so
+-- a session keeps what it found until pg_proc or pg_extension changes
+CREATE FUNCTION public.tp_div(int8, int8) RETURNS int8
+AS '$libdir/vexec_testpack', 'tp_div' LANGUAGE C IMMUTABLE STRICT;
+SELECT function FROM vexec.declared_calls() WHERE function LIKE '%tp_div%' ORDER BY 1;
+               function               
+--------------------------------------
+ vexec_testpack.tp_div(bigint,bigint)
+(1 row)
+
+ALTER EXTENSION vexec_testpack ADD FUNCTION public.tp_div(int8, int8);
+SELECT function FROM vexec.declared_calls() WHERE function LIKE '%tp_div%' ORDER BY 1;
+               function               
+--------------------------------------
+ vexec_testpack.tp_div(bigint,bigint)
+(1 row)
+
+SELECT f FROM dblink(format('host=%s port=%s dbname=%s',
+							current_setting('unix_socket_directories'), current_setting('port'),
+							current_database()),
+					 $$SELECT function FROM vexec.declared_calls() WHERE function LIKE '%tp_div%'$$) AS t(f text)
+ORDER BY 1;
+                  f                   
+--------------------------------------
+ tp_div(bigint,bigint)
+ vexec_testpack.tp_div(bigint,bigint)
+(2 rows)
+
+ALTER EXTENSION vexec_testpack DROP FUNCTION public.tp_div(int8, int8);
+DROP FUNCTION public.tp_div(int8, int8);
+RESET vexec.mode;
+DROP TABLE tp;
+DROP FUNCTION vexec_how(text, bool);
+DROP EXTENSION vexec_testpack;

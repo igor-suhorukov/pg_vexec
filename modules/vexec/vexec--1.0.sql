@@ -33,3 +33,21 @@ CREATE FUNCTION kernels(OUT funcid oid, OUT function text, OUT family text,
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'vexec_kernel_list'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
+-- The kernel packs registered in this server (vexec_kernels.h, §3.17): each
+-- with the extension it serves, the versions of it its declarations were
+-- written for, and how many it declares.
+CREATE FUNCTION kernel_packs(OUT pack text, OUT extension text, OUT versions text[],
+                             OUT declarations int4, OUT minor int4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_kernel_packs'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
+-- The functions of this database a call of which binds to a pack's
+-- declaration now: the extension's own C function, of a version the pack
+-- names, under its name and signature.
+CREATE FUNCTION declared_calls(OUT funcid oid, OUT function text, OUT extension text,
+                               OUT version text, OUT pack text, OUT declaration text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_declared_calls'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
