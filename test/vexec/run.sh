@@ -94,13 +94,18 @@ export VEXEC_PORT_SRC="${VEXEC_PORT_SRC:-$(cd "$ROOT/.." && pwd)/cloudberry-vexe
 if [ "${VEXEC_NOASSERT:-0}" = 1 ]; then
 	export VEXEC_PORT_FLAVOR=portnoassert VEXEC_VANILLA_FLAVOR=vanilla-noassert VEXEC_CBEXT_SUFFIX=-noassert
 	export VEXEC_PORT_BUILD="${VEXEC_PORT_BUILD:-$VEXEC_CACHE/portbuild-noassert}"
+	export VEXEC_ORCA_BUILD="${VEXEC_ORCA_BUILD:-$VEXEC_CACHE/orcabuild-noassert}"
 fi
 export VEXEC_PORT_BUILD="${VEXEC_PORT_BUILD:-$VEXEC_CACHE/portbuild}"
+export VEXEC_ORCA_BUILD="${VEXEC_ORCA_BUILD:-$VEXEC_CACHE/orcabuild}"
 export VEXEC_PAX_CONTRIB="${VEXEC_PAX_CONTRIB:-$VEXEC_CACHE/pax-contrib}"
 if [ "${VEXEC_PORT_STAGE:-}" = none ]; then
 	unset VEXEC_PORT_STAGE
 elif [ -z "${VEXEC_PORT_STAGE:-}" ] && [ -d "$VEXEC_PORT_BUILD/stage/usr/local/pgsql" ]; then
 	export VEXEC_PORT_STAGE="$VEXEC_PORT_BUILD/stage"
+fi
+if [ -z "${VEXEC_ORCA_STAGE:-}" ] && [ -d "$VEXEC_ORCA_BUILD/stage/usr/local/pgsql" ]; then
+	export VEXEC_ORCA_STAGE="$VEXEC_ORCA_BUILD/stage"
 fi
 
 if [ -z "${CB_COMMIT:-}" ]; then
@@ -141,6 +146,25 @@ case "$cmd" in
 		mkdir -p "$VEXEC_PORT_BUILD"
 		PORTBUILD_COMMIT="$(git -C "$VEXEC_PORT_SRC" rev-parse --short HEAD)$( [ -n "$(git -C "$VEXEC_PORT_SRC" status --porcelain -- pg19)" ] && echo +changes)" \
 			docker compose -f "$COMPOSE" --profile run run --rm -T portbuild 2>&1 | grep -v -E '^ (Container|Network) '
+		exit "${PIPESTATUS[0]}"
+		;;
+	orcaimages)
+		[ -n "$CB_COMMIT" ] || die "no pg_accel/cb-ext image, whose DuckDB the image takes: run test/clickbench/run.sh images"
+		docker compose -f "$COMPOSE" --profile build build vexec-dev-vanillaorca
+		;;
+	orcabuild)
+		[ -d "$VEXEC_PORT_SRC/pg19" ] || die "no worktree of the port at $VEXEC_PORT_SRC"
+		mkdir -p "$VEXEC_ORCA_BUILD"
+		PORTBUILD_COMMIT="$(git -C "$VEXEC_PORT_SRC" rev-parse --short HEAD)$( [ -n "$(git -C "$VEXEC_PORT_SRC" status --porcelain -- pg19)" ] && echo +changes)" \
+			docker compose -f "$COMPOSE" --profile run run --rm -T orcabuild 2>&1 | grep -v -E '^ (Container|Network) '
+		exit "${PIPESTATUS[0]}"
+		;;
+	orca)
+		[ -n "${VEXEC_ORCA_STAGE:-}" ] || die "no gp_orca built alone at $VEXEC_ORCA_BUILD: run.sh orcabuild"
+		run="$(new_run orca)"
+		echo "== ORCA on vanilla PostgreSQL 19 (V6): $run"
+		echo "  gp_orca from $(cat "$VEXEC_ORCA_STAGE/COMMIT" 2> /dev/null || echo '?'), the port's worktree $VEXEC_PORT_SRC"
+		in_leg vanilla-orca "$run" "/src/test/vexec/orca.sh" | tee "$run/output"
 		exit "${PIPESTATUS[0]}"
 		;;
 	checks)
@@ -190,12 +214,20 @@ case "$cmd" in
 		exit "${PIPESTATUS[0]}"
 		;;
 	tpc)
+		# TPC_LEG: port, or vanilla-orca -- V6's, one node of vanilla
+		# PostgreSQL 19 with gp_orca built alone (VEXEC_ORCA_STAGE), heap
 		rc=0
-		for storage in ${*:-heap ao_column pax pax_porc_vec}; do
-			run="$(new_run "tpc-$storage")"
+		tpc_leg="${TPC_LEG:-port}"
+		[ "$tpc_leg" = vanilla-orca ] && [ -z "${VEXEC_ORCA_STAGE:-}" ] && die "no gp_orca built alone at $VEXEC_ORCA_BUILD: run.sh orcabuild"
+		for storage in ${*:-$( [ "$tpc_leg" = vanilla-orca ] && echo heap || echo heap ao_column pax pax_porc_vec)}; do
+			run="$(new_run "tpc-$( [ "$tpc_leg" = vanilla-orca ] && echo vanilla-orca- )$storage")"
 			echo "== tpc on $storage: $run"
-			echo "  image pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-$CB_COMMIT, the port's modules from $(cat "${VEXEC_PORT_STAGE:-/nonexistent}/COMMIT" 2> /dev/null || echo 'the image')"
-			in_leg port "$run" "/src/test/vexec/build.sh > /dev/null && { grep -q '^#define USE_ASSERT_CHECKING' \"\$(pg_config --includedir-server)/pg_config.h\" && echo '  server with assertions' || echo '  server without assertions'; } && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} TPC_VEXEC_NUMERIC=${TPC_VEXEC_NUMERIC:-} TPC_VEXEC_SETTINGS='${TPC_VEXEC_SETTINGS:-}' TPC_PLANNER_ROUTE=${TPC_PLANNER_ROUTE:-1} TPC_SEGMENTS=${TPC_SEGMENTS:-4} TPC_ROUNDS=${TPC_ROUNDS:-1} TPC_WORKERS='${TPC_WORKERS:-0}' TPC_KINDS='${TPC_KINDS:-h ds}' TPC_QUERIES='${TPC_QUERIES:-}' TPC_SF=${TPC_SF:-1} TPC_TIMEOUT=${TPC_TIMEOUT:-120} TPC_PLANNING=${TPC_PLANNING:-0} TPC_PLANS=${TPC_PLANS:-0} /src/test/tpc/run.sh" \
+			if [ "$tpc_leg" = vanilla-orca ]; then
+				echo "  image pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-orca, gp_orca built alone from $(cat "$VEXEC_ORCA_STAGE/COMMIT" 2> /dev/null || echo '?')"
+			else
+				echo "  image pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-$CB_COMMIT, the port's modules from $(cat "${VEXEC_PORT_STAGE:-/nonexistent}/COMMIT" 2> /dev/null || echo 'the image')"
+			fi
+			in_leg "$tpc_leg" "$run" "/src/test/vexec/build.sh > /dev/null && { grep -q '^#define USE_ASSERT_CHECKING' \"\$(pg_config --includedir-server)/pg_config.h\" && echo '  server with assertions' || echo '  server without assertions'; } && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} TPC_VEXEC_NUMERIC=${TPC_VEXEC_NUMERIC:-} TPC_VEXEC_SETTINGS='${TPC_VEXEC_SETTINGS:-}' TPC_PLANNER_ROUTE=${TPC_PLANNER_ROUTE:-1} TPC_SEGMENTS=${TPC_SEGMENTS:-$( [ "$tpc_leg" = vanilla-orca ] && echo 0 || echo 4)} TPC_ROUNDS=${TPC_ROUNDS:-1} TPC_WORKERS='${TPC_WORKERS:-0}' TPC_KINDS='${TPC_KINDS:-h ds}' TPC_QUERIES='${TPC_QUERIES:-}' TPC_SF=${TPC_SF:-1} TPC_TIMEOUT=${TPC_TIMEOUT:-120} TPC_PLANNING=${TPC_PLANNING:-0} TPC_PLANS=${TPC_PLANS:-0} /src/test/tpc/run.sh" \
 				| tee "$run/output" || rc=1
 		done
 		exit $rc

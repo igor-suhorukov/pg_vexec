@@ -1,0 +1,11 @@
+# What differs from run to run of PostgreSQL's suite under ORCA on vanilla
+# with the same settings (differential.py; V6, test/vexec/orca.sh): a regular
+# expression a line, its groups replaced.
+#
+# a temporary schema's number: the backend's slot, as the parallel groups'
+# connections come and go
+pg_temp_(\d+)
+# whether autovacuum had analyzed a table when ORCA planned a query of it:
+# its NOTICE of missing statistics, and the HINT after it, come and go
+!^NOTICE:  One or more columns in the following table\(s\) do not have statistics: 
+!^HINT:  For non-partitioned tables, run analyze <table_name>\(<column_list>\)\. For partitioned tables, run analyze rootpartition

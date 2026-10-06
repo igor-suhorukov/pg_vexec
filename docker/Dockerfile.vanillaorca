@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: Apache-2.0
+#
+# ORCA on vanilla PostgreSQL 19 (pg_vector_executor.md §3.3.5, V6): vexec's
+# image of the vanilla leg, with what the port's gp_orca needs to be built
+# there alone, for one node without gp_core (-Dorca_single_node) -- meson,
+# ninja, g++, xerces-c, zlib -- and to run, xerces-c; and DuckDB, from the
+# port's image, as the port pins it, for the tpc suite's answers on one
+# node.  gp_orca is built from a worktree of the port into a stage by the
+# orcabuild service (test/vexec/orcabuild.sh), and the vanilla-orca leg's
+# containers install the stage over the server's tree (build.sh).
+#
+#   BASE_IMAGE    vexec's vanilla image: pg_accel/vexec-dev:vanilla, or
+#                 vanilla-noassert
+#   DUCKDB_IMAGE  an image of the port with /opt/duckdb: pg_accel/cb-ext
+
+ARG BASE_IMAGE=pg_accel/vexec-dev:vanilla
+ARG DUCKDB_IMAGE=pg_accel/cb-ext:unset
+
+FROM ${DUCKDB_IMAGE} AS duckdb
+
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        meson ninja-build pkg-config g++ libxerces-c-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=duckdb /opt/duckdb /opt/duckdb
+USER postgres

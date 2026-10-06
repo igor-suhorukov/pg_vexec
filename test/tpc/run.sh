@@ -41,6 +41,11 @@
 #                 (vexec.orca_settings) and its cost model
 #                 (vexec.orca_cost_model)
 #
+# and what V6 adds: a vanilla PostgreSQL 19, a server with no gp_core, where
+# gp_orca built alone for one node is preloaded (pg_vector_executor.md
+# §3.3.5): one node only, heap tables only, created without the port's
+# DISTRIBUTED clauses, and no extension made;
+#
 # and a cluster secret long enough for gp_core, which refuses one under 16
 # characters (pg19/modules/gp_core/gp_cluster.c:135): "tpc-" and three
 # $RANDOMs come out shorter in 1.4% of runs, when ORCA falls back on every
@@ -130,6 +135,17 @@ case "$STORAGE" in
 	pax_porc_vec) STORAGE_CLAUSE="USING pax WITH (storage_format=porc_vec)"; STORAGE_PRELOAD=",gp_ao,pax"; STORAGE_EXTENSIONS="CREATE EXTENSION pax;" ;;
 	*) echo "  TPC_STORAGE is heap, ao_column, pax or pax_porc_vec, not $STORAGE"; exit 1 ;;
 esac
+# A vanilla server (V6): gp_orca built alone, and nothing else of the port's.
+VANILLA=0
+CORE_PRELOAD="gp_core,gp_orca,gp_sql"
+if [ ! -f "$("$BINDIR/pg_config" --pkglibdir)/gp_core.so" ]; then
+	VANILLA=1
+	CORE_PRELOAD="gp_orca"
+	[ -f "$("$BINDIR/pg_config" --pkglibdir)/gp_orca.so" ] \
+		|| { echo "  a server with neither gp_core nor gp_orca: nothing of ORCA's to run"; exit 1; }
+	[ "$STORAGE" = heap ] || { echo "  a vanilla server has heap tables only, not $STORAGE"; exit 1; }
+	[ "${TPC_SEGMENTS:-4}" = 0 ] || { echo "  a vanilla server is one node: TPC_SEGMENTS=0"; exit 1; }
+fi
 VEXEC_PRELOAD=""
 if [ "${TPC_VEXEC:-1}" = 1 ] && [ -f "$("$BINDIR/pg_config" --pkglibdir)/vexec.so" ]; then
 	VEXEC_PRELOAD=",vexec"
@@ -221,7 +237,7 @@ for n in $NODES; do
 	"$BINDIR/initdb" -D "$(datadir "$n")" -N --locale=C --encoding=UTF8 > "$ROOT/initdb$n.log" 2>&1 \
 		|| { echo "initdb failed for node $n"; tail -20 "$ROOT/initdb$n.log"; exit 1; }
 	{
-		echo "shared_preload_libraries = 'gp_core,gp_orca,gp_sql$STORAGE_PRELOAD$VEXEC_PRELOAD'"
+		echo "shared_preload_libraries = '$CORE_PRELOAD$STORAGE_PRELOAD$VEXEC_PRELOAD'"
 		echo "unix_socket_directories = '$(sockdir "$n")'"
 		echo "listen_addresses = ''"
 		echo "port = $(port "$n")"
@@ -251,6 +267,7 @@ for n in $(seq 1 "$SEGMENTS") 0; do
 		|| { echo "node $n did not start"; tail -20 "$ROOT/node$n.log"; exit 1; }
 done
 for db in template1 postgres; do
+	[ "$VANILLA" = 1 ] && break
 	q "$db" "SET client_min_messages = warning; CREATE EXTENSION gp_core" > /dev/null
 done
 
@@ -268,6 +285,8 @@ for kind in $KINDS; do
 	fi
 	# each table in the storage asked for, its clause before the distribution
 	[ -n "$STORAGE_CLAUSE" ] && sed -i "s/ DISTRIBUTED / $STORAGE_CLAUSE DISTRIBUTED /" "$ROOT/$kind/schema.sql"
+	# on a vanilla server, PostgreSQL's CREATE TABLE: no distribution
+	[ "$VANILLA" = 1 ] && sed -i -E 's/ DISTRIBUTED (REPLICATED|BY \([^)]*\));$/;/' "$ROOT/$kind/schema.sql"
 	out=$(q "$db" "SET client_min_messages = warning; $(cat "$ROOT/$kind/schema.sql")")
 	[ -n "$out" ] && { echo "the tables of $kind: $out"; exit 1; }
 	ls -S "$ROOT/$kind/data/"*.csv | xargs -P 6 -I{} bash -c '

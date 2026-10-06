@@ -48,7 +48,7 @@ while IFS= read -r f; do
 		echo "  $f: a notice that is not pg_accel's"
 		fail=1
 	fi
-done < <(git ls-files --cached --others --exclude-standard modules include test/vexec docker/Dockerfile.vexec docker/vexec.yml \
+done < <(git ls-files --cached --others --exclude-standard modules include test/vexec docker/Dockerfile.vexec docker/Dockerfile.vanillaorca docker/vexec.yml \
 	| grep -v -E '/(expected|results)/|\.out$|/kept/')
 echo "notices: $n files, $([ $fail -eq 0 ] && echo "each with its notice and no other" || echo "some failed")"
 exit $fail

@@ -1,0 +1,13 @@
+--- reference
++++ session
+@@ -1723,7 +1723,7 @@
+ $$;
+ select * from explain_sq_limit();
+-                   explain_sq_limit                    
+--------------------------------------------------------
+-   ->  Seq Scan on sq_limit (actual rows=3.00 loops=1)
++                     explain_sq_limit                      
++-----------------------------------------------------------
++   ->  Vec Seq Scan on sq_limit (actual rows=3.00 loops=1)
+  Limit (actual rows=3.00 loops=1)
+  Optimizer: GPORCA

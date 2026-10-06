@@ -1,0 +1,916 @@
+--- reference
++++ session
+@@ -59,43 +59,49 @@
+ 
+ select explain_filter('explain select * from int8_tbl i8');
+-                     explain_filter                      
+----------------------------------------------------------
+- Optimizer: GPORCA
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++                       explain_filter                        
++-------------------------------------------------------------
++ Optimizer: GPORCA
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
+ (2 rows)
+ 
+ select explain_filter('explain (analyze, buffers off) select * from int8_tbl i8');
+-                                         explain_filter                                          
+--------------------------------------------------------------------------------------------------
+- Execution Time: N.N ms
+- Optimizer: GPORCA
+- Planning Time: N.N ms
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
++ Execution Time: N.N ms
++ Optimizer: GPORCA
++ Planning Time: N.N ms
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+ (4 rows)
+ 
+ select explain_filter('explain (analyze, buffers off, verbose) select * from int8_tbl i8');
+-                                             explain_filter                                             
+---------------------------------------------------------------------------------------------------------
++                                               explain_filter                                               
++------------------------------------------------------------------------------------------------------------
++   Batch Format: postgres
++   Batches: N
++   Fallback Steps: N
++   Heap Pages: N
++   Kernel Steps: N
+    Output: i8.q1, i8.q2
+- Execution Time: N.N ms
+- Optimizer: GPORCA
+- Planning Time: N.N ms
+- Seq Scan on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+-(5 rows)
++   Source: heap's pages
++ Execution Time: N.N ms
++ Optimizer: GPORCA
++ Planning Time: N.N ms
++ Vec Seq Scan on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++(11 rows)
+ 
+ select explain_filter('explain (analyze, buffers, format text) select * from int8_tbl i8');
+-                                         explain_filter                                          
+--------------------------------------------------------------------------------------------------
+- Execution Time: N.N ms
+- Optimizer: GPORCA
+- Planning Time: N.N ms
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
++ Execution Time: N.N ms
++ Optimizer: GPORCA
++ Planning Time: N.N ms
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+ (4 rows)
+ 
+ select explain_filter('explain (buffers, format text) select * from int8_tbl i8');
+-                     explain_filter                      
+----------------------------------------------------------
+- Optimizer: GPORCA
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++                       explain_filter                        
++-------------------------------------------------------------
++ Optimizer: GPORCA
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
+ (2 rows)
+ 
+@@ -106,5 +112,6 @@
+   <Query>
+     <Plan>
+-      <Node-Type>Seq Scan</Node-Type>
++      <Node-Type>Custom Scan</Node-Type>
++      <Custom-Plan-Provider>VecScan</Custom-Plan-Provider>
+       <Parallel-Aware>false</Parallel-Aware>
+       <Async-Capable>false</Async-Capable>
+@@ -120,11 +127,4 @@
+       <Actual-Loops>N</Actual-Loops>
+       <Disabled>false</Disabled>
+-      <Average-Prefetch-Distance>N.N</Average-Prefetch-Distance>
+-      <Max-Prefetch-Distance>N</Max-Prefetch-Distance>
+-      <Prefetch-Capacity>N</Prefetch-Capacity>
+-      <I-O-Count>N</I-O-Count>
+-      <I-O-Waits>N</I-O-Waits>
+-      <Average-I-O-Size>N.N</Average-I-O-Size>
+-      <Average-I-Os-In-Progress>N.N</Average-I-Os-In-Progress>
+       <Shared-Hit-Blocks>N</Shared-Hit-Blocks>
+       <Shared-Read-Blocks>N</Shared-Read-Blocks>
+@@ -160,5 +160,6 @@
+ explain_filter
+ - Plan: 
+-    Node Type: "Seq Scan"
++    Node Type: "Custom Scan"
++    Custom Plan Provider: "VecScan"
+     Parallel Aware: false
+     Async Capable: false
+@@ -174,11 +175,4 @@
+     Actual Loops: N
+     Disabled: false
+-    Average Prefetch Distance: N.N
+-    Max Prefetch Distance: N
+-    Prefetch Capacity: N
+-    I/O Count: N
+-    I/O Waits: N
+-    Average I/O Size: N.N
+-    Average I/Os In Progress: N.N
+     Shared Hit Blocks: N
+     Shared Read Blocks: N
+@@ -225,5 +219,6 @@
+   {
+     "Plan": {
+-      "Node Type": "Seq Scan",
++      "Node Type": "Custom Scan",
++      "Custom Plan Provider": "VecScan",
+       "Parallel Aware": false,
+       "Async Capable": false,
+@@ -266,43 +261,62 @@
+                                                   explain_filter                                                   
+ -------------------------------------------------------------------------------------------------------------------
++                           Batch Format: postgres
++                           Fallback Steps: N
++                           Kernel Steps: N
+                            Output: tenk1.unique1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+-                     ->  Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
++                           Source: heap's pages
++                     ->  Vec Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
++                     Input: batches
+                      Output: tenk1.unique1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+-                     Sort Key: tenk1.ten
+-               ->  Sort  (cost=N.N..N.N rows=N width=N)
++                     Partition Key: tenk1.ten
++               ->  Vec Window Hash Agg  (cost=N.N..N.N rows=N width=N)
+                Output: sum(tenk1.unique1) OVER w1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+                Window: w1 AS (PARTITION BY tenk1.ten RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+          ->  WindowAgg  (cost=N.N..N.N rows=N width=N)
++         Input: rows
++         Order Key within Partitions: tenk1.hundred
+          Output: (sum(tenk1.unique1) OVER w1), tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+-         Sort Key: tenk1.ten, tenk1.hundred
+-   ->  Sort  (cost=N.N..N.N rows=N width=N)
++         Partition Key: tenk1.ten
++   ->  Vec Window Hash Agg  (cost=N.N..N.N rows=N width=N)
+    Output: (sum(tenk1.unique1) OVER w1), sum(tenk1.unique2) OVER w1, sum(tenk1.tenthous) OVER w1
+    Window: w1 AS (PARTITION BY tenk1.ten ORDER BY tenk1.hundred RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  Optimizer: GPORCA
+  WindowAgg  (cost=N.N..N.N rows=N width=N)
+-(15 rows)
++(22 rows)
+ 
+ select explain_filter('explain verbose select sum(unique1) over w1, sum(unique2) over (w1 order by hundred), sum(tenthous) over (w1 order by hundred rows 10 preceding) from tenk1 window w1 as (partition by ten)');
+-                                                     explain_filter                                                      
+--------------------------------------------------------------------------------------------------------------------------
++                                                        explain_filter                                                         
++-------------------------------------------------------------------------------------------------------------------------------
++                                       Batch Format: postgres
++                                       Fallback Steps: N
++                                       Kernel Steps: N
++                                       Output: tenk1.unique1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
++                                       Source: heap's pages
++                                 ->  Vec Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
++                                 Input: batches
+                                  Output: tenk1.unique1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+-                           ->  Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
+-                           Output: tenk1.unique1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+-                           Sort Key: tenk1.ten
+-                     ->  Sort  (cost=N.N..N.N rows=N width=N)
+-                     Output: sum(tenk1.unique1) OVER w1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+-                     Window: w1 AS (PARTITION BY tenk1.ten RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+-               ->  WindowAgg  (cost=N.N..N.N rows=N width=N)
+-               Output: (sum(tenk1.unique1) OVER w1), tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
+-               Sort Key: tenk1.ten, tenk1.hundred
+-         ->  Sort  (cost=N.N..N.N rows=N width=N)
+-         Output: sum(tenk1.unique2) OVER w1, tenk1.ten, tenk1.hundred, tenk1.tenthous, (sum(tenk1.unique1) OVER w1)
+-         Window: w1 AS (PARTITION BY tenk1.ten ORDER BY tenk1.hundred RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+-   ->  WindowAgg  (cost=N.N..N.N rows=N width=N)
++                                 Partition Key: tenk1.ten
++                           ->  Vec Window Hash Agg  (cost=N.N..N.N rows=N width=N)
++                           Output: sum(tenk1.unique1) OVER w1, tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
++                           Window: w1 AS (PARTITION BY tenk1.ten RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
++                     ->  WindowAgg  (cost=N.N..N.N rows=N width=N)
++                     Input: rows
++                     Order Key within Partitions: tenk1.hundred
++                     Output: (sum(tenk1.unique1) OVER w1), tenk1.unique2, tenk1.ten, tenk1.hundred, tenk1.tenthous
++                     Partition Key: tenk1.ten
++               ->  Vec Window Hash Agg  (cost=N.N..N.N rows=N width=N)
++               Output: sum(tenk1.unique2) OVER w1, tenk1.ten, tenk1.hundred, tenk1.tenthous, (sum(tenk1.unique1) OVER w1)
++               Window: w1 AS (PARTITION BY tenk1.ten ORDER BY tenk1.hundred RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
++         ->  WindowAgg  (cost=N.N..N.N rows=N width=N)
++         Input: rows
++         Order Key within Partitions: tenk1.hundred
++         Output: (sum(tenk1.unique2) OVER w1), tenk1.ten, tenk1.hundred, tenk1.tenthous, (sum(tenk1.unique1) OVER w1)
++         Partition Key: tenk1.ten
++   ->  Vec Window Hash Agg  (cost=N.N..N.N rows=N width=N)
+    Output: (sum(tenk1.unique1) OVER w1), (sum(tenk1.unique2) OVER w1), sum(tenk1.tenthous) OVER w1
+    Window: w1 AS (PARTITION BY tenk1.ten ORDER BY tenk1.hundred ROWS BETWEEN 'N'::bigint PRECEDING AND CURRENT ROW)
+  Optimizer: GPORCA
+  WindowAgg  (cost=N.N..N.N rows=N width=N)
+-(18 rows)
++(30 rows)
+ 
+ -- Check output including I/O timings.  These fields are conditional
+@@ -310,7 +324,7 @@
+ set track_io_timing = on;
+ select explain_filter('explain (analyze, buffers, format json) select * from int8_tbl i8');
+-           explain_filter            
+--------------------------------------
+- [                                  +
+   {                                +
+     "Plan": {                      +
+       "Node Type": "Seq Scan",     +
+       "Parallel Aware": false,     +
+       "Async Capable": false,      +
+       "Relation Name": "int8_tbl", +
+       "Alias": "i8",               +
+       "Startup Cost": N.N,         +
+       "Total Cost": N.N,           +
+       "Plan Rows": N,              +
+       "Plan Width": N,             +
+       "Actual Startup Time": N.N,  +
+       "Actual Total Time": N.N,    +
+       "Actual Rows": N.N,          +
+       "Actual Loops": N,           +
+       "Disabled": false,           +
+       "Shared Hit Blocks": N,      +
+       "Shared Read Blocks": N,     +
+       "Shared Dirtied Blocks": N,  +
+       "Shared Written Blocks": N,  +
+       "Local Hit Blocks": N,       +
+       "Local Read Blocks": N,      +
+       "Local Dirtied Blocks": N,   +
+       "Local Written Blocks": N,   +
+       "Temp Read Blocks": N,       +
+       "Temp Written Blocks": N,    +
+       "Shared I/O Read Time": N.N, +
+       "Shared I/O Write Time": N.N,+
+       "Local I/O Read Time": N.N,  +
+       "Local I/O Write Time": N.N, +
+       "Temp I/O Read Time": N.N,   +
+       "Temp I/O Write Time": N.N   +
+     },                             +
+     "Planning": {                  +
+       "Shared Hit Blocks": N,      +
+       "Shared Read Blocks": N,     +
+       "Shared Dirtied Blocks": N,  +
+       "Shared Written Blocks": N,  +
+       "Local Hit Blocks": N,       +
+       "Local Read Blocks": N,      +
+       "Local Dirtied Blocks": N,   +
+       "Local Written Blocks": N,   +
+       "Temp Read Blocks": N,       +
+       "Temp Written Blocks": N,    +
+       "Shared I/O Read Time": N.N, +
+       "Shared I/O Write Time": N.N,+
+       "Local I/O Read Time": N.N,  +
+       "Local I/O Write Time": N.N, +
+       "Temp I/O Read Time": N.N,   +
+       "Temp I/O Write Time": N.N   +
+     },                             +
+     "Planning Time": N.N,          +
+     "Triggers": [                  +
+     ],                             +
+     "Execution Time": N.N          +
+   }                                +
+ ]
++              explain_filter              
++------------------------------------------
++ [                                       +
+   {                                     +
+     "Plan": {                           +
+       "Node Type": "Custom Scan",       +
+       "Custom Plan Provider": "VecScan",+
+       "Parallel Aware": false,          +
+       "Async Capable": false,           +
+       "Relation Name": "int8_tbl",      +
+       "Alias": "i8",                    +
+       "Startup Cost": N.N,              +
+       "Total Cost": N.N,                +
+       "Plan Rows": N,                   +
+       "Plan Width": N,                  +
+       "Actual Startup Time": N.N,       +
+       "Actual Total Time": N.N,         +
+       "Actual Rows": N.N,               +
+       "Actual Loops": N,                +
+       "Disabled": false,                +
+       "Shared Hit Blocks": N,           +
+       "Shared Read Blocks": N,          +
+       "Shared Dirtied Blocks": N,       +
+       "Shared Written Blocks": N,       +
+       "Local Hit Blocks": N,            +
+       "Local Read Blocks": N,           +
+       "Local Dirtied Blocks": N,        +
+       "Local Written Blocks": N,        +
+       "Temp Read Blocks": N,            +
+       "Temp Written Blocks": N,         +
+       "Shared I/O Read Time": N.N,      +
+       "Shared I/O Write Time": N.N,     +
+       "Local I/O Read Time": N.N,       +
+       "Local I/O Write Time": N.N,      +
+       "Temp I/O Read Time": N.N,        +
+       "Temp I/O Write Time": N.N        +
+     },                                  +
+     "Planning": {                       +
+       "Shared Hit Blocks": N,           +
+       "Shared Read Blocks": N,          +
+       "Shared Dirtied Blocks": N,       +
+       "Shared Written Blocks": N,       +
+       "Local Hit Blocks": N,            +
+       "Local Read Blocks": N,           +
+       "Local Dirtied Blocks": N,        +
+       "Local Written Blocks": N,        +
+       "Temp Read Blocks": N,            +
+       "Temp Written Blocks": N,         +
+       "Shared I/O Read Time": N.N,      +
+       "Shared I/O Write Time": N.N,     +
+       "Local I/O Read Time": N.N,       +
+       "Local I/O Write Time": N.N,      +
+       "Temp I/O Read Time": N.N,        +
+       "Temp I/O Write Time": N.N        +
+     },                                  +
+     "Planning Time": N.N,               +
+     "Triggers": [                       +
+     ],                                  +
+     "Execution Time": N.N               +
+   }                                     +
+ ]
+ (1 row)
+ 
+@@ -351,40 +365,40 @@
+ -- MEMORY option
+ select explain_filter('explain (memory) select * from int8_tbl i8');
+-                     explain_filter                      
+----------------------------------------------------------
++                       explain_filter                        
++-------------------------------------------------------------
+    Memory: used=NkB  allocated=NkB
+  Optimizer: GPORCA
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
+ (3 rows)
+ 
+ select explain_filter('explain (memory, analyze, buffers off) select * from int8_tbl i8');
+-                                         explain_filter                                          
+--------------------------------------------------------------------------------------------------
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
+    Memory: used=NkB  allocated=NkB
+  Execution Time: N.N ms
+  Optimizer: GPORCA
+  Planning Time: N.N ms
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+ (5 rows)
+ 
+ select explain_filter('explain (memory, summary, format yaml) select * from int8_tbl i8');
+-        explain_filter         
+--------------------------------
+- - Plan:                      +
+     Node Type: "Seq Scan"    +
+     Parallel Aware: false    +
+     Async Capable: false     +
+     Relation Name: "int8_tbl"+
+     Alias: "i8"              +
+     Startup Cost: N.N        +
+     Total Cost: N.N          +
+     Plan Rows: N             +
+     Plan Width: N            +
+     Disabled: false          +
+   Planning:                  +
+     Memory Used: N           +
+     Memory Allocated: N      +
+   Planning Time: N.N
++           explain_filter            
++-------------------------------------
++ - Plan:                            +
+     Node Type: "Custom Scan"       +
+     Custom Plan Provider: "VecScan"+
+     Parallel Aware: false          +
+     Async Capable: false           +
+     Relation Name: "int8_tbl"      +
+     Alias: "i8"                    +
+     Startup Cost: N.N              +
+     Total Cost: N.N                +
+     Plan Rows: N                   +
+     Plan Width: N                  +
+     Disabled: false                +
+   Planning:                        +
+     Memory Used: N                 +
+     Memory Allocated: N            +
+   Planning Time: N.N
+ (1 row)
+ 
+ select explain_filter('explain (memory, analyze, format json) select * from int8_tbl i8');
+-           explain_filter           
+-------------------------------------
+- [                                 +
+   {                               +
+     "Plan": {                     +
+       "Node Type": "Seq Scan",    +
+       "Parallel Aware": false,    +
+       "Async Capable": false,     +
+       "Relation Name": "int8_tbl",+
+       "Alias": "i8",              +
+       "Startup Cost": N.N,        +
+       "Total Cost": N.N,          +
+       "Plan Rows": N,             +
+       "Plan Width": N,            +
+       "Actual Startup Time": N.N, +
+       "Actual Total Time": N.N,   +
+       "Actual Rows": N.N,         +
+       "Actual Loops": N,          +
+       "Disabled": false,          +
+       "Shared Hit Blocks": N,     +
+       "Shared Read Blocks": N,    +
+       "Shared Dirtied Blocks": N, +
+       "Shared Written Blocks": N, +
+       "Local Hit Blocks": N,      +
+       "Local Read Blocks": N,     +
+       "Local Dirtied Blocks": N,  +
+       "Local Written Blocks": N,  +
+       "Temp Read Blocks": N,      +
+       "Temp Written Blocks": N    +
+     },                            +
+     "Planning": {                 +
+       "Shared Hit Blocks": N,     +
+       "Shared Read Blocks": N,    +
+       "Shared Dirtied Blocks": N, +
+       "Shared Written Blocks": N, +
+       "Local Hit Blocks": N,      +
+       "Local Read Blocks": N,     +
+       "Local Dirtied Blocks": N,  +
+       "Local Written Blocks": N,  +
+       "Temp Read Blocks": N,      +
+       "Temp Written Blocks": N,   +
+       "Memory Used": N,           +
+       "Memory Allocated": N       +
+     },                            +
+     "Planning Time": N.N,         +
+     "Triggers": [                 +
+     ],                            +
+     "Execution Time": N.N         +
+   }                               +
+ ]
++              explain_filter              
++------------------------------------------
++ [                                       +
+   {                                     +
+     "Plan": {                           +
+       "Node Type": "Custom Scan",       +
+       "Custom Plan Provider": "VecScan",+
+       "Parallel Aware": false,          +
+       "Async Capable": false,           +
+       "Relation Name": "int8_tbl",      +
+       "Alias": "i8",                    +
+       "Startup Cost": N.N,              +
+       "Total Cost": N.N,                +
+       "Plan Rows": N,                   +
+       "Plan Width": N,                  +
+       "Actual Startup Time": N.N,       +
+       "Actual Total Time": N.N,         +
+       "Actual Rows": N.N,               +
+       "Actual Loops": N,                +
+       "Disabled": false,                +
+       "Shared Hit Blocks": N,           +
+       "Shared Read Blocks": N,          +
+       "Shared Dirtied Blocks": N,       +
+       "Shared Written Blocks": N,       +
+       "Local Hit Blocks": N,            +
+       "Local Read Blocks": N,           +
+       "Local Dirtied Blocks": N,        +
+       "Local Written Blocks": N,        +
+       "Temp Read Blocks": N,            +
+       "Temp Written Blocks": N          +
+     },                                  +
+     "Planning": {                       +
+       "Shared Hit Blocks": N,           +
+       "Shared Read Blocks": N,          +
+       "Shared Dirtied Blocks": N,       +
+       "Shared Written Blocks": N,       +
+       "Local Hit Blocks": N,            +
+       "Local Read Blocks": N,           +
+       "Local Dirtied Blocks": N,        +
+       "Local Written Blocks": N,        +
+       "Temp Read Blocks": N,            +
+       "Temp Written Blocks": N,         +
+       "Memory Used": N,                 +
+       "Memory Allocated": N             +
+     },                                  +
+     "Planning Time": N.N,               +
+     "Triggers": [                       +
+     ],                                  +
+     "Execution Time": N.N               +
+   }                                     +
+ ]
+ (1 row)
+ 
+ prepare int8_query as select * from int8_tbl i8;
+ select explain_filter('explain (memory) execute int8_query');
+-                     explain_filter                      
+----------------------------------------------------------
++                       explain_filter                        
++-------------------------------------------------------------
+    Memory: used=NkB  allocated=NkB
+  Optimizer: GPORCA
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
+ (3 rows)
+ 
+@@ -407,10 +421,10 @@
+ -- should scan gen_part_1_1 and gen_part_1_2, but not gen_part_2
+ select explain_filter('explain (generic_plan) select key1, key2 from gen_part where key1 = 1 and key2 = $1');
+-                              explain_filter                               
+----------------------------------------------------------------------------
++                                explain_filter                                 
++-------------------------------------------------------------------------------
+          Filter: ((key1 = N) AND (key2 = $N))
+          Filter: ((key1 = N) AND (key2 = $N))
+-   ->  Seq Scan on gen_part_1_1 gen_part_1  (cost=N.N..N.N rows=N width=N)
+-   ->  Seq Scan on gen_part_1_2 gen_part_2  (cost=N.N..N.N rows=N width=N)
++   ->  Vec Seq Scan on gen_part_1_1 gen_part_1  (cost=N.N..N.N rows=N width=N)
++   ->  Vec Seq Scan on gen_part_1_2 gen_part_2  (cost=N.N..N.N rows=N width=N)
+  Append  (cost=N.N..N.N rows=N width=N)
+  Optimizer: Postgres query optimizer
+@@ -442,7 +456,7 @@
+   #- '{0,Plan,Plans,0,Sort Space Type}'
+ );
+-                    jsonb_pretty                     
+------------------------------------------------------
+- [                                                  +
+     {                                              +
+         "Plan": {                                  +
+             "Plans": [                             +
+                 {                                  +
+                     "Alias": "tenk1",              +
+                     "Output": [                    +
+                         "tenk1.unique1",           +
+                         "tenk1.unique2",           +
+                         "tenk1.two",               +
+                         "tenk1.four",              +
+                         "tenk1.ten",               +
+                         "tenk1.twenty",            +
+                         "tenk1.hundred",           +
+                         "tenk1.thousand",          +
+                         "tenk1.twothousand",       +
+                         "tenk1.fivethous",         +
+                         "tenk1.tenthous",          +
+                         "tenk1.odd",               +
+                         "tenk1.even",              +
+                         "tenk1.stringu1",          +
+                         "tenk1.stringu2",          +
+                         "tenk1.string4"            +
+                     ],                             +
+                     "Schema": "public",            +
+                     "Disabled": false,             +
+                     "Node Type": "Seq Scan",       +
+                     "Plan Rows": 0,                +
+                     "Plan Width": 0,               +
+                     "Total Cost": 0.0,             +
+                     "Actual Rows": 0.0,            +
+                     "Actual Loops": 0,             +
+                     "Startup Cost": 0.0,           +
+                     "Async Capable": false,        +
+                     "Relation Name": "tenk1",      +
+                     "Parallel Aware": false,       +
+                     "Local Hit Blocks": 0,         +
+                     "Temp Read Blocks": 0,         +
+                     "Actual Total Time": 0.0,      +
+                     "Local Read Blocks": 0,        +
+                     "Shared Hit Blocks": 0,        +
+                     "Shared Read Blocks": 0,       +
+                     "Actual Startup Time": 0.0,    +
+                     "Parent Relationship": "Outer",+
+                     "Temp Written Blocks": 0,      +
+                     "Local Dirtied Blocks": 0,     +
+                     "Local Written Blocks": 0,     +
+                     "Shared Dirtied Blocks": 0,    +
+                     "Shared Written Blocks": 0     +
+                 }                                  +
+             ],                                     +
+             "Output": [                            +
+                 "tenk1.unique1",                   +
+                 "tenk1.unique2",                   +
+                 "tenk1.two",                       +
+                 "tenk1.four",                      +
+                 "tenk1.ten",                       +
+                 "tenk1.twenty",                    +
+                 "tenk1.hundred",                   +
+                 "tenk1.thousand",                  +
+                 "tenk1.twothousand",               +
+                 "tenk1.fivethous",                 +
+                 "tenk1.tenthous",                  +
+                 "tenk1.odd",                       +
+                 "tenk1.even",                      +
+                 "tenk1.stringu1",                  +
+                 "tenk1.stringu2",                  +
+                 "tenk1.string4"                    +
+             ],                                     +
+             "Disabled": false,                     +
+             "Sort Key": [                          +
+                 "tenk1.tenthous"                   +
+             ],                                     +
+             "Node Type": "Sort",                   +
+             "Plan Rows": 0,                        +
+             "Plan Width": 0,                       +
+             "Total Cost": 0.0,                     +
+             "Actual Rows": 0.0,                    +
+             "Sort Method": "quicksort",            +
+             "Actual Loops": 0,                     +
+             "Startup Cost": 0.0,                   +
+             "Async Capable": false,                +
+             "Parallel Aware": false,               +
+             "Sort Space Type": "Memory",           +
+             "Sort Space Used": 0,                  +
+             "Local Hit Blocks": 0,                 +
+             "Temp Read Blocks": 0,                 +
+             "Actual Total Time": 0.0,              +
+             "Local Read Blocks": 0,                +
+             "Shared Hit Blocks": 0,                +
+             "Shared Read Blocks": 0,               +
+             "Actual Startup Time": 0.0,            +
+             "Temp Written Blocks": 0,              +
+             "Local Dirtied Blocks": 0,             +
+             "Local Written Blocks": 0,             +
+             "Shared Dirtied Blocks": 0,            +
+             "Shared Written Blocks": 0             +
+         },                                         +
+         "Planning": {                              +
+             "Local Hit Blocks": 0,                 +
+             "Temp Read Blocks": 0,                 +
+             "Local Read Blocks": 0,                +
+             "Shared Hit Blocks": 0,                +
+             "Shared Read Blocks": 0,               +
+             "Temp Written Blocks": 0,              +
+             "Local Dirtied Blocks": 0,             +
+             "Local Written Blocks": 0,             +
+             "Shared Dirtied Blocks": 0,            +
+             "Shared Written Blocks": 0             +
+         },                                         +
+         "Triggers": [                              +
+         ],                                         +
+         "Planning Time": 0.0,                      +
+         "Execution Time": 0.0                      +
+     }                                              +
+ ]
++                      jsonb_pretty                      
++--------------------------------------------------------
++ [                                                     +
+     {                                                 +
+         "Plan": {                                     +
+             "Input": "batches",                       +
+             "Plans": [                                +
+                 {                                     +
+                     "Alias": "tenk1",                 +
+                     "Output": [                       +
+                         "tenk1.unique1",              +
+                         "tenk1.unique2",              +
+                         "tenk1.two",                  +
+                         "tenk1.four",                 +
+                         "tenk1.ten",                  +
+                         "tenk1.twenty",               +
+                         "tenk1.hundred",              +
+                         "tenk1.thousand",             +
+                         "tenk1.twothousand",          +
+                         "tenk1.fivethous",            +
+                         "tenk1.tenthous",             +
+                         "tenk1.odd",                  +
+                         "tenk1.even",                 +
+                         "tenk1.stringu1",             +
+                         "tenk1.stringu2",             +
+                         "tenk1.string4"               +
+                     ],                                +
+                     "Schema": "public",               +
+                     "Source": "heap's pages",         +
+                     "Batches": 0,                     +
+                     "Disabled": false,                +
+                     "Node Type": "Custom Scan",       +
+                     "Plan Rows": 0,                   +
+                     "Heap Pages": 0,                  +
+                     "Plan Width": 0,                  +
+                     "Total Cost": 0.0,                +
+                     "Actual Rows": 0.0,               +
+                     "Actual Loops": 0,                +
+                     "Batch Format": "postgres",       +
+                     "Kernel Steps": 0,                +
+                     "Startup Cost": 0.0,              +
+                     "Async Capable": false,           +
+                     "Relation Name": "tenk1",         +
+                     "Fallback Steps": 0,              +
+                     "Parallel Aware": false,          +
+                     "Local Hit Blocks": 0,            +
+                     "Temp Read Blocks": 0,            +
+                     "Actual Total Time": 0.0,         +
+                     "Local Read Blocks": 0,           +
+                     "Shared Hit Blocks": 0,           +
+                     "Shared Read Blocks": 0,          +
+                     "Actual Startup Time": 0.0,       +
+                     "Parent Relationship": "Outer",   +
+                     "Temp Written Blocks": 0,         +
+                     "Custom Plan Provider": "VecScan",+
+                     "Local Dirtied Blocks": 0,        +
+                     "Local Written Blocks": 0,        +
+                     "Shared Dirtied Blocks": 0,       +
+                     "Shared Written Blocks": 0        +
+                 }                                     +
+             ],                                        +
+             "Output": [                               +
+                 "tenk1.unique1",                      +
+                 "tenk1.unique2",                      +
+                 "tenk1.two",                          +
+                 "tenk1.four",                         +
+                 "tenk1.ten",                          +
+                 "tenk1.twenty",                       +
+                 "tenk1.hundred",                      +
+                 "tenk1.thousand",                     +
+                 "tenk1.twothousand",                  +
+                 "tenk1.fivethous",                    +
+                 "tenk1.tenthous",                     +
+                 "tenk1.odd",                          +
+                 "tenk1.even",                         +
+                 "tenk1.stringu1",                     +
+                 "tenk1.stringu2",                     +
+                 "tenk1.string4"                       +
+             ],                                        +
+             "Batches": 0,                             +
+             "Disabled": false,                        +
+             "Sort Key": [                             +
+                 "tenk1.tenthous"                      +
+             ],                                        +
+             "Node Type": "Custom Scan",               +
+             "Plan Rows": 0,                           +
+             "Plan Width": 0,                          +
+             "Total Cost": 0.0,                        +
+             "Actual Rows": 0.0,                       +
+             "Rows Sorted": 0,                         +
+             "Sort Method": "quicksort",               +
+             "Actual Loops": 0,                        +
+             "Batch Format": "postgres",               +
+             "Kernel Steps": 0,                        +
+             "Startup Cost": 0.0,                      +
+             "Async Capable": false,                   +
+             "Fallback Steps": 0,                      +
+             "Parallel Aware": false,                  +
+             "Sort Space Type": "Memory",              +
+             "Sort Space Used": 0,                     +
+             "Local Hit Blocks": 0,                    +
+             "Temp Read Blocks": 0,                    +
+             "Actual Total Time": 0.0,                 +
+             "Local Read Blocks": 0,                   +
+             "Shared Hit Blocks": 0,                   +
+             "Shared Read Blocks": 0,                  +
+             "Actual Startup Time": 0.0,               +
+             "Temp Written Blocks": 0,                 +
+             "Custom Plan Provider": "VecSort",        +
+             "Local Dirtied Blocks": 0,                +
+             "Local Written Blocks": 0,                +
+             "Shared Dirtied Blocks": 0,               +
+             "Shared Written Blocks": 0                +
+         },                                            +
+         "Planning": {                                 +
+             "Local Hit Blocks": 0,                    +
+             "Temp Read Blocks": 0,                    +
+             "Local Read Blocks": 0,                   +
+             "Shared Hit Blocks": 0,                   +
+             "Shared Read Blocks": 0,                  +
+             "Temp Written Blocks": 0,                 +
+             "Local Dirtied Blocks": 0,                +
+             "Local Written Blocks": 0,                +
+             "Shared Dirtied Blocks": 0,               +
+             "Shared Written Blocks": 0                +
+         },                                            +
+         "Triggers": [                                 +
+         ],                                            +
+         "Planning Time": 0.0,                         +
+         "Execution Time": 0.0                         +
+     }                                                 +
+ ]
+ (1 row)
+ 
+@@ -455,20 +469,30 @@
+                        explain_filter                       
+ ------------------------------------------------------------
++   Batch Format: postgres
++   Fallback Steps: N
+    Filter: (pg_temp.mysin(t1.f1) < 'N.N'::double precision)
++   Kernel Steps: N
+    Output: t1.f1
+- Optimizer: GPORCA
+- Seq Scan on pg_temp.t1  (cost=N.N..N.N rows=N width=N)
+-(4 rows)
++   Row-by-Row Qual: mysin(), which may raise
++   Source: heap's pages
++   Vector Quals: N of N
++ Optimizer: GPORCA
++ Vec Seq Scan on pg_temp.t1  (cost=N.N..N.N rows=N width=N)
++(10 rows)
+ 
+ -- Test compute_query_id
+ set compute_query_id = on;
+ select explain_filter('explain (verbose) select * from int8_tbl i8');
+-                         explain_filter                         
+-----------------------------------------------------------------
++                           explain_filter                           
++--------------------------------------------------------------------
++   Batch Format: postgres
++   Fallback Steps: N
++   Kernel Steps: N
+    Output: i8.q1, i8.q2
++   Source: heap's pages
+  Optimizer: GPORCA
+  Query Identifier: N
+- Seq Scan on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N)
+-(4 rows)
++ Vec Seq Scan on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++(8 rows)
+ 
+ -- Test compute_query_id with utility statements containing plannable query
+@@ -493,42 +517,42 @@
+ -- Test SERIALIZE option
+ select explain_filter('explain (analyze,buffers off,serialize) select * from int8_tbl i8');
+-                                         explain_filter                                          
+--------------------------------------------------------------------------------------------------
+- Execution Time: N.N ms
+- Optimizer: GPORCA
+- Planning Time: N.N ms
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
++ Execution Time: N.N ms
++ Optimizer: GPORCA
++ Planning Time: N.N ms
+  Serialization: time=N.N ms  output=NkB  format=text
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+ (5 rows)
+ 
+ select explain_filter('explain (analyze,serialize text,buffers,timing off) select * from int8_tbl i8');
+-                                  explain_filter                                   
+------------------------------------------------------------------------------------
+- Execution Time: N.N ms
+- Optimizer: GPORCA
+- Planning Time: N.N ms
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual rows=N.N loops=N)
++                                    explain_filter                                     
++---------------------------------------------------------------------------------------
++ Execution Time: N.N ms
++ Optimizer: GPORCA
++ Planning Time: N.N ms
+  Serialization: output=NkB  format=text
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual rows=N.N loops=N)
+ (5 rows)
+ 
+ select explain_filter('explain (analyze,serialize binary,buffers,timing) select * from int8_tbl i8');
+-                                         explain_filter                                          
+--------------------------------------------------------------------------------------------------
+- Execution Time: N.N ms
+- Optimizer: GPORCA
+- Planning Time: N.N ms
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
++ Execution Time: N.N ms
++ Optimizer: GPORCA
++ Planning Time: N.N ms
+  Serialization: time=N.N ms  output=NkB  format=binary
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+ (5 rows)
+ 
+ -- this tests an edge case where we have no data to return
+ select explain_filter('explain (analyze,buffers off,serialize) create temp table explain_temp as select * from int8_tbl i8');
+-                                         explain_filter                                          
+--------------------------------------------------------------------------------------------------
+- Execution Time: N.N ms
+- Optimizer: GPORCA
+- Planning Time: N.N ms
+- Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
++ Execution Time: N.N ms
++ Optimizer: GPORCA
++ Planning Time: N.N ms
+  Serialization: time=N.N ms  output=NkB  format=text
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+ (5 rows)
+ 
+@@ -565,7 +589,12 @@
+ ----------------------------------------------------------------------------------------------------------
+          ->  Function Scan on generate_series (actual time=N.N..N.N rows=N.N loops=N)
+-         Sort Key: ((generate_series < N))
+-         Sort Method: external merge  Disk: NkB
+-   ->  Sort (actual time=N.N..N.N rows=N.N loops=N)
++         Partition Key: ((generate_series < N))
++         Partitions: N
++         Peak Memory Usage: N kB
++         Rows Sorted Past the Last Level: N
++         Rows Spilled: N
++         Spill Depth: N
++         Spill Files: N
++   ->  Vec Window Hash Agg (actual time=N.N..N.N rows=N.N loops=N)
+    Storage: Disk  Maximum Storage: NkB
+    Window: w1 AS (PARTITION BY ((generate_series < N)) RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+@@ -574,5 +603,5 @@
+  Planning Time: N.N ms
+  WindowAgg (actual time=N.N..N.N rows=N.N loops=N)
+-(10 rows)
++(15 rows)
+ 
+ reset work_mem;

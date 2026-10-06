@@ -29,6 +29,14 @@ if [ -d /cbstage/usr/local/pgsql ] && [ -d /cb/pg19 ] && [ ! -f /tmp/.vexec-port
 	echo "the port's modules from the stage: $(cat /cbstage/COMMIT 2> /dev/null || echo '?')"
 fi
 
+# gp_orca built alone, for one node without gp_core (orcabuild.sh, V6), when
+# a leg is given its stage: installed over the vanilla image's server.
+if [ -d /orcastage/usr/local/pgsql ] && [ ! -d /cb/pg19 ] && [ ! -f /tmp/.vexec-orca-staged ]; then
+	cp -a /orcastage/usr/local/pgsql/. "$(dirname "$("$PG_CONFIG" --bindir)")/"
+	touch /tmp/.vexec-orca-staged
+	echo "gp_orca built alone, from the stage: $(cat /orcastage/COMMIT 2> /dev/null || echo '?')"
+fi
+
 echo "building against $("$PG_CONFIG" --version) at $(cat "$("$PG_CONFIG" --bindir)/../.pg_ref_commit" 2>/dev/null || echo '?')"
 for m in vexec vexec_test; do
 	[ -f "$BUILD/modules/$m/Makefile" ] || continue

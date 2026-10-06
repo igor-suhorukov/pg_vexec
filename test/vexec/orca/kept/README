@@ -1,0 +1,28 @@
+SPDX-License-Identifier: Apache-2.0
+
+PostgreSQL 19's regression tests under ORCA on vanilla PostgreSQL 19, with
+gp_orca built alone for one node (pg_vector_executor.md V6; ../../orca.sh,
+section pg): the differences from PostgreSQL's expected output that were
+reviewed and kept here, because vanilla's differ from the port's.
+
+orca.sh compares each test as the port's singlenode suite compares
+PostgreSQL's tests under ORCA (pg19/test/singlenode/run.sh): gpdiff.pl with
+plans not compared, gp_orca's Optimizer line dropped, and a test passes when
+nothing differs, or exactly a difference kept -- the port's, in
+pg19/test/singlenode/orca/ with its README, or one of this directory's.  Each
+file here is in the form the port's canon.pl gives, named for the expected
+output it differs from.
+
+window  The port's orca/window.diff less one hunk.  The rest -- window frames
+  and last_value() over rows no ORDER BY orders, or over ties, which ORCA
+  takes in another order -- is the port's, line for line.  The hunk left out
+  is the port's grammar's, not ORCA's: the test's SELECT count() OVER () FROM
+  tenk1, which the port's parse analysis takes for count(*) and answers
+  (gp_desugar.c; the port's postgres/README), and which vanilla PostgreSQL
+  refuses, "count(*) must be used to call a parameterless aggregate
+  function", as the expected output says.
+
+Of the port's other kept differences, tablespace's is gp_sql's too: ALTER
+TABLE SET TABLESPACE of a partitioned table, which moves its partitions on
+the port.  Vanilla answers as the expected output does, and the test passes
+without it.

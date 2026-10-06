@@ -51,6 +51,7 @@ x-run: &run
     VEXEC_SRC: /src
     VEXEC_WORK: /work
     CB_SRC_MOUNT: ${CB_SRC_MOUNT:-}
+    VEXEC_ORCA_SECTIONS: ${VEXEC_ORCA_SECTIONS:-}
     # the legs' own settings, passed through when the host sets them
     VEXEC_SEED: ${VEXEC_SEED:-}
     VEXEC_CORPORA: ${VEXEC_CORPORA:-}
@@ -122,9 +123,57 @@ services:
       PORTBUILD_COMMIT: ${PORTBUILD_COMMIT:-unknown}
     profiles: ["run"]
 
+  # V6 (pg_vector_executor.md §3.3.5): ORCA on vanilla PostgreSQL 19.  vexec's
+  # vanilla image with what the port's gp_orca needs to be built and run
+  # there, and DuckDB, from the port's image, for the tpc suite.
+  vexec-dev-vanillaorca:
+    image: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-orca
+    build:
+      context: .
+      dockerfile: Dockerfile.vanillaorca
+      args:
+        BASE_IMAGE: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}
+        DUCKDB_IMAGE: pg_accel/cb-ext${VEXEC_CBEXT_SUFFIX:-}:${CB_COMMIT:-unset}
+    profiles: ["build"]
+
+  # gp_orca built alone, for one node without gp_core (-Dorca_single_node),
+  # from VEXEC_PORT_SRC against the vanilla server, into VEXEC_ORCA_BUILD,
+  # and staged there for the vanilla-orca leg (test/vexec/orcabuild.sh).
+  orcabuild:
+    image: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-orca
+    user: postgres
+    network_mode: none
+    entrypoint: ["/src/test/vexec/orcabuild.sh"]
+    mem_limit: ${VEXEC_PORTBUILD_MEM:-16g}
+    memswap_limit: ${VEXEC_PORTBUILD_MEM:-16g}
+    cpus: ${VEXEC_CPUS:-0}
+    tmpfs:
+      - /tmp:exec
+    volumes:
+      - ..:/src:ro
+      - ${VEXEC_PORT_SRC:-/nonexistent}:/cbsrc:ro
+      - ${VEXEC_ORCA_BUILD:-/nonexistent}:/cbbuild
+    environment:
+      PORTBUILD_JOBS: ${PORTBUILD_JOBS:-8}
+      PORTBUILD_COMMIT: ${PORTBUILD_COMMIT:-unknown}
+    profiles: ["run"]
+
   vanilla:
     <<: *run
     image: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}
+    profiles: ["run"]
+
+  # The vanilla server with gp_orca built alone (VEXEC_ORCA_STAGE), which
+  # build.sh installs over the server's tree; and the port's worktree it was
+  # built from, whose ORCA comparison of PostgreSQL's suite orca.sh reuses.
+  vanilla-orca:
+    <<: *run
+    image: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-orca
+    volumes:
+      - ..:/src:ro
+      - ${VEXEC_WORK:-/nonexistent}:/work
+      - ${VEXEC_ORCA_STAGE:-/nonexistent}:/orcastage:ro
+      - ${VEXEC_PORT_SRC:-/nonexistent}:/cbsrc:ro
     profiles: ["run"]
 
   port:
