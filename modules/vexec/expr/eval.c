@@ -259,8 +259,18 @@ bool_register(VexecEval *ev, uint64 *truth, uint64 *valid)
 	VexecVec   *v = vexec_batch_alloc0(ev->work, sizeof(VexecVec));
 	static VexecType *booltype = NULL;
 
+	/*
+	 * Made once a backend and kept for every statement after: in
+	 * TopMemoryContext, not in the statement's memory, which is gone when
+	 * the next statement's registers point at it.
+	 */
 	if (booltype == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopMemoryContext);
+
 		booltype = vexec_type_make(BOOLOID, -1, InvalidOid);
+		MemoryContextSwitchTo(old);
+	}
 	v->type = booltype;
 	v->shape = vexec_bool_bits;
 	v->encoding = VEXEC_FLAT;

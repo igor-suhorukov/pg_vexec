@@ -359,6 +359,28 @@ else
 	echo "  FAILED an ordered aggregate under gp.optimizer_enable_groupagg=off:"; echo "$out" | sed 's/^/      /'; fail=1
 fi
 
+# ---------------------------------------------------------------------
+# registers: the one type every boolean register of a backend shares, made
+# once in TopMemoryContext -- made in a statement's memory (since V1), a
+# later statement's register read it freed: bool_and(NOT b2) under ORCA in
+# force mode, a second time in a session, raised "no conversion from bit"
+# or crashed the server
+# ---------------------------------------------------------------------
+echo "== registers"
+out=$(q "$D" postgres "SET client_min_messages = warning;
+CREATE TABLE f_bool (b1 bool, b2 bool);
+INSERT INTO f_bool VALUES (true, NULL), (false, true), (NULL, false)")
+case "$out" in *ERROR*) echo "  FAILED the registers' data: $out"; fail=1 ;; esac
+# each statement a query of its own, as a client sends them: in one query
+# string the first's freed memory is taken again by the same type's
+out=$(PGOPTIONS="$(session_opts orca-postgres)" "$BINDIR/psql" -X -q -At -h "$D/sock" -U postgres -d postgres \
+	-c "SELECT bool_and(NOT b2) FROM f_bool" -c "SELECT bool_and(NOT b2) FROM f_bool" -c "SELECT bool_and(NOT b2) FROM f_bool" 2>&1)
+if [ "$(echo "$out" | tr '\n' ' ')" = "f f f " ]; then
+	echo "  ok a boolean register's type outlives its statement: bool_and(NOT b2) three times in a session under ORCA"
+else
+	echo "  FAILED bool_and(NOT b2) three times in a session under ORCA:"; echo "$out" | sed 's/^/      /'; fail=1
+fi
+
 [ -n "${RESULTS_DIR:-}" ] && echo "$fail" > "$RESULTS_DIR/orcacost.fail"
 if [ $fail = 0 ]; then echo "orcacost: passed"; else echo "orcacost: FAILED"; fi
 exit $fail
