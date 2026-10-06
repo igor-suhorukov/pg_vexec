@@ -1,0 +1,102 @@
+0a1,101
+> @@ -1,81 +1,81 @@
+> -scan_seq|Seq Scan
+> +scan_seq|Vec Seq Scan
+>  11208|POINT(126.522745 128.356924)
+>  19845|POINT(127.584643 134.083138)
+>  27373|POINT(125.017705 130.219927)
+>  33863|POINT(131.608071 127.468328)
+>  45851|POINT(130.986464 132.890625)
+> -scan_seq|Seq Scan
+> +scan_seq|Vec Seq Scan
+>  11208|POINT(126.522745 128.356924)
+>  19845|POINT(127.584643 134.083138)
+>  27373|POINT(125.017705 130.219927)
+>  33863|POINT(131.608071 127.468328)
+>  45851|POINT(130.986464 132.890625)
+> -scan_seq|Seq Scan
+> +scan_seq|Vec Seq Scan
+>  11208|POINT(126.522745 128.356924)
+>  19845|POINT(127.584643 134.083138)
+>  27373|POINT(125.017705 130.219927)
+>  33863|POINT(131.608071 127.468328)
+>  45851|POINT(130.986464 132.890625)
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  11208|POINT(126.522745 128.356924)
+>  19845|POINT(127.584643 134.083138)
+>  27373|POINT(125.017705 130.219927)
+>  33863|POINT(131.608071 127.468328)
+>  45851|POINT(130.986464 132.890625)
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  11208|POINT(126.522745 128.356924)
+>  19845|POINT(127.584643 134.083138)
+>  27373|POINT(125.017705 130.219927)
+>  33863|POINT(131.608071 127.468328)
+>  45851|POINT(130.986464 132.890625)
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  11208|POINT(126.522745 128.356924)
+>  19845|POINT(127.584643 134.083138)
+>  27373|POINT(125.017705 130.219927)
+>  33863|POINT(131.608071 127.468328)
+>  45851|POINT(130.986464 132.890625)
+> -scan_seq|Seq Scan
+> +scan_seq|Vec Seq Scan
+>  11208|POINT(126.522745 128.356924)
+>  19845|POINT(127.584643 134.083138)
+>  27373|POINT(125.017705 130.219927)
+>  33863|POINT(131.608071 127.468328)
+>  45851|POINT(130.986464 132.890625)
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  11208|POINT(126.522745 128.356924)
+>  19845|POINT(127.584643 134.083138)
+>  27373|POINT(125.017705 130.219927)
+>  33863|POINT(131.608071 127.468328)
+>  45851|POINT(130.986464 132.890625)
+> -scan_seq|Seq Scan
+> +scan_seq|Vec Seq Scan
+>  11208|POINT(126.522745 128.356924)
+>  19845|POINT(127.584643 134.083138)
+>  27373|POINT(125.017705 130.219927)
+>  33863|POINT(131.608071 127.468328)
+>  45851|POINT(130.986464 132.890625)
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  11208|POINT(126.522745 128.356924)
+>  19845|POINT(127.584643 134.083138)
+>  27373|POINT(125.017705 130.219927)
+>  33863|POINT(131.608071 127.468328)
+>  45851|POINT(130.986464 132.890625)
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  2d|1
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  2d|20
+>  summarize 2d|8
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  2d|20
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  3d|1
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  3d|20
+>  summarize 3d|8
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  3d|20
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  4d|1
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  4d|20
+>  summarize 4d|8
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  4d|20

@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# vexec_postgis: vexec's kernel pack for PostGIS
+comment = 'vexec''s kernel pack for PostGIS: box operators, accessors and predicates'' short-circuits, a batch''s rows at a time'
+default_version = '1.0'
+module_pathname = '$libdir/vexec_postgis'
+relocatable = false
+schema = vexec_postgis
+requires = 'postgis'

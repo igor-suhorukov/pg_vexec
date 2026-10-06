@@ -1,0 +1,10 @@
+0a1,9
+> @@ -1,4 +1,4 @@
+> -&/&|26619|Seq Scan|26619|Index Scan
+> -@>>|4677|Seq Scan|4677|Index Scan
+> -<<@|4677|Seq Scan|4677|Index Scan
+> -~==|199|Seq Scan|199|Index Scan
+> +&/&|26619|Vec Seq Scan|26619|Index Scan
+> +@>>|4677|Vec Seq Scan|4677|Index Scan
+> +<<@|4677|Vec Seq Scan|4677|Index Scan
+> +~==|199|Vec Seq Scan|199|Index Scan

@@ -1,0 +1,15 @@
+The differences of PostGIS's core regression tests that test/corpus.sh keeps,
+reviewed (2026-10-06, PostGIS 3.7.0rc2 at e2ea03ad0bf, vexec on pg_accel's
+vk branch), one file a session and test: exactly the difference the run
+compares, between off's answer -- every core test passes against PostGIS's
+expected output with vexec.mode = off -- and the session's.
+
+Every one is a plan's node name, and nothing else: PostGIS's index tests
+(regress_index, regress_brin_index, regress_brin_index_3d,
+regress_brin_index_geography, regress_gist_index_nd, regress_spgist_index_2d,
+regress_spgist_index_3d, regress_spgist_index_nd, temporal_knn) print the
+node type of each query's plan beside its count of rows, and in force mode
+vexec's vector scans stand where PostgreSQL's scans stood: "Seq Scan" is
+"Vec Seq Scan", "Bitmap Heap Scan" is "Vec Bitmap Heap Scan".  The counts on
+the same lines are off's.  They are the same with the pack preloaded and
+without it, in both batch formats.

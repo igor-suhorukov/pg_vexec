@@ -1,0 +1,29 @@
+0a1,28
+> @@ -1,5 +1,5 @@
+>  brin_proc_12|brin_geography_inclusion_ops|12|geog_brin_inclusion_mergeable
+> -scan_seq|Seq Scan
+> +scan_seq|Vec Seq Scan
+>  42.01|POINT Z (42.01 42.01 42.01)
+>  42.03|POINT Z (42.03 42.03 42.03)
+>  42.04|POINT Z (42.04 42.04 42.04)
+> @@ -82,9 +82,9 @@
+>  42.97|POINT Z (42.97 42.97 42.97)
+>  42.98|POINT Z (42.98 42.98 42.98)
+>  42.99|POINT Z (42.99 42.99 42.99)
+> -scan_seq|Seq Scan
+> +scan_seq|Vec Seq Scan
+>  1001
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  42.01|POINT Z (42.01 42.01 42.01)
+>  42.03|POINT Z (42.03 42.03 42.03)
+>  42.04|POINT Z (42.04 42.04 42.04)
+> @@ -167,7 +167,7 @@
+>  42.97|POINT Z (42.97 42.97 42.97)
+>  42.98|POINT Z (42.98 42.98 42.98)
+>  42.99|POINT Z (42.99 42.99 42.99)
+> -scan_idx|Bitmap Heap Scan,Bitmap Index Scan
+> +scan_idx|Vec Bitmap Heap Scan,Bitmap Index Scan
+>  1001
+>  #4608-1|3681
+>  #4608-2|3681
