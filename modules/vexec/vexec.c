@@ -171,6 +171,7 @@ _PG_init(void)
 	vexec_orca_install();
 	vexec_explain_install();
 	vexec_egress_install();
+	vexec_ingest_install();
 
 	/*
 	 * This build has no GPU tier (V8): with vexec.gpu_devices set anyway it

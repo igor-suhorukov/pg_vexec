@@ -524,5 +524,57 @@ for t in t_heap t_porc_vec; do
 	done
 done
 
+# VI: an INSERT's rows written on the segments by VecInsert, under the
+# ModifyTable gp_core dispatches a write by (plan/insert.c): each storage
+# loaded alike in force mode and off, under ORCA; EXPLAIN ANALYZE shows the
+# VecInsert each segment ran; and a client's stream read on the coordinator
+# by VecIngest, redistributed to the segments' VecInserts
+vi_storage() {
+	case "$1" in
+		t_heap) echo "" ;;
+		t_aoco) echo "USING ao_column WITH (compresstype=zstd)" ;;
+		t_porc) echo "USING pax WITH (storage_format=porc)" ;;
+		t_porc_vec) echo "USING pax WITH (storage_format=porc_vec)" ;;
+	esac
+}
+digest="SELECT count(*) || ' ' || md5(string_agg(r::text, '|' ORDER BY r.id))"
+for t in t_heap t_aoco t_porc t_porc_vec; do
+	out=$(cq 0 $DB "SET client_min_messages = warning;
+		DROP TABLE IF EXISTS ${t}_off, ${t}_vi;
+		CREATE TABLE ${t}_off (LIKE $t) $(vi_storage $t) DISTRIBUTED BY (id);
+		CREATE TABLE ${t}_vi (LIKE $t) $(vi_storage $t) DISTRIBUTED BY (id);
+		SET gp.optimizer = on; SET vexec.mode = off;
+		INSERT INTO ${t}_off SELECT * FROM $t;
+		SET vexec.mode = force;
+		INSERT INTO ${t}_vi SELECT * FROM $t;")
+	case "$out" in *ERROR*) echo "  FAILED the loads of $t: $out"; fail=1; continue ;; esac
+	check "under ORCA, the segments' VecInserts load $t as ModifyTable does" \
+		"$(cq 0 $DB "$digest FROM ${t}_vi r")" "$(cq 0 $DB "$digest FROM ${t}_off r")"
+done
+plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET vexec.debug_check_plans = on; EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) INSERT INTO t_porc_vec_vi SELECT * FROM t_porc_vec")
+if echo "$plan" | grep -q "Insert on t_porc_vec_vi" && echo "$plan" | grep -q "Vec Insert on t_porc_vec_vi (actual rows" &&
+	echo "$plan" | grep -q "Write: sink pax"; then
+	echo "  ok under ORCA, each segment's VecInsert runs under the dispatched ModifyTable, through PAX's sink"
+else
+	echo "  FAILED no VecInsert ran on the segments:"
+	echo "$plan" | sed 's/^/    /'
+	fail=1
+fi
+out=$("$BINDIR/psql" -X -q -At -h "$(sockdir 0)" -p "$(port 0)" -U postgres -d $DB 2>&1 <<SQL
+SET gp.optimizer = on;
+SET vexec.mode = force;
+SET client_min_messages = warning;
+TRUNCATE t_porc_vec_vi;
+BEGIN;
+SELECT handle AS h FROM vexec_test.ingest_begin((SELECT stream FROM vexec_test.egress('SELECT * FROM t_porc_vec'))) \\gset
+INSERT INTO t_porc_vec_vi SELECT * FROM vexec.ingest_stream(:h)
+	AS s(id int4, k int4, v int4, n numeric(12,4), s text, d date, b bool);
+COMMIT;
+SQL
+)
+case "$out" in *ERROR*) echo "  FAILED the stream's load: $out"; fail=1 ;; esac
+check "a client's stream, read by VecIngest on the coordinator, is written by the segments' VecInserts" \
+	"$(cq 0 $DB "$digest FROM t_porc_vec_vi r")" "$(cq 0 $DB "$digest FROM t_porc_vec_off r")"
+
 echo "cluster: $([ $fail -eq 0 ] && echo passed || echo FAILED)"
 exit $fail

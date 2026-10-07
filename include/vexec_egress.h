@@ -79,6 +79,21 @@
  * PostgreSQL type its Arrow type names, and then the parameter's type by
  * assignment, as INSERT assigns values to columns.
  *
+ * Ingest (minor version 1, §3.16).  ingest_begin() takes the Schema message
+ * a client's stream of rows starts with, and a read function vexec calls for
+ * each later message as a statement reads the stream: the client's rows go
+ * into a table by "INSERT INTO t (...) SELECT ... FROM
+ * vexec.ingest_stream(handle) AS s(...)", the handle ingest_handle()'s, in
+ * the session that began it, and VecInsert writes them a batch of columns
+ * at a time where the target allows it.  ingest_columns() gives each column
+ * of the stream the PostgreSQL type its Arrow type names, as a parameter of
+ * no type would read it; the column definition list may name those types,
+ * which are read without copying where they can be, or any other the values
+ * can be assigned to, as parameters are.  The stream is read once, by one
+ * statement.  ingest_finished() says the read function has returned the
+ * end; ingest_end() unregisters it.  A stream lives no longer than the
+ * transaction it began in.
+ *
  * Every call runs on the backend's main thread and may ereport.
  *
  * Versions: as vexec_source.h's.  The major version is in the rendezvous
@@ -96,7 +111,7 @@
 
 #define VEXEC_EGRESS_RENDEZVOUS	"vexec/egress_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_EGRESS_MINOR		0
+#define VEXEC_EGRESS_MINOR		1	/* 1: ingest (§3.16) */
 #define VEXEC_EGRESS_MAGIC		0x56584531	/* "VXE1" */
 
 /* The Arrow C Data Interface's structures: a caller defines them itself. */
@@ -137,6 +152,23 @@ typedef void (*VexecEgressWriteFn) (void *arg, const VexecEgressMessage *msg);
 /* Takes a parameter row: its values are valid until it returns. */
 typedef void (*VexecEgressRowFn) (void *arg, int64 rownum,
 								  const Datum *values, const bool *isnull);
+
+/*
+ * Reads a client's next Arrow IPC message: its flatbuffer metadata and its
+ * body, valid until the next call; false at the end of the stream.  It may
+ * ereport.
+ */
+typedef bool (*VexecEgressReadFn) (void *arg, const char **metadata, size_t *metadata_len,
+								   const char **body, size_t *body_len);
+
+/* A column of a client's stream, and the PostgreSQL type its Arrow type names. */
+typedef struct VexecIngestColumn
+{
+	const char *name;			/* the field's name */
+	Oid			type;
+	int32		typmod;
+	bool		nullable;
+} VexecIngestColumn;
 
 /*
  * What a caller asks of a result's column, beside its type's own Arrow
@@ -214,6 +246,15 @@ typedef struct VexecEgressRoutine
 								 const char *body, size_t body_len,
 								 VexecEgressRowFn row, void *arg);
 	void		(*params_end) (void *state);
+
+	/* minor 1: ingest (§3.16) */
+	void	   *(*ingest_begin) (const char *metadata, size_t len,
+								 VexecEgressReadFn read, void *arg);
+	int			(*ingest_columns) (void *stream, const VexecIngestColumn **columns);
+	int64		(*ingest_handle) (void *stream);
+	int64		(*ingest_rows) (void *stream);
+	bool		(*ingest_finished) (void *stream);
+	void		(*ingest_end) (void *stream);
 } VexecEgressRoutine;
 
 /* The routine vexec published in this process, or NULL. */

@@ -3,13 +3,15 @@
  *
  * registry.c
  *	  vexec's side of the batch-source registry (pg_vector_executor.md
- *	  §3.5.1; the contract is vexec_source.h).
+ *	  §3.5.1; the contract is vexec_source.h), and of the batch-sink
+ *	  registry (§3.16; vexec_sink.h).
  *
  * The registry lives behind a rendezvous variable, and storage modules
  * register into it from their own _PG_init in any order with vexec.  vexec
  * makes it when it loads, reads it when it plans a scan, and shows it in
  * vexec.sources().  Heap and every access method without a source are read
- * through the slot path (§3.5.2, §3.5.5), from V1.
+ * through the slot path (§3.5.2, §3.5.5), from V1.  The sinks' registry is
+ * the same, read when VecInsert writes and shown in vexec.sinks(), from VI.
  *
  *-------------------------------------------------------------------------
  */
@@ -23,12 +25,14 @@
 #include "utils/builtins.h"
 #include "utils/tuplestore.h"
 
+#include "vexec_sink.h"
 #include "vexec_source.h"
 
 #include "vexec.h"
 #include "source/source.h"
 
 PG_FUNCTION_INFO_V1(vexec_sources);
+PG_FUNCTION_INFO_V1(vexec_sinks);
 
 void
 vexec_source_registry_install(void)
@@ -61,9 +65,9 @@ vexec_source_for(Relation rel, const char **how)
 	return NULL;
 }
 
-/* The name of the table access method of this database a source serves. */
+/* The name of the table access method of this database a routine serves. */
 static char *
-source_am_name(const VexecSourceRoutine *src)
+source_am_name(const TableAmRoutine *routine)
 {
 	Relation	pg_am;
 	SysScanDesc scan;
@@ -77,7 +81,7 @@ source_am_name(const VexecSourceRoutine *src)
 		Form_pg_am	am = (Form_pg_am) GETSTRUCT(tup);
 
 		if (am->amtype == AMTYPE_TABLE &&
-			GetTableAmRoutine(am->amhandler) == src->am)
+			GetTableAmRoutine(am->amhandler) == routine)
 		{
 			amname = pstrdup(NameStr(am->amname));
 			break;
@@ -112,7 +116,7 @@ vexec_sources(PG_FUNCTION_ARGS)
 		const VexecSourceRoutine *src = reg->sources[i];
 		Datum		values[5];
 		bool		nulls[5] = {false, false, false, false, false};
-		char	   *amname = source_am_name(src);
+		char	   *amname = source_am_name(src->am);
 
 		values[0] = CStringGetTextDatum(src->name ? src->name : "");
 		if (amname)
@@ -122,6 +126,44 @@ vexec_sources(PG_FUNCTION_ARGS)
 		values[2] = Int32GetDatum(src->minor);
 		values[3] = BoolGetDatum(VEXEC_SOURCE_HAS(src, estimate));
 		values[4] = BoolGetDatum(VEXEC_SOURCE_HAS(src, aggregate));
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * vexec.sinks(): the sinks registered in this server, each with the table
+ * access method of this database it serves, if any.
+ */
+Datum
+vexec_sinks(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	VexecSinkRegistry **rv;
+	VexecSinkRegistry *reg;
+	int			i;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	rv = (VexecSinkRegistry **) find_rendezvous_variable(VEXEC_SINK_RENDEZVOUS);
+	reg = *rv;
+	if (reg == NULL || reg->magic != VEXEC_SINK_MAGIC)
+		PG_RETURN_VOID();
+
+	for (i = 0; i < reg->nsinks; i++)
+	{
+		const VexecSinkRoutine *sink = reg->sinks[i];
+		Datum		values[3];
+		bool		nulls[3] = {false, false, false};
+		char	   *amname = source_am_name(sink->am);
+
+		values[0] = CStringGetTextDatum(sink->name ? sink->name : "");
+		if (amname)
+			values[1] = CStringGetTextDatum(amname);
+		else
+			nulls[1] = true;
+		values[2] = Int32GetDatum(sink->minor);
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 

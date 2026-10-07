@@ -108,3 +108,19 @@ CREATE FUNCTION egress_params(stream bytea, types regtype[], OUT rownum int8, OU
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'vexec_test_egress_params'
 LANGUAGE C STRICT VOLATILE;
+
+-- Ingest (§3.16, the egress's minor version 1): an encapsulated IPC stream --
+-- egress()'s, or pyarrow's -- begun as a client's stream for
+-- vexec.ingest_stream(handle), in this transaction: its handle, and its
+-- columns, "name type" each, the type its Arrow type names.
+CREATE FUNCTION ingest_begin(stream bytea, OUT handle int8, OUT columns text[])
+RETURNS record
+AS 'MODULE_PATHNAME', 'vexec_test_ingest_begin'
+LANGUAGE C STRICT VOLATILE;
+
+-- What a test ingest stream's reader has read: its rows, and whether it read
+-- to the end.
+CREATE FUNCTION ingest_status(handle int8, OUT rows int8, OUT finished bool)
+RETURNS record
+AS 'MODULE_PATHNAME', 'vexec_test_ingest_status'
+LANGUAGE C STRICT VOLATILE;

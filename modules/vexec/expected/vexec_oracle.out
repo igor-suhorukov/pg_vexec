@@ -91,3 +91,9 @@ SELECT * FROM vexec.sources();
 --------+---------------+-------+-----------+------------
 (0 rows)
 
+-- and the sinks: none either (§3.16)
+SELECT * FROM vexec.sinks();
+ sink | access_method | minor 
+------+---------------+-------
+(0 rows)
+

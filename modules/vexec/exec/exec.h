@@ -52,6 +52,8 @@
 #define VEXEC_BITMAPSCAN_NAME	"VecBitmapHeapScan"
 #define VEXEC_REPART_NAME	"VecRepartition"
 #define VEXEC_WINDOW_NAME	"VecWindowHashAgg"
+#define VEXEC_INSERT_NAME	"VecInsert"
+#define VEXEC_INGEST_NAME	"VecIngest"
 
 typedef enum VexecNodeKind
 {
@@ -61,7 +63,9 @@ typedef enum VexecNodeKind
 	VEXEC_NODE_HASHJOIN,
 	VEXEC_NODE_SORT,
 	VEXEC_NODE_REPART,
-	VEXEC_NODE_WINDOW
+	VEXEC_NODE_WINDOW,
+	VEXEC_NODE_INSERT,
+	VEXEC_NODE_INGEST
 } VexecNodeKind;
 
 /*
@@ -332,6 +336,8 @@ extern const CustomScanMethods *vexec_sort_methods(void);
 extern const CustomScanMethods *vexec_bitmapscan_methods(void);
 extern const CustomScanMethods *vexec_repart_methods(void);
 extern const CustomScanMethods *vexec_window_methods(void);
+extern const CustomScanMethods *vexec_insert_methods(void);
+extern const CustomScanMethods *vexec_ingest_methods(void);
 
 /* node.c: what every node shares */
 extern void vexec_node_begin(VexecNode *node, EState *estate);
@@ -383,6 +389,12 @@ extern void vexec_repart_plan_decode(CustomScan *cscan, VexecRepartPlan *plan);
 extern Node *vexec_create_window_state(CustomScan *cscan);
 extern List *vexec_window_plan_encode(const VexecWindowPlan *plan);
 extern void vexec_window_plan_decode(CustomScan *cscan, VexecWindowPlan *plan);
+
+/* vecinsert.c */
+extern Node *vexec_create_insert_state(CustomScan *cscan);
+
+/* vecingest.c */
+extern Node *vexec_create_ingest_state(CustomScan *cscan);
 
 /* vechashjoin.c */
 extern Node *vexec_create_hashjoin_state(CustomScan *cscan);

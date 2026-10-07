@@ -219,7 +219,8 @@ EXPLAIN (VEXEC, COSTS OFF) INSERT INTO vu SELECT a, b FROM vt ON CONFLICT DO NOT
  Vexec: mode explain, format postgres
    VecScan on vt: not chosen (explain mode)
      source: heap's pages; quals: 0 kernel steps, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
-(6 rows)
+   VecInsert on INSERT INTO vu: not possible (ON CONFLICT)
+(7 rows)
 
 DROP INDEX vu_a;
 EXPLAIN (VEXEC, COSTS OFF) DECLARE vc CURSOR FOR SELECT * FROM vt;

@@ -32,3 +32,5 @@ DROP DOMAIN vexec_price;
 
 -- the sources storage modules registered: none in this build
 SELECT * FROM vexec.sources();
+-- and the sinks: none either (§3.16)
+SELECT * FROM vexec.sinks();

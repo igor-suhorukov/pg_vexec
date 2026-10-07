@@ -15,6 +15,12 @@
  *	egress_params(...)	a stream of parameter batches -- pyarrow's, or the
  *						egress's own -- read back as the values of given
  *						types, a row of text each
+ *	ingest_begin(stream)	an ingest stream (§3.16, minor version 1) of an
+ *						encapsulated IPC stream's messages, read as a client's
+ *						are, for vexec.ingest_stream(): its handle, and its
+ *						columns, "name type" each
+ *	ingest_status(handle)	the rows its reader has read, and whether it has
+ *						read to the end
  *
  * The egress is reached as vexec_flight reaches it, through the rendezvous
  * variable; the vector batches' count, by symbol.
@@ -23,14 +29,18 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
+#include "storage/proc.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/tuplestore.h"
 
 #include "vexec_egress.h"
@@ -42,6 +52,8 @@
 
 PG_FUNCTION_INFO_V1(vexec_test_egress);
 PG_FUNCTION_INFO_V1(vexec_test_egress_params);
+PG_FUNCTION_INFO_V1(vexec_test_ingest_begin);
+PG_FUNCTION_INFO_V1(vexec_test_ingest_status);
 
 static const VexecEgressRoutine *
 egress(void)
@@ -261,4 +273,135 @@ vexec_test_egress_params(PG_FUNCTION_ARGS)
 	if (state)
 		eg->params_end(state);
 	return (Datum) 0;
+}
+
+/*
+ * An ingest stream over an encapsulated IPC stream's bytes, kept with the
+ * transaction: the Schema message begins it, and its read function hands
+ * out each later message until the end-of-stream marker.
+ */
+typedef struct TestIngest
+{
+	char	   *data;
+	size_t		len;
+	size_t		pos;
+	void	   *stream;
+	int64		handle;
+	LocalTransactionId lxid;	/* the transaction it lives in */
+} TestIngest;
+
+static List *test_ingests = NIL;
+
+static bool
+test_ingest_read(void *arg, const char **metadata, size_t *metadata_len,
+				 const char **body, size_t *body_len)
+{
+	TestIngest *t = arg;
+	VexecIpcHeader h;
+	size_t		consumed;
+
+	if (!vexec_ipc_read_prefix(t->data + t->pos, t->len - t->pos, &h, &consumed))
+		elog(ERROR, "the stream is cut short");
+	if (h.kind == VEXEC_IPC_END)
+		return false;
+	t->pos += consumed;
+	if (h.body_len < 0 || (size_t) h.body_len > t->len - t->pos)
+		elog(ERROR, "the stream is cut short");
+	*metadata = h.metadata;
+	*metadata_len = h.metadata_len;
+	*body = t->data + t->pos;
+	*body_len = (size_t) h.body_len;
+	t->pos += h.body_len;
+	return true;
+}
+
+static TestIngest *
+test_ingest_find(int64 handle)
+{
+	ListCell   *lc;
+
+	foreach(lc, test_ingests)
+	{
+		TestIngest *t = lfirst(lc);
+
+		if (t->handle == handle && t->lxid == MyProc->vxid.lxid)
+			return t;
+	}
+	elog(ERROR, "no test ingest stream " INT64_FORMAT " in this transaction", handle);
+	return NULL;
+}
+
+/* ingest_begin(stream bytea, OUT handle int8, OUT columns text[]) */
+Datum
+vexec_test_ingest_begin(PG_FUNCTION_ARGS)
+{
+	bytea	   *stream = PG_GETARG_BYTEA_PP(0);
+	const VexecEgressRoutine *eg = egress();
+	const VexecIngestColumn *cols;
+	TupleDesc	desc;
+	TestIngest *t;
+	MemoryContext old;
+	VexecIpcHeader h;
+	size_t		consumed;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	Datum	   *texts;
+	int			n;
+	int			i;
+	ListCell   *lc;
+
+	if (!VEXEC_EGRESS_HAS(eg, ingest_end))
+		elog(ERROR, "vexec's egress API has no ingest");
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "ingest_begin() returns a record");
+
+	/* the stream's bytes and the stream itself live with the transaction */
+	foreach(lc, test_ingests)
+		if (((TestIngest *) lfirst(lc))->lxid != MyProc->vxid.lxid)
+		{
+			list_free(test_ingests);
+			test_ingests = NIL;
+			break;
+		}
+	old = MemoryContextSwitchTo(TopTransactionContext);
+	t = palloc0(sizeof(TestIngest));
+	t->len = VARSIZE_ANY_EXHDR(stream);
+	t->data = palloc(Max(t->len, 1));
+	memcpy(t->data, VARDATA_ANY(stream), t->len);
+	t->lxid = MyProc->vxid.lxid;
+	if (!vexec_ipc_read_prefix(t->data, t->len, &h, &consumed) || h.kind != VEXEC_IPC_SCHEMA)
+		elog(ERROR, "the stream does not begin with a Schema message");
+	t->pos = consumed + h.body_len;
+	t->stream = eg->ingest_begin(h.metadata, h.metadata_len, test_ingest_read, t);
+	t->handle = eg->ingest_handle(t->stream);
+	MemoryContextSwitchTo(TopMemoryContext);
+	test_ingests = lappend(test_ingests, t);
+	MemoryContextSwitchTo(old);
+
+	n = eg->ingest_columns(t->stream, &cols);
+	texts = palloc(sizeof(Datum) * Max(n, 1));
+	for (i = 0; i < n; i++)
+		texts[i] = CStringGetTextDatum(psprintf("%s %s", quote_identifier(cols[i].name),
+												format_type_with_typemod(cols[i].type,
+																		 cols[i].typmod)));
+	values[0] = Int64GetDatum(t->handle);
+	values[1] = PointerGetDatum(construct_array_builtin(texts, n, TEXTOID));
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
+}
+
+/* ingest_status(handle int8, OUT rows int8, OUT finished bool) */
+Datum
+vexec_test_ingest_status(PG_FUNCTION_ARGS)
+{
+	TestIngest *t = test_ingest_find(PG_GETARG_INT64(0));
+	const VexecEgressRoutine *eg = egress();
+	TupleDesc	desc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "ingest_status() returns a record");
+	values[0] = Int64GetDatum(eg->ingest_rows(t->stream));
+	values[1] = BoolGetDatum(eg->ingest_finished(t->stream));
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(BlessTupleDesc(desc), values, nulls)));
 }

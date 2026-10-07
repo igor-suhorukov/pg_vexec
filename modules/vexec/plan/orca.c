@@ -23,6 +23,12 @@
  *	end		the plan check, the reasons for EXPLAIN (VEXEC), and
  *			vexec.debug_require_vector.
  *
+ * From VI, build makes two more (§3.16): a FunctionScan of
+ * vexec.ingest_stream() a VecIngest (ingest.c), and an INSERT's ModifyTable
+ * a VecInsert (insert.c), in the segments' fragment that writes on a
+ * cluster; end adds a partitioned target's partitions to the relations the
+ * plan depends on.
+ *
  * From V5, through the API's minor version 2, at four more:
  *
  *	set_options	before ORCA is asked: create_vectorization_plan, which
@@ -550,6 +556,115 @@ orca_mergejoin(MergeJoin *mj)
 		mj->join.plan.righttree = vexec_unbuild_sort((CustomScan *) inner);
 }
 
+/* A FunctionScan of vexec.ingest_stream() ORCA's translator built, and its VecIngest. */
+static Plan *
+orca_ingest(VexecPlanState *ps, FunctionScan *fs, List *rtable)
+{
+	VexecAlt   *alt = NULL;
+	const char *refusal;
+	Plan	   *built;
+
+	built = vexec_build_ingest_from_functionscan(fs, rtable, &refusal);
+	if (built == NULL && refusal == NULL)
+		return NULL;			/* another function */
+	if (ps->record)
+		alt = vexec_alt_record(ps, "VecIngest", "vexec.ingest_stream()", NULL, NULL);
+	if (built == NULL)
+	{
+		vexec_alt_refuse(ps, alt, refusal);
+		return NULL;
+	}
+	if (alt != NULL)
+	{
+		VexecCost	cost;
+
+		memset(&cost, 0, sizeof(cost));
+		cost.rows = fs->scan.plan.plan_rows;
+		vexec_alt_costed(ps, alt, &cost, "ORCA's function scan; source: the client's stream");
+	}
+	ps->npossible++;
+	if (!chosen(ps, NULL))
+		return NULL;
+	return built;
+}
+
+/*
+ * The rows an INSERT of ORCA's writes, as ORCA estimated them: the
+ * translator gives the Result it puts under the ModifyTable none of its
+ * own (CTranslatorDXLToPlStmt::TranslateDXLDml()), so the first node down
+ * that has an estimate.  A client's stream read by VecIngest, through a
+ * Motion on a cluster, is as long as the client makes it, which ORCA
+ * prices as any function's rows, 1,000: it counts as vexec.min_rows.
+ */
+static double
+insert_rows(ModifyTable *mt)
+{
+	Plan	   *p;
+	double		rows = mt->plan.plan_rows;
+
+	for (p = mt->plan.lefttree; p != NULL; p = p->lefttree)
+	{
+		if (rows <= 0 && p->plan_rows > 0)
+			rows = p->plan_rows;
+		if (IsA(p, CustomScan) && ((CustomScan *) p)->methods == vexec_ingest_methods())
+			return Max(rows, vexec_min_rows);
+	}
+	return rows;
+}
+
+/* An INSERT's ModifyTable ORCA's translator built, and its VecInsert. */
+static Plan *
+orca_insert(VexecPlanState *ps, ModifyTable *mt, List *rtable)
+{
+	VexecAlt   *alt = NULL;
+	const char *refusal;
+	Plan	   *built;
+	List	   *oids = NIL;
+
+	if (mt->operation != CMD_INSERT)
+		return NULL;
+	if (ps->record)
+		alt = vexec_alt_record(ps, "VecInsert", "ORCA's INSERT", NULL, NULL);
+	built = vexec_build_insert_from_modifytable(mt, rtable, &refusal, &oids);
+	if (built == NULL)
+	{
+		vexec_alt_refuse(ps, alt, refusal ? refusal : "not an INSERT");
+		return NULL;
+	}
+	if (ps->mode != VEXEC_MODE_FORCE && insert_rows(mt) < vexec_min_rows)
+	{
+		vexec_alt_refuse(ps, alt, psprintf("%.0f rows, fewer than vexec.min_rows",
+										   insert_rows(mt)));
+		return NULL;
+	}
+	if (alt != NULL)
+	{
+		VexecCost	cost;
+
+		memset(&cost, 0, sizeof(cost));
+		cost.rows = insert_rows(mt);
+		vexec_alt_costed(ps, alt, &cost,
+						 psprintf("ORCA's INSERT; input: %s",
+								  vexec_is_vector_node(mt->plan.lefttree) ? "batches" : "rows"));
+	}
+	ps->npossible++;
+	if (!chosen(ps, NULL))
+		return NULL;
+	ps->relation_oids = list_concat(ps->relation_oids, oids);
+
+	/*
+	 * On a cluster's coordinator the ModifyTable stays, the dispatcher's
+	 * mark of a write, and VecInsert below it writes the rows (insert.c).
+	 */
+	if (vexec_on_coordinator())
+	{
+		mt->plan.lefttree = built;
+		ps->insert_inputs = true;
+		return NULL;
+	}
+	return built;
+}
+
 static Plan *
 orca_build(void *state, Plan *plan, List *rtable)
 {
@@ -571,6 +686,10 @@ orca_build(void *state, Plan *plan, List *rtable)
 			return orca_sort(ps, (Sort *) plan);
 		case T_BitmapHeapScan:
 			return orca_bitmapscan(ps, (BitmapHeapScan *) plan, rtable);
+		case T_FunctionScan:
+			return orca_ingest(ps, (FunctionScan *) plan, rtable);
+		case T_ModifyTable:
+			return orca_insert(ps, (ModifyTable *) plan, rtable);
 		case T_Limit:
 			vexec_orca_limit_bound((Limit *) plan);
 			return NULL;
@@ -962,6 +1081,19 @@ orca_end(void *state, PlannedStmt *stmt)
 	VexecPlanState *ps = state;
 	int			nodes = -1;
 
+	/* a VecInsert's partitions: the plan depends on each (insert.c) */
+	if (ps->relation_oids != NIL)
+		stmt->relationOids = list_concat(stmt->relationOids, ps->relation_oids);
+
+	/*
+	 * A node added beside ORCA's own -- a VecInsert under the ModifyTable
+	 * the dispatcher writes by -- numbered past the plan's others, as the
+	 * port's passes over ORCA's plans number theirs (pg19/orca/merge.c,
+	 * parallel.c): a node's id says which node a segment's figures are
+	 * for.  Found in the finished plan, which may hold a copy of it.
+	 */
+	if (ps->insert_inputs)
+		vexec_number_insert_inputs(stmt);
 	if (vexec_debug_check_plans || vexec_debug_require_vector)
 		nodes = vexec_check_plan(stmt, ps->mode);
 	if (ps->record)

@@ -97,6 +97,8 @@ typedef struct ParamCol
 	FmgrInfo	input;			/* utf8: the parameter type's input */
 	Oid			ioparam;
 	ExprState  *cast;			/* natural to type, or NULL when they are one */
+	bool		stream;			/* a column of an ingest stream, not a
+								 * parameter: errors name it so */
 } ParamCol;
 
 typedef struct ParamsState
@@ -159,12 +161,20 @@ time_unit(char c)
 	return -1;
 }
 
+/* What a message calls the value's column: a parameter, or a stream's column. */
+static char *
+value_name(const ParamCol *col, int param)
+{
+	return col->stream ? psprintf("column %d of the client's stream", param) :
+		psprintf("parameter $%d", param);
+}
+
 pg_noreturn static void
-not_a_parameter(int param, const char *format)
+not_a_parameter(const ParamCol *col, int param, const char *format)
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_DATATYPE_MISMATCH),
-			 errmsg("parameter $%d cannot be read from Arrow's type \"%s\"", param, format)));
+			 errmsg("%s cannot be read from Arrow's type \"%s\"", value_name(col, param), format)));
 }
 
 /* How a client's column reads, and which PostgreSQL type it names. */
@@ -223,7 +233,7 @@ param_kind(ParamCol *col, int param, const struct ArrowSchema *field)
 					(bw != 32 && bw != 64 && bw != 128 && bw != 256) ||
 					col->precision < 1 || col->precision > 76 ||
 					col->scale < -76 || col->scale > 76)
-					not_a_parameter(param, f);
+					not_a_parameter(col, param, f);
 				col->kind = PK_DECIMAL;
 				col->width = bw / 8;
 				col->natural = NUMERICOID;
@@ -259,7 +269,7 @@ param_kind(ParamCol *col, int param, const struct ArrowSchema *field)
 
 				col->width = atoi(f + 2);
 				if (col->width <= 0)
-					not_a_parameter(param, f);
+					not_a_parameter(col, param, f);
 				if (col->width == UUID_LEN && ext && strcmp(ext, "arrow.uuid") == 0)
 				{
 					col->kind = PK_UUID;
@@ -312,7 +322,7 @@ param_kind(ParamCol *col, int param, const struct ArrowSchema *field)
 			}
 			break;
 	}
-	not_a_parameter(param, f);
+	not_a_parameter(col, param, f);
 }
 
 /* The assignment of a natural type to the parameter's, once (pl_exec.c's way). */
@@ -322,7 +332,12 @@ param_cast(ParamCol *col, int param)
 	CaseTestExpr *placeholder;
 	Node	   *cast;
 
-	if (col->kind == PK_NULL || col->natural == col->type)
+	/*
+	 * The same type needs no cast, but for its typmod: a stream's column
+	 * definition list may bound a numeric or a string, which a function's
+	 * result is not checked against (§3.16).
+	 */
+	if (col->kind == PK_NULL || (col->natural == col->type && col->typmod < 0))
 		return;
 	placeholder = makeNode(CaseTestExpr);
 	placeholder->typeId = col->natural;
@@ -334,8 +349,9 @@ param_cast(ParamCol *col, int param)
 	if (cast == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("parameter $%d is of type %s, and its Arrow values are of type %s",
-						param, format_type_be(col->type), format_type_be(col->natural)),
+				 errmsg("%s is of type %s, and its Arrow values are of type %s",
+						value_name(col, param), format_type_be(col->type),
+						format_type_be(col->natural)),
 				 errhint("Send it as a type that can be assigned to %s, or as utf8.",
 						 format_type_be(col->type))));
 	col->cast = ExecInitExpr(expression_planner((Expr *) cast), NULL);
@@ -396,11 +412,11 @@ vexec_egress_params_begin(const char *metadata, size_t len, int nparams,
  */
 
 pg_noreturn static void
-param_out_of_range(int param, const char *what)
+param_out_of_range(const ParamCol *col, int param, const char *what)
 {
 	ereport(ERROR,
 			(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-			 errmsg("parameter $%d holds %s out of PostgreSQL's range", param, what)));
+			 errmsg("%s holds %s out of PostgreSQL's range", value_name(col, param), what)));
 }
 
 /* float16's bits as a float4 (IEEE 754 binary16). */
@@ -623,8 +639,8 @@ param_value(ParamCol *col, int param, const struct ArrowArray *a, int64 row, boo
 								if (u > (uint64) PG_INT64_MAX)
 									ereport(ERROR,
 											(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-											 errmsg("parameter $%d holds a value out of bigint's range",
-													param)));
+											 errmsg("%s holds a value out of bigint's range",
+													value_name(col, param))));
 								v = (int64) u;
 							}
 							break;
@@ -661,7 +677,7 @@ param_value(ParamCol *col, int param, const struct ArrowArray *a, int64 row, boo
 				if (memchr(p, '\0', len) != NULL)
 					ereport(ERROR,
 							(errcode(ERRCODE_UNTRANSLATABLE_CHARACTER),
-							 errmsg("parameter $%d holds a NUL character, which text cannot", param)));
+							 errmsg("%s holds a NUL character, which text cannot", value_name(col, param))));
 				s = pg_any_to_server(p, (int) len, PG_UTF8);
 				if (s == p)
 					s = pnstrdup(p, len);
@@ -686,7 +702,7 @@ param_value(ParamCol *col, int param, const struct ArrowArray *a, int64 row, boo
 				if (len > MaxAllocSize - VARHDRSZ)
 					ereport(ERROR,
 							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-							 errmsg("parameter $%d holds a value too long for bytea", param)));
+							 errmsg("%s holds a value too long for bytea", value_name(col, param))));
 				b = palloc(len + VARHDRSZ);
 				SET_VARSIZE(b, len + VARHDRSZ);
 				memcpy(VARDATA(b), p, len);
@@ -715,7 +731,7 @@ param_value(ParamCol *col, int param, const struct ArrowArray *a, int64 row, boo
 				}
 				d = days - VEXEC_EPOCH_DAYS;
 				if (!IS_VALID_DATE(d))
-					param_out_of_range(param, "a date");
+					param_out_of_range(col, param, "a date");
 				return DateADTGetDatum((DateADT) d);
 			}
 		case PK_TIME:
@@ -724,7 +740,7 @@ param_value(ParamCol *col, int param, const struct ArrowArray *a, int64 row, boo
 				int64		us;
 
 				if (!to_usecs(v, col->unit_us, &us) || us < 0 || us > USECS_PER_DAY)
-					param_out_of_range(param, "a time");
+					param_out_of_range(col, param, "a time");
 				return TimeADTGetDatum(us);
 			}
 		case PK_TIMESTAMP:
@@ -735,7 +751,7 @@ param_value(ParamCol *col, int param, const struct ArrowArray *a, int64 row, boo
 				if (!to_usecs(((const int64 *) vals)[i], col->unit_us, &us) ||
 					pg_sub_s64_overflow(us, VEXEC_EPOCH_USECS, &ts) ||
 					!IS_VALID_TIMESTAMP(ts))
-					param_out_of_range(param, "a timestamp");
+					param_out_of_range(col, param, "a timestamp");
 				return TimestampGetDatum(ts);
 			}
 		case PK_DURATION:
@@ -748,7 +764,7 @@ param_value(ParamCol *col, int param, const struct ArrowArray *a, int64 row, boo
 				if (col->kind == PK_DURATION)
 				{
 					if (!to_usecs(((const int64 *) vals)[i], col->unit_us, &iv->time))
-						param_out_of_range(param, "a duration");
+						param_out_of_range(col, param, "a duration");
 				}
 				else if (col->kind == PK_INTERVAL_YM)
 					iv->month = ((const int32 *) vals)[i];
@@ -773,7 +789,7 @@ param_value(ParamCol *col, int param, const struct ArrowArray *a, int64 row, boo
 				}
 				/* ±infinity's fields are PostgreSQL's own: not a client's */
 				if (INTERVAL_NOT_FINITE(iv))
-					param_out_of_range(param, "an interval");
+					param_out_of_range(col, param, "an interval");
 				return IntervalPGetDatum(iv);
 			}
 	}
@@ -834,4 +850,75 @@ vexec_egress_params_end(void *state)
 
 	FreeExprContext(st->econtext, true);
 	MemoryContextDelete(st->mcxt);
+}
+
+/* ---------------------------------------------------------------------
+ * For ingest (ingest.c): a client's stream read as columns, by the same
+ * rules as parameters
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * The PostgreSQL type an Arrow field names, as a parameter of no type of its
+ * own would read it: a decimal's typmod its precision and scale, where
+ * numeric has them; a column of Arrow's null type, text.
+ */
+void
+vexec_egress_param_natural(const struct ArrowSchema *field, int column,
+						   Oid *type, int32 *typmod)
+{
+	ParamCol	col;
+
+	memset(&col, 0, sizeof(col));
+	col.type = InvalidOid;
+	col.stream = true;
+	param_kind(&col, column, field);
+	*type = col.kind == PK_NULL ? TEXTOID : col.natural;
+	*typmod = -1;
+	if (col.kind == PK_DECIMAL && col.precision >= 1 &&
+		col.precision <= NUMERIC_MAX_PRECISION && col.scale >= 0 && col.scale <= col.precision)
+		*typmod = ((col.precision << 16) | col.scale) + VARHDRSZ;
+}
+
+/*
+ * A stream's columns read as the types given, as params_begin() reads
+ * parameters: its errors name each value a column of the client's stream.
+ */
+void *
+vexec_egress_stream_columns(const char *metadata, size_t len, int ncols,
+							const Oid *types, const int32 *typmods)
+{
+	ParamsState *st = vexec_egress_params_begin(metadata, len, ncols, types, typmods);
+	int			i;
+
+	for (i = 0; i < ncols; i++)
+		st->cols[i].stream = true;
+	return st;
+}
+
+/* A column's value at a row of a batch's column, as params_batch() reads it. */
+Datum
+vexec_egress_stream_value(void *state, int column, const struct ArrowArray *a,
+						  int64 row, bool *isnull)
+{
+	ParamsState *st = state;
+	ParamCol   *col = &st->cols[column];
+	Datum		v = param_value(col, column + 1, a, row, isnull);
+
+	if (col->cast != NULL)
+	{
+		st->econtext->caseValue_datum = v;
+		st->econtext->caseValue_isNull = *isnull;
+		v = ExecEvalExpr(col->cast, st->econtext, isnull);
+	}
+	return v;
+}
+
+/* Reset what the values of a row used. */
+void
+vexec_egress_stream_row_done(void *state)
+{
+	ParamsState *st = state;
+
+	ResetExprContext(st->econtext);
 }

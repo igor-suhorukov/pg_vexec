@@ -62,6 +62,16 @@ static const CustomScanMethods window_methods = {
 	.CreateCustomScanState = vexec_create_window_state,
 };
 
+static const CustomScanMethods insert_methods = {
+	.CustomName = VEXEC_INSERT_NAME,
+	.CreateCustomScanState = vexec_create_insert_state,
+};
+
+static const CustomScanMethods ingest_methods = {
+	.CustomName = VEXEC_INGEST_NAME,
+	.CreateCustomScanState = vexec_create_ingest_state,
+};
+
 void
 vexec_exec_install(void)
 {
@@ -73,6 +83,8 @@ vexec_exec_install(void)
 	RegisterCustomScanMethods(&bitmapscan_methods);
 	RegisterCustomScanMethods(&repart_methods);
 	RegisterCustomScanMethods(&window_methods);
+	RegisterCustomScanMethods(&insert_methods);
+	RegisterCustomScanMethods(&ingest_methods);
 }
 
 const CustomScanMethods *
@@ -123,6 +135,18 @@ vexec_window_methods(void)
 	return &window_methods;
 }
 
+const CustomScanMethods *
+vexec_insert_methods(void)
+{
+	return &insert_methods;
+}
+
+const CustomScanMethods *
+vexec_ingest_methods(void)
+{
+	return &ingest_methods;
+}
+
 /* Whether a plan node is one of vexec's vector nodes. */
 bool
 vexec_is_vector_node(Plan *plan)
@@ -135,7 +159,8 @@ vexec_is_vector_node(Plan *plan)
 	return cscan->methods == &scan_methods || cscan->methods == &result_methods ||
 		cscan->methods == &agg_methods || cscan->methods == &hashjoin_methods ||
 		cscan->methods == &sort_methods || cscan->methods == &bitmapscan_methods ||
-		cscan->methods == &repart_methods || cscan->methods == &window_methods;
+		cscan->methods == &repart_methods || cscan->methods == &window_methods ||
+		cscan->methods == &insert_methods || cscan->methods == &ingest_methods;
 }
 
 /* Whether a plan state is one of vexec's vector nodes'. */

@@ -16,6 +16,14 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'vexec_sources'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
 
+-- The batch sinks storage modules registered (vexec_sink.h), each with the
+-- table access method of this database it serves: VecInsert writes a
+-- table of one through its sink (§3.16).
+CREATE FUNCTION sinks(OUT sink text, OUT access_method text, OUT minor int4)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_sinks'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
 -- How a batch holds a type: its class, its layout in the PostgreSQL format
 -- and in the Arrow format, and every layout it can be held in.  The type is
 -- named as SQL names it, typmod and all: 'numeric(10,2)'.
@@ -51,3 +59,12 @@ CREATE FUNCTION declared_calls(OUT funcid oid, OUT function text, OUT extension 
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'vexec_declared_calls'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
+-- A client's stream of Arrow record batches, which vexec's egress API began
+-- in this session (§3.16): read once, by INSERT ... SELECT ... FROM
+-- vexec.ingest_stream(handle) AS s(...), its column definition list naming
+-- each column's type.  A session reads only its own streams.
+CREATE FUNCTION ingest_stream(handle bigint) RETURNS SETOF record
+	AS 'MODULE_PATHNAME', 'vexec_ingest_stream'
+	LANGUAGE C VOLATILE STRICT PARALLEL UNSAFE ROWS 1000000;
+GRANT USAGE ON SCHEMA @extschema@ TO PUBLIC;

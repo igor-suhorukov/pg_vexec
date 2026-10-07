@@ -102,6 +102,11 @@ typedef struct VexecPlanState
 	bool		orca_costed;	/* ORCA's search priced vexec's nodes
 								 * (CCostModelVec): translation builds them
 								 * where it priced them */
+	List	   *relation_oids;	/* ORCA's: relations its plan depends on
+								 * beyond its range table, a VecInsert's
+								 * partitions (plan/insert.c) */
+	bool		insert_inputs;	/* ORCA's: a VecInsert made a ModifyTable's
+								 * input, numbered once its plan is made */
 } VexecPlanState;
 
 /* The most alternatives one statement records. */
@@ -182,6 +187,23 @@ extern Plan *vexec_build_sort_from_sort(Sort *sort);
 extern Plan *vexec_unbuild_sort(CustomScan *cscan);
 extern Sort *vexec_sort_describe(CustomScan *cscan);
 extern void vexec_orca_limit_bound(Limit *limit);
+
+/* ingest.c */
+extern void vexec_consider_ingest(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
+								  VexecPlanState *ps);
+
+/* insert.c */
+extern void vexec_consider_insert(PlannerInfo *root, RelOptInfo *final_rel,
+								  VexecPlanState *ps);
+extern void vexec_insert_finish_plan(PlannedStmt *pstmt);
+extern bool vexec_on_coordinator(void);
+extern int	vexec_max_plan_node_id(PlannedStmt *pstmt);
+extern void vexec_number_insert_inputs(PlannedStmt *pstmt);
+extern Plan *vexec_build_insert_from_modifytable(ModifyTable *mt, List *rtable,
+												 const char **refusal,
+												 List **relation_oids);
+extern Plan *vexec_build_ingest_from_functionscan(FunctionScan *fs, List *rtable,
+												  const char **refusal);
 
 /* window.c */
 extern Plan *vexec_build_window(VexecPlanState *ps, WindowAgg *window, List *rtable);

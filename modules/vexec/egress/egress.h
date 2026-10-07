@@ -57,5 +57,31 @@ extern int64 vexec_egress_params_batch(void *state, const char *metadata, size_t
 									   const char *body, size_t body_len,
 									   VexecEgressRowFn row, void *arg);
 extern void vexec_egress_params_end(void *state);
+extern void vexec_egress_param_natural(const struct ArrowSchema *field, int column,
+									   Oid *type, int32 *typmod);
+extern void *vexec_egress_stream_columns(const char *metadata, size_t len, int ncols,
+										 const Oid *types, const int32 *typmods);
+extern Datum vexec_egress_stream_value(void *state, int column, const struct ArrowArray *a,
+									   int64 row, bool *isnull);
+extern void vexec_egress_stream_row_done(void *state);
+
+/* ingest.c: a client's stream as a source (§3.16) */
+typedef struct VexecIngestCursor VexecIngestCursor;
+
+extern void *vexec_egress_ingest_begin(const char *metadata, size_t len,
+									   VexecEgressReadFn read, void *arg);
+extern int	vexec_egress_ingest_columns(void *stream, const VexecIngestColumn **columns);
+extern int64 vexec_egress_ingest_handle(void *stream);
+extern int64 vexec_egress_ingest_rows(void *stream);
+extern bool vexec_egress_ingest_finished(void *stream);
+extern void vexec_egress_ingest_end(void *stream);
+extern void vexec_ingest_install(void);
+extern VexecIngestCursor *vexec_ingest_open(int64 handle, int ncols, const Oid *types,
+											const int32 *typmods);
+extern bool vexec_ingest_next_window(VexecIngestCursor *cursor, VexecBatch *batch,
+									 const VexecLayoutConfig *layout);
+extern bool vexec_ingest_next_row(VexecIngestCursor *cursor, Datum *values, bool *isnull);
+extern void vexec_ingest_close(VexecIngestCursor *cursor);
+extern bool vexec_ingest_zero_copy(VexecIngestCursor *cursor);
 
 #endif							/* VEXEC_EGRESS_EGRESS_H */

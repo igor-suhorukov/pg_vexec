@@ -118,7 +118,8 @@ vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost *cost, const
 	built_now = strcmp(alt->node, "VecScan") == 0 || strcmp(alt->node, "VecResult") == 0 ||
 		strcmp(alt->node, "VecAgg") == 0 || strcmp(alt->node, "VecHashJoin") == 0 ||
 		strcmp(alt->node, "VecSort") == 0 || strcmp(alt->node, "VecBitmapHeapScan") == 0 ||
-		strcmp(alt->node, "VecWindowHashAgg") == 0;
+		strcmp(alt->node, "VecWindowHashAgg") == 0 || strcmp(alt->node, "VecInsert") == 0 ||
+		strcmp(alt->node, "VecIngest") == 0;
 	if (ps->mode == VEXEC_MODE_EXPLAIN)
 	{
 		alt->status = "not chosen";

@@ -30,6 +30,10 @@
 #   run.sh sources               the batch sources on a single node of the
 #                                port: heap, ao_row, ao_column, PAX porc and
 #                                porc_vec, each query off and in force mode
+#   run.sh sinks                 the batch sinks on a single node of the port
+#                                (VI): each storage loaded by VecInsert,
+#                                against COPY's load and ModifyTable's, its
+#                                errors and aborts
 #   run.sh portsuites            the port's singlenode and greenplum suites,
 #                                each pass, with vexec.mode = force in both
 #                                formats, against off (VEXEC_PORT_SUITES,
@@ -223,6 +227,12 @@ case "$cmd" in
 		run="$(new_run sources)"
 		echo "== the batch sources on the port: $run"
 		in_leg port "$run" "/src/test/vexec/sources.sh" | tee "$run/output"
+		exit "${PIPESTATUS[0]}"
+		;;
+	sinks)
+		run="$(new_run sinks)"
+		echo "== the batch sinks on the port: $run"
+		in_leg port "$run" "/src/test/vexec/sinks.sh" | tee "$run/output"
 		exit "${PIPESTATUS[0]}"
 		;;
 	tpc)

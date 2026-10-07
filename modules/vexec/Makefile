@@ -22,6 +22,7 @@ OBJS = \
 	batch/numeric.o \
 	batch/rows.o \
 	batch/types.o \
+	egress/ingest.o \
 	egress/params.o \
 	egress/receiver.o \
 	egress/routine.o \
@@ -30,6 +31,8 @@ OBJS = \
 	exec/methods.o \
 	exec/node.o \
 	exec/vecagg.o \
+	exec/vecingest.o \
+	exec/vecinsert.o \
 	exec/vechashjoin.o \
 	exec/vecrepart.o \
 	exec/vecresult.o \
@@ -53,6 +56,8 @@ OBJS = \
 	plan/check.o \
 	plan/cost.o \
 	plan/explain.o \
+	plan/ingest.o \
+	plan/insert.o \
 	plan/join.o \
 	plan/oracle.o \
 	plan/orca.o \
@@ -71,9 +76,10 @@ DATA = vexec--1.0.sql
 # kernel packs' registry, for packs built elsewhere, and the egress API, for
 # an extension that serves Arrow to clients (V10): installed into the
 # server's include directory, under extension/vexec/.
-HEADERS = ../../include/vexec_source.h ../../include/vexec_kernels.h ../../include/vexec_egress.h
+HEADERS = ../../include/vexec_source.h ../../include/vexec_kernels.h ../../include/vexec_egress.h \
+	../../include/vexec_sink.h
 
-REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs
+REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_ingest vexec_insert vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs
 
 PG_CPPFLAGS = -I$(srcdir) -I$(srcdir)/pgxs/include -I$(srcdir)/../../include
 

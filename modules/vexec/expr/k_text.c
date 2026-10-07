@@ -3,7 +3,8 @@
  *
  * k_text.c
  *	  Kernels over text, varchar and bpchar (pg_vector_executor.md §3.7,
- *	  H7 of §3.14): comparisons, LIKE, and length.
+ *	  H7 of §3.14): comparisons, LIKE, and length; and, for an INSERT's
+ *	  values (§3.16), the length coercions of char(n) and varchar(n).
  *
  * Collations.  A kernel is bound only under a deterministic collation; a
  * nondeterministic one keeps PostgreSQL's function (§3.7, "Collations").
@@ -29,7 +30,9 @@
  *
  * Values are read through their layout: a Datum's bytes after its header,
  * a view's, or an offset's (§3.4.3).  A compressed or external Datum is
- * detoasted into the work batch first.  None of these kernels can raise.
+ * detoasted into the work batch first.  None of these kernels can raise:
+ * a row PostgreSQL's function would raise on fails, and the function
+ * raises it (§3.7).
  *
  *-------------------------------------------------------------------------
  */
@@ -551,6 +554,200 @@ len_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
 static const VexecKernelDef len_def = {"length", true, len_bind, len_variant};
 static const VexecKernelDef octet_len_def = {"octet_length", false, len_bind, len_variant};
 
+/* ---- the length coercions ---- */
+
+/*
+ * bpchar(bpchar, int4, bool) and varchar(varchar, int4, bool): a value
+ * coerced to its typmod's length, as varchar.c's bpchar() and varchar()
+ * coerce it -- the casts an INSERT gives a value for a char(n) or
+ * varchar(n) column, after text's binary coercion.  The typmod and whether
+ * the cast is explicit are constants.
+ *
+ *	bpchar	a value of n characters is kept; a shorter one is padded with
+ *			blanks to n; a longer one is cut at n characters, as
+ *			pg_mbcharcliplen() cuts it, where what is cut is all blanks or
+ *			the cast is explicit
+ *	varchar	a value of n bytes or fewer is kept, as varchar() keeps it
+ *			before counting characters; a longer one is cut as bpchar's
+ *			is, without padding
+ *
+ * A value too long whose cut bytes are not all blanks fails, for the
+ * function to raise "value too long".  Characters are counted as
+ * pg_mbstrlen_with_len() counts them in UTF8 (utf8_chars()), a character
+ * running past the value's end failing the row; in a single-byte encoding
+ * they are its bytes.  Another multibyte encoding binds no kernel.  The
+ * result is OFFSETS, its bytes in the work batch.
+ */
+typedef struct CoerceInfo
+{
+	bool		bpchar;
+} CoerceInfo;
+
+typedef struct CoerceCall
+{
+	bool		bpchar;
+	int32		maxlen;			/* characters; -1: the typmod is none */
+	bool		isexplicit;
+} CoerceCall;
+
+static bool
+coerce_bind(VexecExpr *call, const void *info)
+{
+	List	   *args;
+	Const	   *typmod;
+	Const	   *isexplicit;
+	CoerceCall *cc;
+
+	if (call->kind != VE_CALL || !IsA(call->expr, FuncExpr))
+		return false;
+	args = ((FuncExpr *) call->expr)->args;
+	if (list_length(args) != 3 || !IsA(lsecond(args), Const) || !IsA(lthird(args), Const))
+		return false;
+	typmod = lsecond_node(Const, args);
+	isexplicit = lthird_node(Const, args);
+	if (typmod->constisnull || isexplicit->constisnull)
+		return false;
+	if (GetDatabaseEncoding() != PG_UTF8 && pg_database_encoding_max_length() != 1)
+		return false;
+	cc = palloc0(sizeof(CoerceCall));
+	cc->bpchar = ((const CoerceInfo *) info)->bpchar;
+	cc->maxlen = DatumGetInt32(typmod->constvalue) < (int32) VARHDRSZ ? -1 :
+		DatumGetInt32(typmod->constvalue) - (int32) VARHDRSZ;
+	cc->isexplicit = DatumGetBool(isexplicit->constvalue);
+	call->extra = cc;
+	return true;
+}
+
+/*
+ * The bytes of a value's first n characters, as pg_mbcharcliplen() cuts it:
+ * a NUL where a character begins ends the value.  The value's characters
+ * were counted already, none running past its end.
+ */
+static int
+clip_chars(const char *a, int alen, int n, bool bytes)
+{
+	int			j = 0;
+	int			nch = 0;
+
+	if (bytes)
+	{
+		alen = Min(alen, n);
+		while (j < alen && a[j] != '\0')
+			j++;
+		return j;
+	}
+	while (j < alen && a[j] != '\0')
+	{
+		int			l = utf8_char_len((unsigned char) a[j]);
+
+		if (++nch > n)
+			break;
+		j += l;
+	}
+	return j;
+}
+
+static void
+coerce_kernel(VexecKernelCall *kc)
+{
+	const CoerceCall *cc = kc->call->extra;
+	const VexecVec *s = kc->args[0];
+	VexecVec   *out = kc->result;
+	bool		bytes = pg_database_encoding_max_length() == 1;
+	int32	   *offsets = (int32 *) out->values;
+	int64		size = 64;
+	int64		used = 0;
+	char	   *data;
+
+	/* the input's bytes, and a row's padding, as the buffer's first size */
+	for (int i = 0; i < kc->nrows; i++)
+	{
+		const char *a;
+		int			alen;
+
+		if (!vexec_bit(kc->active, i))
+			continue;
+		bytes_at(s, i, &a, &alen);
+		size += alen + (cc->bpchar && cc->maxlen > 0 ? cc->maxlen : 0);
+	}
+	data = vexec_batch_alloc(kc->work, size);
+	out->nbuffers = 1;
+	out->buffers = vexec_batch_alloc0(kc->work, sizeof(char *));
+	out->buffer_sizes = vexec_batch_alloc0(kc->work, sizeof(int64));
+
+	offsets[0] = 0;
+	for (int i = 0; i < kc->nrows; i++)
+	{
+		const char *a;
+		int			alen;
+		int			keep;
+		int			pad = 0;
+
+		offsets[i + 1] = (int32) used;
+		if (!vexec_bit(kc->active, i))
+			continue;
+		bytes_at(s, i, &a, &alen);
+		keep = alen;
+		if (cc->maxlen >= 0 && !(!cc->bpchar && alen <= cc->maxlen))
+		{
+			int32		chars = bytes ? alen : utf8_chars(a, alen);
+
+			if (chars < 0)
+			{
+				vexec_fail(kc, i);
+				continue;
+			}
+			if (chars > cc->maxlen)
+			{
+				keep = clip_chars(a, alen, cc->maxlen, bytes);
+				if (!cc->isexplicit)
+				{
+					int			j;
+
+					for (j = keep; j < alen && a[j] == ' '; j++)
+						;
+					if (j < alen)
+					{
+						vexec_fail(kc, i);
+						continue;
+					}
+				}
+			}
+			else if (cc->bpchar)
+				pad = cc->maxlen - chars;
+		}
+		if (used + keep + pad > size)
+		{
+			/* a cut kept fewer bytes, a pad no more than counted: never */
+			elog(ERROR, "vexec: a length coercion's result outgrew its buffer");
+		}
+		if (used + keep + pad > PG_INT32_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("a batch's offsets column cannot hold more than %d bytes",
+							PG_INT32_MAX)));
+		memcpy(data + used, a, keep);
+		memset(data + used + keep, ' ', pad);
+		used += keep + pad;
+		offsets[i + 1] = (int32) used;
+	}
+	out->buffers[0] = data;
+	out->buffer_sizes[0] = size;
+}
+
+static bool
+coerce_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
+{
+	args[0] = plain(kc, args[0]);
+	memset(&v->result, 0, sizeof(VexecShape));
+	v->result.layout = VEXEC_OFFSETS;
+	v->fn = coerce_kernel;
+	return true;
+}
+
+static const VexecKernelDef bpchar_coerce_def = {"bpchar", true, coerce_bind, coerce_variant};
+static const VexecKernelDef varchar_coerce_def = {"varchar", true, coerce_bind, coerce_variant};
+
 /* ---- the table ---- */
 
 static const struct
@@ -571,6 +768,8 @@ static const LikeInfo like_pos = {false};
 static const LikeInfo like_neg = {true};
 static const LenInfo len_chars = {false};
 static const LenInfo len_octets = {true};
+static const CoerceInfo coerce_bpchar = {true};
+static const CoerceInfo coerce_varchar = {false};
 
 void
 vexec_kernels_text(void (*add) (Oid, const VexecKernelDef *, const void *))
@@ -589,4 +788,6 @@ vexec_kernels_text(void (*add) (Oid, const VexecKernelDef *, const void *))
 	add(F_CHAR_LENGTH_TEXT, &len_def, &len_chars);
 	add(F_CHARACTER_LENGTH_TEXT, &len_def, &len_chars);
 	add(F_OCTET_LENGTH_TEXT, &octet_len_def, &len_octets);
+	add(F_BPCHAR_BPCHAR_INT4_BOOL, &bpchar_coerce_def, &coerce_bpchar);
+	add(F_VARCHAR_VARCHAR_INT4_BOOL, &varchar_coerce_def, &coerce_varchar);
 }

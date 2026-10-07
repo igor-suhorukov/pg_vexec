@@ -8,10 +8,12 @@
  *
  *	planner_setup_hook		the statement's gates, into the planner's
  *							global extension state
- *	set_rel_pathlist_hook	VecScan, for a table's sequential scan
+ *	set_rel_pathlist_hook	VecScan, for a table's sequential scan; VecIngest,
+ *							for vexec.ingest_stream()'s function scan
+ *							(ingest.c)
  *	set_join_pathlist_hook	VecHashJoin, for a hash-joinable join (join.c)
  *	create_upper_paths_hook	VecAgg (GROUP_AGG, agg.c), VecSort (ORDERED,
- *							sort.c)
+ *							sort.c), VecInsert (FINAL, insert.c)
  *	planner_shutdown_hook	the plan check, and the reasons into the plan
  *
  * With vexec.mode = off, every hook calls the one it took the place of and
@@ -217,6 +219,8 @@ vexec_planner_shutdown(PlannerGlobal *glob, Query *parse, const char *query_stri
 	 */
 	if (ps != NULL && (ps->joins_built || ps->sorts_built))
 		vexec_join_finish_plan(pstmt);
+	if (ps != NULL)
+		vexec_insert_finish_plan(pstmt);
 
 	if (vexec_debug_check_plans || vexec_debug_require_vector)
 		nodes = vexec_check_plan(pstmt, ps ? ps->mode : VEXEC_MODE_OFF);
@@ -484,7 +488,9 @@ vexec_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEn
 {
 	VexecPlanState *ps = vexec_plan_state(root);
 
-	if (ps != NULL)
+	if (ps != NULL && rte->rtekind == RTE_FUNCTION)
+		vexec_consider_ingest(root, rel, rte, ps);
+	else if (ps != NULL)
 		consider_scan(root, rel, rti, rte, ps);
 
 	if (prev_set_rel_pathlist)
@@ -522,6 +528,8 @@ vexec_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 						   upper_target(root, root->processed_groupClause ? "GROUP BY" : "aggregates"));
 	else if (ps != NULL && stage == UPPERREL_ORDERED)
 		vexec_consider_sort(root, input_rel, output_rel, ps, upper_target(root, "ORDER BY"));
+	else if (ps != NULL && stage == UPPERREL_FINAL)
+		vexec_consider_insert(root, output_rel, ps);
 
 	if (prev_create_upper_paths)
 		prev_create_upper_paths(root, stage, input_rel, output_rel, extra);

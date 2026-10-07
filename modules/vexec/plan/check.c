@@ -31,8 +31,18 @@
 typedef struct CheckContext
 {
 	Bitmapset  *ids;
+	List	   *nodes;			/* the nodes seen, to name an id's two */
 	int			vector_nodes;
 } CheckContext;
+
+/* A plan node's name in the check's errors: its tag, or its custom name. */
+static const char *
+node_name(Plan *plan)
+{
+	if (IsA(plan, CustomScan))
+		return ((CustomScan *) plan)->methods->CustomName;
+	return psprintf("node %d", (int) nodeTag(plan));
+}
 
 /*
  * Whether a CustomScan is one of vexec's vector nodes, and that it is in
@@ -43,7 +53,10 @@ typedef struct CheckContext
  * VecHashJoin its sides in lefttree and righttree, its scan tuple their
  * columns, and its keys its operators'; a VecSort its child in lefttree,
  * its scan tuple the child's row, and its keys the child's columns; a
- * VecWindowHashAgg too, with no qual.
+ * VecWindowHashAgg too, with no qual; a VecInsert its child in lefttree, its
+ * scan tuple the child's row, and its target in custom_private; a VecIngest
+ * no relation and no child, its scan tuple the stream's columns, and the
+ * stream's handle in custom_exprs.
  */
 static bool
 is_vector_node(CustomScan *cscan)
@@ -149,6 +162,22 @@ is_vector_node(CustomScan *cscan)
 		if (list_length(cscan->custom_scan_tlist) != list_length(child->targetlist))
 			elog(ERROR, "vexec plan check: a VecRepartition whose scan tuple is not its child's row");
 	}
+	else if (cscan->methods == vexec_insert_methods())
+	{
+		Plan	   *child = cscan->scan.plan.lefttree;
+
+		if (cscan->scan.scanrelid != 0 || child == NULL || cscan->custom_plans != NIL ||
+			cscan->scan.plan.qual != NIL || list_length(cscan->custom_private) != 2 ||
+			list_length(cscan->custom_scan_tlist) != list_length(child->targetlist))
+			elog(ERROR, "vexec plan check: a VecInsert not in its canonical form");
+	}
+	else if (cscan->methods == vexec_ingest_methods())
+	{
+		if (cscan->scan.scanrelid != 0 || cscan->scan.plan.lefttree != NULL ||
+			cscan->custom_plans != NIL || cscan->custom_scan_tlist == NIL ||
+			list_length(cscan->custom_exprs) != 1)
+			elog(ERROR, "vexec plan check: a VecIngest not in its canonical form");
+	}
 	else if (cscan->scan.scanrelid != 0 || cscan->scan.plan.lefttree == NULL)
 		elog(ERROR, "vexec plan check: a VecResult not in its canonical form");
 	return true;
@@ -164,8 +193,18 @@ check_plan_node(Plan *plan, CheckContext *ctx)
 	check_stack_depth();
 
 	if (bms_is_member(plan->plan_node_id, ctx->ids))
-		elog(ERROR, "vexec plan check: plan node id %d is used twice", plan->plan_node_id);
+	{
+		ListCell   *ln;
+		Plan	   *other = NULL;
+
+		foreach(ln, ctx->nodes)
+			if (((Plan *) lfirst(ln))->plan_node_id == plan->plan_node_id)
+				other = lfirst(ln);
+		elog(ERROR, "vexec plan check: plan node id %d is used twice, by a %s and a %s",
+			 plan->plan_node_id, other ? node_name(other) : "?", node_name(plan));
+	}
 	ctx->ids = bms_add_member(ctx->ids, plan->plan_node_id);
+	ctx->nodes = lappend(ctx->nodes, plan);
 
 	switch (nodeTag(plan))
 	{
@@ -205,10 +244,118 @@ check_plan_node(Plan *plan, CheckContext *ctx)
 	check_plan_node(plan->righttree, ctx);
 }
 
+/* The largest plan_node_id below plan, the walk check_plan_node() makes. */
+static int
+max_plan_node_id(Plan *plan)
+{
+	ListCell   *lc;
+	List	   *children = NIL;
+	int			max;
+
+	if (plan == NULL)
+		return -1;
+	check_stack_depth();
+	max = plan->plan_node_id;
+	switch (nodeTag(plan))
+	{
+		case T_CustomScan:
+			children = ((CustomScan *) plan)->custom_plans;
+			break;
+		case T_Append:
+			children = ((Append *) plan)->appendplans;
+			break;
+		case T_MergeAppend:
+			children = ((MergeAppend *) plan)->mergeplans;
+			break;
+		case T_BitmapAnd:
+			children = ((BitmapAnd *) plan)->bitmapplans;
+			break;
+		case T_BitmapOr:
+			children = ((BitmapOr *) plan)->bitmapplans;
+			break;
+		case T_SubqueryScan:
+			max = Max(max, max_plan_node_id(((SubqueryScan *) plan)->subplan));
+			break;
+		default:
+			break;
+	}
+	foreach(lc, children)
+		max = Max(max, max_plan_node_id(lfirst(lc)));
+	max = Max(max, max_plan_node_id(plan->lefttree));
+	return Max(max, max_plan_node_id(plan->righttree));
+}
+
+/* The largest plan_node_id of a statement's plan, its subplans' included. */
+int
+vexec_max_plan_node_id(PlannedStmt *pstmt)
+{
+	int			max = max_plan_node_id(pstmt->planTree);
+	ListCell   *lc;
+
+	foreach(lc, pstmt->subplans)
+		max = Max(max, max_plan_node_id(lfirst(lc)));
+	return max;
+}
+
+/*
+ * Each VecInsert that is a ModifyTable's input and has its id -- the copy
+ * of the ModifyTable's plan it was made from, on a cluster's coordinator
+ * (plan/insert.c) -- given an id past *next, found wherever the finished
+ * plan has it: the port's dispatcher may copy a writing fragment after
+ * its nodes were built.
+ */
+static void
+number_insert_inputs(Plan *plan, int *next)
+{
+	ListCell   *lc;
+	List	   *children = NIL;
+
+	if (plan == NULL)
+		return;
+	check_stack_depth();
+	if (IsA(plan, ModifyTable) && plan->lefttree != NULL &&
+		IsA(plan->lefttree, CustomScan) &&
+		((CustomScan *) plan->lefttree)->methods == vexec_insert_methods() &&
+		plan->lefttree->plan_node_id == plan->plan_node_id)
+		plan->lefttree->plan_node_id = ++(*next);
+	switch (nodeTag(plan))
+	{
+		case T_CustomScan:
+			children = ((CustomScan *) plan)->custom_plans;
+			break;
+		case T_Append:
+			children = ((Append *) plan)->appendplans;
+			break;
+		case T_MergeAppend:
+			children = ((MergeAppend *) plan)->mergeplans;
+			break;
+		case T_SubqueryScan:
+			number_insert_inputs(((SubqueryScan *) plan)->subplan, next);
+			break;
+		default:
+			break;
+	}
+	foreach(lc, children)
+		number_insert_inputs(lfirst(lc), next);
+	number_insert_inputs(plan->lefttree, next);
+	number_insert_inputs(plan->righttree, next);
+}
+
+void
+vexec_number_insert_inputs(PlannedStmt *pstmt)
+{
+	int			next = vexec_max_plan_node_id(pstmt);
+	ListCell   *lc;
+
+	number_insert_inputs(pstmt->planTree, &next);
+	foreach(lc, pstmt->subplans)
+		number_insert_inputs(lfirst(lc), &next);
+}
+
 int
 vexec_check_plan(PlannedStmt *pstmt, int mode)
 {
-	CheckContext ctx = {NULL, 0};
+	CheckContext ctx = {NULL, NIL, 0};
 	ListCell   *lc;
 
 	check_plan_node(pstmt->planTree, &ctx);

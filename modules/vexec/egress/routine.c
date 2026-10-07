@@ -126,6 +126,12 @@ static const VexecEgressRoutine egress_routine = {
 	.params_begin = vexec_egress_params_begin,
 	.params_batch = vexec_egress_params_batch,
 	.params_end = vexec_egress_params_end,
+	.ingest_begin = vexec_egress_ingest_begin,
+	.ingest_columns = vexec_egress_ingest_columns,
+	.ingest_handle = vexec_egress_ingest_handle,
+	.ingest_rows = vexec_egress_ingest_rows,
+	.ingest_finished = vexec_egress_ingest_finished,
+	.ingest_end = vexec_egress_ingest_end,
 };
 
 /*

@@ -9,7 +9,8 @@
 #     cb_module.h, cb_explain.h (V0, V1), and gp_orca_vec.h, gp_orca's API,
 #     which V1 adds to the port;
 #   - vexec's own batch-source contract, include/vexec_source.h, whose copy
-#     the port's storage modules compile against in pg19/include (V1).
+#     the port's storage modules compile against in pg19/include (V1), and
+#     its batch-sink contract, include/vexec_sink.h, the same way (VI).
 #
 # A change to one fails here until its copy is refreshed in the same commit.
 # On the host.  The port's checkout to compare with is V1's worktree,
@@ -41,12 +42,13 @@ for copy in "$COPIES"/*.h; do
 		fail=1
 	fi
 done
-if [ -f "$CB_SRC/pg19/include/vexec_source.h" ]; then
-	if cmp -s "$ROOT/include/vexec_source.h" "$CB_SRC/pg19/include/vexec_source.h"; then
-		echo "  ok vexec_source.h, the port's copy"
+for contract in vexec_source.h vexec_sink.h; do
+	[ -f "$CB_SRC/pg19/include/$contract" ] || continue
+	if cmp -s "$ROOT/include/$contract" "$CB_SRC/pg19/include/$contract"; then
+		echo "  ok $contract, the port's copy"
 	else
-		echo "  DIFFERS vexec_source.h: refresh the port's pg19/include copy from include/vexec_source.h"
+		echo "  DIFFERS $contract: refresh the port's pg19/include copy from include/$contract"
 		fail=1
 	fi
-fi
+done
 exit $fail
