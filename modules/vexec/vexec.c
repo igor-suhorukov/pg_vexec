@@ -26,6 +26,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/guc.h"
+#include "utils/plancache.h"
 
 #include "vexec.h"
 #include "egress/egress.h"
@@ -58,6 +59,7 @@ bool		vexec_enable_sort = true;
 bool		vexec_enable_running_bound = true;
 bool		vexec_enable_window = true;
 bool		vexec_enable_insert = true;
+bool		vexec_enable_motion_frames = true;
 bool		vexec_orca = true;
 bool		vexec_orca_cost_model = true;
 char	   *vexec_orca_settings = NULL;
@@ -137,6 +139,21 @@ static const struct config_enum_entry gpu_options[] = {
 };
 
 static void define_settings(void);
+
+/*
+ * vexec.enable_motion_frames, as it changes: frames change a plan's shape
+ * (§3.10, "Switching frames and transports"), so the session's cached
+ * plans are planned again at their next execution, with the new value --
+ * as DISCARD PLANS has them (PG19:src/backend/commands/discard.c:41, 76).
+ * ResetPlanCache() marks them invalid, and raises nothing.
+ */
+static void
+assign_enable_motion_frames(bool newval, void *extra)
+{
+	(void) extra;
+	if (newval != vexec_enable_motion_frames)
+		ResetPlanCache();
+}
 
 const char *
 vexec_mode_name(int mode)
@@ -285,6 +302,14 @@ define_settings(void)
 							 "Enables vector inserts.",
 							 NULL, &vexec_enable_insert, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_motion_frames",
+							 "Sends batches across ORCA's Motions as Arrow IPC frames.",
+							 "Where a Motion's fragment's top is a vector node, it sends its batches "
+							 "as frames, and a vector node above the Motion takes them; off, rows, one "
+							 "a row.  Read when a statement is planned: a change of its value has the "
+							 "session's cached plans planned again.",
+							 &vexec_enable_motion_frames, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, assign_enable_motion_frames, NULL);
 	DefineCustomBoolVariable("vexec.orca",
 							 "Uses ORCA's front end where gp_orca's API is present.",
 							 NULL, &vexec_orca, true,

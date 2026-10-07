@@ -47,6 +47,8 @@ x-run: &run
     - ..:/src:ro
     - ${VEXEC_WORK:-/nonexistent}:/work
     - ${VEXEC_PORT_STAGE:-/nonexistent}:/cbstage:ro
+    # the port's worktree, whose own tests a leg may run (shm.sh: pg19/test/ic)
+    - ${VEXEC_PORT_SRC:-/nonexistent}:/cbsrc:ro
   environment:
     VEXEC_SRC: /src
     VEXEC_WORK: /work
@@ -67,6 +69,8 @@ x-run: &run
     VEXEC_PORT_SUITES: ${VEXEC_PORT_SUITES:-}
     VEXEC_PORT_PASSES: ${VEXEC_PORT_PASSES:-}
     VEXEC_PORT_SESSIONS: ${VEXEC_PORT_SESSIONS:-}
+    VEXEC_INTERCONNECT: ${VEXEC_INTERCONNECT:-}
+    VEXEC_SHM_PARTS: ${VEXEC_SHM_PARTS:-}
     MAKE_JOBS: ${MAKE_JOBS:-4}
 
 services:

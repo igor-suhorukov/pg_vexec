@@ -19,7 +19,10 @@
  *			Hash a VecHashJoin (join.c), and a Sort a VecSort (sort.c),
  *			where the oracle accepts them and the mode chooses them; a Limit
  *			of constants over a VecSort bounds it, and a merge join keeps
- *			its inner side's Sort, which it marks and restores;
+ *			its inner side's Sort, which it marks and restores; and from V7
+ *			a Motion over a vector node carries its batches as frames,
+ *			VecMotionSend below it and VecMotionRecv above it, the Motion
+ *			rebuilt where it stands (motion.c);
  *	end		the plan check, the reasons for EXPLAIN (VEXEC), and
  *			vexec.debug_require_vector.
  *
@@ -82,6 +85,7 @@
 #include "vexec.h"
 #include "exec/aggtrans.h"
 #include "exec/exec.h"
+#include "motion/motion.h"
 #include "plan/plan.h"
 #include "source/source.h"
 
@@ -137,6 +141,7 @@ orca_begin(Query *parse, int cursorOptions, struct ExplainState *es)
 	ps->record = vexec_mode == VEXEC_MODE_EXPLAIN || vexec_explain_requested(es);
 	ps->layout = vexec_layout_config();
 	ps->parse = parse;
+	ps->cursor_options = cursorOptions;
 	return ps;
 }
 
@@ -696,6 +701,11 @@ orca_build(void *state, Plan *plan, List *rtable)
 		case T_MergeJoin:
 			orca_mergejoin((MergeJoin *) plan);
 			return NULL;
+		case T_CustomScan:
+			/* a Motion over a vector node: its frames (motion.c, V7) */
+			if (vexec_is_gp_motion(plan))
+				return vexec_orca_motion(ps, (CustomScan *) plan, ps->cursor_options);
+			return NULL;
 		default:
 			return NULL;
 	}
@@ -730,6 +740,18 @@ orca_describe(Plan *plan, GpOrcaVecNode *vn)
 		vn->kind = GP_ORCA_VEC_OTHER;	/* a scan of its bitmap's pages */
 	else if (cscan->methods == vexec_result_methods())
 		vn->kind = GP_ORCA_VEC_RESULT;
+	else if (cscan->methods == vexec_motion_send_methods())
+	{
+		/*
+		 * the top of a Motion's fragment, which passes its child's rows on
+		 * in frames, and computes a Redistribute's keys; M8's Gather may go
+		 * above it, each participant sending its share's frames
+		 */
+		vn->kind = GP_ORCA_VEC_RESULT;
+		vn->exprs = cscan->custom_exprs;
+	}
+	else if (cscan->methods == vexec_motion_recv_methods())
+		vn->kind = GP_ORCA_VEC_RESULT;	/* what the Motion's rows were */
 	else if (cscan->methods == vexec_hashjoin_methods())
 	{
 		VexecJoinPlan jp;
@@ -1094,6 +1116,10 @@ orca_end(void *state, PlannedStmt *stmt)
 	 */
 	if (ps->insert_inputs)
 		vexec_number_insert_inputs(stmt);
+
+	/* the nodes made around Motions, numbered past the plan's own */
+	vexec_orca_motion_number(ps, stmt);
+
 	if (vexec_debug_check_plans || vexec_debug_require_vector)
 		nodes = vexec_check_plan(stmt, ps->mode);
 	if (ps->record)

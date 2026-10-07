@@ -30,6 +30,7 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.enable_bitmapscan     | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_hashjoin       | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_insert         | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_motion_frames  | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_repartition    | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_running_bound  | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_scan           | on                        |      | user       | bool    |         |              |                             | t
@@ -49,7 +50,7 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.orca                  | on                        |      | user       | bool    |         |              |                             | t
  vexec.orca_cost_model       | on                        |      | user       | bool    |         |              |                             | t
  vexec.orca_settings         |                           |      | user       | string  |         |              |                             | t
-(38 rows)
+(39 rows)
 
 -- the modes
 SET vexec.mode = explain;

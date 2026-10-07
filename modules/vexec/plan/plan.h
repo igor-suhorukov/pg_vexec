@@ -107,6 +107,9 @@ typedef struct VexecPlanState
 								 * partitions (plan/insert.c) */
 	bool		insert_inputs;	/* ORCA's: a VecInsert made a ModifyTable's
 								 * input, numbered once its plan is made */
+	int			cursor_options; /* ORCA's: the statement's */
+	int			motions_framed; /* ORCA's Motions given frames (motion.c),
+								 * whose nodes are numbered at its end */
 } VexecPlanState;
 
 /* The most alternatives one statement records. */

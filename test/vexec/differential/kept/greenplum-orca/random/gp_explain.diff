@@ -1,0 +1,9 @@
+--- reference
++++ session
+@@ -135,5 +135,5 @@
+  vmem_reserved_lines | executor_memory_lines 
+ ---------------------+-----------------------
+-                   2 |                     2
++                   2 |                     3
+ (1 row)
+ 

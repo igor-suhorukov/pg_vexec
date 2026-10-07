@@ -65,9 +65,12 @@
  * Where PostgreSQL leaves a side unread and the side receives a Motion,
  * gp_core's executor would squelch it (pg19/modules/gp_core/gp_motion.c:
  * 1869-1896, 2062-2079), or its senders wait.  A VecHashJoin is no node
- * gp_core squelches, so it reads such a side's Motions to their end, and
- * EXPLAIN ANALYZE counts them, until gp_core gives vexec a squelch call
- * (§3.10, V7).
+ * gp_core's wrappers squelch: a vector parent takes its batches without
+ * ExecProcNode.  From V7 it asks gp_core to squelch its subtree
+ * (GpCoreApi.squelch_subtree, §3.10), which gp_core does in a fragment
+ * whose slices stream, where the join is never run again; elsewhere -- on
+ * the coordinator, below a nested loop's inner side -- it reads such a
+ * side's Motions to their end, and EXPLAIN ANALYZE counts them.
  *
  *-------------------------------------------------------------------------
  */
@@ -104,6 +107,7 @@
 #include "batch/batch.h"
 #include "exec/exec.h"
 #include "expr/expr.h"
+#include "motion/motion.h"
 
 /* the grace join's partitions: five bits of the hash a level */
 #define HJ_PARTITION_BITS	5
@@ -346,8 +350,10 @@ typedef struct HjState
 	/* figures */
 	int64		inner_rows;		/* put in the table */
 	int64		join_filtered;	/* pairs the first level turned down */
-	int64		drained_motions;
-	int64		drained_rows;
+	bool		squelched;		/* gp_core stopped its sides' Motions; the
+								 * counts are the node's stats, which the
+								 * coordinator's EXPLAIN prints from the
+								 * segments' */
 	int64		outer_rows_one; /* outer rows read a row at a time */
 	int64		rounds;
 } HjState;
@@ -1957,10 +1963,10 @@ drain(HjState *s, PlanState *ps)
 
 			if (TupIsNull(slot))
 				break;
-			s->drained_rows++;
+			s->node.stats.drained_rows++;
 			CHECK_FOR_INTERRUPTS();
 		}
-		s->drained_motions++;
+		s->node.stats.drained_motions++;
 		return;
 	}
 	drain(s, outerPlanState(ps));
@@ -1987,11 +1993,25 @@ drain(HjState *s, PlanState *ps)
 	}
 }
 
+/*
+ * A side the join reads no more: its Motions' senders stopped, where
+ * gp_core squelches the join's subtree -- a fragment whose slices stream,
+ * the join never run again (GpCoreApi.squelch_subtree, V7) -- else the
+ * side's Motions read to their end.  The join reads neither side again
+ * once it stops reading one: it gives no row.
+ */
 static void
 drain_side(HjState *s, HjSide *side)
 {
 	side->touched = true;
-	drain(s, side->ps);
+	if (!s->squelched && vexec_gp_core_squelch(&s->node.css.ss.ps))
+	{
+		s->squelched = true;
+		s->node.stats.squelched++;
+		return;
+	}
+	if (!s->squelched)
+		drain(s, side->ps);
 }
 
 /* ---------------------------------------------------------------------
@@ -3441,6 +3461,22 @@ hj_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		ExplainPropertyText("Outer Input", side_input(&s->side[0]), es);
 		ExplainPropertyText("Inner Input", side_input(&s->side[1]), es);
 	}
+	/*
+	 * the sides it left unread: its own, or where the segments ran it, theirs
+	 * (motion/gpcore.c)
+	 */
+	if (es->analyze && (s->node.ran || s->node.segments_seen > 0))
+	{
+		const VexecNodeStats *st = s->node.ran ? &s->node.stats : &s->node.segment_stats;
+
+		if (st->drained_motions > 0)
+		{
+			ExplainPropertyInteger("Drained Motions", NULL, st->drained_motions, es);
+			ExplainPropertyInteger("Drained Rows", NULL, st->drained_rows, es);
+		}
+		if (st->squelched > 0)
+			ExplainPropertyInteger("Squelched", NULL, st->squelched, es);
+	}
 	if (es->analyze && s->node.ran)
 	{
 		if (s->nl1 > 0)
@@ -3452,11 +3488,6 @@ hj_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 			ExplainPropertyInteger("Spilled Partitions", NULL, s->spilled_parts, es);
 			ExplainPropertyInteger("Spilled Rows", NULL, s->spilled_rows, es);
 			ExplainPropertyInteger("Spill Depth", NULL, s->max_depth, es);
-		}
-		if (s->drained_motions > 0)
-		{
-			ExplainPropertyInteger("Drained Motions", NULL, s->drained_motions, es);
-			ExplainPropertyInteger("Drained Rows", NULL, s->drained_rows, es);
 		}
 		if (es->verbose)
 		{

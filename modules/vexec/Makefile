@@ -34,6 +34,7 @@ OBJS = \
 	exec/vecingest.o \
 	exec/vecinsert.o \
 	exec/vechashjoin.o \
+	exec/vecmotion.o \
 	exec/vecrepart.o \
 	exec/vecresult.o \
 	exec/vecscan.o \
@@ -51,6 +52,9 @@ OBJS = \
 	ipc/flatbuf.o \
 	ipc/read.o \
 	ipc/write.o \
+	motion/cdbhash.o \
+	motion/frame.o \
+	motion/gpcore.o \
 	plan/agg.o \
 	plan/build.o \
 	plan/check.o \
@@ -59,6 +63,7 @@ OBJS = \
 	plan/ingest.o \
 	plan/insert.o \
 	plan/join.o \
+	plan/motion.o \
 	plan/oracle.o \
 	plan/orca.o \
 	plan/paths.o \
@@ -79,7 +84,7 @@ DATA = vexec--1.0.sql
 HEADERS = ../../include/vexec_source.h ../../include/vexec_kernels.h ../../include/vexec_egress.h \
 	../../include/vexec_sink.h
 
-REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_ingest vexec_insert vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs
+REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_ingest vexec_insert vexec_frames vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs
 
 PG_CPPFLAGS = -I$(srcdir) -I$(srcdir)/pgxs/include -I$(srcdir)/../../include
 
