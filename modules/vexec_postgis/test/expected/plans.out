@@ -1,0 +1,135 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- What the pack changes of vexec's plans (pg_vector_executor.md §3.17, VK's
+-- "done when"), with vexec_postgis preloaded: a qual or a target over the
+-- declared functions compiles eager, where it was row by row; EXPLAIN
+-- VERBOSE names each declared call, its pack and its declaration; and
+-- EXPLAIN ANALYZE counts the rows a prefilter decided and those it sent to
+-- PostGIS's own function, through PostgreSQL's evaluator.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+CREATE EXTENSION IF NOT EXISTS postgis;
+RESET client_min_messages;
+SELECT pack, extension, versions, declarations FROM vexec.kernel_packs();
+     pack      | extension |  versions  | declarations 
+---------------+-----------+------------+--------------
+ vexec_postgis | postgis   | {3.7.0rc2} |           26
+(1 row)
+
+SELECT function, declaration FROM vexec.declared_calls() ORDER BY function COLLATE "C";
+                function                | declaration  
+----------------------------------------+--------------
+ geometry_above(geometry,geometry)      | never raises
+ geometry_below(geometry,geometry)      | never raises
+ geometry_contains(geometry,geometry)   | never raises
+ geometry_left(geometry,geometry)       | never raises
+ geometry_overabove(geometry,geometry)  | never raises
+ geometry_overbelow(geometry,geometry)  | never raises
+ geometry_overlaps(geometry,geometry)   | never raises
+ geometry_overleft(geometry,geometry)   | never raises
+ geometry_overright(geometry,geometry)  | never raises
+ geometry_right(geometry,geometry)      | never raises
+ geometry_same(geometry,geometry)       | never raises
+ geometry_within(geometry,geometry)     | never raises
+ st_contains(geometry,geometry)         | prefilter
+ st_containsproperly(geometry,geometry) | prefilter
+ st_coveredby(geometry,geometry)        | prefilter
+ st_covers(geometry,geometry)           | prefilter
+ st_crosses(geometry,geometry)          | prefilter
+ st_disjoint(geometry,geometry)         | prefilter
+ st_equals(geometry,geometry)           | prefilter
+ st_intersects(geometry,geometry)       | prefilter
+ st_overlaps(geometry,geometry)         | prefilter
+ st_srid(geometry)                      | never raises
+ st_touches(geometry,geometry)          | prefilter
+ st_within(geometry,geometry)           | prefilter
+ st_x(geometry)                         | check
+ st_y(geometry)                         | check
+(26 rows)
+
+-- how force mode's vector nodes run a query
+CREATE FUNCTION vexec_how(q text, with_analyze bool DEFAULT false) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	PERFORM set_config('vexec.mode', 'force', true);
+	FOR l IN EXECUTE format('EXPLAIN (VERBOSE, COSTS OFF%s) %s',
+							CASE WHEN with_analyze THEN ', ANALYZE, TIMING OFF, SUMMARY OFF, BUFFERS OFF' ELSE '' END, q) LOOP
+		IF l ~ '^\s*(->\s+)?(Vec |Limit|Sort|Seq Scan)' OR
+		   l ~ '(Vector Quals|Row-by-Row|Fallback Steps|Declared Calls|Rows Sent to PostgreSQL|Rows Through Declared Calls|Input:)' THEN
+			RETURN NEXT regexp_replace(l, '^\s+(->\s+)?', '');
+		END IF;
+	END LOOP;
+END
+$$;
+CREATE TABLE places (id int, g geometry);
+INSERT INTO places
+SELECT i, CASE WHEN i % 2 = 0 THEN ST_SetSRID(ST_MakePoint(i % 100, i / 30), 4326)
+			   ELSE ST_MakeEnvelope(i % 100, i / 30, i % 100 + 0.5, i / 30 + 0.5, 4326) END
+FROM generate_series(1, 3000) i;
+ANALYZE places;
+-- a box filter: a declared call that never raises
+SELECT * FROM vexec_how('SELECT id FROM places WHERE g && ST_MakeEnvelope(10, 10, 20, 20, 4326)', true);
+                                     vexec_how                                      
+------------------------------------------------------------------------------------
+ Vec Seq Scan on public.places (actual rows=44.00 loops=1)
+ Vector Quals: 1 of 1
+ Fallback Steps: 0
+ Declared Calls: geometry_overlaps(geometry,geometry) [vexec_postgis: never raises]
+ Rows Through Declared Calls: 3000
+(5 rows)
+
+-- the other box operators and ST_SRID
+SELECT * FROM vexec_how('SELECT g ~= g, g @ g, g ~ g, g << g, g &< g, g <<| g, g &<| g, g &> g, g >> g, g |&> g, g |>> g, ST_SRID(g) FROM places');
+                                                                                                                                                                                                                                                                                                                                                                                                          vexec_how                                                                                                                                                                                                                                                                                                                                                                                                          
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Vec Seq Scan on public.places
+ Fallback Steps: 0
+ Declared Calls: geometry_same(geometry,geometry) [vexec_postgis: never raises], geometry_within(geometry,geometry) [vexec_postgis: never raises], geometry_contains(geometry,geometry) [vexec_postgis: never raises], geometry_left(geometry,geometry) [vexec_postgis: never raises], geometry_overleft(geometry,geometry) [vexec_postgis: never raises], geometry_below(geometry,geometry) [vexec_postgis: never raises], geometry_overbelow(geometry,geometry) [vexec_postgis: never raises], geometry_overright(geometry,geometry) [vexec_postgis: never raises], geometry_right(geometry,geometry) [vexec_postgis: never raises], geometry_overabove(geometry,geometry) [vexec_postgis: never raises], geometry_above(geometry,geometry) [vexec_postgis: never raises], st_srid(geometry) [vexec_postgis: never raises]
+(3 rows)
+
+-- ST_X under its check
+SELECT * FROM vexec_how('SELECT ST_X(g), ST_Y(g) FROM places WHERE id % 2 = 0', true);
+                                          vexec_how                                           
+----------------------------------------------------------------------------------------------
+ Vec Seq Scan on public.places (actual rows=1500.00 loops=1)
+ Vector Quals: 1 of 1
+ Fallback Steps: 0
+ Declared Calls: st_x(geometry) [vexec_postgis: check], st_y(geometry) [vexec_postgis: check]
+ Rows Through Declared Calls: 3000
+(5 rows)
+
+-- a predicate's prefilter: its answers where the boxes decide, PostGIS's
+-- function on the other rows
+SELECT * FROM vexec_how('SELECT id FROM places WHERE ST_Intersects(g, ST_MakeEnvelope(10, 10, 20, 20, 4326))', true);
+                                  vexec_how                                  
+-----------------------------------------------------------------------------
+ Vec Seq Scan on public.places (actual rows=44.00 loops=1)
+ Vector Quals: 1 of 1
+ Fallback Steps: 0
+ Declared Calls: st_intersects(geometry,geometry) [vexec_postgis: prefilter]
+ Rows Sent to PostgreSQL: 44
+ Rows Through Declared Calls: 2956
+(6 rows)
+
+SELECT * FROM vexec_how('SELECT ST_Contains(ST_MakeEnvelope(10, 10, 60, 60, 4326), g), ST_Within(g, ST_MakeEnvelope(10, 10, 60, 60, 4326)), ST_Equals(g, g), ST_Disjoint(g, g) FROM places');
+                                                                                                                       vexec_how                                                                                                                        
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Vec Seq Scan on public.places
+ Fallback Steps: 0
+ Declared Calls: st_contains(geometry,geometry) [vexec_postgis: prefilter], st_within(geometry,geometry) [vexec_postgis: prefilter], st_equals(geometry,geometry) [vexec_postgis: prefilter], st_disjoint(geometry,geometry) [vexec_postgis: prefilter]
+(3 rows)
+
+-- a function the pack does not declare stays row by row
+SELECT * FROM vexec_how('SELECT id FROM places WHERE ST_DWithin(g, ''SRID=4326;POINT(50 50)''::geometry, 5)');
+                   vexec_how                    
+------------------------------------------------
+ Vec Seq Scan on public.places
+ Vector Quals: 0 of 1
+ Fallback Steps: 0
+ Row-by-Row Qual: st_dwithin(), which may raise
+(4 rows)
+
+DROP TABLE places;
+DROP FUNCTION vexec_how(text, bool);
