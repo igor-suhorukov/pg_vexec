@@ -1,21 +1,22 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# The port's modules, built from a worktree of the port (pg_vector_executor.md
-# §5 V1): the entrypoint of the portbuild service (docker/vexec.yml), in the
+# The port's modules, built from its sources -- the build's checkout of the
+# port, or a phase's worktree of it (pg_vector_executor.md §5 V1): the
+# entrypoint of the portbuild service (docker/vexec.yml), in the
 # portdev image, as postgres.  V1 changes the port's modules on a branch of
 # its own -- PAX's and gp_ao's batch readers, gp_orca's API, gp_core's list of
 # settings -- and the legs run them before an image of that branch exists.
 #
-#   /cbsrc       the worktree, read-only, with PAX's two submodules mounted
-#                over their empty directories
+#   /cbsrc       the sources, read-only, with PAX's two submodules mounted
+#                over their directories
 #   /cbbuild     the build directory and the stage, kept between runs, so that
 #                ninja builds only what changed
 #
 # It configures once, builds, and stages an install of every module into
 # /cbbuild/stage, which a leg copies over its image's /usr/local/pgsql
-# (build.sh, VEXEC_PORT_STAGE).  /cbbuild/stage/COMMIT names the worktree's
-# commit and whether it had changes.
+# (build.sh, VEXEC_PORT_STAGE).  /cbbuild/stage/COMMIT names the sources'
+# commit and whether they had changes.
 #
 #   PORTBUILD_JOBS   ninja's jobs: 8, beside other sessions' tests
 set -eu
@@ -25,7 +26,7 @@ BUILD=/cbbuild/build
 STAGE=/cbbuild/stage
 PG_CONFIG=/usr/local/pgsql/bin/pg_config
 
-[ -f "$SRC/pg19/meson.build" ] || { echo "portbuild: no port worktree at $SRC"; exit 1; }
+[ -f "$SRC/pg19/meson.build" ] || { echo "portbuild: no sources of the port at $SRC"; exit 1; }
 [ -f "$SRC/contrib/pax_storage/src/cpp/contrib/tabulate/CMakeLists.txt" ] \
 	|| { echo "portbuild: PAX's submodules are not mounted"; exit 1; }
 

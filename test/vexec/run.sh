@@ -6,15 +6,26 @@
 # a run of the cache.  Nothing is installed on the host; it needs docker,
 # git and python3.
 #
+#   run.sh cloudberry [update]   the port's checkout the build uses, CB_SRC:
+#                                extension_postgresql_19 of
+#                                github.com/igor-suhorukov/cloudberry, cloned
+#                                where there is none, and with update moved
+#                                on to the branch's head (checkouts.sh)
+#   run.sh postgres [update]     the port's fork of PostgreSQL the build
+#                                uses, PG_SRC: REL_19_STABLE_CLOUDBERRY and
+#                                REL_19_STABLE of
+#                                github.com/igor-suhorukov/postgres, the same
+#                                way; the images take PostgreSQL's regression
+#                                suite from it
 #   run.sh images                the dev images: the vanilla leg's, from the
 #                                port's cloudberry/pg19-vanilla; the port's,
 #                                from VB's pg_accel/cb-ext at CB_COMMIT, and
 #                                the port's build tools on it (portdev)
-#   run.sh portbuild             the port's modules built from VEXEC_PORT_SRC,
-#                                V1's worktree of the port, into
-#                                VEXEC_PORT_BUILD, and staged there: the port
-#                                leg's containers install the stage over
-#                                their image's modules (VEXEC_PORT_STAGE)
+#   run.sh portbuild             the port's modules built from its sources,
+#                                VEXEC_PORT_SRC, into VEXEC_PORT_BUILD, and
+#                                staged there: the port leg's containers
+#                                install the stage over their image's
+#                                modules (VEXEC_PORT_STAGE)
 #   run.sh checks                the header copies, the notices, the tree
 #                                (on the host)
 #   run.sh suite [leg]           vexec's own regression suite
@@ -71,8 +82,10 @@
 #
 # Settings, from the environment:
 #   VEXEC_CACHE   the runs: ~/.cache/pg_accel/vexec
-#   CB_SRC, PG_SRC the port's and PostgreSQL's checkouts: ../../cloudberry,
-#                 ../../postgres
+#   CB_SRC        the port's checkout, which checkouts.sh makes and keeps:
+#                 ~/.cache/pg_accel/cloudberry
+#   PG_SRC        the checkout of the port's fork of PostgreSQL, the same
+#                 way: ~/.cache/pg_accel/postgres
 #   CB_COMMIT     the port's build: the newest pg_accel/cb-ext image's
 #   VEXEC_CPUS    each container's CPUs: 0, as many as there are; 1 beside a
 #                 timed run
@@ -80,12 +93,14 @@
 #   VEXEC_FULLRUN_RUNS  the full runs to make: "0 1", without vexec and
 #                 with it; "1" compares a new run with vexec with the
 #                 latest run without it
-#   VEXEC_PORT_SRC  V1's worktree of the port: ../../cloudberry-vexec/wt
+#   VEXEC_PORT_SRC  the port's sources its modules are built from, and its
+#                 tests read: CB_SRC; a phase that changes the port gives its
+#                 worktree of the port
 #   VEXEC_PORT_BUILD  its build and stage: $VEXEC_CACHE/portbuild
 #   VEXEC_PORT_STAGE  the stage the port leg installs: VEXEC_PORT_BUILD's,
 #                 when it has one; "none" for the image's own modules
-#   VEXEC_PAX_CONTRIB  clones of PAX's two submodules at the commits the
-#                 tree pins: $VEXEC_CACHE/pax-contrib
+#   VEXEC_PAX_CONTRIB  PAX's two submodules at the commits the port pins,
+#                 mounted over a worktree's empty directories: CB_SRC's
 #
 # Timed runs measure the host: ClickBench's time mode (test/clickbench) asks
 # for nothing else to run.  Beside one, give VEXEC_CPUS=1, and leave tpc and
@@ -98,10 +113,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$here/../.." && pwd)"
 COMPOSE="$ROOT/docker/vexec.yml"
 export VEXEC_CACHE="${VEXEC_CACHE:-$HOME/.cache/pg_accel/vexec}"
-export CB_SRC="${CB_SRC:-$(cd "$ROOT/.." && pwd)/cloudberry}"
-export PG_SRC="${PG_SRC:-$(cd "$ROOT/.." && pwd)/postgres}"
+export CB_SRC="${CB_SRC:-$HOME/.cache/pg_accel/cloudberry}"
+export PG_SRC="${PG_SRC:-$HOME/.cache/pg_accel/postgres}"
 export VEXEC_CPUS="${VEXEC_CPUS:-0}"
-export VEXEC_PORT_SRC="${VEXEC_PORT_SRC:-$(cd "$ROOT/.." && pwd)/cloudberry-vexec/wt}"
+export VEXEC_PORT_SRC="${VEXEC_PORT_SRC:-$CB_SRC}"
 # A timed run measures the server without its assertions (§6.3): the port's
 # images built without them, and the port's modules built against those.
 [ "${CB_TPC:-}" = time ] && [ -z "${VEXEC_NOASSERT:-}" ] && VEXEC_NOASSERT=1
@@ -112,7 +127,7 @@ if [ "${VEXEC_NOASSERT:-0}" = 1 ]; then
 fi
 export VEXEC_PORT_BUILD="${VEXEC_PORT_BUILD:-$VEXEC_CACHE/portbuild}"
 export VEXEC_ORCA_BUILD="${VEXEC_ORCA_BUILD:-$VEXEC_CACHE/orcabuild}"
-export VEXEC_PAX_CONTRIB="${VEXEC_PAX_CONTRIB:-$VEXEC_CACHE/pax-contrib}"
+export VEXEC_PAX_CONTRIB="${VEXEC_PAX_CONTRIB:-$CB_SRC/contrib/pax_storage/src/cpp/contrib}"
 if [ "${VEXEC_PORT_STAGE:-}" = none ]; then
 	unset VEXEC_PORT_STAGE
 elif [ -z "${VEXEC_PORT_STAGE:-}" ] && [ -d "$VEXEC_PORT_BUILD/stage/usr/local/pgsql" ]; then
@@ -147,7 +162,31 @@ legs() { [ $# -gt 0 ] && echo "$@" || echo "vanilla port"; }
 
 cmd="${1:-}"
 [ $# -gt 0 ] && shift
+
+# The checkouts (checkouts.sh), made first where a command needs one: the
+# port's for a command that builds or tests from the port's sources,
+# PostgreSQL's for the images, which take its regression suite.  The other
+# legs mount the port's sources without reading them, and do not mount a
+# checkout that is not there yet, so that docker does not make its directory.
 case "$cmd" in
+	portbuild|orcabuild|orca|shm|checks)
+		"$here/checkouts.sh" cloudberry > /dev/null || die "no checkout of the port at $CB_SRC"
+		;;
+	images)
+		"$here/checkouts.sh" postgres > /dev/null || die "no checkout of PostgreSQL's fork at $PG_SRC"
+		;;
+	cloudberry|postgres)
+		;;
+	*)
+		[ -d "$VEXEC_PORT_SRC" ] || export VEXEC_PORT_SRC=/nonexistent
+		[ -d "$VEXEC_PAX_CONTRIB" ] || export VEXEC_PAX_CONTRIB=/nonexistent
+		;;
+esac
+
+case "$cmd" in
+	cloudberry|postgres)
+		exec "$here/checkouts.sh" "$cmd" "$@"
+		;;
 	images)
 		docker compose -f "$COMPOSE" --profile build build vexec-dev-vanilla || exit 1
 		[ -n "$CB_COMMIT" ] || die "no pg_accel/cb-ext image: run test/clickbench/run.sh images"
@@ -156,7 +195,7 @@ case "$cmd" in
 		;;
 	portbuild)
 		[ -n "$CB_COMMIT" ] || die "no pg_accel/cb-ext image: run test/clickbench/run.sh images"
-		[ -d "$VEXEC_PORT_SRC/pg19" ] || die "no worktree of the port at $VEXEC_PORT_SRC"
+		[ -d "$VEXEC_PORT_SRC/pg19" ] || die "no sources of the port at $VEXEC_PORT_SRC"
 		mkdir -p "$VEXEC_PORT_BUILD"
 		PORTBUILD_COMMIT="$(git -C "$VEXEC_PORT_SRC" rev-parse --short HEAD)$( [ -n "$(git -C "$VEXEC_PORT_SRC" status --porcelain -- pg19)" ] && echo +changes)" \
 			docker compose -f "$COMPOSE" --profile run run --rm -T portbuild 2>&1 | grep -v -E '^ (Container|Network) '
@@ -167,7 +206,7 @@ case "$cmd" in
 		docker compose -f "$COMPOSE" --profile build build vexec-dev-vanillaorca
 		;;
 	orcabuild)
-		[ -d "$VEXEC_PORT_SRC/pg19" ] || die "no worktree of the port at $VEXEC_PORT_SRC"
+		[ -d "$VEXEC_PORT_SRC/pg19" ] || die "no sources of the port at $VEXEC_PORT_SRC"
 		mkdir -p "$VEXEC_ORCA_BUILD"
 		PORTBUILD_COMMIT="$(git -C "$VEXEC_PORT_SRC" rev-parse --short HEAD)$( [ -n "$(git -C "$VEXEC_PORT_SRC" status --porcelain -- pg19)" ] && echo +changes)" \
 			docker compose -f "$COMPOSE" --profile run run --rm -T orcabuild 2>&1 | grep -v -E '^ (Container|Network) '
@@ -177,15 +216,18 @@ case "$cmd" in
 		[ -n "${VEXEC_ORCA_STAGE:-}" ] || die "no gp_orca built alone at $VEXEC_ORCA_BUILD: run.sh orcabuild"
 		run="$(new_run orca)"
 		echo "== ORCA on vanilla PostgreSQL 19 (V6): $run"
-		echo "  gp_orca from $(cat "$VEXEC_ORCA_STAGE/COMMIT" 2> /dev/null || echo '?'), the port's worktree $VEXEC_PORT_SRC"
+		echo "  gp_orca from $(cat "$VEXEC_ORCA_STAGE/COMMIT" 2> /dev/null || echo '?'), the port's sources $VEXEC_PORT_SRC"
 		in_leg vanilla-orca "$run" "/src/test/vexec/orca.sh" | tee "$run/output"
 		exit "${PIPESTATUS[0]}"
 		;;
 	checks)
+		# a check that has nothing to look at here exits 77, and is skipped
 		rc=0
-		"$here/checks/headers.sh" || rc=1
-		"$here/checks/notices.sh" || rc=1
-		"$here/checks/tree.sh" || rc=1
+		for c in headers notices tree; do
+			"$here/checks/$c.sh"
+			r=$?
+			[ $r -eq 0 ] || [ $r -eq 77 ] || rc=1
+		done
 		exit $rc
 		;;
 	suite|states|pgregress|differential)
@@ -293,7 +335,7 @@ case "$cmd" in
 		exit $rc
 		;;
 	*)
-		sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '3,/^# A leg is/p' "$0" | sed 's/^# \{0,1\}//'
 		exit 2
 		;;
 esac

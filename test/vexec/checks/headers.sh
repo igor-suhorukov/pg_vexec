@@ -13,22 +13,21 @@
 #     its batch-sink contract, include/vexec_sink.h, the same way (VI).
 #
 # A change to one fails here until its copy is refreshed in the same commit.
-# On the host.  The port's checkout to compare with is V1's worktree,
-# VEXEC_PORT_SRC (../cloudberry-vexec/wt), where it is, else CB_SRC
-# (../cloudberry).
+# On the host.  The port's sources to compare with are VEXEC_PORT_SRC, a
+# phase's worktree of the port, where it is, else the build's checkout of
+# the port, CB_SRC (~/.cache/pg_accel/cloudberry, test/vexec/checkouts.sh).
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$here/../../.." && pwd)"
-PORT_SRC="${VEXEC_PORT_SRC:-$ROOT/../cloudberry-vexec/wt}"
+CB_SRC="${CB_SRC:-$HOME/.cache/pg_accel/cloudberry}"
+PORT_SRC="${VEXEC_PORT_SRC:-$CB_SRC}"
 if [ -d "$PORT_SRC/pg19/include" ]; then
 	CB_SRC="$PORT_SRC"
-else
-	CB_SRC="${CB_SRC:-$ROOT/../cloudberry}"
 fi
 COPIES="$ROOT/modules/vexec/pgxs/include"
 
 if [ ! -d "$CB_SRC/pg19/include" ]; then
-	echo "  skipped: no port checkout at $CB_SRC (set CB_SRC)"
+	echo "  skipped: no port checkout at $CB_SRC (test/vexec/run.sh cloudberry)"
 	exit 77
 fi
 echo "headers: the copies against $CB_SRC at $(git -C "$CB_SRC" rev-parse --short HEAD 2>/dev/null)"

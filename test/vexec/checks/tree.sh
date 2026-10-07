@@ -2,22 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # The tree check (pg_vector_executor.md §3.1 principle 11): this work
-# changes Cloudberry's sources only under pg19/.  In the port's checkout,
-# the working tree's changes, and each branch of this work against the base
-# it was made from, must name no path outside pg19/.  On the host; CB_SRC is
-# the port's checkout.
+# changes Cloudberry's sources only under pg19/.  In the port's checkout
+# where this work's branches are, the working tree's changes, and each branch
+# of this work against the base it was made from, must name no path outside
+# pg19/.  On the host.  The build's own checkout of the port (CB_SRC,
+# test/vexec/checkouts.sh) holds the published branch alone, and is not the
+# one this looks at.
 #
+#   CB_WORK_SRC   the port's checkout where this work's branches are:
+#                 ../cloudberry; where there is none, the check is skipped
 #   CB_BASE       the base: extension_postgresql_19
 #   CB_BRANCHES   the branches of this work: the local branches named vexec*
 #                 and the one checked out
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$here/../../.." && pwd)"
-CB_SRC="${CB_SRC:-$ROOT/../cloudberry}"
+CB_SRC="${CB_WORK_SRC:-$ROOT/../cloudberry}"
 BASE="${CB_BASE:-extension_postgresql_19}"
 
 if ! git -C "$CB_SRC" rev-parse --git-dir > /dev/null 2>&1; then
-	echo "  skipped: no port checkout at $CB_SRC (set CB_SRC)"
+	echo "  skipped: no checkout of the port with this work's branches at $CB_SRC (set CB_WORK_SRC)"
 	exit 77
 fi
 fail=0

@@ -32,7 +32,7 @@
 #      back, and no process keeps a mapping, nor /dev/shm a file -- through
 #      POSIX shared memory too;
 #   6. the port's own interconnect test (pg19/test/ic), which carries shm
-#      too, where the port's worktree is mounted (/cbsrc);
+#      too, where the port's sources are mounted (/cbsrc);
 #   7. informally, a large Redistribute timed under tcp and under shm.
 #
 #   VEXEC_SEGMENTS   4
@@ -493,7 +493,7 @@ if [[ "$PARTS" == *" ic "* ]]; then
 		echo "$out" | tail -1 | grep -q " 0 failed" && echo "  ok the port's interconnect test passes, shm among its transports" \
 			|| { echo "  FAILED the port's interconnect test"; echo "$out" | grep -A2 "NOT OK" | sed 's/^/    /'; fail=1; }
 	else
-		echo "  (the port's worktree is not mounted at /cbsrc: skipped)"
+		echo "  (the port's sources are not mounted at /cbsrc: skipped)"
 	fi
 fi
 

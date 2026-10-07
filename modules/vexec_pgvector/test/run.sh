@@ -17,8 +17,9 @@
 # Settings, from the environment:
 #   VEXEC_SRC         the tree whose vexec the legs build: the pack's own, ../..
 #   CB_COMMIT         the port's build: the newest pg_accel/cb-ext image's
-#   VEXEC_PORT_STAGE  the port's modules the legs install:
-#                     ~/.cache/pg_accel/vexec/portbuild-vk/stage
+#   VEXEC_PORT_STAGE  the port's modules the legs install: the stage
+#                     test/vexec/run.sh portbuild makes from the port's
+#                     checkout, ~/.cache/pg_accel/vexec/portbuild/stage
 #   PACK_SEGMENTS     the cluster's segments: 2
 #   PACK_CPUS         each container's CPUs: 4
 #   PACK_MEM          each container's memory: 8g
@@ -30,7 +31,7 @@ set -u -o pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$here/.." && pwd)"
 VEXEC_SRC="${VEXEC_SRC:-$(cd "$ROOT/../.." && pwd)}"
-VEXEC_PORT_STAGE="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/portbuild-vk/stage}"
+VEXEC_PORT_STAGE="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/portbuild/stage}"
 PACK_CACHE="${PACK_CACHE:-$HOME/.cache/pg_accel/vexec_pgvector}"
 if [ -z "${CB_COMMIT:-}" ]; then
 	CB_COMMIT="$(docker images pg_accel/cb-ext --format '{{.CreatedAt}} {{.Tag}}' 2> /dev/null | sort -r | awk 'NR == 1 {print $NF}')"
@@ -38,7 +39,7 @@ fi
 
 die() { echo "run.sh: $*" >&2; exit 1; }
 [ -n "$CB_COMMIT" ] || die "no pg_accel/cb-ext image"
-[ -d "$VEXEC_PORT_STAGE/usr/local/pgsql" ] || die "no stage of the port's modules at $VEXEC_PORT_STAGE"
+[ -d "$VEXEC_PORT_STAGE/usr/local/pgsql" ] || die "no stage of the port's modules at $VEXEC_PORT_STAGE (test/vexec/run.sh portbuild)"
 [ -f "$VEXEC_SRC/include/vexec_kernels.h" ] || die "no vexec with the kernel packs' registry at $VEXEC_SRC"
 
 leg() {						# leg <name>: in a container, its run's output
@@ -68,7 +69,7 @@ case "$cmd" in
 		exit $rc
 		;;
 	*)
-		sed -n '3,29p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n "3,/^# A leg's outcome/p" "$0" | sed 's/^# \{0,1\}//'
 		exit 2
 		;;
 esac

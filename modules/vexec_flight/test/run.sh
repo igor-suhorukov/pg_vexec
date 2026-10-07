@@ -30,9 +30,10 @@
 # Settings, from the environment:
 #   VEXEC_SRC         the tree whose vexec the legs build: vexec_flight's own, ../..
 #   CB_COMMIT         the port's build: the newest pg_accel/cb-ext image's
-#   VEXEC_PORT_STAGE  the port's modules the port leg installs (pg_accel's
-#                     test/vexec/run.sh portbuild): ~/.cache/pg_accel/vexec/portbuild-v10/stage,
-#                     or portbuild-v10-noassert's
+#   VEXEC_PORT_STAGE  the port's modules the port leg installs, the stage
+#                     test/vexec/run.sh portbuild makes from the port's
+#                     checkout: ~/.cache/pg_accel/vexec/portbuild/stage, or
+#                     portbuild-noassert's
 #   FLIGHT_SEGMENTS   the port leg's segments: 2; 0 is one node of the port
 #   FLIGHT_CPUS       each container's CPUs: 4
 #   FLIGHT_MEM        each container's memory: 8g
@@ -49,7 +50,7 @@
 #   FLIGHT_CACHE      the runs: ~/.cache/pg_accel/flight
 #   FLIGHT_NOASSERT   1: the servers without their assertions, as a timed run
 #                     wants them (pg_accel's vanilla-noassert and portnoassert
-#                     images, and the stage portbuild-v10-noassert); images
+#                     images, and the stage portbuild-noassert); images
 #                     of their own, built by images with it set
 #
 # A leg's outcome is its container's exit status, through tee (pipefail).
@@ -63,11 +64,11 @@ FLIGHT_CPUS="${FLIGHT_CPUS:-4}"
 FLIGHT_MEM="${FLIGHT_MEM:-8g}"
 FLAVOR_VANILLA=vanilla
 FLAVOR_PORT=port
-STAGE=portbuild-v10
+STAGE=portbuild
 if [ "${FLIGHT_NOASSERT:-0}" = 1 ]; then
 	FLAVOR_VANILLA=vanilla-noassert
 	FLAVOR_PORT=portnoassert
-	STAGE=portbuild-v10-noassert
+	STAGE=portbuild-noassert
 fi
 VEXEC_PORT_STAGE="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/$STAGE/stage}"
 if [ -z "${CB_COMMIT:-}" ]; then
@@ -103,7 +104,7 @@ in_leg() {					# in_leg <leg> <run dir> <command...>
 	local stage=()
 	shift 2
 	if [ "$leg" = port ]; then
-		[ -d "$VEXEC_PORT_STAGE/usr/local/pgsql" ] || die "no stage of the port's modules at $VEXEC_PORT_STAGE"
+		[ -d "$VEXEC_PORT_STAGE/usr/local/pgsql" ] || die "no stage of the port's modules at $VEXEC_PORT_STAGE (test/vexec/run.sh portbuild)"
 		stage=(-v "$VEXEC_PORT_STAGE:/cbstage:ro" -e "FLIGHT_SEGMENTS=${FLIGHT_SEGMENTS:-2}")
 	fi
 	docker run --rm "${DOCKER_RUN_OPTS[@]}" --network none --cpus "$FLIGHT_CPUS" -m "$FLIGHT_MEM" --memory-swap "$FLIGHT_MEM" \
@@ -152,7 +153,7 @@ case "$cmd" in
 		tail -3 "$run/output"
 		;;
 	*)
-		sed -n '3,53p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n "3,/^# A leg's outcome/p" "$0" | sed 's/^# \{0,1\}//'
 		exit 2
 		;;
 esac

@@ -126,6 +126,9 @@ directory's `Makefile` and `test/run.sh`.
 ## vexec
 
 ```sh
+test/vexec/run.sh cloudberry       # the port's checkout the build uses, cloned where there is none
+test/vexec/run.sh cloudberry update   # ... moved on to its branch's head
+test/vexec/run.sh postgres         # the port's fork of PostgreSQL the build uses, the same way
 test/vexec/run.sh images           # the dev images: vanilla, and the port's (from VB's pg_vexec/cb-ext)
 test/vexec/run.sh checks           # the header copies, the notices, the tree check
 test/vexec/run.sh suite            # vexec's own suite, on the vanilla leg and the port
@@ -138,17 +141,32 @@ test/vexec/run.sh shm              # the shm transport (V7): Motions, switches, 
 test/vexec/run.sh tpc              # the tpc suite in each storage, vexec preloaded
 test/vexec/run.sh fullrun          # the port's full run with vexec on every node, against the run without it
 test/vexec/run.sh v0               # V0's checks: checks, suite, states, pgregress, differential, cluster
-test/vexec/run.sh portbuild        # the port's modules from V1's worktree (VEXEC_PORT_SRC), staged for the port's legs
+test/vexec/run.sh portbuild        # the port's modules from its checkout (or VEXEC_PORT_SRC), staged for the port's legs
 test/vexec/run.sh sources          # every storage's batch source on one node, in seven sessions, ORCA's among them
 test/vexec/run.sh portsuites       # the port's singlenode and greenplum suites, force against off
 ```
 
-From V1 the port's legs install the port's modules of V1's worktree over
-the image's own, from the stage `portbuild` makes
-(`~/.cache/pg_vexec/vexec/portbuild/stage`); `VEXEC_PORT_STAGE=none` runs
-them on the image's own. `TPC_VEXEC_MODE` and `TPC_VEXEC_FORMAT` set the tpc
-leg's `vexec.mode` and format, and `TPC_WORKERS` its parallel workers a
-segment, each query run once with each of them ("0 4").
+The port the build uses is a checkout of its branch
+[`extension_postgresql_19`](https://github.com/igor-suhorukov/cloudberry/tree/extension_postgresql_19)
+on GitHub, a clone of its own that `test/vexec/checkouts.sh` makes in
+`~/.cache/pg_accel/cloudberry` (`CB_SRC`) where there is none, with PAX's two
+submodules, and moves on only when asked (`run.sh cloudberry update`).  The
+port's images are built from it (`test/clickbench/run.sh images`), and so are
+its modules (`portbuild`) and gp_orca built alone (`orcabuild`); a phase that
+changes the port gives its worktree of the port as `VEXEC_PORT_SRC`.  The
+port's fork of PostgreSQL is a checkout the same way, in
+`~/.cache/pg_accel/postgres` (`PG_SRC`, `run.sh postgres`): its
+[`REL_19_STABLE_CLOUDBERRY`](https://github.com/igor-suhorukov/postgres/tree/REL_19_STABLE_CLOUDBERRY),
+the core series the port's servers are built from, and `REL_19_STABLE`,
+from which the images take PostgreSQL's regression suite at their servers'
+commits.
+
+The port's legs install the port's modules over the image's own, from the
+stage `portbuild` makes (`~/.cache/pg_vexec/vexec/portbuild/stage`), as the
+modules' legs do; `VEXEC_PORT_STAGE=none` runs them on the image's own.
+`TPC_VEXEC_MODE` and `TPC_VEXEC_FORMAT` set the tpc leg's `vexec.mode` and
+format, and `TPC_WORKERS` its parallel workers a segment, each query run
+once with each of them ("0 4").
 
 Every leg runs in a container; nothing is installed on the host. The legs
 build `vexec` from the tree by PGXS into a copy, with warnings as errors.
@@ -179,7 +197,7 @@ prices it below the row scan.
 ## ClickBench
 
 ```sh
-test/clickbench/run.sh images      # the servers' images, from the port's Dockerfiles
+test/clickbench/run.sh images      # the servers' images, from the port's Dockerfiles in its checkout
 test/clickbench/run.sh prepare     # hits.tsv.gz (16.3 GB), the 1M and 10M subsets, DuckDB's answers
 test/clickbench/run.sh baseline    # check mode on 1M rows, time mode on 10M rows, saved and checked
 test/clickbench/run.sh run time vanilla-heap port-aoco-s4   # any loads, into a run of the cache
@@ -189,8 +207,8 @@ CB_VEXEC="force-postgres force-arrow" test/clickbench/run.sh run check vanilla-h
 
 `CB_VEXEC` adds `vexec`'s sessions to each load's planners, in check mode
 (VH with V1): `vexec` built in its own images and installed in each
-container as it starts, with the port's modules of V1's worktree on the
-port's route.
+container as it starts, with the port's modules of the stage `portbuild`
+makes on the port's route.
 
 The data, DuckDB's answers and every answer PostgreSQL gave stay in the cache
 (`~/.cache/pg_vexec/clickbench`), outside the tree: ClickBench is

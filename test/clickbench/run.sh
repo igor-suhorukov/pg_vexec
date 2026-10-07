@@ -7,8 +7,9 @@
 # needs docker, curl and python3.
 #
 #   run.sh images             the images, built from the port's Dockerfiles in
-#                             its checkout and tagged by the commits they are
-#                             built from (the port's own tags are not touched)
+#                             its checkout, CB_SRC, and tagged by the commits
+#                             they are built from (the port's own tags are not
+#                             touched)
 #   run.sh fetch              hits.tsv.gz into the cache, from ClickBench's own
 #                             address (lib/download-hits-tsv); 16.3 GB
 #   run.sh prepare            the 1M- and 10M-row subsets, and DuckDB's answers
@@ -35,8 +36,16 @@
 #   CLICKBENCH_CACHE   the data, DuckDB's answers, and the runs, with the
 #                      answers PostgreSQL gave: ~/.cache/pg_accel/clickbench
 #   CLICKBENCH_SRC     ClickBench's checkout: ../../../ClickBench (dfe44c96)
-#   CB_SRC, PG_SRC     the port's and PostgreSQL's checkouts: ../../cloudberry,
-#                      ../../postgres
+#   CB_SRC             the port's checkout: extension_postgresql_19 of
+#                      github.com/igor-suhorukov/cloudberry, which
+#                      test/vexec/checkouts.sh clones where there is none
+#                      and moves on (test/vexec/run.sh cloudberry update):
+#                      ~/.cache/pg_accel/cloudberry
+#   PG_SRC             the checkout of the port's fork of PostgreSQL:
+#                      REL_19_STABLE_CLOUDBERRY and REL_19_STABLE of
+#                      github.com/igor-suhorukov/postgres, the same way
+#                      (test/vexec/run.sh postgres update):
+#                      ~/.cache/pg_accel/postgres
 #   CB_TESTS_MEM       each container's memory, 40g (the port's tests' cap)
 #   CB_SUBSET, CB_REPS, CB_TRIES, CB_TIMEOUT, CB_COLD, CB_QUERIES, CB_WORKERS,
 #   CB_STATS           passed to bench.sh, which says what they do
@@ -84,8 +93,13 @@ COMPOSE="$ROOT/docker/compose.yml"
 
 export CLICKBENCH_CACHE="${CLICKBENCH_CACHE:-$HOME/.cache/pg_accel/clickbench}"
 export CLICKBENCH_SRC="$(cd "${CLICKBENCH_SRC:-$ROOT/../../ClickBench}" && pwd)"
-export CB_SRC="$(cd "${CB_SRC:-$ROOT/../cloudberry}" && pwd)"
-export PG_SRC="$(cd "${PG_SRC:-$ROOT/../postgres}" && pwd)"
+export CB_SRC="${CB_SRC:-$HOME/.cache/pg_accel/cloudberry}"
+export PG_SRC="${PG_SRC:-$HOME/.cache/pg_accel/postgres}"
+for c in cloudberry postgres; do
+	"$ROOT/test/vexec/checkouts.sh" "$c" > /dev/null || { echo "run.sh: no checkout of $c" >&2; exit 1; }
+done
+export CB_SRC="$(cd "$CB_SRC" && pwd)"
+export PG_SRC="$(cd "$PG_SRC" && pwd)"
 export CLICKBENCH_WORK="$CLICKBENCH_CACHE/work"
 export CLICKBENCH_RUNS="$CLICKBENCH_CACHE/runs"
 export CLICKBENCH_HOST="${CLICKBENCH_HOST:-$(hostname -s)}"
@@ -104,8 +118,8 @@ if [ "${1:-}" = baseline ] && [ -z "${CB_COMMIT:-}${PG_PATCHED_COMMIT:-}" ]; the
 		echo "  the baseline begun in $(dirname "$began") goes on with the port at $CB_COMMIT"
 	fi
 fi
-export CB_COMMIT="${CB_COMMIT:-$(git -C "$CB_SRC" rev-parse extension_postgresql_19)}"
-export PG_PATCHED_COMMIT="${PG_PATCHED_COMMIT:-$(git -C "$PG_SRC" rev-parse REL_19_STABLE_CLOUDBERRY)}"
+export CB_COMMIT="${CB_COMMIT:-$(git -C "$CB_SRC" rev-parse "${CB_BRANCH:-extension_postgresql_19}")}"
+export PG_PATCHED_COMMIT="${PG_PATCHED_COMMIT:-$(git -C "$PG_SRC" rev-parse "${PG_BRANCH:-REL_19_STABLE_CLOUDBERRY}")}"
 ORCA_CHECK_IMAGE="pg_accel/cb-ext:$CB_COMMIT"
 ORCA_TIME_IMAGE="pg_accel/cb-ext-noassert:$CB_COMMIT"
 VANILLA_IMAGE="pg_accel/clickbench-vanilla:latest"

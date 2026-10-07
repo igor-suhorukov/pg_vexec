@@ -17,8 +17,9 @@
 #                       modules without assertions and ORCA without
 #                       GPOS_DEBUG, under the tag portnoassert-<commit>
 #
-# The checkouts are build contexts: PG_SRC (github/postgres), for the
-# regression suite at the server's own commit.
+# The checkouts are build contexts: PG_SRC, the build's clone of the port's
+# fork of PostgreSQL (~/.cache/pg_accel/postgres, test/vexec/checkouts.sh),
+# for the regression suite at the server's own commit.
 
 name: pg_accel_vexec
 
@@ -26,7 +27,7 @@ x-dev: &dev
   context: .
   dockerfile: Dockerfile.vexec
   additional_contexts:
-    pgsrc: ${PG_SRC:-../../postgres}
+    pgsrc: ${PG_SRC:-${HOME}/.cache/pg_accel/postgres}
 
 # A suite's container: the tree read-only, and a scratch directory of its
 # own for the builds and the servers.  Within the port's tests' memory cap
@@ -47,7 +48,7 @@ x-run: &run
     - ..:/src:ro
     - ${VEXEC_WORK:-/nonexistent}:/work
     - ${VEXEC_PORT_STAGE:-/nonexistent}:/cbstage:ro
-    # the port's worktree, whose own tests a leg may run (shm.sh: pg19/test/ic)
+    # the port's sources, whose own tests a leg may run (shm.sh: pg19/test/ic)
     - ${VEXEC_PORT_SRC:-/nonexistent}:/cbsrc:ro
   environment:
     VEXEC_SRC: /src
@@ -112,8 +113,7 @@ services:
     profiles: ["build"]
 
   # The port's build tools on vexec's dev image of the port: the port's
-  # modules built from a worktree of the port (V1's branch, vexec_v1) by the
-  # portbuild service.
+  # modules built from its sources (VEXEC_PORT_SRC) by the portbuild service.
   vexec-dev-portdev:
     image: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}dev-${CB_COMMIT:-unset}
     build:
@@ -123,10 +123,11 @@ services:
         BASE_IMAGE: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-${CB_COMMIT:-unset}
     profiles: ["build"]
 
-  # The port's modules built from VEXEC_PORT_SRC, a worktree of the port, into
+  # The port's modules built from VEXEC_PORT_SRC -- the build's checkout of the
+  # port (test/vexec/checkouts.sh), or a phase's worktree of it -- into
   # VEXEC_PORT_BUILD, and staged there for the legs (test/vexec/portbuild.sh).
-  # PAX's two submodules, which a worktree does not check out, are clones of
-  # the commits the tree pins, mounted over their empty directories.
+  # PAX's two submodules, which a worktree does not check out, are the
+  # checkout's (VEXEC_PAX_CONTRIB), mounted over their directories.
   portbuild:
     image: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}dev-${CB_COMMIT:-unset}
     user: postgres
@@ -189,7 +190,7 @@ services:
     profiles: ["run"]
 
   # The vanilla server with gp_orca built alone (VEXEC_ORCA_STAGE), which
-  # build.sh installs over the server's tree; and the port's worktree it was
+  # build.sh installs over the server's tree; and the port's sources it was
   # built from, whose ORCA comparison of PostgreSQL's suite orca.sh reuses.
   vanilla-orca:
     <<: *run

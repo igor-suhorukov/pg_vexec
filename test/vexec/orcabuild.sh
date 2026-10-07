@@ -8,13 +8,14 @@
 # unmodified, its translator, and the stand-in that answers what gp_orca asks
 # of gp_core on one node -- against the image's vanilla server.
 #
-#   /cbsrc       a worktree of the port, read-only
+#   /cbsrc       the port's sources, read-only: the build's checkout of the
+#                port, or a phase's worktree of it
 #   /cbbuild     the build directory and the stage, kept between runs, so that
 #                ninja builds only what changed
 #
 # It configures once, builds, and stages an install into /cbbuild/stage, which
 # a vanilla-orca leg copies over its image's /usr/local/pgsql (build.sh,
-# VEXEC_ORCA_STAGE).  /cbbuild/stage/COMMIT names the worktree's commit and
+# VEXEC_ORCA_STAGE).  /cbbuild/stage/COMMIT names the sources' commit and
 # whether it had changes.
 #
 #   PORTBUILD_JOBS   ninja's jobs: 8, beside other sessions' tests
@@ -25,7 +26,7 @@ BUILD=/cbbuild/build
 STAGE=/cbbuild/stage
 PG_CONFIG=/usr/local/pgsql/bin/pg_config
 
-[ -f "$SRC/pg19/meson.build" ] || { echo "orcabuild: no port worktree at $SRC"; exit 1; }
+[ -f "$SRC/pg19/meson.build" ] || { echo "orcabuild: no sources of the port at $SRC"; exit 1; }
 grep -q "orca_single_node" "$SRC/pg19/meson_options.txt" \
 	|| { echo "orcabuild: the port at $SRC has no -Dorca_single_node"; exit 1; }
 

@@ -4,7 +4,7 @@
 # ORCA on vanilla PostgreSQL 19 (pg_vector_executor.md §3.3.5, V6): the
 # port's gp_orca built alone for one node without gp_core (orcabuild.sh), on
 # REL_19_STABLE as it is, with vexec beside it.  In the vanilla-orca image,
-# the stage installed over the server (build.sh), and the port's worktree it
+# the stage installed over the server (build.sh), and the port's sources it
 # was built from at /cbsrc.
 #
 #   module        gp_orca alone: it loads with no gp_core and no core series,
@@ -49,7 +49,7 @@ PKGLIB="$("$BINDIR/pg_config" --pkglibdir)"
 [ -f "$PKGLIB/gp_orca.so" ] \
 	|| { echo "orca: this server has no gp_orca; give the leg its stage (run.sh orcabuild)"; exit 1; }
 [ -f /cbsrc/pg19/test/singlenode/canon.pl ] && [ -f /cbsrc/src/test/regress/gpdiff.pl ] \
-	|| { echo "orca: no worktree of the port at /cbsrc (VEXEC_PORT_SRC)"; exit 1; }
+	|| { echo "orca: no sources of the port at /cbsrc (VEXEC_PORT_SRC)"; exit 1; }
 [ ! -f "$PKGLIB/gp_core.so" ] || { echo "orca: this server has gp_core; the leg is the vanilla one's"; exit 1; }
 
 PGSUITE="${PG_REGRESS_SUITE:-/cb/pgregress}"

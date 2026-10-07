@@ -4,8 +4,8 @@
 # containers it runs in.  test/clickbench/run.sh drives it; nothing is
 # installed on the host.
 #
-# The servers are the port's builds (github/cloudberry, branch
-# extension_postgresql_19), made from the port's own Dockerfiles in its
+# The servers are the port's builds (github.com/igor-suhorukov/cloudberry,
+# branch extension_postgresql_19), made from the port's own Dockerfiles in its
 # checkout and tagged here by the commits they are built from, so that a
 # baseline names exactly what it ran and the port's own cloudberry/* tags are
 # left as they are:
@@ -22,23 +22,25 @@
 #                                          /pg/vanilla-noassert, with DuckDB
 #
 # The checkouts are build contexts; their paths are all there is to change if
-# they live elsewhere: CB_SRC (github/cloudberry), PG_SRC (github/postgres).
-# run.sh sets the commits (PG_PATCHED_COMMIT, CB_COMMIT) and the run's paths.
+# they live elsewhere: CB_SRC and PG_SRC, the build's clones of the port and
+# of its fork of PostgreSQL (~/.cache/pg_accel/cloudberry and
+# ~/.cache/pg_accel/postgres, test/vexec/checkouts.sh).  run.sh sets the
+# commits (PG_PATCHED_COMMIT, CB_COMMIT) and the run's paths.
 
 name: pg_accel
 
 x-port-pg: &port-pg
-  context: ${CB_SRC:-../../cloudberry}/pg19/docker
+  context: ${CB_SRC:-${HOME}/.cache/pg_accel/cloudberry}/pg19/docker
   dockerfile: Dockerfile.pg
   additional_contexts:
-    pgsrc: ${PG_SRC:-../../postgres}
+    pgsrc: ${PG_SRC:-${HOME}/.cache/pg_accel/postgres}
 
 x-port-ext: &port-ext
-  context: ${CB_SRC:-../../cloudberry}/pg19/docker
+  context: ${CB_SRC:-${HOME}/.cache/pg_accel/cloudberry}/pg19/docker
   dockerfile: Dockerfile.cbext
   additional_contexts:
-    cbsrc: ${CB_SRC:-../../cloudberry}
-    pgsrc: ${PG_SRC:-../../postgres}
+    cbsrc: ${CB_SRC:-${HOME}/.cache/pg_accel/cloudberry}
+    pgsrc: ${PG_SRC:-${HOME}/.cache/pg_accel/postgres}
 
 # A run's container: the suite read-only, ClickBench's checkout read-only, the
 # data cache, the servers' data directories on disk (a cold run reads them from
