@@ -3,20 +3,23 @@
 #
 # bench.sh: one load of ClickBench's table, and its 43 queries run on it --
 # the part of the suite that runs inside a container (run.sh starts it, as
-# docker/compose.yml's vanilla and orca services).  A load is the table in one
-# storage on one server or cluster; each planner of CB_PLANNERS is then one
-# configuration of pg_vector_executor.md §6.9, run on that load.
+# docker/compose.yml's vanilla, orca and vanillaorca services).  A load is the
+# table in one storage on one server or cluster; each planner of CB_PLANNERS
+# is then one configuration of pg_vector_executor.md §6.9, run on that load.
 #
 #   CB_MODE      check: each query once and its answer kept, on the servers
 #                built with assertions; time: ClickBench's protocol, CB_REPS
 #                times over, on the servers built without them
 #   CB_ROUTE     vanilla: vanilla PostgreSQL 19, one server, PostgreSQL's
 #                planner with parallel workers; port: the port, a coordinator
-#                and CB_SEGMENTS segments
-#   CB_STORAGE   vanilla: heap, heap_pk (with the primary key's btree);
-#                port: aoco, porc, porc_vec
-#   CB_PLANNERS  vanilla: planner; port: "orca planner" -- ORCA, and the
-#                planner's route on the same tables
+#                and CB_SEGMENTS segments; vanilla-orca: V6's, vanilla
+#                PostgreSQL 19 with the port's gp_orca built alone for one
+#                node preloaded, the vanilla route's settings, in the image's
+#                own server (vexec-entry.sh installs gp_orca over it)
+#   CB_STORAGE   vanilla and vanilla-orca: heap, heap_pk (with the primary
+#                key's btree); port: aoco, porc, porc_vec
+#   CB_PLANNERS  vanilla: planner; port and vanilla-orca: "orca planner" --
+#                ORCA, and the planner's route on the same tables
 #   CB_SUBSET    1m, 10m, full: the rows loaded (clickbench.py subsets)
 #   CB_SEGMENTS  4
 #   CB_REPS      time mode: how many times the protocol runs over, 3
@@ -76,7 +79,8 @@ case "$MODE" in check|time) ;; *) die "CB_MODE is check or time" ;; esac
 case "$ROUTE:$STORAGE" in
 	vanilla:heap|vanilla:heap_pk) PLANNERS="${CB_PLANNERS:-planner}" ;;
 	port:aoco|port:porc|port:porc_vec) PLANNERS="${CB_PLANNERS:-orca planner}" ;;
-	*) die "CB_ROUTE and CB_STORAGE: vanilla with heap or heap_pk, port with aoco, porc or porc_vec" ;;
+	vanilla-orca:heap|vanilla-orca:heap_pk) PLANNERS="${CB_PLANNERS:-orca planner}" ;;
+	*) die "CB_ROUTE and CB_STORAGE: vanilla or vanilla-orca with heap or heap_pk, port with aoco, porc or porc_vec" ;;
 esac
 VEXEC="${CB_VEXEC:-}"
 if [ -n "$VEXEC" ]; then
@@ -110,10 +114,14 @@ esac
 [ -r "$TSV" ] || die "no $TSV: run.sh prepare makes it"
 ROWS=$(case "$SUBSET" in 1m) echo 999975 ;; 10m) echo 9999750 ;; full) echo 99997497 ;; *) wc -l < "$TSV" ;; esac)
 
-# The servers: vanilla's two builds are in one image, the port's in two.
+# The servers: vanilla's two builds are in one image, the port's in two, and
+# vanilla-orca's in two (vexec's vanilla images, run.sh picking by mode).
 if [ "$ROUTE" = vanilla ]; then
 	PREFIX=/pg/vanilla
 	[ "$MODE" = time ] && PREFIX=/pg/vanilla-noassert
+	NODES=0
+elif [ "$ROUTE" = vanilla-orca ]; then
+	PREFIX=/usr/local/pgsql
 	NODES=0
 else
 	PREFIX=/usr/local/pgsql
@@ -122,6 +130,14 @@ fi
 BINDIR="$PREFIX/bin"
 PSQL="$BINDIR/psql"
 export LD_LIBRARY_PATH="$("$BINDIR/pg_config" --libdir):$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [ "$ROUTE" = vanilla-orca ]; then
+	[ -f "$("$BINDIR/pg_config" --pkglibdir)/gp_orca.so" ] \
+		|| die "the server has no gp_orca: vexec-entry.sh installs it from the stage (CB_ORCA_STAGE)"
+	grep -q "^#define USE_ASSERT_CHECKING" "$("$BINDIR/pg_config" --includedir-server)/pg_config.h" \
+		&& asserts=yes || asserts=no
+	[ "$asserts" = "$([ "$MODE" = check ] && echo yes || echo no)" ] \
+		|| die "$MODE mode on a server whose assertions are $asserts: run.sh picks the image"
+fi
 
 mapfile -t Q < <(grep -v '^[[:space:]]*$' "$SRC/postgresql/queries.sql")
 [ "${#Q[@]}" -eq 43 ] || die "${#Q[@]} queries in $SRC/postgresql/queries.sql"
@@ -198,7 +214,8 @@ for n in $NODES; do
 		# the temporary files of EXPLAIN ANALYZE's queries, from the log
 		echo "log_temp_files = 0"
 		[ -n "$VEXEC" ] && [ "$ROUTE" = vanilla ] && echo "shared_preload_libraries = 'vexec'"
-		if [ "$ROUTE" = vanilla ]; then
+		[ "$ROUTE" = vanilla-orca ] && echo "shared_preload_libraries = 'gp_orca${VEXEC:+,vexec}'"
+		if [ "$ROUTE" != port ]; then
 			# ClickBench's PostgreSQL settings (postgresql/install), the
 			# container's memory for the machine's
 			echo "shared_buffers = $((MEM_KB / 4))kB"
@@ -278,7 +295,7 @@ echo "ClickBench, $MODE mode: $ROUTE, $STORAGE, $SUBSET rows ($ROWS)$([ "$ROUTE"
 echo "  bindir $BINDIR, data in $WORK"
 t0=$(now_ms)
 step create -f "$WORK/create.sql"
-if [ "$ROUTE" = vanilla ]; then
+if [ "$ROUTE" != port ]; then
 	# as ClickBench's own load: TRUNCATE and COPY FREEZE in one transaction
 	step copy -c "BEGIN" -c "TRUNCATE TABLE hits" -c "\\copy hits FROM '$TSV' WITH (FREEZE)" -c "COMMIT"
 	[ "$STORAGE" = heap_pk ] && step index -c "CREATE INDEX hits_pk ON hits USING btree ($PK)"
@@ -354,6 +371,13 @@ opts() {					# opts <planner> [timeout]: the session's settings
 			planner) o="$o -c gp.optimizer=off" ;;
 		esac
 		[ "$WORKERS" -gt 0 ] && o="$o -c gp.enable_parallel=on -c max_parallel_workers_per_gather=$WORKERS"
+	elif [ "$ROUTE" = vanilla-orca ]; then
+		# gp_orca alone has no gp.enable_parallel (gp_core's): ORCA's plans
+		# are serial, the planner's take the vanilla route's workers
+		case "$base" in
+			orca) o="$o -c gp.optimizer=on -c gp.optimizer_trace_fallback=on" ;;
+			planner) o="$o -c gp.optimizer=off" ;;
+		esac
 	fi
 	# vexec's session: its mode and format; off where the planner has none
 	if [ -n "$VEXEC" ]; then

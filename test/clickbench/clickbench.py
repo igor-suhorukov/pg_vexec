@@ -744,6 +744,8 @@ def config_name(cfg, planner):
     base, _, vexec = planner.partition('+')
     if cfg['route'] == 'vanilla':
         name = 'vanilla-%s' % cfg['storage']
+    elif cfg['route'] == 'vanilla-orca':
+        name = '%s-vanilla-%s' % ('orca' if base == 'orca' else 'planner', cfg['storage'])
     else:
         name = '%s-%s-s%d' % ('orca' if base == 'orca' else 'planner', cfg['storage'], cfg['segments'])
     return name + ('+' + vexec if vexec else '')
@@ -754,8 +756,11 @@ def write_clickbench(run, cfg, name, per_q, load, size):
     os.makedirs(d, exist_ok=True)
     nreps = max((len(e['reps']) for e in per_q), default=0)
     host = cfg.get('host') or 'localhost'
-    system = {'vanilla': 'PostgreSQL 19 (vanilla)', 'orca': 'Cloudberry on PostgreSQL 19 (ORCA)',
-              'planner': 'Cloudberry on PostgreSQL 19 (planner)'}[name.split('-')[0]]
+    if cfg['route'] == 'vanilla-orca':
+        system = 'PostgreSQL 19 (vanilla) with gp_orca (%s)' % ('ORCA' if name.startswith('orca-') else 'planner')
+    else:
+        system = {'vanilla': 'PostgreSQL 19 (vanilla)', 'orca': 'Cloudberry on PostgreSQL 19 (ORCA)',
+                  'planner': 'Cloudberry on PostgreSQL 19 (planner)'}[name.split('-')[0]]
     for i in range(nreps):
         doc = {'system': '%s, %s, %s rows' % (system, cfg['storage'], cfg['subset']),
                'date': cfg['date'], 'machine': '%s r%d' % (host, i + 1),

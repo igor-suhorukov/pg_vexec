@@ -132,3 +132,20 @@ services:
     <<: *run
     image: ${ORCA_IMAGE:-unset}
     profiles: ["run"]
+
+  # V6's route: vanilla PostgreSQL 19 with the port's gp_orca built alone for
+  # one node.  ORCA_IMAGE is vexec's pg_accel/vexec-dev:vanilla-orca for check
+  # mode and vanilla-noassert-orca for time mode (test/vexec/run.sh
+  # orcaimages), and CB_ORCA_STAGE the stage of gp_orca built against that
+  # server (test/vexec/run.sh orcabuild), which vexec-entry.sh installs.
+  vanillaorca:
+    <<: *run
+    image: ${ORCA_IMAGE:-unset}
+    volumes:
+      - ../test/clickbench:/clickbench:ro
+      - ${CLICKBENCH_SRC:-../../../ClickBench}:/clickbench-src:ro
+      - ${CLICKBENCH_CACHE:-/nonexistent}:/cache
+      - ${CLICKBENCH_WORK:-/nonexistent}:/work
+      - ${CLICKBENCH_RUNS:-/nonexistent}:/runs
+      - ${CB_ORCA_STAGE:-/nonexistent}:/orcastage:ro
+    profiles: ["run"]

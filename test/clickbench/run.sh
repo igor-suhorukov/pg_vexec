@@ -15,9 +15,12 @@
 #                             over each (CLICKBENCH_FULL=1: the full table too)
 #   run.sh run <mode> <load>...
 #                             loads run in <mode>, check or time, into a new run
-#                             of the cache, each then reported; a load is
-#                             vanilla-heap, vanilla-heap_pk, or
-#                             port-<aoco|porc|porc_vec>-s<segments>
+#                             of the cache (CB_RUN: a run to go on with), each
+#                             then reported; a load is vanilla-heap,
+#                             vanilla-heap_pk, port-<aoco|porc|porc_vec>-s<segments>,
+#                             or V6's vanillaorca-heap, vanillaorca-heap_pk:
+#                             vanilla PostgreSQL 19 with gp_orca built alone
+#                             (CB_ORCA_STAGE), ORCA and the planner
 #   run.sh baseline           the baseline, before development: every load in
 #                             check mode on 1M rows and in time mode on 10M rows,
 #                             ClickBench's protocol three times over, saved into
@@ -55,7 +58,20 @@
 #                      load's container started through vexec-entry.sh.  In
 #                      time mode both are the builds without assertions
 #                      (VEXEC_NOASSERT=1 test/vexec/run.sh images and
-#                      portbuild), as the timed servers are
+#                      portbuild), as the timed servers are.  The vanillaorca
+#                      loads take the vanilla route's vexec, built against
+#                      the same server
+#   CB_RUN             the run of the cache "run" goes on with, rather than
+#                      making a new one: a load it has reported is not run
+#                      again
+#   CB_ORCA_STAGE      the vanillaorca loads' gp_orca, built alone for one
+#                      node by test/vexec/run.sh orcabuild: its build cache's
+#                      stage, ~/.cache/pg_accel/vexec/orcabuild/stage, and in
+#                      time mode orcabuild-noassert's, built against the
+#                      server without assertions.  Their servers are vexec's
+#                      images pg_accel/vexec-dev:vanilla-orca and
+#                      vanilla-noassert-orca (VEXEC_NOASSERT=1
+#                      test/vexec/run.sh orcaimages)
 #
 # One container runs at a time, and nothing else should: a timed run measures
 # the host.
@@ -93,6 +109,8 @@ export PG_PATCHED_COMMIT="${PG_PATCHED_COMMIT:-$(git -C "$PG_SRC" rev-parse REL_
 ORCA_CHECK_IMAGE="pg_accel/cb-ext:$CB_COMMIT"
 ORCA_TIME_IMAGE="pg_accel/cb-ext-noassert:$CB_COMMIT"
 VANILLA_IMAGE="pg_accel/clickbench-vanilla:latest"
+VANILLAORCA_CHECK_IMAGE="pg_accel/vexec-dev:vanilla-orca"
+VANILLAORCA_TIME_IMAGE="pg_accel/vexec-dev:vanilla-noassert-orca"
 ALL_LOADS="vanilla-heap vanilla-heap_pk port-aoco-s4 port-aoco-s8 port-aoco-s16 port-porc-s4 port-porc-s8 port-porc-s16 port-porc_vec-s4 port-porc_vec-s8 port-porc_vec-s16"
 
 die() { echo "run.sh: $*" >&2; exit 1; }
@@ -105,10 +123,22 @@ images() {
 	compose --profile build build cb-ext cb-ext-noassert
 }
 
+# have_images [<mode> <load>...]: the images the loads run on in that mode,
+# and the vanilla image, where DuckDB is; with no loads, the baseline's.
 have_images() {
-	local i
-	for i in "$VANILLA_IMAGE" "$ORCA_CHECK_IMAGE" "$ORCA_TIME_IMAGE"; do
-		docker image inspect "$i" > /dev/null 2>&1 || return 1
+	local mode="${1:-}" i imgs="$VANILLA_IMAGE" load
+	[ $# -gt 0 ] && shift
+	[ $# -eq 0 ] && imgs="$imgs $ORCA_CHECK_IMAGE $ORCA_TIME_IMAGE"
+	for load in "$@"; do
+		case "$load:$mode" in
+			port-*:time) imgs="$imgs $ORCA_TIME_IMAGE" ;;
+			port-*) imgs="$imgs $ORCA_CHECK_IMAGE" ;;
+			vanillaorca-*:time) imgs="$imgs $VANILLAORCA_TIME_IMAGE" ;;
+			vanillaorca-*) imgs="$imgs $VANILLAORCA_CHECK_IMAGE" ;;
+		esac
+	done
+	for i in $imgs; do
+		docker image inspect "$i" > /dev/null 2>&1 || { echo "  no image $i" >&2; return 1; }
 	done
 }
 
@@ -170,8 +200,18 @@ environment() {
 # for time mode -- and copied into the cache with the port's stage, where
 # vexec-entry.sh installs them in each container.  ASSERTS says which build
 # it was made against, which vexec-entry.sh checks against the server's.
+# vexec_build <mode> [<load>...]: the routes of the loads given, every route
+# without loads.
 vexec_build() {
-	local mode="$1" leg dest stage flavors=() asserts=yes
+	local mode="$1" leg legs="" load dest stage flavors=() asserts=yes
+	shift
+	[ $# -eq 0 ] && set -- vanilla- port-
+	for load in "$@"; do
+		case "$load" in
+			vanilla-*|vanillaorca-*) [[ " $legs " == *" vanilla "* ]] || legs="$legs vanilla" ;;
+			port-*) [[ " $legs " == *" port "* ]] || legs="$legs port" ;;
+		esac
+	done
 	if [ "$mode" = time ]; then
 		stage="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/portbuild-noassert/stage}"
 		flavors=(VEXEC_PORT_FLAVOR=portnoassert VEXEC_VANILLA_FLAVOR=vanilla-noassert)
@@ -179,8 +219,12 @@ vexec_build() {
 	else
 		stage="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/portbuild/stage}"
 	fi
-	[ -d "$stage/usr/local/pgsql" ] || die "no port stage at $stage: test/vexec/run.sh portbuild makes it"
-	for leg in vanilla port; do
+	if [[ " $legs " == *" port "* ]]; then
+		[ -d "$stage/usr/local/pgsql" ] || die "no port stage at $stage: test/vexec/run.sh portbuild makes it"
+	else
+		stage=/nonexistent
+	fi
+	for leg in $legs; do
 		dest="$CLICKBENCH_CACHE/vexec/$leg"
 		rm -rf "$dest"
 		mkdir -p "$dest"
@@ -204,10 +248,10 @@ vexec_build() {
 
 # run_loads <mode> <run id> <load>...: each in its container, then reported.
 run_loads() {
-	local mode="$1" id="$2" load route storage seg service image rc failed=0
+	local mode="$1" id="$2" load route storage seg service image orca_stage rc failed=0
 	shift 2
 	mkdir -p "$CLICKBENCH_RUNS/$id"
-	have_images || die "the images are missing: run.sh images"
+	have_images "$mode" "$@" || die "the images are missing: run.sh images (vanillaorca's: test/vexec/run.sh orcaimages)"
 	[ -s "$CLICKBENCH_CACHE/ref/${CB_SUBSET:-1m}/refs.json" ] || die "DuckDB's answers are missing: run.sh prepare"
 	local others
 	others=$(docker ps --format '{{.Names}}' | grep -v '^pg_accel' | tr '\n' ' ')
@@ -219,8 +263,16 @@ run_loads() {
 			port-aoco-s*|port-porc-s*|port-porc_vec-s*)
 				route=port; seg="${load##*-s}"; storage="${load#port-}"; storage="${storage%-s*}"; service=orca
 				[ "$mode" = time ] && image="$ORCA_TIME_IMAGE" || image="$ORCA_CHECK_IMAGE" ;;
+			vanillaorca-heap|vanillaorca-heap_pk)
+				route=vanilla-orca; storage="${load#vanillaorca-}"; seg=0; service=vanillaorca
+				[ "$mode" = time ] && image="$VANILLAORCA_TIME_IMAGE" || image="$VANILLAORCA_CHECK_IMAGE" ;;
 			*) die "no such load: $load" ;;
 		esac
+		orca_stage=/nonexistent
+		if [ "$route" = vanilla-orca ]; then
+			orca_stage="${CB_ORCA_STAGE:-$HOME/.cache/pg_accel/vexec/orcabuild$([ "$mode" = time ] && echo -noassert)/stage}"
+			[ -d "$orca_stage/usr/local/pgsql" ] || die "no gp_orca built alone at $orca_stage: test/vexec/run.sh orcabuild makes it"
+		fi
 		local out="$CLICKBENCH_RUNS/$id/$load" stats=""
 		# a load a run has already reported is kept: a run goes on where it stopped
 		if [ -s "$out/report.json" ]; then
@@ -232,8 +284,9 @@ run_loads() {
 		[ -n "${CB_STATS_RUN:-}" ] && stats="/runs/$CB_STATS_RUN/$load/stats.json"
 		echo "== $mode, $load: $(date '+%F %T')"
 		local start=()
-		[ -n "${CB_VEXEC:-}" ] && start=(--user root --entrypoint /clickbench/vexec-entry.sh)
-		ORCA_IMAGE="$image" compose --profile run run --rm -T "${start[@]}" \
+		{ [ -n "${CB_VEXEC:-}" ] || [ "$route" = vanilla-orca ]; } &&
+			start=(--user root --entrypoint /clickbench/vexec-entry.sh)
+		ORCA_IMAGE="$image" CB_ORCA_STAGE="$orca_stage" compose --profile run run --rm -T "${start[@]}" \
 			-e CB_MODE="$mode" -e CB_ROUTE="$route" -e CB_STORAGE="$storage" -e CB_SEGMENTS="$seg" \
 			-e CB_VEXEC="${CB_VEXEC:-}" \
 			-e CB_SUBSET="${CB_SUBSET:-1m}" -e CB_REPS="${CB_REPS:-3}" -e CB_TRIES="${CB_TRIES:-3}" \
@@ -295,9 +348,9 @@ case "$cmd" in
 		mode="$1"; shift
 		[ "$mode" = time ] && export CB_SUBSET="${CB_SUBSET:-10m}"
 		if [ -n "${CB_VEXEC:-}" ]; then
-			vexec_build "$mode" || exit 1
+			vexec_build "$mode" "$@" || exit 1
 		fi
-		run_loads "$mode" "$(date +%Y%m%dT%H%M%S)-$mode${CB_VEXEC:+-vexec}" "$@" ;;
+		run_loads "$mode" "${CB_RUN:-$(date +%Y%m%dT%H%M%S)-$mode${CB_VEXEC:+-vexec}}" "$@" ;;
 	baseline) baseline ;;
 	report)
 		[ $# -eq 1 ] || die "report <run>"
