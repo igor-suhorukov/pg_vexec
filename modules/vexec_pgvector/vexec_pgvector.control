@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# vexec_pgvector: vexec's kernel pack for pgvector
+comment = 'vexec''s kernel pack for pgvector: its distances, called a batch''s rows at a time where their dimensions agree'
+default_version = '1.0'
+module_pathname = '$libdir/vexec_pgvector'
+relocatable = false
+schema = vexec_pgvector
+requires = 'vector'

@@ -1,0 +1,302 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- Same answers with or without the pack (pg_vector_executor.md §3.17, VK's
+-- "done when"): each query over pgvector's distances gives PostgreSQL's
+-- answer -- its rows, or its error -- in vexec's force mode, in the
+-- PostgreSQL and the Arrow format, as vexec_check() compares.  test/run.sh
+-- runs this file on a server with vexec_pgvector preloaded, where the
+-- distances are declared calls, and on one without it, where they are
+-- calls row by row: its expected output is the same, PostgreSQL's.
+--
+-- The cases: a nearest-neighbour search without an index and with a
+-- filter; each distance in a qual, a target, a sort key and an aggregate;
+-- halfvec's; vectors stored out of line; zero vectors under cosine
+-- distance; vectors of other dimensions, which raise pgvector's error in
+-- row order, and nowhere a qual before has removed them or a LIMIT has
+-- stopped short of them; batch edges.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+CREATE EXTENSION IF NOT EXISTS vector;
+RESET client_min_messages;
+-- a query's answer in one configuration: its rows as text, sorted -- a
+-- long one as its count and md5 -- or its error
+CREATE FUNCTION vexec_run(q text, m text, f text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+	n int8;
+BEGIN
+	PERFORM set_config('vexec.mode', m, true);
+	PERFORM set_config('vexec.batch_format', f, true);
+	BEGIN
+		EXECUTE format('SELECT coalesce(string_agg(x::text, %L ORDER BY x::text COLLATE "C"), %L), count(*) FROM (%s) x',
+					   ' | ', '(none)', q) INTO r, n;
+		IF length(r) > 200 THEN
+			r := format('%s rows, md5 %s', n, md5(r));
+		END IF;
+	EXCEPTION WHEN OTHERS THEN
+		r := 'ERROR ' || SQLSTATE || ': ' || SQLERRM;
+	END;
+	RETURN r;
+END
+$$;
+-- PostgreSQL's answer, where force mode in both formats gives it
+CREATE FUNCTION vexec_check(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ref text := vexec_run(q, 'off', 'postgres');
+	got text;
+	f text;
+BEGIN
+	FOREACH f IN ARRAY ARRAY['postgres', 'arrow'] LOOP
+		got := vexec_run(q, 'force', f);
+		IF got IS DISTINCT FROM ref THEN
+			RETURN format('DIFFERS in the %s format: off gives [%s], force gives [%s]', f, ref, got);
+		END IF;
+	END LOOP;
+	RETURN ref;
+END
+$$;
+-- 6000 rows of 16 dimensions, a category each; every 500th a zero vector
+SELECT setseed(0.42);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE items (id int, category int, embedding vector(16), half halfvec(16));
+INSERT INTO items
+SELECT g, g % 10,
+	   CASE WHEN g % 500 = 0 THEN array_fill(0::real, ARRAY[16])
+			ELSE (SELECT array_agg((random() * 2 - 1)::real) FROM generate_series(1, 16) WHERE g > 0) END::vector,
+	   NULL
+FROM generate_series(1, 6000) g;
+UPDATE items SET half = embedding::halfvec;
+UPDATE items SET embedding = NULL, half = NULL WHERE id % 777 = 0;
+ANALYZE items;
+-- 1025 rows of 1536 dimensions, stored out of line
+CREATE TABLE wide (id int, e vector(1536));
+INSERT INTO wide
+SELECT g, (SELECT array_agg(sin(g * 0.37 + i)::real) FROM generate_series(1, 1536) i)::vector
+FROM generate_series(1, 1025) g;
+ANALYZE wide;
+SELECT count(*) FILTER (WHERE pg_column_toast_chunk_id(e) IS NOT NULL) AS out_of_line FROM wide;
+ out_of_line 
+-------------
+        1025
+(1 row)
+
+-- 3000 rows of 3 dimensions but every 1000th, of 2
+CREATE TABLE mixed (id int, e vector);
+INSERT INTO mixed
+SELECT g, CASE WHEN g % 1000 = 0 THEN ARRAY[g, 1]::real[] ELSE ARRAY[g % 7, g % 11, g % 13]::real[] END::vector
+FROM generate_series(1, 3000) g;
+ANALYZE mixed;
+-- the query vectors
+CREATE TABLE q AS
+SELECT (SELECT array_agg(cos(i)::real) FROM generate_series(1, 16) i)::vector AS v16,
+	   (SELECT array_agg(cos(i)::real) FROM generate_series(1, 16) i)::halfvec AS h16,
+	   (SELECT array_agg(cos(i * 0.5)::real) FROM generate_series(1, 1536) i)::vector AS v1536;
+-- a nearest-neighbour search without an index, with a filter and without
+SELECT vexec_check(format('SELECT id FROM items WHERE category = 3 ORDER BY embedding <-> %L, id LIMIT 10', v16)) FROM q;
+                                     vexec_check                                      
+--------------------------------------------------------------------------------------
+ (1613) | (2273) | (3) | (3133) | (3643) | (4893) | (4953) | (5123) | (5293) | (5393)
+(1 row)
+
+SELECT vexec_check(format('SELECT id, embedding <-> %L AS d FROM items ORDER BY d, id LIMIT 10', v16)) FROM q;
+                  vexec_check                  
+-----------------------------------------------
+ 10 rows, md5 41522f08410c397056076fc2622d58aa
+(1 row)
+
+SELECT vexec_check(format('SELECT id FROM items WHERE category IN (1, 2) ORDER BY embedding <=> %L, id LIMIT 7', v16)) FROM q;
+                         vexec_check                         
+-------------------------------------------------------------
+ (1922) | (3102) | (3772) | (4671) | (4852) | (5461) | (902)
+(1 row)
+
+SELECT vexec_check(format('SELECT id FROM items ORDER BY embedding <#> %L, id LIMIT 5', v16)) FROM q;
+                vexec_check                 
+--------------------------------------------
+ (3772) | (3935) | (4679) | (4852) | (5461)
+(1 row)
+
+SELECT vexec_check(format('SELECT id FROM items ORDER BY embedding <+> %L, id LIMIT 5', v16)) FROM q;
+                vexec_check                
+-------------------------------------------
+ (2555) | (2668) | (3497) | (5461) | (584)
+(1 row)
+
+-- every distance of vector, in quals and targets
+SELECT vexec_check(format('SELECT count(*) FROM items WHERE l2_distance(embedding, %L) < 3', v16)) FROM q;
+ vexec_check 
+-------------
+ (613)
+(1 row)
+
+SELECT vexec_check(format('SELECT id, inner_product(embedding, %L), vector_negative_inner_product(embedding, %L) FROM items WHERE id %% 13 = 0', v16, v16)) FROM q;
+                  vexec_check                   
+------------------------------------------------
+ 461 rows, md5 31b9bc2bdeef631b124ff2715b57fd28
+(1 row)
+
+SELECT vexec_check(format('SELECT id, cosine_distance(embedding, %L), l1_distance(embedding, %L) FROM items WHERE id %% 11 = 0', v16, v16)) FROM q;
+                  vexec_check                   
+------------------------------------------------
+ 545 rows, md5 626a7a321a5c85ab44f69c14ece67194
+(1 row)
+
+SELECT vexec_check(format('SELECT id, vector_l2_squared_distance(embedding, %L), vector_spherical_distance(embedding, %L) FROM items WHERE id %% 17 = 0', v16, v16)) FROM q;
+                  vexec_check                   
+------------------------------------------------
+ 352 rows, md5 cb0908208fe94c224c760b50148c78c9
+(1 row)
+
+SELECT vexec_check(format('SELECT category, count(*), sum(embedding <-> %L), min(embedding <=> %L) FROM items GROUP BY category', v16, v16)) FROM q;
+                  vexec_check                  
+-----------------------------------------------
+ 10 rows, md5 9fe122af754a821a52d10fb22839c489
+(1 row)
+
+-- zero vectors under cosine distance: NaN
+SELECT vexec_check(format('SELECT id, embedding <=> %L FROM items WHERE id %% 500 = 0', v16)) FROM q;
+                                                                       vexec_check                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+ (1000,NaN) | (1500,NaN) | (2000,NaN) | (2500,NaN) | (3000,NaN) | (3500,NaN) | (4000,NaN) | (4500,NaN) | (500,NaN) | (5000,NaN) | (5500,NaN) | (6000,NaN)
+(1 row)
+
+-- every distance of halfvec
+SELECT vexec_check(format('SELECT id FROM items WHERE category = 5 ORDER BY half <-> %L, id LIMIT 10', h16)) FROM q;
+                                      vexec_check                                      
+---------------------------------------------------------------------------------------
+ (1495) | (2555) | (2655) | (3085) | (3935) | (415) | (4365) | (5065) | (545) | (5615)
+(1 row)
+
+SELECT vexec_check(format('SELECT id, l2_distance(half, %L), inner_product(half, %L), cosine_distance(half, %L), l1_distance(half, %L) FROM items WHERE id %% 19 = 0', h16, h16, h16, h16)) FROM q;
+                  vexec_check                   
+------------------------------------------------
+ 315 rows, md5 090244e96a132f7bc45ecadb7a83efc7
+(1 row)
+
+SELECT vexec_check(format('SELECT id, halfvec_l2_squared_distance(half, %L), halfvec_negative_inner_product(half, %L), halfvec_spherical_distance(half, %L) FROM items WHERE id %% 23 = 0', h16, h16, h16)) FROM q;
+                  vexec_check                   
+------------------------------------------------
+ 260 rows, md5 09bcbe2502a6d8716d6cd86216cae2e7
+(1 row)
+
+-- two columns of the table, neither a constant
+SELECT vexec_check('SELECT a.id, a.embedding <-> b.embedding FROM items a JOIN items b ON b.id = a.id + 1 WHERE a.id % 97 = 0');
+                  vexec_check                  
+-----------------------------------------------
+ 61 rows, md5 2767f3eba41e0f3280cf1a578aff5a83
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM items WHERE embedding <-> half::vector > 0.0005');
+ vexec_check 
+-------------
+ (862)
+(1 row)
+
+-- vectors stored out of line, 1536 dimensions
+SELECT vexec_check(format('SELECT id FROM wide ORDER BY e <-> %L, id LIMIT 10', v1536)) FROM q;
+                                  vexec_check                                  
+-------------------------------------------------------------------------------
+ (510) | (527) | (544) | (561) | (578) | (595) | (612) | (629) | (646) | (663)
+(1 row)
+
+SELECT vexec_check(format('SELECT id, e <=> %L FROM wide WHERE id %% 101 = 0', v1536)) FROM q;
+                  vexec_check                  
+-----------------------------------------------
+ 10 rows, md5 128a34a44ec383c5a3f462a48bc0e5c1
+(1 row)
+
+SELECT vexec_check(format('SELECT count(*) FROM wide WHERE e <#> %L < 0', v1536)) FROM q;
+ vexec_check 
+-------------
+ (511)
+(1 row)
+
+-- other dimensions: pgvector's error, at the first row PostgreSQL reaches
+SELECT vexec_check('SELECT count(*) FROM mixed WHERE e <-> ''[1,2,3]'' < 5');
+                   vexec_check                    
+--------------------------------------------------
+ ERROR 22000: different vector dimensions 2 and 3
+(1 row)
+
+SELECT vexec_check('SELECT id, e <=> ''[1,2,3]'' FROM mixed ORDER BY 2, id');
+                   vexec_check                    
+--------------------------------------------------
+ ERROR 22000: different vector dimensions 2 and 3
+(1 row)
+
+SELECT vexec_check('SELECT sum(l1_distance(e, ''[1,2,3]'')) FROM mixed');
+                   vexec_check                    
+--------------------------------------------------
+ ERROR 22000: different vector dimensions 2 and 3
+(1 row)
+
+SELECT vexec_check('SELECT id FROM mixed WHERE id > 990 AND id < 1010 AND e <+> ''[1,2]'' < 1');
+                   vexec_check                    
+--------------------------------------------------
+ ERROR 22000: different vector dimensions 3 and 2
+(1 row)
+
+-- PostgreSQL makes an equality to a constant again from its equivalence
+-- class, after the other quals: the distance is computed first, and raises
+-- on the first such row, in vexec too
+SELECT vexec_check('SELECT count(*) FROM mixed WHERE vector_dims(e) = 3 AND e <-> ''[1,2,3]'' < 5');
+                   vexec_check                    
+--------------------------------------------------
+ ERROR 22000: different vector dimensions 2 and 3
+(1 row)
+
+-- and nowhere PostgreSQL reaches no such row: a qual before it, rows past a
+-- LIMIT -- a batch's eager target is computed for row 1000, and its error
+-- never raised
+SELECT vexec_check('SELECT count(*) FROM mixed WHERE vector_dims(e) > 2 AND e <-> ''[1,2,3]'' < 5');
+ vexec_check 
+-------------
+ (818)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM mixed WHERE id % 1000 <> 0 AND e <-> ''[1,2,3]'' < 5');
+ vexec_check 
+-------------
+ (818)
+(1 row)
+
+SELECT vexec_check('SELECT count(*) FROM mixed WHERE id % 1000 <> 0 AND e <=> ''[1,2,3]'' < 0.1');
+ vexec_check 
+-------------
+ (1582)
+(1 row)
+
+SELECT vexec_check('SELECT id, e <-> ''[1,2,3]'' FROM mixed WHERE id < 1990 LIMIT 900');
+                  vexec_check                   
+------------------------------------------------
+ 900 rows, md5 cc257ba7eb3b0967b509cc3a695a0770
+(1 row)
+
+-- batch edges: 1023, 1024 and 1025 rows
+SELECT vexec_check(format('SELECT count(*), sum(e <-> %L) FROM wide WHERE id <= 1023', v1536)) FROM q;
+       vexec_check        
+--------------------------
+ (1023,40088.13456377741)
+(1 row)
+
+SELECT vexec_check(format('SELECT count(*), sum(e <-> %L) FROM wide WHERE id <= 1024', v1536)) FROM q;
+       vexec_check        
+--------------------------
+ (1024,40127.32712226272)
+(1 row)
+
+SELECT vexec_check(format('SELECT count(*), sum(e <-> %L) FROM wide', v1536)) FROM q;
+       vexec_check        
+--------------------------
+ (1025,40166.53187574125)
+(1 row)
+
+DROP TABLE items, wide, mixed, q;
+DROP FUNCTION vexec_check(text);
+DROP FUNCTION vexec_run(text, text, text);
