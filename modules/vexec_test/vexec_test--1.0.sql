@@ -88,3 +88,38 @@ CREATE FUNCTION raw(value anyelement)
 RETURNS bytea
 AS 'MODULE_PATHNAME', 'vexec_test_raw'
 LANGUAGE C STRICT IMMUTABLE;
+
+-- The frames of V7: every batch of a query, in a configuration, sent as a
+-- Redistribute sends it -- its rows dealt among "parts" segments, a frame
+-- each, after its shapes' schema -- each frame decoded where it lies
+-- aligned and from one byte past it, and every value compared with the
+-- row's.  An error names the first value that did not come back.
+CREATE FUNCTION frames(query text, format text DEFAULT 'postgres',
+                       varlena text DEFAULT 'format', bool text DEFAULT 'format',
+                       temporal text DEFAULT 'format', "numeric" text DEFAULT 'format',
+                       parts int4 DEFAULT 1,
+                       OUT col int4, OUT type text, OUT layouts text, OUT rows int8,
+                       OUT nulls int8, OUT frames int8, OUT schemas int4, OUT bytes int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_test_frames'
+LANGUAGE C VOLATILE;
+
+-- The first batch's frame of a query with byte "at" set to "value", cut to
+-- "cut" bytes -- both counted from its end where negative -- decoded: its
+-- error where it is malformed.
+CREATE FUNCTION frame_patch(query text, at int4, value int4, cut int4 DEFAULT NULL)
+RETURNS text
+AS 'MODULE_PATHNAME', 'vexec_test_frame_patch'
+LANGUAGE C VOLATILE;
+
+-- The vector cdbhash of a query's rows, its columns a distribution key,
+-- against gp_core's own cdbhash, a row at a time, over "nsegs" segments:
+-- the rows, the key columns a kernel hashed, and the rows whose segments
+-- differ.  Needs gp_core.
+CREATE FUNCTION cdbhash(query text, nsegs int4, format text DEFAULT 'postgres',
+                        varlena text DEFAULT 'format', bool text DEFAULT 'format',
+                        temporal text DEFAULT 'format', "numeric" text DEFAULT 'format',
+                        OUT rows int8, OUT kernels int4, OUT mismatches int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_test_cdbhash'
+LANGUAGE C VOLATILE;

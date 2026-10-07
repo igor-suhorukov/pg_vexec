@@ -102,6 +102,9 @@ typedef struct VexecPlanState
 	bool		orca_costed;	/* ORCA's search priced vexec's nodes
 								 * (CCostModelVec): translation builds them
 								 * where it priced them */
+	int			cursor_options; /* ORCA's: the statement's */
+	int			motions_framed; /* ORCA's Motions given frames (motion.c),
+								 * whose nodes are numbered at its end */
 } VexecPlanState;
 
 /* The most alternatives one statement records. */

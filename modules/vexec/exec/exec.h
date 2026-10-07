@@ -52,6 +52,8 @@
 #define VEXEC_BITMAPSCAN_NAME	"VecBitmapHeapScan"
 #define VEXEC_REPART_NAME	"VecRepartition"
 #define VEXEC_WINDOW_NAME	"VecWindowHashAgg"
+#define VEXEC_MOTION_SEND_NAME	"VecMotionSend"
+#define VEXEC_MOTION_RECV_NAME	"VecMotionRecv"
 
 typedef enum VexecNodeKind
 {
@@ -61,7 +63,9 @@ typedef enum VexecNodeKind
 	VEXEC_NODE_HASHJOIN,
 	VEXEC_NODE_SORT,
 	VEXEC_NODE_REPART,
-	VEXEC_NODE_WINDOW
+	VEXEC_NODE_WINDOW,
+	VEXEC_NODE_MOTION_SEND,
+	VEXEC_NODE_MOTION_RECV
 } VexecNodeKind;
 
 /*
@@ -212,6 +216,25 @@ typedef struct VexecWindowPlan
 	List	   *sortnullsfirst;
 } VexecWindowPlan;
 
+/*
+ * VecMotionSend's plan (vecmotion.c encodes and decodes custom_private;
+ * motion/motion.h): the kind of the Motion above it as ORCA built it --
+ * whose frames it sends to the segments its keys hash to, the next segment
+ * in turn, every segment or the one gathering -- and, for a Redistribute,
+ * its hash functions, one for each key of custom_exprs, which read the
+ * child's rows as OUTER_VAR, and whether one is a legacy function.  Its scan
+ * tuple, which custom_scan_tlist describes, is the child's row, then the
+ * frame's segment and the frame, which its target list gives out.
+ */
+typedef struct VexecMotionSendPlan
+{
+	int			motion;			/* VEXEC_GP_MOTION_*: HASH, RANDOM,
+								 * BROADCAST or GATHER */
+	bool		legacy;			/* a key hashed by a legacy function */
+	List	   *hashfuncs;
+	int			ncols;			/* the child's columns */
+} VexecMotionSendPlan;
+
 typedef struct VexecNode VexecNode;
 
 /* What the node's EXPLAIN ANALYZE counts. */
@@ -225,6 +248,9 @@ typedef struct VexecNodeStats
 	int64		redo_rows;		/* rows a kernel sent to it */
 	int64		declared_rows;	/* rows declared calls answered */
 	int64		batches_out;	/* handed to a vector parent */
+	int64		drained_motions;	/* Motions read to their end, unread */
+	int64		drained_rows;
+	int64		squelched;		/* subtrees gp_core squelched (V7) */
 } VexecNodeStats;
 
 struct VexecNode
@@ -318,6 +344,14 @@ struct VexecNode
 	bool		ran;
 
 	VexecNodeStats stats;
+
+	/*
+	 * The segments' figures of the node, on the coordinator, where it did
+	 * not run: their sums, and how many reported them (motion/gpcore.c,
+	 * GpCoreApi.explain_register).
+	 */
+	int			segments_seen;
+	VexecNodeStats segment_stats;
 };
 
 /* methods.c */
@@ -332,6 +366,8 @@ extern const CustomScanMethods *vexec_sort_methods(void);
 extern const CustomScanMethods *vexec_bitmapscan_methods(void);
 extern const CustomScanMethods *vexec_repart_methods(void);
 extern const CustomScanMethods *vexec_window_methods(void);
+extern const CustomScanMethods *vexec_motion_send_methods(void);
+extern const CustomScanMethods *vexec_motion_recv_methods(void);
 
 /* node.c: what every node shares */
 extern void vexec_node_begin(VexecNode *node, EState *estate);
@@ -383,6 +419,12 @@ extern void vexec_repart_plan_decode(CustomScan *cscan, VexecRepartPlan *plan);
 extern Node *vexec_create_window_state(CustomScan *cscan);
 extern List *vexec_window_plan_encode(const VexecWindowPlan *plan);
 extern void vexec_window_plan_decode(CustomScan *cscan, VexecWindowPlan *plan);
+
+/* vecmotion.c */
+extern Node *vexec_create_motion_send_state(CustomScan *cscan);
+extern Node *vexec_create_motion_recv_state(CustomScan *cscan);
+extern List *vexec_motion_send_plan_encode(const VexecMotionSendPlan *plan);
+extern void vexec_motion_send_plan_decode(CustomScan *cscan, VexecMotionSendPlan *plan);
 
 /* vechashjoin.c */
 extern Node *vexec_create_hashjoin_state(CustomScan *cscan);

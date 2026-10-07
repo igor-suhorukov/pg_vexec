@@ -137,6 +137,32 @@ is_vector_node(CustomScan *cscan)
 			if (lfirst_int(lc) < 1 || lfirst_int(lc) > list_length(child->targetlist))
 				elog(ERROR, "vexec plan check: a VecWindowHashAgg's key is not a column of its child");
 	}
+	else if (cscan->methods == vexec_motion_send_methods())
+	{
+		VexecMotionSendPlan plan;
+		Plan	   *child = cscan->scan.plan.lefttree;
+
+		if (cscan->scan.scanrelid != 0 || child == NULL || cscan->custom_plans != NIL ||
+			cscan->scan.plan.righttree != NULL || cscan->scan.plan.qual != NIL)
+			elog(ERROR, "vexec plan check: a VecMotionSend not in its canonical form");
+		vexec_motion_send_plan_decode(cscan, &plan);
+		if (plan.ncols != list_length(child->targetlist) ||
+			list_length(cscan->custom_scan_tlist) != plan.ncols + 2 ||
+			list_length(cscan->scan.plan.targetlist) != plan.ncols + 2)
+			elog(ERROR, "vexec plan check: a VecMotionSend whose rows are not its child's and a frame's");
+	}
+	else if (cscan->methods == vexec_motion_recv_methods())
+	{
+		Plan	   *motion = cscan->scan.plan.lefttree;
+
+		if (cscan->scan.scanrelid != 0 || motion == NULL || !IsA(motion, CustomScan) ||
+			cscan->custom_plans != NIL || cscan->scan.plan.righttree != NULL ||
+			list_length(cscan->custom_private) != 1)
+			elog(ERROR, "vexec plan check: a VecMotionRecv not in its canonical form");
+		if (list_length(cscan->custom_scan_tlist) != intVal(linitial(cscan->custom_private)) ||
+			list_length(motion->targetlist) != list_length(cscan->custom_scan_tlist) + 2)
+			elog(ERROR, "vexec plan check: a VecMotionRecv whose scan tuple is not its frames'");
+	}
 	else if (cscan->methods == vexec_repart_methods())
 	{
 		VexecRepartPlan plan;

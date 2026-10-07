@@ -7,7 +7,7 @@
 # preloaded where it runs.
 
 MODULE_big = vexec_test
-OBJS = vexec_test.o ipc_test.o nanoarrow/nanoarrow.o
+OBJS = vexec_test.o ipc_test.o frame_test.o nanoarrow/nanoarrow.o
 PGFILEDESC = "vexec_test - vexec's batch layer, tested from SQL"
 
 EXTENSION = vexec_test

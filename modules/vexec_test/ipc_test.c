@@ -70,7 +70,7 @@ na_ok(int code, struct ArrowError *error, const char *what)
 				(errmsg("vexec_test: %s: %s", what, ArrowErrorMessage(error))));
 }
 
-static void
+void
 layout_config(FunctionCallInfo fcinfo, int arg, VexecLayoutConfig *cfg)
 {
 	cfg->format = (uint8) setting_value("vexec.batch_format", text_to_cstring(PG_GETARG_TEXT_PP(arg)),

@@ -62,6 +62,16 @@ static const CustomScanMethods window_methods = {
 	.CreateCustomScanState = vexec_create_window_state,
 };
 
+static const CustomScanMethods motion_send_methods = {
+	.CustomName = VEXEC_MOTION_SEND_NAME,
+	.CreateCustomScanState = vexec_create_motion_send_state,
+};
+
+static const CustomScanMethods motion_recv_methods = {
+	.CustomName = VEXEC_MOTION_RECV_NAME,
+	.CreateCustomScanState = vexec_create_motion_recv_state,
+};
+
 void
 vexec_exec_install(void)
 {
@@ -73,6 +83,8 @@ vexec_exec_install(void)
 	RegisterCustomScanMethods(&bitmapscan_methods);
 	RegisterCustomScanMethods(&repart_methods);
 	RegisterCustomScanMethods(&window_methods);
+	RegisterCustomScanMethods(&motion_send_methods);
+	RegisterCustomScanMethods(&motion_recv_methods);
 }
 
 const CustomScanMethods *
@@ -123,6 +135,18 @@ vexec_window_methods(void)
 	return &window_methods;
 }
 
+const CustomScanMethods *
+vexec_motion_send_methods(void)
+{
+	return &motion_send_methods;
+}
+
+const CustomScanMethods *
+vexec_motion_recv_methods(void)
+{
+	return &motion_recv_methods;
+}
+
 /* Whether a plan node is one of vexec's vector nodes. */
 bool
 vexec_is_vector_node(Plan *plan)
@@ -135,7 +159,8 @@ vexec_is_vector_node(Plan *plan)
 	return cscan->methods == &scan_methods || cscan->methods == &result_methods ||
 		cscan->methods == &agg_methods || cscan->methods == &hashjoin_methods ||
 		cscan->methods == &sort_methods || cscan->methods == &bitmapscan_methods ||
-		cscan->methods == &repart_methods || cscan->methods == &window_methods;
+		cscan->methods == &repart_methods || cscan->methods == &window_methods ||
+		cscan->methods == &motion_send_methods || cscan->methods == &motion_recv_methods;
 }
 
 /* Whether a plan state is one of vexec's vector nodes'. */

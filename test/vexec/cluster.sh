@@ -45,8 +45,13 @@
 #   - the batch layer in a coordinator's backend over rows gathered from the
 #     segments: vexec_test's round trips and export check.
 #
-#   VEXEC_SEGMENTS   4
-#   VEXEC_ROWS       rows of each table: 50000
+#   VEXEC_SEGMENTS      4
+#   VEXEC_ROWS          rows of each table: 50000
+#   VEXEC_INTERCONNECT  every node's gp.interconnect_type: gp_core's default,
+#                       tcp; with shm, the shm module preloaded on every node
+#                       after gp_core, its begins logged
+#                       (gp.log_interconnect = verbose), and the suite's
+#                       Motions found to have gone through its rings (V7)
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$here/build.sh" || exit 1
@@ -54,7 +59,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SEGMENTS="${VEXEC_SEGMENTS:-4}"
 ROWS="${VEXEC_ROWS:-50000}"
+INTERCONNECT="${VEXEC_INTERCONNECT:-}"
 PRELOAD="gp_core,gp_orca,gp_sql,gp_ao,pax,vexec"
+[ "$INTERCONNECT" = shm ] && PRELOAD="gp_core,shm,gp_orca,gp_sql,gp_ao,pax,vexec"
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/vexec-cluster-XXXXXX")"
 SOCK="$(mktemp -d /tmp/vxc-XXXXXX)"
 BASEPORT=$((7300 + RANDOM % 200))
@@ -89,7 +96,7 @@ check() {					# check <what> <got> <want>
 	fi
 }
 
-echo "the cluster leg: a coordinator and $SEGMENTS segments, $PRELOAD on every node"
+echo "the cluster leg: a coordinator and $SEGMENTS segments, $PRELOAD on every node${INTERCONNECT:+, gp.interconnect_type = $INTERCONNECT}"
 CONF="$ROOT/gp_cluster.conf"
 for n in $NODES; do
 	echo "$((n + 1)) $((n - 1)) p $(sockdir "$n") $(port "$n") $(datadir "$n")"
@@ -113,6 +120,8 @@ for n in $NODES; do
 		echo "max_parallel_workers_per_gather = 0"
 		echo "max_worker_processes = 24"
 		echo "max_parallel_workers = 16"
+		[ -n "$INTERCONNECT" ] && echo "gp.interconnect_type = '$INTERCONNECT'"
+		[ "$INTERCONNECT" = shm ] && echo "gp.log_interconnect = verbose"
 		[ "$n" -eq 0 ] && echo "gp.role = 'dispatch'"
 	} >> "$(datadir "$n")/postgresql.auto.conf"
 done
@@ -130,6 +139,13 @@ DB=vexec_cluster
 out=$(cq 0 $DB "SET client_min_messages = warning; CREATE EXTENSION gp_sql; CREATE EXTENSION gp_ao; CREATE EXTENSION pax; CREATE EXTENSION vexec; CREATE EXTENSION vexec_test")
 [ -n "$out" ] && { echo "the extensions: $out"; exit 1; }
 
+# the interconnect the leg was asked for, on every node
+if [ -n "$INTERCONNECT" ]; then
+	for n in $NODES; do
+		check "node $n has gp.interconnect_type = $INTERCONNECT" \
+			"$(cq "$n" postgres "SHOW gp.interconnect_type")" "$INTERCONNECT"
+	done
+fi
 # vexec on every node, in off mode
 for n in $NODES; do
 	check "node $n has vexec loaded, in off mode" \
@@ -191,7 +207,7 @@ QUERIES=(
 # segments with its other settings
 SEED="${VEXEC_SEED:-$(( (RANDOM << 15 | RANDOM) % 2147483646 + 1 ))}"
 echo "  random session's seed: $SEED (VEXEC_SEED=$SEED reruns it)"
-SESSIONS=("off" "explain" "auto" "force-postgres" "force-arrow" "force-random" "force-parallel")
+SESSIONS=("off" "explain" "auto" "force-postgres" "force-arrow" "force-random" "force-parallel" "force-rows")
 # with workers (V4): under ORCA M8's Gathers in the segments' fragments,
 # whose parallel.c weighs them in PostgreSQL's units; on the gather route
 # the segments' own plans
@@ -205,6 +221,8 @@ session_sets() {
 		force-arrow) echo "SET vexec.mode = force; SET vexec.batch_format = arrow;" ;;
 		force-random) echo "SET vexec.mode = force; SET vexec.debug_layout_seed = $SEED;" ;;
 		force-parallel) echo "SET vexec.mode = force; $PARALLEL_SETS" ;;
+		# V7: the Motions carry rows, as before frames (§3.10, step C)
+		force-rows) echo "SET vexec.mode = force; SET vexec.enable_motion_frames = off;" ;;
 	esac
 }
 nq=0
@@ -253,14 +271,23 @@ done
 # each segment ran its part of the vector scan, with rows of its own
 # (§6.8): EXPLAIN ANALYZE's per-segment figures, gp.enable_explain_allstat's
 # "allstat: seg_firststart_total_ntuples/seg0_<ms>_<ms>_<rows>/..."
+# -- with the Motions carrying rows: with frames (V7), the scan's batches go
+# to VecMotionSend, a vector parent, whose rows gp_core counts instead
 for t in t_heap t_aoco t_porc t_porc_vec; do
-	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.enable_explain_allstat = on;
+	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.enable_explain_allstat = on; SET vexec.enable_motion_frames = off;
 		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT k, v FROM $t WHERE v > 1000" |
 		awk -v t="$t" 'index($0, "Vec Seq Scan on " t) { found = 1 }
 			found && /allstat:/ { sub(/.*allstat: /, ""); n = split($0, e, "/"); c = 0
 				for (i = 2; i <= n; i++) { k = split(e[i], f, "_"); if (f[k] + 0 > 0) c++ }
 				print c; exit }')
 	check "each of the $SEGMENTS segments ran the vector scan of $t, with rows of its own" "$out" "$SEGMENTS"
+	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.enable_explain_allstat = on;
+		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT k, v FROM $t WHERE v > 1000" |
+		awk '/Vec Motion Send/ { found = 1 }
+			found && /allstat:/ { sub(/.*allstat: /, ""); n = split($0, e, "/"); c = 0
+				for (i = 2; i <= n; i++) { k = split(e[i], f, "_"); if (f[k] + 0 > 0) c++ }
+				print c; exit }')
+	check "V7: each of the $SEGMENTS segments sent its vector scan of $t's batches as frames" "$out" "$SEGMENTS"
 done
 # under ORCA: aggregation in two stages (§3.10), a partial VecAgg on every
 # segment below the Motion, the final one after it -- on the segments past a
@@ -278,7 +305,7 @@ for t in t_heap t_aoco t_porc t_porc_vec; do
 			fail=1
 		fi
 	done
-	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.optimizer_force_multistage_agg = on; SET gp.enable_explain_allstat = on;
+	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.optimizer_force_multistage_agg = on; SET gp.enable_explain_allstat = on; SET vexec.enable_motion_frames = off;
 		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*), sum(n) FROM $t" |
 		awk '/Vec Partial Aggregate/ { found = 1 }
 			found && /allstat:/ { sub(/.*allstat: /, ""); n = split($0, e, "/"); c = 0
@@ -303,7 +330,7 @@ for t in t_heap t_aoco t_porc t_porc_vec; do
 	# allstat lists the segments where a node first started, which gp_core
 	# learns from the node's ExecProcNode: a node whose rows a parent reads,
 	# not one a vector parent reads by batches
-	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.enable_explain_allstat = on;
+	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET gp.enable_explain_allstat = on; SET vexec.enable_motion_frames = off;
 		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT a.k, b.v FROM $t a JOIN $t b ON a.v = b.id" |
 		awk '/Vec Hash Join/ { found = 1 }
 			found && /allstat:/ { sub(/.*allstat: /, ""); n = split($0, e, "/"); c = 0
@@ -311,35 +338,36 @@ for t in t_heap t_aoco t_porc t_porc_vec; do
 				print c; exit }')
 	check "each of the $SEGMENTS segments ran the VecHashJoin of $t, with rows of its own" "$out" "$SEGMENTS"
 done
-# an empty build side: the probe side's Motions read to their end, and the
-# statement ends, under an Append whose next branch needs the same senders.
+# an empty build side: the probe side's Motions stopped, and the statement
+# ends, under an Append whose next branch needs the same senders.
 # Broadcasts off, both sides are redistributed: the probe side receives a
-# Motion that its VecHashJoin, its build side empty, never reads for rows.
-# The coordinator sees what the segments' Instrumentation says -- the
-# probe side's Motion read past the batch read before the build, to its
-# end -- and none of a VecHashJoin's own figures, its drained Motions among
-# them, which gp_core does not bring back: the coordinator, where the node
-# never ran, prints none of them rather than its own zeros.
+# Motion that its VecHashJoin, its build side empty, reads no more.  From V7
+# gp_core squelches the join's subtree, as it would a HashJoin's, in a
+# fragment whose slices stream (GpCoreApi.squelch_subtree) -- with the
+# Motions carrying frames or rows -- and the coordinator, where the node
+# never ran, prints what each segment kept of its own figures, as gp_core
+# brings them back (GpCoreApi.explain_register): its subtree squelched on
+# every segment, no Motion read to its end, and none of the figures only
+# the process that ran it has, such as its inner rows.
 for t in t_heap t_aoco t_porc_vec; do
 	q="SELECT count(*) FROM (SELECT a.k FROM $t a JOIN (SELECT * FROM t_heap WHERE v < 0) e ON a.v = e.k
 		UNION ALL SELECT k FROM $t WHERE v > 99000) u"
 	sets="SET gp.optimizer = on; SET gp.optimizer_enable_motion_broadcast = off; SET statement_timeout = '120s';"
 	want=$(cq 0 $DB "$sets SET vexec.mode = off; $q")
-	got=$(cq 0 $DB "$sets SET vexec.mode = force; $q")
-	check "an empty build side over a Motion of $t, under an Append: the statement ends, answering as off" "$got" "$want"
-	plan=$(cq 0 $DB "$sets SET vexec.mode = force;
-		EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*) FROM $t a JOIN (SELECT * FROM t_heap WHERE v < 0) e ON a.v = e.k")
-	probe=$(echo "$plan" | awk '/Vec Hash Join/ { found = 1 }
-		found && /Motion/ { sub(/.*actual rows=/, ""); sub(/[.].*/, ""); print; exit }')
-	if echo "$plan" | grep -q "Vec Hash Join (actual rows=0" && [ "${probe:-0}" -gt 1024 ] &&
-		! echo "$plan" | grep -q "Inner Rows:"; then
-		echo "  ok an empty build side's VecHashJoin reads its probe side's Motion of $t to its end;"
-		echo "     the coordinator, which never ran it, prints none of its own figures"
-	else
-		echo "  FAILED the empty build side's plan of $t drains no Motion:"
-		echo "$plan" | sed 's/^/    /'
-		fail=1
-	fi
+	for frames in on off; do
+		got=$(cq 0 $DB "$sets SET vexec.mode = force; SET vexec.enable_motion_frames = $frames; $q")
+		check "an empty build side over a Motion of $t, frames $frames, under an Append: the statement ends, answering as off" "$got" "$want"
+		plan=$(cq 0 $DB "$sets SET vexec.mode = force; SET vexec.enable_motion_frames = $frames;
+			EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*) FROM $t a JOIN (SELECT * FROM t_heap WHERE v < 0) e ON a.v = e.k")
+		if echo "$plan" | grep -q "Vec Hash Join (actual rows=0" && echo "$plan" | grep -q "Squelched: $SEGMENTS" &&
+			! echo "$plan" | grep -q "Drained Motions" && ! echo "$plan" | grep -q "Inner Rows:"; then
+			echo "  ok an empty build side's VecHashJoin of $t, frames $frames: gp_core squelched its probe side on every segment"
+		else
+			echo "  FAILED the empty build side's VecHashJoin of $t, frames $frames, is not squelched on every segment:"
+			echo "$plan" | sed 's/^/    /'
+			fail=1
+		fi
+	done
 done
 
 # V4, M8: under ORCA with workers, each segment's writer runs its fragment's
@@ -514,6 +542,305 @@ planner=$(cq 0 $DB "SET gp.optimizer = off; SET vexec.mode = explain; EXPLAIN (V
 [ "$planner" -gt 0 ] && echo "  ok the planner's route records vector alternatives on the coordinator ($planner lines)" \
 	|| { echo "  FAILED the planner's route records nothing"; fail=1; }
 
+# V7: batches across ORCA's Motions as Arrow IPC frames (§3.10, step A)
+# -- over a Redistribute (made an Explicit Redistribute), a Broadcast and a
+# Gather, a vector node on each side; not over a sorted Gather
+frames_plan() {				# frames_plan <sets> <query>: EXPLAIN's text
+	cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; $1 EXPLAIN (COSTS OFF) $2"
+}
+plan=$(frames_plan "" "SELECT s, count(*) FROM t_heap GROUP BY s")
+if echo "$plan" | grep -q "Explicit Redistribute Motion" && echo "$plan" | grep -q "Frames To: the segments their keys hash to" &&
+	echo "$plan" | grep -q "Frames To: the one gathering" && echo "$plan" | grep -q "Vec Motion Receive"; then
+	echo "  ok V7: a grouping's Redistribute and its Gather carry frames, VecMotionSend below, VecMotionRecv above"
+else
+	echo "  FAILED V7: no frames over the grouping's Motions:"; echo "$plan" | sed 's/^/    /'; fail=1
+fi
+plan=$(frames_plan "SET gp.optimizer_enable_motion_broadcast = on;" "SELECT a.id FROM t_heap a JOIN (SELECT * FROM t_aoco WHERE id < 100) b ON a.k = b.k")
+echo "$plan" | grep -q "Frames To: every segment" && echo "  ok V7: a Broadcast carries frames" \
+	|| { echo "  FAILED V7: no frames over the Broadcast:"; echo "$plan" | sed 's/^/    /'; fail=1; }
+plan=$(frames_plan "" "SELECT id, v FROM t_heap WHERE v > 99000 ORDER BY v, id")
+if echo "$plan" | grep -q "Merge Key" && ! echo "$plan" | grep -q "Frames To: the one gathering"; then
+	echo "  ok V7: a sorted Gather, which merges its senders' rows, carries rows"
+else
+	echo "  FAILED V7: the sorted Gather:"; echo "$plan" | sed 's/^/    /'; fail=1
+fi
+plan=$(frames_plan "SET vexec.enable_motion_frames = off;" "SELECT s, count(*) FROM t_heap GROUP BY s")
+if ! echo "$plan" | grep -q "Vec Motion" && echo "$plan" | grep -q "Redistribute Motion"; then
+	echo "  ok V7: with vexec.enable_motion_frames off, the Motions carry rows"
+else
+	echo "  FAILED V7: frames with vexec.enable_motion_frames off:"; echo "$plan" | sed 's/^/    /'; fail=1
+fi
+# EXPLAIN ANALYZE: the frames each node sent and received, which the
+# segments kept and gp_core brought back (GpCoreApi.explain_register)
+plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force;
+	EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT s, count(*) FROM t_porc_vec GROUP BY s")
+sent=$(echo "$plan" | awk '/Vec Motion Send/ { s = 1 } s && /Frames: / { sub(/.*Frames: /, ""); print; exit }')
+batches=$(echo "$plan" | awk '/Vec Partial HashAggregate/ { s = 1 } s && /Batches: / { sub(/.*Batches: /, ""); print; exit }')
+if [ "${sent:-0}" -ge "$SEGMENTS" ] && [ "${batches:-0}" -gt 0 ] && echo "$plan" | grep -q "Segments Reporting: $SEGMENTS"; then
+	echo "  ok V7: EXPLAIN ANALYZE prints the frames and batches the segments' vector nodes counted ($sent frames)"
+else
+	echo "  FAILED V7: EXPLAIN ANALYZE prints none of the segments' figures:"; echo "$plan" | sed 's/^/    /'; fail=1
+fi
+
+# V7: the switch acts from one statement to the next (§3.10): a prepared
+# statement's generic plan and a PL/pgSQL function's cached plan included,
+# with the same answers -- the setting's assign hook makes the session's
+# cached plans be planned again
+out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET plan_cache_mode = force_generic_plan;
+	PREPARE p(int) AS SELECT s, count(*) FROM t_heap WHERE k < \$1 GROUP BY s;
+	EXPLAIN (COSTS OFF) EXECUTE p(50);
+	SET vexec.enable_motion_frames = off;
+	EXPLAIN (COSTS OFF) EXECUTE p(50);
+	SET vexec.enable_motion_frames = on;
+	EXPLAIN (COSTS OFF) EXECUTE p(50);" | grep -c "Vec Motion Send")
+on1=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET plan_cache_mode = force_generic_plan;
+	PREPARE p(int) AS SELECT s, count(*) FROM t_heap WHERE k < \$1 GROUP BY s;
+	EXPLAIN (COSTS OFF) EXECUTE p(50);" | grep -c "Vec Motion Send")
+off1=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET plan_cache_mode = force_generic_plan;
+	PREPARE p(int) AS SELECT s, count(*) FROM t_heap WHERE k < \$1 GROUP BY s;
+	EXECUTE p(50); SET vexec.enable_motion_frames = off;
+	EXPLAIN (COSTS OFF) EXECUTE p(50);" | grep -c "Vec Motion Send")
+check "V7: a prepared statement's generic plan follows SET vexec.enable_motion_frames, off then on" "$on1|$off1|$out" "2|0|4"
+answers=$(for f in on off on; do cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET vexec.enable_motion_frames = $f;
+	PREPARE p(int) AS SELECT s, count(*) FROM t_heap WHERE k < \$1 GROUP BY s; EXECUTE p(50);" | sort | md5sum; done | sort -u | wc -l)
+check "V7: and answers alike with frames and with rows" "$answers" "1"
+cq 0 $DB "CREATE OR REPLACE FUNCTION v7_count(lim int) RETURNS bigint LANGUAGE plpgsql AS \$f\$
+	DECLARE n bigint; BEGIN SELECT sum(c) INTO n FROM (SELECT s, count(*) c FROM t_heap WHERE k < lim GROUP BY s) g; RETURN n; END \$f\$" > /dev/null
+out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET plan_cache_mode = force_generic_plan;
+	LOAD 'auto_explain'; SET auto_explain.log_min_duration = 0; SET auto_explain.log_nested_statements = on;
+	SET client_min_messages = log;
+	SELECT v7_count(50); SET vexec.enable_motion_frames = off; SELECT v7_count(50);
+	SET vexec.enable_motion_frames = on; SELECT v7_count(50);" 2>&1)
+# auto_explain prints the coordinator's part of the plan: the receiver
+fp=$(echo "$out" | awk '/Query Text: SELECT sum\(c\)/ { n++ } /Vec Motion Receive/ && n > 0 { f[n]++ } END { for (i = 1; i <= n; i++) printf "%s%d", (i > 1 ? "|" : ""), (f[i] > 0) }')
+check "V7: a PL/pgSQL function's cached plan follows the setting: frames, rows, frames" "$fp" "1|0|1"
+
+# V7: the vector cdbhash puts each row where gp_core's cdbhash puts it, for
+# every key type, in both formats (§6.2): tables distributed by a key of
+# each type, loaded through ORCA's Redistribute with frames, and with
+# vexec off, every key on the same segment.  Not name, whose INSERT ORCA
+# leaves to the planner: vexec_test's cdbhash() checks its kernel, with
+# every other one, against gp_core's cdbhash row by row (below)
+KEYS=("int2" "int4" "int8" "numeric(12,4)" "numeric(30,6)" "numeric" "float4" "float8" "text" "varchar(20)" "bpchar(12)" "bytea"
+	"date" "timestamp" "timestamptz" "time" "interval" "bool" "uuid" "oid" "int4,text")
+keyexpr() {					# keyexpr <type>: a key of the type over g, NULLs among them
+	case "$1" in
+		int2) echo "(g % 30000 - 15000)::int2" ;;
+		int4) echo "(g * 7919 - 4000000)::int4" ;;
+		int8) echo "(g::int8 * 1000000007 - 5000000000000)" ;;
+		"numeric(12,4)") echo "((g % 100000) / 7.0 - 5000)::numeric(12,4)" ;;
+		"numeric(30,6)") echo "(g::numeric * 1234567.891234 - 999999999.5)::numeric(30,6)" ;;
+		numeric) echo "CASE g % 211 WHEN 0 THEN 'NaN'::numeric WHEN 1 THEN 'Infinity' ELSE g::numeric / 3 END" ;;
+		float4) echo "CASE g % 101 WHEN 0 THEN 'NaN'::float4 WHEN 1 THEN '-0' WHEN 2 THEN 'Infinity' ELSE g * 0.37 END::float4" ;;
+		float8) echo "CASE g % 101 WHEN 0 THEN 'NaN'::float8 WHEN 1 THEN '-0' WHEN 2 THEN '-Infinity' ELSE g * 0.37 END" ;;
+		text) echo "'k' || g % 3000 || repeat('x', g % 20)" ;;
+		"varchar(20)") echo "('v' || g % 3000)::varchar(20)" ;;
+		"bpchar(12)") echo "('b' || g % 500)::bpchar(12)" ;;
+		bytea) echo "decode(md5((g % 4000)::text), 'hex')" ;;
+		date) echo "CASE g % 997 WHEN 0 THEN 'infinity'::date ELSE DATE '2000-01-01' + (g % 20000 - 10000) END" ;;
+		timestamp) echo "CASE g % 997 WHEN 0 THEN '-infinity'::timestamp ELSE TIMESTAMP '2000-01-01' + g * interval '17 minutes' END" ;;
+		timestamptz) echo "TIMESTAMPTZ '1999-12-31 23:00+00' + g * interval '1 hour 1 second'" ;;
+		time) echo "TIME '00:00' + (g % 1440) * interval '1 minute'" ;;
+		interval) echo "g * interval '1 hour 3 minutes'" ;;
+		bool) echo "g % 3 = 0" ;;
+		uuid) echo "md5((g % 5000)::text)::uuid" ;;
+		oid) echo "(g % 100000)::oid" ;;
+		"int4,text") echo "g % 1000, 't' || g % 77" ;;
+	esac
+}
+for f in postgres arrow; do
+	bad=""
+	for kt in "${KEYS[@]}"; do
+		cols="k"
+		defs="k $kt"
+		if [ "$kt" = "int4,text" ]; then cols="k, k2"; defs="k int4, k2 text"; fi
+		tn="dk_$(echo "$kt" | tr -c 'a-z0-9' '_' | sed 's/_*$//')"
+		out=$(cq 0 $DB "SET client_min_messages = warning; DROP TABLE IF EXISTS ${tn}_r, ${tn}_f;
+			CREATE TABLE ${tn}_r ($defs) DISTRIBUTED BY ($cols); CREATE TABLE ${tn}_f ($defs) DISTRIBUTED BY ($cols);
+			SET gp.optimizer = on;
+			SET vexec.mode = off; INSERT INTO ${tn}_r SELECT $(keyexpr "$kt") FROM (SELECT CASE WHEN id % 53 = 0 THEN NULL ELSE id END AS g FROM src) x;
+			SET vexec.mode = force; SET vexec.batch_format = $f;
+			INSERT INTO ${tn}_f SELECT $(keyexpr "$kt") FROM (SELECT CASE WHEN id % 53 = 0 THEN NULL ELSE id END AS g FROM src) x;
+			SELECT (SELECT count(*) FROM ${tn}_f) || '|' ||
+				(SELECT count(*) FROM ((SELECT $cols, gp_segment_id FROM ${tn}_r EXCEPT ALL SELECT $cols, gp_segment_id FROM ${tn}_f)
+				 UNION ALL (SELECT $cols, gp_segment_id FROM ${tn}_f EXCEPT ALL SELECT $cols, gp_segment_id FROM ${tn}_r)) d)" 2>&1 | tail -1)
+		plan=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET vexec.batch_format = $f;
+			EXPLAIN (COSTS OFF) INSERT INTO ${tn}_f SELECT $(keyexpr "$kt") FROM (SELECT id AS g FROM src) x")
+		if [ "$out" != "$ROWS|0" ] || ! echo "$plan" | grep -q "Frames To: the segments their keys hash to"; then
+			bad="$bad $kt[$out$(echo "$plan" | grep -q 'Frames To' || echo ', no frames')]"
+		fi
+	done
+	check "V7: the vector cdbhash puts every key, ${#KEYS[@]} types with NULLs, -0, NaN and the infinities, where gp_core's does, $f format" "${bad:- none differ}" " none differ"
+done
+
+# V7: the vector cdbhash's kernels against gp_core's own cdbhash, row by
+# row (vexec_test.cdbhash()), for every key type -- name too -- and keys of
+# several columns, over segment counts that are and are not powers of two,
+# in both formats and with the per-structure layouts' other choices: the
+# kernels read every layout a key's column can have
+CONFIGS=("postgres format format format format" "arrow format format format format"
+	"postgres view format format format" "arrow offsets byte postgres format"
+	"postgres format bit arrow varlena" "arrow datum format format varlena")
+bad=""
+for cfg in "${CONFIGS[@]}"; do
+	read -r f vl bo te nu <<< "$cfg"
+	for kt in "${KEYS[@]}" name "int8,date,text"; do
+		case "$kt" in
+			name) ke="('n' || g % 700)::name" ;;
+			"int8,date,text") ke="g::int8 * 31, DATE '2001-01-01' + g % 4000, 'z' || g % 101" ;;
+			*) ke="$(keyexpr "$kt")" ;;
+		esac
+		out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force;
+			SELECT coalesce(string_agg(n || ':' || h.rows || '/' || h.mismatches, ' '), 'same')
+			FROM unnest(ARRAY[1, 2, 3, 4, 5, 7, 16]) n,
+			     LATERAL vexec_test.cdbhash(\$q\$SELECT $ke FROM (SELECT CASE WHEN id % 53 = 0 THEN NULL ELSE id END AS g FROM src WHERE id <= 20000) x\$q\$,
+			                                n, '$f', '$vl', '$bo', '$te', '$nu') h
+			WHERE h.mismatches <> 0 OR h.rows <> 20000")
+		[ "$out" = same ] || bad="$bad [$cfg] $kt: $out;"
+	done
+done
+check "V7: the vector cdbhash gives gp_core's segment to every row, $((${#KEYS[@]} + 2)) key types in ${#CONFIGS[@]} layouts, 1 to 16 segments" "${bad:- none differ}" " none differ"
+
+# V7: and every key type of the layouts' semantics corpus (§6.2), each of
+# its columns a key on its own where its type has a hash operator class,
+# with its NULLs, -0, NaN, infinities, numerics of several scales, bpchar's
+# padding and TOAST's values, in both formats
+"$BINDIR/psql" -X -q -At -v ON_ERROR_STOP=1 -h "$(sockdir 0)" -p "$(port 0)" -U postgres -d $DB \
+	-f "$here/../../modules/vexec/sql/vexec_corpus_setup.sql" > /dev/null 2>&1 || { echo "  FAILED the corpus"; fail=1; }
+cq 0 $DB "CREATE FUNCTION v7_corpus_cdbhash(f text) RETURNS text LANGUAGE plpgsql AS \$f\$
+DECLARE c record; r record; bad text := ''; nk int := 0; nohash text := '';
+BEGIN
+	FOR c IN SELECT attname, format_type(atttypid, atttypmod) AS t FROM pg_attribute
+		WHERE attrelid = 'corpus'::regclass AND attnum > 0 AND NOT attisdropped ORDER BY attnum LOOP
+		BEGIN
+			FOR r IN SELECT n, h.mismatches, h.rows FROM unnest(ARRAY[1, 2, 3, 4, 5, 7, 16]) n,
+				LATERAL vexec_test.cdbhash(format('SELECT %I FROM corpus', c.attname), n, f) h LOOP
+				IF r.mismatches <> 0 OR r.rows <> 2600 THEN
+					bad := bad || format(' %s/%s:%s', c.attname, r.n, r.mismatches);
+				END IF;
+			END LOOP;
+			nk := nk + 1;
+		EXCEPTION WHEN undefined_object OR internal_error THEN
+			nohash := nohash || ' ' || c.t;
+		END;
+	END LOOP;
+	RETURN nk || ' keys;' || coalesce(nullif(bad, ''), ' none differ') || '; no hash operator class:' || nohash;
+END \$f\$" > /dev/null
+for f in postgres arrow; do
+	out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET client_min_messages = warning; SELECT v7_corpus_cdbhash('$f')")
+	check "V7: the vector cdbhash gives gp_core's segment to every value of the corpus's key types, 1 to 16 segments, $f format" \
+		"$out" "36 keys; none differ; no hash operator class: money json point"
+done
+
+# V7: a Redistribute ORCA hashes with the legacy cdbhash -- every table of
+# the query keyed with a cdbhash_*_ops class, or placed at random -- sends
+# its frames where gp_core's legacy cdbhash puts each key, the keys hashed
+# row by row by gp_core (GpCoreApi.hash_segment): a join into a legacy-keyed
+# table's placement finds each of its rows, in both formats.  ORCA has found
+# int4's and int8's legacy families since the port's 11af2ab11f4.
+out=$(cq 0 $DB "SET client_min_messages = warning;
+	CREATE TABLE lg_t (key text, n int) DISTRIBUTED BY (key cdbhash_text_ops);
+	CREATE TABLE lg_n (key numeric(12,4), n int) DISTRIBUTED BY (key cdbhash_numeric_ops);
+	CREATE TABLE lg_i (key int4, n int) DISTRIBUTED BY (key cdbhash_int4_ops);
+	CREATE TABLE lg_l (key int8, n int) DISTRIBUTED BY (key cdbhash_int8_ops);
+	CREATE TABLE lg_r (id int, t text, nu numeric(12,4), i int4, l int8) DISTRIBUTED RANDOMLY;
+	INSERT INTO lg_t SELECT 'k' || g, g FROM generate_series(1, 20000) g;
+	INSERT INTO lg_n SELECT g / 4.0, g FROM generate_series(1, 20000) g;
+	INSERT INTO lg_i SELECT g * 7, g FROM generate_series(1, 20000) g;
+	INSERT INTO lg_l SELECT g * 1000003::int8, g FROM generate_series(1, 20000) g;
+	INSERT INTO lg_r SELECT g, 'k' || g, g / 4.0, g * 7, g * 1000003::int8 FROM generate_series(1, 20000) g;
+	ANALYZE lg_t; ANALYZE lg_n; ANALYZE lg_i; ANALYZE lg_l; ANALYZE lg_r" 2>&1)
+[ -n "$out" ] && { echo "  FAILED the legacy-keyed tables: $out"; fail=1; }
+bad=""
+for lk in lg_t:t lg_n:nu lg_i:i lg_l:l; do
+	q="SELECT count(*) FROM lg_r r JOIN ${lk%:*} x ON x.key = r.${lk#*:}"
+	for f in postgres arrow; do
+		sets="SET gp.optimizer = on; SET vexec.mode = force; SET vexec.batch_format = $f; SET gp.optimizer_enable_motion_broadcast = off;"
+		plan=$(cq 0 $DB "$sets EXPLAIN (VERBOSE, COSTS OFF) $q")
+		echo "$plan" | grep -q "Hash: legacy, row by row" && echo "$plan" | grep -q "Optimizer: GPORCA" \
+			|| bad="$bad ${lk%:*}/$f[no legacy frames]"
+		got=$(cq 0 $DB "$sets $q")
+		[ "$got" = 20000 ] || bad="$bad ${lk%:*}/$f[$got]"
+	done
+done
+check "V7: legacy-hashed Redistributes' frames -- text, numeric, int4, int8 keys -- go where gp_core's legacy cdbhash puts their rows, both formats" \
+	"${bad:- every row found}" " every row found"
+
+# V7: the rows a vector node leaves undecided -- a qual or a join filter
+# PostgreSQL's evaluator is to compute, which may raise, outside its
+# batch's selection (vexec_next_batch()) -- resolved by VecMotionSend below
+# a Gather, a Broadcast and a Redistribute: a division by zero raises, and
+# a timestamp compared with a timestamptz passes its rows, as across Motions
+# that carry rows.  The port's suites found them dropped (2026-10-07), and
+# each of these lost them then.
+out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SELECT id FROM t_heap WHERE k / (v - v) = 9" 2>&1)
+check "V7: a qual dividing by zero, its rows left to PostgreSQL's evaluator under a Gather's frames, raises" \
+	"$(echo "$out" | grep -c 'division by zero')" "1"
+out=$(cq 0 $DB "SET client_min_messages = warning;
+	CREATE TABLE v7_ts1 (a int, b timestamp, bb timestamptz) DISTRIBUTED BY (a, b);
+	CREATE TABLE v7_ts2 (c int, d timestamp, dd timestamptz) DISTRIBUTED BY (c, d);
+	INSERT INTO v7_ts1 SELECT g, timestamp '2016-11-01' + g * interval '1 day', timestamptz '2016-11-01 00:00+00' + g * interval '1 day' FROM generate_series(9, 13) g;
+	INSERT INTO v7_ts2 SELECT g, timestamp '2016-11-01' + g * interval '1 day', timestamptz '2016-11-01 00:00+00' + g * interval '1 day' FROM generate_series(9, 13) g;
+	CREATE TABLE v7_tsb1 (a int, b timestamp, bb timestamptz) DISTRIBUTED BY (a, b);
+	CREATE TABLE v7_tsb2 (c int, d timestamp, dd timestamptz) DISTRIBUTED BY (c, d);
+	INSERT INTO v7_tsb1 SELECT g, timestamp '2016-11-01' + g * interval '1 hour', timestamptz '2016-11-01 00:00+00' + g * interval '1 hour' FROM generate_series(1, 3000) g;
+	INSERT INTO v7_tsb2 SELECT g, timestamp '2016-11-01' + g * interval '1 hour', timestamptz '2016-11-01 00:00+00' + g * interval '1 hour' FROM generate_series(1, 3000) g;
+	ANALYZE v7_ts1; ANALYZE v7_ts2; ANALYZE v7_tsb1; ANALYZE v7_tsb2" 2>&1)
+[ -n "$out" ] && { echo "  FAILED the timestamp tables: $out"; fail=1; }
+bad=""
+for q in "SELECT a, b FROM v7_ts1 JOIN v7_ts2 ON a = c AND b = dd AND b = bb AND b = timestamp '2016-11-11'" \
+	"SELECT count(*), sum(t.id) FROM (SELECT a, c FROM v7_tsb1 JOIN v7_tsb2 ON a = c AND b = dd) j JOIN t_heap t ON t.v = j.a" \
+	"SELECT j.a % 10, count(*) FROM (SELECT a, c FROM v7_tsb1 JOIN v7_tsb2 ON a = c AND b = dd) j GROUP BY 1 ORDER BY 1"; do
+	for f in postgres arrow; do
+		sets="SET gp.optimizer = on; SET vexec.mode = force; SET vexec.batch_format = $f;"
+		want=$(cq 0 $DB "$sets SET vexec.enable_motion_frames = off; $q")
+		got=$(cq 0 $DB "$sets $q")
+		plan=$(cq 0 $DB "$sets EXPLAIN (COSTS OFF) $q")
+		[ "$got" = "$want" ] && [ -n "$(echo "$want" | grep -v '^0|$')" ] && echo "$plan" | grep -q "Vec Motion Send" \
+			|| bad="$bad [$f: $q: $(echo "$got" | head -2 | tr '\n' ' ')]"
+	done
+done
+check "V7: a join filter's rows left to PostgreSQL's evaluator, through a Gather's, a Broadcast's and a Redistribute's frames, as across rows, both formats" \
+	"${bad:- all alike}" " all alike"
+
+# V7: a numeric a kernel computes is scaled at its arithmetic's scale,
+# whatever the column's typmod -- extract()'s here -- and crosses a
+# Redistribute in that shape, which the receiver takes as one of numeric's
+# (frame.c).  The port's suites found it refused as malformed (2026-10-07),
+# and each of these was then.
+bad=""
+for q in "SELECT y, rank() OVER (PARTITION BY y ORDER BY id) FROM (SELECT id, extract(year FROM d) AS y FROM t_heap) s ORDER BY 2, 1 LIMIT 5" \
+	"SELECT count(*), sum(a.m) FROM (SELECT extract(year FROM d) AS y, n * 3 + 1 AS m FROM t_heap) a JOIN t_heap b ON a.y = b.k"; do
+	for f in postgres arrow; do
+		sets="SET gp.optimizer = on; SET vexec.mode = force; SET vexec.batch_format = $f;"
+		want=$(cq 0 $DB "$sets SET vexec.enable_motion_frames = off; $q")
+		got=$(cq 0 $DB "$sets $q")
+		plan=$(cq 0 $DB "$sets EXPLAIN (COSTS OFF) $q")
+		[ "$got" = "$want" ] && echo "$plan" | grep -q "Vec Motion Send" || bad="$bad [$f: $q: $(echo "$got" | head -2 | tr '\n' ' ')]"
+	done
+done
+check "V7: numerics scaled by kernels -- extract()'s -- cross Redistributes as frames, both formats" \
+	"${bad:- all alike}" " all alike"
+
+# V7: the hang tests (§6.5) with frames: a LIMIT over Motions, a CTE read in
+# two slices, a cursor read in part and closed, and a statement cancelled in
+# the middle of its frames -- each ends, and the cluster answers after
+out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET statement_timeout = '120s';
+	SELECT count(*) FROM (SELECT a.id FROM t_heap a JOIN t_heap b ON a.k = b.v LIMIT 7) l")
+check "V7: a LIMIT over an island with frames below it ends" "$out" "7"
+out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET statement_timeout = '120s';
+	WITH c AS (SELECT k, count(*) AS n FROM t_porc GROUP BY k) SELECT count(*) FROM c a JOIN c b ON a.k = b.k + 1")
+check "V7: a CTE read twice, its slices' frames shared, ends" "$out" "96"
+out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET statement_timeout = '120s';
+	BEGIN; DECLARE cur NO SCROLL CURSOR FOR SELECT s, count(*) FROM t_heap GROUP BY s; FETCH 5 FROM cur; CLOSE cur; COMMIT;
+	SELECT 'after'" | tail -1)
+check "V7: a cursor over frames read five rows and closed, the session goes on" "$out" "after"
+out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SET statement_timeout = '300ms';
+	SELECT count(*) FROM t_heap a JOIN t_heap b ON a.k = b.k JOIN t_aoco c ON b.k = c.k" 2>&1 | grep -c "canceling statement due to statement timeout")
+check "V7: statement_timeout in the middle of the frames cancels the statement" "$out" "1"
+out=$(cq 0 $DB "SET gp.optimizer = on; SET vexec.mode = force; SELECT count(*) FROM t_heap a JOIN t_heap b ON a.id = b.v")
+check "V7: and the cluster answers after it" "$out" "$(cq 0 $DB "SET vexec.mode = off; SELECT count(*) FROM t_heap a JOIN t_heap b ON a.id = b.v")"
+
 # the batch layer over rows gathered from the segments
 for t in t_heap t_porc_vec; do
 	out=$(cq 0 $DB "SELECT count(*), min(rows), max(batches) FROM vexec_test.roundtrip('SELECT * FROM $t')")
@@ -523,6 +850,19 @@ for t in t_heap t_porc_vec; do
 		check "the export check over $t's rows, $f format" "$out" "7|$ROWS"
 	done
 done
+
+# over shm: the segments' logs have its senders and receivers through rings
+if [ "$INTERCONNECT" = shm ]; then
+	sends=$(cat "$ROOT"/node[1-9]*.log | grep -c "interconnect shm: .* sends to .* through shared memory")
+	recvs=$(cat "$ROOT"/node[1-9]*.log | grep -c "interconnect shm: .* receives from .* through shared memory")
+	tcps=$(cat "$ROOT"/node[1-9]*.log | grep -c "interconnect shm: .* over tcp")
+	if [ "$sends" -gt 0 ] && [ "$recvs" -gt 0 ] && [ "$tcps" = 0 ]; then
+		echo "  ok the suite's Motions went through shm's rings: $sends senders and $recvs receivers began so, none over tcp"
+	else
+		echo "  FAILED the suite's Motions over shm: $sends senders and $recvs receivers through rings, $tcps over tcp"
+		fail=1
+	fi
+fi
 
 echo "cluster: $([ $fail -eq 0 ] && echo passed || echo FAILED)"
 exit $fail

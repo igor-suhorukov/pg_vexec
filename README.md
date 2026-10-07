@@ -90,6 +90,8 @@ test/vexec/run.sh states           # §1.2's states: installed and not preloaded
 test/vexec/run.sh pgregress        # PostgreSQL's own suite, unchanged, with vexec installed, preloaded off, and in explain mode
 test/vexec/run.sh differential     # the differential runner: off, force postgres, force arrow, force with random layouts
 test/vexec/run.sh cluster          # a coordinator and four segments of the port, vexec on every node
+VEXEC_INTERCONNECT=shm test/vexec/run.sh cluster   # the same over the port's shm transport (V7)
+test/vexec/run.sh shm              # the shm transport (V7): Motions, switches, remote path, hangs, kills, the port's ic test
 test/vexec/run.sh tpc              # the tpc suite in each storage, vexec preloaded
 test/vexec/run.sh fullrun          # the port's full run with vexec on every node, against the run without it
 test/vexec/run.sh v0               # V0's checks: checks, suite, states, pgregress, differential, cluster

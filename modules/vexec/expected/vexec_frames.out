@@ -1,0 +1,329 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- Batches across Motions as Arrow IPC frames (pg_vector_executor.md §3.10,
+-- step A; §5 V7): every type of the layouts' corpus (§6.2), in both formats
+-- and with each per-structure setting, sent as a Redistribute sends it --
+-- dealt among 1, 3 or 7 segments, a frame each -- and decoded value for
+-- value, from aligned and from unaligned bytes; and a malformed frame
+-- refused, never read outside its bytes.  vexec_test runs the checks
+-- (frame_test.c); the frames across a cluster's Motions, and the vector
+-- cdbhash against gp_core's, are the cluster leg's (test/vexec/cluster.sh).
+\i sql/vexec_corpus_setup.sql
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- The layouts' semantics corpus (pg_vector_executor.md §6.2, "Layouts"): a
+-- table of every kind of type vexec holds, with the values at each layout's
+-- edges, over 2,600 rows -- three batches, the last short -- with NULLs at
+-- the edges of the bitmaps' words and of the batches.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+CREATE EXTENSION IF NOT EXISTS vexec_test;
+RESET client_min_messages;
+CREATE TABLE corpus (
+	id int4,
+	b bool, i2 int2, i4 int4, i8 int8, f4 float4, f8 float8,
+	o oid, m money, ch "char",
+	d date, t time, ts timestamp, tstz timestamptz, iv interval, tz timetz,
+	n numeric, n10_2 numeric(10,2), n18_0 numeric(18,0), n38_5 numeric(38,5),
+	n5_m2 numeric(5,-2), n3_10 numeric(3,10), n40_2 numeric(40,2),
+	tx text, vc varchar(200), bp char(5), bt bytea, js json, jb jsonb,
+	u uuid, nm name, mac macaddr, mac8 macaddr8, ip inet, pt point,
+	a4 int4[], at text[], k int4, big text
+);
+-- big's long values are stored out of line, uncompressed
+ALTER TABLE corpus ALTER COLUMN big SET STORAGE EXTERNAL;
+-- a row's value is NULL where its id is at a word's edge, or every 7th
+CREATE FUNCTION corpus_null(id int4, col int4) RETURNS bool
+LANGUAGE sql IMMUTABLE AS
+$$ SELECT (id - 1) % 64 IN (0, 63) OR (id + col) % 7 = 0 OR id IN (1024, 1025, 2048) $$;
+INSERT INTO corpus
+SELECT g,
+	CASE WHEN corpus_null(g, 1) THEN NULL ELSE g % 3 = 0 END,
+	CASE WHEN corpus_null(g, 2) THEN NULL
+		 WHEN g % 50 = 1 THEN 32767 WHEN g % 50 = 2 THEN -32768 ELSE (g * 7) % 30000 - 15000 END,
+	CASE WHEN corpus_null(g, 3) THEN NULL
+		 WHEN g % 50 = 3 THEN 2147483647 WHEN g % 50 = 4 THEN -2147483648 ELSE (g::int8 * 1000003 % 1000000007)::int4 END,
+	CASE WHEN corpus_null(g, 4) THEN NULL
+		 WHEN g % 50 = 5 THEN 9223372036854775807 WHEN g % 50 = 6 THEN -9223372036854775808
+		 ELSE g::int8 * 1000000007 * 97 END,
+	CASE WHEN corpus_null(g, 5) THEN NULL
+		 WHEN g % 50 = 7 THEN 'NaN' WHEN g % 50 = 8 THEN '-0' WHEN g % 50 = 9 THEN '-Infinity'
+		 ELSE g / 7.0 END,
+	CASE WHEN corpus_null(g, 6) THEN NULL
+		 WHEN g % 50 = 10 THEN 'NaN' WHEN g % 50 = 11 THEN '-0' WHEN g % 50 = 12 THEN 'Infinity'
+		 WHEN g % 50 = 13 THEN 1e308 ELSE g / 3.0 END,
+	CASE WHEN corpus_null(g, 7) THEN NULL WHEN g % 50 = 14 THEN 4294967295 ELSE g END,
+	CASE WHEN corpus_null(g, 8) THEN NULL ELSE (g * 1.25)::money END,
+	CASE WHEN corpus_null(g, 9) THEN NULL ELSE chr(33 + g % 90)::"char" END,
+	-- dates: the infinities, PostgreSQL's limits
+	CASE WHEN corpus_null(g, 10) THEN NULL
+		 WHEN g % 50 = 15 THEN 'infinity' WHEN g % 50 = 16 THEN '-infinity'
+		 WHEN g % 50 = 17 THEN '4714-11-24 BC' WHEN g % 50 = 18 THEN '5874897-12-31'
+		 ELSE '2000-01-01'::date + (g * 37 - 40000) END,
+	-- time, 24:00:00 included
+	CASE WHEN corpus_null(g, 11) THEN NULL WHEN g % 50 = 19 THEN '24:00:00'
+		 ELSE '00:00:00'::time + g * interval '17 seconds' END,
+	-- timestamps: the infinities, the limits, and from 294247-01-10 on
+	CASE WHEN corpus_null(g, 12) THEN NULL
+		 WHEN g % 50 = 20 THEN 'infinity' WHEN g % 50 = 21 THEN '-infinity'
+		 WHEN g % 50 = 22 THEN '4714-11-24 00:00:00 BC'
+		 WHEN g % 50 = 23 AND g > 2000 THEN '294276-12-31 23:59:59.999999'
+		 WHEN g % 50 = 24 AND g > 2000 THEN '294247-01-10 04:00:54.775808'
+		 WHEN g % 50 = 25 THEN '294247-01-10 04:00:54.775807'
+		 ELSE '2000-01-01'::timestamp + g * interval '1 day 3 hours 7 minutes 11.123456 seconds' END,
+	CASE WHEN corpus_null(g, 13) THEN NULL
+		 WHEN g % 50 = 20 THEN 'infinity' WHEN g % 50 = 21 THEN '-infinity'
+		 WHEN g % 50 = 23 AND g > 2000 THEN '294276-12-30 23:59:59.999999+00'
+		 ELSE '1999-12-31 00:00:00+00'::timestamptz - g * interval '13 days 5 hours 0.5 seconds' END,
+	-- intervals: the infinities, and time parts on both sides of 292 years in ns
+	CASE WHEN corpus_null(g, 14) THEN NULL
+		 WHEN g % 50 = 26 THEN 'infinity' WHEN g % 50 = 27 AND g > 2000 THEN '-infinity'
+		 WHEN g % 50 = 28 AND g > 1000 THEN '2562048 hours'
+		 WHEN g % 50 = 29 THEN '2562047 hours 47 minutes 16.854775 seconds'
+		 ELSE make_interval(months => g % 13, days => g % 31, secs => g * 1.000001) END,
+	CASE WHEN corpus_null(g, 15) THEN NULL ELSE ('10:11:12.13'::time + g * interval '1 second')::timetz END,
+	-- numerics: NaN and the infinities, and each typmod's edges
+	CASE WHEN corpus_null(g, 16) THEN NULL
+		 WHEN g % 50 = 30 THEN 'NaN' WHEN g % 50 = 31 THEN 'Infinity' WHEN g % 50 = 32 THEN '-Infinity'
+		 WHEN g % 50 = 33 THEN 1.000 ELSE g / 7.0::numeric END,
+	CASE WHEN corpus_null(g, 17) THEN NULL
+		 WHEN g % 50 = 34 THEN 99999999.99 WHEN g % 50 = 35 THEN -99999999.99 WHEN g % 50 = 36 THEN 0
+		 ELSE g * 1.07 - 1000 END,
+	CASE WHEN corpus_null(g, 18) THEN NULL
+		 WHEN g % 50 = 34 THEN 999999999999999999 WHEN g % 50 = 35 THEN -999999999999999999
+		 ELSE g::int8 * 123456789 END,
+	CASE WHEN corpus_null(g, 19) THEN NULL
+		 WHEN g % 50 = 34 THEN 999999999999999999999999999999999.99999
+		 WHEN g % 50 = 35 THEN -999999999999999999999999999999999.99999
+		 WHEN g % 50 = 36 AND g > 1000 THEN 'NaN'
+		 ELSE g * 1234567890123456789.12345 END,
+	CASE WHEN corpus_null(g, 20) THEN NULL WHEN g % 50 = 34 THEN 9999900 ELSE g * 100 END,
+	CASE WHEN corpus_null(g, 21) THEN NULL ELSE g * 0.0000000001 / 1000 END,
+	CASE WHEN corpus_null(g, 22) THEN NULL ELSE g * 1.5 END,
+	-- strings: 12 and 13 bytes (a view's inline edge), 126 and 127 (the short
+	-- header's), compressed inline, and external
+	CASE WHEN corpus_null(g, 23) THEN NULL
+		 WHEN g % 50 = 37 THEN repeat('x', 12) WHEN g % 50 = 38 THEN repeat('y', 13)
+		 WHEN g % 50 = 39 THEN repeat('z', 126) WHEN g % 50 = 40 THEN repeat('w', 127)
+		 WHEN g % 50 = 41 THEN repeat('compressible ', 400)
+		 WHEN g % 50 = 42 THEN (SELECT string_agg(md5((g * 1000 + s)::text), '') FROM generate_series(1, 300) s)
+		 WHEN g % 50 = 43 THEN '' WHEN g % 50 = 44 THEN 'äöü €'
+		 ELSE 'row ' || g END,
+	CASE WHEN corpus_null(g, 24) THEN NULL ELSE repeat(chr(97 + g % 26), g % 200) END,
+	CASE WHEN corpus_null(g, 25) THEN NULL WHEN g % 50 = 45 THEN '' ELSE substr('abcdefgh', 1 + g % 5, g % 4) END,
+	CASE WHEN corpus_null(g, 26) THEN NULL
+		 WHEN g % 50 = 46 THEN '\x00ff00'::bytea WHEN g % 50 = 47 THEN decode(repeat('ab', 70), 'hex')
+		 ELSE int4send(g) END,
+	CASE WHEN corpus_null(g, 27) THEN NULL ELSE ('{"g": ' || g || ', "s": "' || repeat('j', g % 20) || '"}')::json END,
+	CASE WHEN corpus_null(g, 28) THEN NULL ELSE ('{"g": ' || g || ', "a": [1, 2, ' || g % 10 || ']}')::jsonb END,
+	CASE WHEN corpus_null(g, 29) THEN NULL ELSE md5(g::text)::uuid END,
+	CASE WHEN corpus_null(g, 30) THEN NULL ELSE ('name_' || g)::name END,
+	CASE WHEN corpus_null(g, 31) THEN NULL ELSE ('08:00:2b:01:02:' || lpad(to_hex(g % 256), 2, '0'))::macaddr END,
+	CASE WHEN corpus_null(g, 32) THEN NULL ELSE ('08:00:2b:01:02:03:04:' || lpad(to_hex(g % 256), 2, '0'))::macaddr8 END,
+	CASE WHEN corpus_null(g, 33) THEN NULL ELSE ('10.' || g % 256 || '.' || g / 256 % 256 || '.1/24')::inet END,
+	CASE WHEN corpus_null(g, 34) THEN NULL ELSE point(g, -g / 3.0) END,
+	CASE WHEN corpus_null(g, 35) THEN NULL ELSE ARRAY[g, g + 1, NULL, g % 5] END,
+	CASE WHEN corpus_null(g, 36) THEN NULL ELSE ARRAY['a' || g, NULL, repeat('t', g % 30)] END,
+	42,
+	CASE WHEN corpus_null(g, 37) THEN NULL WHEN g % 10 = 1 THEN repeat('external ' || g, 400)
+		 ELSE 'short ' || g END
+FROM generate_series(1, 2600) g;
+ANALYZE corpus;
+-- every column, in each format: the shapes its frames carried
+SELECT * FROM vexec_test.frames('SELECT * FROM corpus ORDER BY id', 'postgres');
+ col |    type     |      layouts       | rows | nulls | frames | schemas |  bytes  
+-----+-------------+--------------------+------+-------+--------+---------+---------
+   1 | int4        | fixed(4)           | 2600 |     0 |      3 |       2 | 3189992
+   2 | bool        | byte               | 2600 |   441 |      3 |       2 | 3189992
+   3 | int2        | fixed(2)           | 2600 |   440 |      3 |       2 | 3189992
+   4 | int4        | fixed(4)           | 2600 |   440 |      3 |       2 | 3189992
+   5 | int8        | fixed(8)           | 2600 |   441 |      3 |       2 | 3189992
+   6 | float4      | fixed(4)           | 2600 |   441 |      3 |       2 | 3189992
+   7 | float8      | fixed(8)           | 2600 |   441 |      3 |       2 | 3189992
+   8 | oid         | fixed(4)           | 2600 |   442 |      3 |       2 | 3189992
+   9 | money       | fixed(8)           | 2600 |   441 |      3 |       2 | 3189992
+  10 | char        | fixed(1)           | 2600 |   440 |      3 |       2 | 3189992
+  11 | date        | fixed(4,postgres)  | 2600 |   440 |      3 |       2 | 3189992
+  12 | time        | fixed(8)           | 2600 |   441 |      3 |       2 | 3189992
+  13 | timestamp   | fixed(8,postgres)  | 2600 |   441 |      3 |       2 | 3189992
+  14 | timestamptz | fixed(8,postgres)  | 2600 |   441 |      3 |       2 | 3189992
+  15 | interval    | fixed(16,postgres) | 2600 |   442 |      3 |       2 | 3189992
+  16 | timetz      | fixed(12/16)       | 2600 |   441 |      3 |       2 | 3189992
+  17 | numeric     | datum              | 2600 |   440 |      3 |       2 | 3189992
+  18 | numeric     | scaled(8,2)        | 2600 |   440 |      3 |       2 | 3189992
+  19 | numeric     | scaled(8,0)        | 2600 |   441 |      3 |       2 | 3189992
+  20 | numeric     | scaled(16,5) datum | 2600 |   441 |      3 |       2 | 3189992
+  21 | numeric     | scaled(8,0)        | 2600 |   441 |      3 |       2 | 3189992
+  22 | numeric     | scaled(8,10)       | 2600 |   442 |      3 |       2 | 3189992
+  23 | numeric     | datum              | 2600 |   441 |      3 |       2 | 3189992
+  24 | text        | datum              | 2600 |   440 |      3 |       2 | 3189992
+  25 | varchar     | datum              | 2600 |   440 |      3 |       2 | 3189992
+  26 | bpchar      | datum              | 2600 |   441 |      3 |       2 | 3189992
+  27 | bytea       | datum              | 2600 |   441 |      3 |       2 | 3189992
+  28 | json        | datum              | 2600 |   441 |      3 |       2 | 3189992
+  29 | jsonb       | datum              | 2600 |   442 |      3 |       2 | 3189992
+  30 | uuid        | fixed(16)          | 2600 |   441 |      3 |       2 | 3189992
+  31 | name        | fixed(64)          | 2600 |   440 |      3 |       2 | 3189992
+  32 | macaddr     | fixed(6/8)         | 2600 |   440 |      3 |       2 | 3189992
+  33 | macaddr8    | fixed(8)           | 2600 |   441 |      3 |       2 | 3189992
+  34 | inet        | datum              | 2600 |   441 |      3 |       2 | 3189992
+  35 | point       | fixed(16)          | 2600 |   441 |      3 |       2 | 3189992
+  36 | _int4       | datum              | 2600 |   442 |      3 |       2 | 3189992
+  37 | _text       | datum              | 2600 |   441 |      3 |       2 | 3189992
+  38 | int4        | fixed(4)           | 2600 |     0 |      3 |       2 | 3189992
+  39 | text        | datum              | 2600 |   440 |      3 |       2 | 3189992
+(39 rows)
+
+SELECT * FROM vexec_test.frames('SELECT * FROM corpus ORDER BY id', 'arrow', parts => 7);
+ col |    type     |             layouts              | rows | nulls | frames | schemas |  bytes  
+-----+-------------+----------------------------------+------+-------+--------+---------+---------
+   1 | int4        | fixed(4)                         | 2600 |     0 |      3 |       2 | 3611016
+   2 | bool        | bit                              | 2600 |   441 |      3 |       2 | 3611016
+   3 | int2        | fixed(2)                         | 2600 |   440 |      3 |       2 | 3611016
+   4 | int4        | fixed(4)                         | 2600 |   440 |      3 |       2 | 3611016
+   5 | int8        | fixed(8)                         | 2600 |   441 |      3 |       2 | 3611016
+   6 | float4      | fixed(4)                         | 2600 |   441 |      3 |       2 | 3611016
+   7 | float8      | fixed(8)                         | 2600 |   441 |      3 |       2 | 3611016
+   8 | oid         | fixed(4)                         | 2600 |   442 |      3 |       2 | 3611016
+   9 | money       | fixed(8)                         | 2600 |   441 |      3 |       2 | 3611016
+  10 | char        | fixed(1)                         | 2600 |   440 |      3 |       2 | 3611016
+  11 | date        | fixed(4,arrow)                   | 2600 |   440 |      3 |       2 | 3611016
+  12 | time        | fixed(8)                         | 2600 |   441 |      3 |       2 | 3611016
+  13 | timestamp   | fixed(8,postgres)                | 2600 |   441 |      3 |       2 | 3611016
+  14 | timestamptz | fixed(8,arrow) fixed(8,postgres) | 2600 |   441 |      3 |       2 | 3611016
+  15 | interval    | fixed(16,postgres)               | 2600 |   442 |      3 |       2 | 3611016
+  16 | timetz      | fixed(12)                        | 2600 |   441 |      3 |       2 | 3611016
+  17 | numeric     | view                             | 2600 |   440 |      3 |       2 | 3611016
+  18 | numeric     | scaled(8,2)                      | 2600 |   440 |      3 |       2 | 3611016
+  19 | numeric     | scaled(8,0)                      | 2600 |   441 |      3 |       2 | 3611016
+  20 | numeric     | scaled(16,5) view                | 2600 |   441 |      3 |       2 | 3611016
+  21 | numeric     | scaled(8,0)                      | 2600 |   441 |      3 |       2 | 3611016
+  22 | numeric     | scaled(8,10)                     | 2600 |   442 |      3 |       2 | 3611016
+  23 | numeric     | view                             | 2600 |   441 |      3 |       2 | 3611016
+  24 | text        | view                             | 2600 |   440 |      3 |       2 | 3611016
+  25 | varchar     | view                             | 2600 |   440 |      3 |       2 | 3611016
+  26 | bpchar      | view                             | 2600 |   441 |      3 |       2 | 3611016
+  27 | bytea       | view                             | 2600 |   441 |      3 |       2 | 3611016
+  28 | json        | view                             | 2600 |   441 |      3 |       2 | 3611016
+  29 | jsonb       | view                             | 2600 |   442 |      3 |       2 | 3611016
+  30 | uuid        | fixed(16)                        | 2600 |   441 |      3 |       2 | 3611016
+  31 | name        | fixed(64)                        | 2600 |   440 |      3 |       2 | 3611016
+  32 | macaddr     | fixed(6)                         | 2600 |   440 |      3 |       2 | 3611016
+  33 | macaddr8    | fixed(8)                         | 2600 |   441 |      3 |       2 | 3611016
+  34 | inet        | view                             | 2600 |   441 |      3 |       2 | 3611016
+  35 | point       | fixed(16)                        | 2600 |   441 |      3 |       2 | 3611016
+  36 | _int4       | view                             | 2600 |   442 |      3 |       2 | 3611016
+  37 | _text       | view                             | 2600 |   441 |      3 |       2 | 3611016
+  38 | int4        | fixed(4)                         | 2600 |     0 |      3 |       2 | 3611016
+  39 | text        | view                             | 2600 |   440 |      3 |       2 | 3611016
+(39 rows)
+
+-- each per-structure setting changed alone, in each format, dealt to 3
+SELECT f.format, v.varlena, b.bool, t.temporal, n.numeric,
+       count(*) AS columns, sum(e.rows) AS rows, sum(e.nulls) AS nulls,
+       max(e.frames) AS frames, max(e.schemas) AS schemas
+FROM (VALUES ('postgres'), ('arrow')) f(format),
+     (VALUES ('format'), ('datum'), ('view'), ('offsets')) v(varlena),
+     (VALUES ('format'), ('byte'), ('bit')) b(bool),
+     (VALUES ('format'), ('postgres'), ('arrow')) t(temporal),
+     (VALUES ('format'), ('scaled'), ('varlena')) n(numeric),
+     LATERAL vexec_test.frames('SELECT * FROM corpus ORDER BY id', f.format,
+                               v.varlena, b.bool, t.temporal, n.numeric, 3) e
+WHERE (v.varlena = 'format')::int + (b.bool = 'format')::int +
+      (t.temporal = 'format')::int + (n.numeric = 'format')::int >= 3
+GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5;
+  format  | varlena |  bool  | temporal | numeric | columns |  rows  | nulls | frames | schemas 
+----------+---------+--------+----------+---------+---------+--------+-------+--------+---------
+ arrow    | datum   | format | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ arrow    | format  | bit    | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ arrow    | format  | byte   | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ arrow    | format  | format | arrow    | format  |      39 | 101400 | 16311 |      9 |       2
+ arrow    | format  | format | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ arrow    | format  | format | format   | scaled  |      39 | 101400 | 16311 |      9 |       2
+ arrow    | format  | format | format   | varlena |      39 | 101400 | 16311 |      9 |       2
+ arrow    | format  | format | postgres | format  |      39 | 101400 | 16311 |      9 |       2
+ arrow    | offsets | format | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ arrow    | view    | format | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ postgres | datum   | format | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ postgres | format  | bit    | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ postgres | format  | byte   | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ postgres | format  | format | arrow    | format  |      39 | 101400 | 16311 |      9 |       2
+ postgres | format  | format | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ postgres | format  | format | format   | scaled  |      39 | 101400 | 16311 |      9 |       2
+ postgres | format  | format | format   | varlena |      39 | 101400 | 16311 |      9 |       1
+ postgres | format  | format | postgres | format  |      39 | 101400 | 16311 |      9 |       2
+ postgres | offsets | format | format   | format  |      39 | 101400 | 16311 |      9 |       2
+ postgres | view    | format | format   | format  |      39 | 101400 | 16311 |      9 |       2
+(20 rows)
+
+-- no rows: no frame
+SELECT col, rows, frames, schemas FROM vexec_test.frames('SELECT * FROM corpus WHERE false')
+WHERE col <= 2;
+ col | rows | frames | schemas 
+-----+------+--------+---------
+   1 |    0 |      0 |       0
+   2 |    0 |      0 |       0
+(2 rows)
+
+-- a malformed frame, refused with its SQLSTATE
+CREATE FUNCTION frame_try(at int4, value int4, cut int4 DEFAULT NULL) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	detail text;
+BEGIN
+	RETURN vexec_test.frame_patch('SELECT i4, tx, n10_2, d FROM corpus ORDER BY id', at, value, cut);
+EXCEPTION WHEN OTHERS THEN
+	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+	RETURN SQLSTATE || ': ' || SQLERRM || coalesce(' -- ' || nullif(detail, ''), '');
+END $$;
+SELECT frame_try(-100000, 0) AS as_written;
+    as_written     
+-------------------
+ decoded 1024 rows
+(1 row)
+
+SELECT frame_try(0, 0) AS magic;
+                                     magic                                      
+--------------------------------------------------------------------------------
+ 22P03: a vector Motion's frame is malformed -- A frame without vexec's header.
+(1 row)
+
+SELECT frame_try(4, 1) AS reserved;
+                                    reserved                                    
+--------------------------------------------------------------------------------
+ 22P03: a vector Motion's frame is malformed -- A frame without vexec's header.
+(1 row)
+
+SELECT frame_try(8, 1) AS schema_hash;
+                                          schema_hash                                          
+-----------------------------------------------------------------------------------------------
+ 22P03: a vector Motion's frame is malformed -- A record batch of a schema not sent before it.
+(1 row)
+
+SELECT frame_try(-100000, 0, 12) AS cut_in_header;
+                                  cut_in_header                                  
+---------------------------------------------------------------------------------
+ 22P03: a vector Motion's frame is malformed -- A frame shorter than its header.
+(1 row)
+
+SELECT frame_try(-100000, 0, 40) AS cut_in_metadata;
+                                    cut_in_metadata                                    
+---------------------------------------------------------------------------------------
+ 22P03: a vector Motion's frame is malformed -- A frame that is not one whole message.
+(1 row)
+
+SELECT frame_try(-100000, 0, -8) AS cut_in_body;
+                                      cut_in_body                                      
+---------------------------------------------------------------------------------------
+ 22P03: a vector Motion's frame is malformed -- A frame that is not one whole message.
+(1 row)
+
+SELECT frame_try(20, 255) AS metadata_length;
+                                    metadata_length                                    
+---------------------------------------------------------------------------------------
+ 22P03: a vector Motion's frame is malformed -- A frame that is not one whole message.
+(1 row)
+
+DROP FUNCTION frame_try(int4, int4, int4);
+DROP TABLE corpus;
+DROP FUNCTION corpus_null(int4, int4);

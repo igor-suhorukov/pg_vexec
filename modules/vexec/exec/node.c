@@ -53,6 +53,7 @@
 #include "exec/exec.h"
 #include "expr/expr.h"
 #include "expr/kernel.h"
+#include "motion/motion.h"
 
 void
 vexec_node_begin(VexecNode *node, EState *estate)
@@ -69,6 +70,9 @@ vexec_node_begin(VexecNode *node, EState *estate)
 	node->eager_econtext = CreateExprContext(estate);
 	node->work = vexec_batch_create(node->mcxt, 0, NULL);
 	node->loaded_row = -1;
+
+	/* on a cluster, the segments' figures of vector nodes for EXPLAIN ANALYZE */
+	vexec_gp_core_explain_register();
 }
 
 /*
@@ -621,6 +625,7 @@ bool
 vexec_node_batchable(VexecNode *node)
 {
 	return node->kind != VEXEC_NODE_AGG && node->kind != VEXEC_NODE_WINDOW &&
+		node->kind != VEXEC_NODE_MOTION_SEND &&
 		node->first_lazy == node->nquals && !node->any_lazy_target &&
 		!node->row_input;
 }
@@ -781,16 +786,24 @@ vexec_node_explain_properties(VexecNode *node, List *ancestors, ExplainState *es
 				break;
 			}
 	}
-	if (es->analyze && es->verbose && node->ran)
+	if (es->analyze && es->verbose && (node->ran || node->segments_seen > 0))
 	{
-		ExplainPropertyInteger("Batches", NULL, node->stats.batches, es);
-		if (node->stats.lazy_rows > 0)
-			ExplainPropertyInteger("Rows Evaluated Row by Row", NULL, node->stats.lazy_rows, es);
-		if (node->stats.redo_rows > 0)
-			ExplainPropertyInteger("Rows Sent to PostgreSQL", NULL, node->stats.redo_rows, es);
-		if (node->stats.declared_rows > 0)
+		/*
+		 * Where the segments ran it and the coordinator did not, their sums,
+		 * as they reported them (motion/gpcore.c)
+		 */
+		const VexecNodeStats *st = node->ran ? &node->stats : &node->segment_stats;
+
+		ExplainPropertyInteger("Batches", NULL, st->batches, es);
+		if (st->lazy_rows > 0)
+			ExplainPropertyInteger("Rows Evaluated Row by Row", NULL, st->lazy_rows, es);
+		if (st->redo_rows > 0)
+			ExplainPropertyInteger("Rows Sent to PostgreSQL", NULL, st->redo_rows, es);
+		if (st->declared_rows > 0)
 			ExplainPropertyInteger("Rows Through Declared Calls", NULL,
-								   node->stats.declared_rows, es);
+								   st->declared_rows, es);
+		if (!node->ran)
+			ExplainPropertyInteger("Segments Reporting", NULL, node->segments_seen, es);
 	}
 }
 

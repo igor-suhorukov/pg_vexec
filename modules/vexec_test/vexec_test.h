@@ -10,6 +10,7 @@
 #ifndef VEXEC_TEST_H
 #define VEXEC_TEST_H
 
+#include "fmgr.h"
 #include "utils/array.h"
 #include "utils/portal.h"
 
@@ -39,6 +40,9 @@ extern const char *const bool_names[3];
 extern const char *const temporal_names[3];
 extern const char *const numeric_names[3];
 extern int	setting_value(const char *name, const char *value, const char *const *names, int n);
+
+/* A configuration from five text arguments from "arg" on: format, varlena, bool, temporal, numeric. */
+extern void layout_config(FunctionCallInfo fcinfo, int arg, VexecLayoutConfig *cfg);
 
 extern void check_views(struct ArrowArray *a, int col);
 

@@ -34,7 +34,13 @@
 #                                each pass, with vexec.mode = force in both
 #                                formats, against off (VEXEC_PORT_SUITES,
 #                                VEXEC_PORT_PASSES, VEXEC_PORT_SESSIONS)
-#   run.sh cluster               the cluster leg, four segments of the port
+#   run.sh cluster               the cluster leg, four segments of the port;
+#                                VEXEC_INTERCONNECT=shm runs it over the shm
+#                                transport, preloaded on every node (V7)
+#   run.sh shm                   the shm transport's leg (V7): its Motions,
+#                                switches, remote path, hang tests and kills,
+#                                and the port's interconnect test from
+#                                VEXEC_PORT_SRC (shm.sh)
 #   run.sh orcacost              V5's leg: ORCA's vector cost model and its
 #                                hashed window, VecWindowHashAgg, on a node of
 #                                the port
@@ -46,7 +52,9 @@
 #                                pax_porc_vec, vexec preloaded in
 #                                TPC_VEXEC_MODE (off) and TPC_VEXEC_FORMAT,
 #                                with TPC_WORKERS parallel workers a
-#                                segment ("0")
+#                                segment ("0"); TPC_INTERCONNECT tcp or
+#                                shm, every node's transport, shm
+#                                preloaded (V7)
 #   run.sh fullrun [suite...]    the port's full run with vexec on every
 #                                node, and without it, compared: each
 #                                run's latest of VEXEC_FULLRUN_RUNS
@@ -201,6 +209,13 @@ case "$cmd" in
 		in_leg port "$run" "/src/test/vexec/cluster.sh" | tee "$run/output"
 		exit "${PIPESTATUS[0]}"
 		;;
+	shm)
+		run="$(new_run shm)"
+		echo "== the shm transport: $run"
+		echo "  the port's modules from $(cat "${VEXEC_PORT_STAGE:-/nonexistent}/COMMIT" 2> /dev/null || echo 'the image'), the port's tests from $VEXEC_PORT_SRC"
+		in_leg port "$run" "/src/test/vexec/shm.sh" | tee "$run/output"
+		exit "${PIPESTATUS[0]}"
+		;;
 	portsuites)
 		run="$(new_run portsuites)"
 		echo "== the port's suites, force against off: $run"
@@ -239,7 +254,7 @@ case "$cmd" in
 			else
 				echo "  image pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-$CB_COMMIT, the port's modules from $(cat "${VEXEC_PORT_STAGE:-/nonexistent}/COMMIT" 2> /dev/null || echo 'the image')"
 			fi
-			in_leg "$tpc_leg" "$run" "/src/test/vexec/build.sh > /dev/null && { grep -q '^#define USE_ASSERT_CHECKING' \"\$(pg_config --includedir-server)/pg_config.h\" && echo '  server with assertions' || echo '  server without assertions'; } && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} TPC_VEXEC_NUMERIC=${TPC_VEXEC_NUMERIC:-} TPC_VEXEC_SETTINGS='${TPC_VEXEC_SETTINGS:-}' TPC_PLANNER_ROUTE=${TPC_PLANNER_ROUTE:-1} TPC_SEGMENTS=${TPC_SEGMENTS:-$( [ "$tpc_leg" = vanilla-orca ] && echo 0 || echo 4)} TPC_ROUNDS=${TPC_ROUNDS:-1} TPC_WORKERS='${TPC_WORKERS:-0}' TPC_KINDS='${TPC_KINDS:-h ds}' TPC_QUERIES='${TPC_QUERIES:-}' TPC_SF=${TPC_SF:-1} TPC_TIMEOUT=${TPC_TIMEOUT:-120} TPC_PLANNING=${TPC_PLANNING:-0} TPC_PLANS=${TPC_PLANS:-0} /src/test/tpc/run.sh" \
+			in_leg "$tpc_leg" "$run" "/src/test/vexec/build.sh > /dev/null && { grep -q '^#define USE_ASSERT_CHECKING' \"\$(pg_config --includedir-server)/pg_config.h\" && echo '  server with assertions' || echo '  server without assertions'; } && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} TPC_VEXEC_NUMERIC=${TPC_VEXEC_NUMERIC:-} TPC_VEXEC_SETTINGS='${TPC_VEXEC_SETTINGS:-}' TPC_PLANNER_ROUTE=${TPC_PLANNER_ROUTE:-1} TPC_SEGMENTS=${TPC_SEGMENTS:-$( [ "$tpc_leg" = vanilla-orca ] && echo 0 || echo 4)} TPC_ROUNDS=${TPC_ROUNDS:-1} TPC_WORKERS='${TPC_WORKERS:-0}' TPC_KINDS='${TPC_KINDS:-h ds}' TPC_QUERIES='${TPC_QUERIES:-}' TPC_SF=${TPC_SF:-1} TPC_TIMEOUT=${TPC_TIMEOUT:-120} TPC_PLANNING=${TPC_PLANNING:-0} TPC_PLANS=${TPC_PLANS:-0} TPC_INTERCONNECT=${TPC_INTERCONNECT:-} /src/test/tpc/run.sh" \
 				| tee "$run/output" || rc=1
 		done
 		exit $rc

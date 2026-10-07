@@ -1,5 +1,12 @@
 --- reference
 +++ session
+@@ -198,5 +198,5 @@
+ create table dispatchtesttab(t text);
+ select * from dispatchtesttab where t = repeat('x', 1024*11);
+-ERROR:  Query plan size limit exceeded, current size: 46KB, max allowed size: 10KB
++ERROR:  Query plan size limit exceeded, current size: 49KB, max allowed size: 10KB
+ --
+ -- test QD will report failure if QE fails to send its motion_listener back
 @@ -433,6 +433,8 @@
  select * from dispatch_test_t1, dispatch_test_t2, dispatch_test_t3
  where dispatch_test_t1.c2 = dispatch_test_t2.c2 and dispatch_test_t2.c3 = dispatch_test_t3.c3;

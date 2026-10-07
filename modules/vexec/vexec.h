@@ -103,6 +103,7 @@ extern PGDLLIMPORT bool vexec_enable_sort;
 extern PGDLLIMPORT bool vexec_enable_running_bound;
 extern PGDLLIMPORT bool vexec_enable_window;
 extern PGDLLIMPORT bool vexec_enable_insert;
+extern PGDLLIMPORT bool vexec_enable_motion_frames;
 extern PGDLLIMPORT bool vexec_orca;
 extern PGDLLIMPORT bool vexec_orca_cost_model;
 extern PGDLLIMPORT char *vexec_orca_settings;

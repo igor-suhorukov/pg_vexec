@@ -46,6 +46,11 @@
 # §3.3.5): one node only, heap tables only, created without the port's
 # DISTRIBUTED clauses, and no extension made;
 #
+# and what V7 adds: TPC_INTERCONNECT, every node's gp.interconnect_type --
+# tcp or shm -- with the port's shm module preloaded after gp_core
+# whichever it names, so that the two transports are timed with one set of
+# libraries (pg_vector_executor.md V7's measurement);
+#
 # and a cluster secret long enough for gp_core, which refuses one under 16
 # characters (pg19/modules/gp_core/gp_cluster.c:135): "tpc-" and three
 # $RANDOMs come out shorter in 1.4% of runs, when ORCA falls back on every
@@ -146,6 +151,19 @@ if [ ! -f "$("$BINDIR/pg_config" --pkglibdir)/gp_core.so" ]; then
 	[ "$STORAGE" = heap ] || { echo "  a vanilla server has heap tables only, not $STORAGE"; exit 1; }
 	[ "${TPC_SEGMENTS:-4}" = 0 ] || { echo "  a vanilla server is one node: TPC_SEGMENTS=0"; exit 1; }
 fi
+# TPC_INTERCONNECT: the transport every node's Motions take, shm loaded
+INTERCONNECT="${TPC_INTERCONNECT:-}"
+if [ -n "$INTERCONNECT" ]; then
+	case "$INTERCONNECT" in
+		tcp|shm) ;;
+		*) echo "  TPC_INTERCONNECT is tcp or shm, not $INTERCONNECT"; exit 1 ;;
+	esac
+	[ "$VANILLA" = 0 ] && [ "${TPC_SEGMENTS:-4}" != 0 ] ||
+		{ echo "  TPC_INTERCONNECT needs a cluster of the port"; exit 1; }
+	[ -f "$("$BINDIR/pg_config" --pkglibdir)/shm.so" ] ||
+		{ echo "  TPC_INTERCONNECT: no shm module in $("$BINDIR/pg_config" --pkglibdir)"; exit 1; }
+	CORE_PRELOAD="gp_core,shm,gp_orca,gp_sql"
+fi
 VEXEC_PRELOAD=""
 if [ "${TPC_VEXEC:-1}" = 1 ] && [ -f "$("$BINDIR/pg_config" --pkglibdir)/vexec.so" ]; then
 	VEXEC_PRELOAD=",vexec"
@@ -214,6 +232,7 @@ else
 	echo "TPC-H and TPC-DS, ${MODE%e}ed: scale factor $SF, one node, $STORAGE tables"
 fi
 [ -n "$VEXEC_PRELOAD" ] && echo "  vexec    preloaded on every node: $VEXEC_OPTIONS"
+[ -n "$INTERCONNECT" ] && echo "  motions  gp.interconnect_type = $INTERCONNECT on every node, shm preloaded"
 echo "  bindir   $BINDIR"
 echo "  root     $ROOT"
 echo "  duckdb   $("$TPC_PYTHON" -c 'import duckdb; print(duckdb.__version__)')"
@@ -259,6 +278,7 @@ for n in $NODES; do
 		echo "jit = off"
 		echo "fsync = off"
 		echo "synchronous_commit = off"
+		[ -n "$INTERCONNECT" ] && echo "gp.interconnect_type = '$INTERCONNECT'"
 		[ "$n" -eq 0 ] && [ "$SEGMENTS" -gt 0 ] && echo "gp.role = 'dispatch'"
 	} >> "$(datadir "$n")/postgresql.auto.conf"
 done
