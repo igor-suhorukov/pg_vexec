@@ -1,0 +1,32 @@
+Flight.proto, FlightSql.proto
+
+Apache Arrow's Flight and Flight SQL protocols, copied unmodified from
+apache/arrow at c07de67a7c (2026-09-18; the files last changed in
+2cd5ad233fab, 2026-06-08), oss_databases/arrow/format/.  Apache License 2.0,
+as their headers say; Apache Arrow's NOTICE:
+
+  Apache Arrow
+  Copyright 2016-2026 The Apache Software Foundation
+
+  This product includes software developed at
+  The Apache Software Foundation (http://www.apache.org/).
+
+  sha256  ccd439108e960d83a285f759a3c2b7cd6432320b8491734d13f589edccf1d5b0  Flight.proto
+          8e05bdf3a8e3bde84f2647bae31cf674b4790aa7068f1ab198cb25ee1656a5e5  FlightSql.proto
+
+The build does not compile these files as they are.  protobuf-c 1.5.1, the
+generator Debian 13 ships, refuses proto3's "optional" fields ("hasn't been
+updated to support optional fields in proto3"), so transform.sh writes copies
+into gen/ in which each
+
+    optional T name = N;
+
+is the one-field oneof protoc itself makes of it, which has the same wire
+format and keeps the field's presence:
+
+    oneof _name { T name = N; }
+
+and FlightSql.proto's declaration of the "experimental" message option, which
+nothing uses, is dropped with its import of google/protobuf/descriptor.proto.
+Flight.proto's import of google/protobuf/timestamp.proto is generated from
+protobuf's own copy, /usr/include/google/protobuf/timestamp.proto.
