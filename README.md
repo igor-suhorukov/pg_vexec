@@ -106,30 +106,126 @@ The plan's phases land here in order, each on a branch of its own:
 
 ## Building
 
-The four extensions are built by PGXS from the top, one after another,
-against an installed PostgreSQL 19 -- vanilla `REL_19_STABLE` or the port's
-server:
+pg_vexec is four PGXS extensions: `vexec`, and beside it in `modules/` the
+kernel packs `vexec_pgvector` and `vexec_postgis` and the Flight SQL endpoint
+`vexec_flight`.  They build against an installed PostgreSQL 19.  The tests
+build and run them in containers, from images made of two checkouts from
+GitHub ([the development environment](#the-development-environment)).
+
+### The extensions
+
+They need:
+
+- PostgreSQL 19, installed with its server headers and `pg_config`: vanilla
+  `REL_19_STABLE`, or the Cloudberry port's server, the fork's
+  [`REL_19_STABLE_CLOUDBERRY`](https://github.com/igor-suhorukov/postgres/tree/REL_19_STABLE_CLOUDBERRY)
+  with the port's modules;
+- a C compiler and GNU make;
+- for `vexec_flight` alone: nghttp2, protobuf-c and its compiler `protoc-c`,
+  protobuf's well-known `.proto` files, and OpenSSL; on Debian and Ubuntu,
+  `libnghttp2-dev libprotobuf-c-dev protobuf-c-compiler libprotobuf-dev libssl-dev`.
 
 ```sh
 make PG_CONFIG=/usr/local/pgsql/bin/pg_config      # vexec, vexec_pgvector, vexec_postgis, vexec_flight
-make PG_CONFIG=... install
+make PG_CONFIG=/usr/local/pgsql/bin/pg_config install
 make PG_CONFIG=... EXTENSIONS="vexec vexec_pgvector vexec_postgis"   # without vexec_flight's dependencies
 ```
 
 The packs and `vexec_flight` compile against `include/` here, not against
-`vexec`'s installed headers, so that a commit builds as one.
-`vexec_flight` needs nghttp2, protobuf-c and its compiler, protobuf's
-well-known `.proto` files and OpenSSL.  Each extension is preloaded beside
-`vexec`, in any order, and is built and tested on its own too, by its
-directory's `Makefile` and `test/run.sh`.
+`vexec`'s installed headers, so that a commit builds as one.  Each of them
+also builds alone from its directory (`make -C modules/vexec_pgvector
+PG_CONFIG=...`), against the headers `vexec` installs under
+`$(pg_config --includedir-server)/extension/vexec`, where storage modules
+and packs built elsewhere find them too.
+
+### Loading them
+
+`vexec` and the extensions beside it are loaded at server start, in any
+order:
+
+```ini
+shared_preload_libraries = 'vexec'   # with the others: 'vexec,vexec_pgvector,vexec_postgis,vexec_flight'
+vexec.mode = auto                    # off (the default), explain, auto or force
+```
+
+- With `vexec.mode = off` every hook adds nothing, and `EXPLAIN (VEXEC)`
+  shows the vector alternatives the planner considered and why each was not
+  taken.
+- `CREATE EXTENSION vexec` is not needed to plan and run queries.  It adds
+  SQL functions that list the batch sources and sinks, the kernels and the
+  packs' declared calls, and `vexec.ingest_stream()`, which `vexec_flight`'s
+  bulk ingestion needs in the database it loads into.
+- The packs bind to pgvector 0.8.6 and 0.8.7 and to PostGIS 3.7.0rc2; with
+  another version they bind nothing, and those calls run row by row.
+- `vexec_flight` listens only when `vexec_flight.listen_addresses` names an
+  address (port 32010), and runs a statement only while `vexec.mode` is
+  `auto` or `force` in its session.
+- ORCA on vanilla PostgreSQL 19 is the port's `gp_orca` built alone, without
+  the rest of the port, with meson, ninja, g++, Xerces-C and zlib
+  (`test/vexec/orcabuild.sh`):
+
+  ```sh
+  meson setup build <cloudberry>/pg19 -Dpg_config=/usr/local/pgsql/bin/pg_config \
+      --prefix=/usr/local/pgsql -Dorca_single_node=true
+  ninja -C build install
+  ```
+
+  and preloaded with `vexec`: `shared_preload_libraries = 'gp_orca,vexec'`.
+- On the Cloudberry port, `vexec` is preloaded on the coordinator and on
+  every segment, beside the port's modules.
+
+### The development environment
+
+Every leg builds `vexec` and runs in a container, from images the build
+makes; nothing is installed on the host.  It needs Docker with Compose v2
+and BuildKit, git and python3.  On a clean machine, in this order:
+
+```sh
+test/vexec/run.sh cloudberry       # the port's checkout: ~/.cache/pg_accel/cloudberry
+test/vexec/run.sh postgres         # the port's fork of PostgreSQL: ~/.cache/pg_accel/postgres
+
+# vanilla PostgreSQL 19, with assertions and without, from the port's Dockerfile
+docker compose -f ~/.cache/pg_accel/cloudberry/pg19/docker/compose.yml --profile compare \
+    build pg19-vanilla pg19-vanilla-noassert
+
+test/clickbench/run.sh images      # the patched servers and the port's images (cb-ext), with assertions and without
+test/vexec/run.sh images           # vexec's dev images: vanilla, the port's, and the port's build tools
+CB_COMMIT="$(git -C ~/.cache/pg_accel/cloudberry rev-parse extension_postgresql_19)" \
+    docker compose -f docker/vexec.yml --profile build build vexec-dev-vanillaarrow vexec-dev-portarrow
+                                   # the same with pyarrow, for the ipc leg and vexec_flight's images
+test/vexec/run.sh portbuild        # the port's modules from its checkout, staged for the port's legs
+
+test/vexec/run.sh orcaimages       # ORCA on vanilla PostgreSQL 19 (V6), when wanted
+test/vexec/run.sh orcabuild
+modules/vexec_flight/test/run.sh images   # vexec_flight's images, when wanted
+```
+
+The port the build uses is a checkout of its branch
+[`extension_postgresql_19`](https://github.com/igor-suhorukov/cloudberry/tree/extension_postgresql_19)
+on GitHub: a clone of its own that `test/vexec/checkouts.sh` makes in
+`~/.cache/pg_accel/cloudberry` (`CB_SRC`) where there is none, with PAX's two
+submodules, and moves on only when asked (`run.sh cloudberry update`, a
+fast-forward).  The port's images are built from it, and so are its modules
+(`portbuild`) and gp_orca built alone (`orcabuild`); a phase that changes the
+port gives its worktree of the port as `VEXEC_PORT_SRC`.  The port's fork of
+PostgreSQL is a checkout the same way, in `~/.cache/pg_accel/postgres`
+(`PG_SRC`, `run.sh postgres update`): its `REL_19_STABLE_CLOUDBERRY`, the core
+series the port's servers are built from, and `REL_19_STABLE`, from which the
+dev images take PostgreSQL's regression suite at their servers' commits.
+
+The vanilla servers keep the port's own tags
+(`cloudberry/pg19-vanilla:latest`, `-noassert`); the other images are tagged
+by the commits they are built from (`pg_accel/pg19-patched:<fork commit>`,
+`pg_accel/cb-ext:<port commit>`, `pg_accel/vexec-dev:port-<port commit>`),
+and the legs take the newest `pg_accel/cb-ext`.  Timed runs use the builds
+without assertions: `VEXEC_NOASSERT=1 test/vexec/run.sh images` and
+`VEXEC_NOASSERT=1 test/vexec/run.sh portbuild`.  After a checkout is updated,
+the steps from the first that reads it run again; `portbuild` and
+`orcabuild` rebuild only what changed.  The legs are in the next section.
 
 ## vexec
 
 ```sh
-test/vexec/run.sh cloudberry       # the port's checkout the build uses, cloned where there is none
-test/vexec/run.sh cloudberry update   # ... moved on to its branch's head
-test/vexec/run.sh postgres         # the port's fork of PostgreSQL the build uses, the same way
-test/vexec/run.sh images           # the dev images: vanilla, and the port's (from VB's pg_vexec/cb-ext)
 test/vexec/run.sh checks           # the header copies, the notices, the tree check
 test/vexec/run.sh suite            # vexec's own suite, on the vanilla leg and the port
 test/vexec/run.sh states           # §1.2's states: installed and not preloaded, objects without the library, library removed
@@ -141,25 +237,9 @@ test/vexec/run.sh shm              # the shm transport (V7): Motions, switches, 
 test/vexec/run.sh tpc              # the tpc suite in each storage, vexec preloaded
 test/vexec/run.sh fullrun          # the port's full run with vexec on every node, against the run without it
 test/vexec/run.sh v0               # V0's checks: checks, suite, states, pgregress, differential, cluster
-test/vexec/run.sh portbuild        # the port's modules from its checkout (or VEXEC_PORT_SRC), staged for the port's legs
 test/vexec/run.sh sources          # every storage's batch source on one node, in seven sessions, ORCA's among them
 test/vexec/run.sh portsuites       # the port's singlenode and greenplum suites, force against off
 ```
-
-The port the build uses is a checkout of its branch
-[`extension_postgresql_19`](https://github.com/igor-suhorukov/cloudberry/tree/extension_postgresql_19)
-on GitHub, a clone of its own that `test/vexec/checkouts.sh` makes in
-`~/.cache/pg_accel/cloudberry` (`CB_SRC`) where there is none, with PAX's two
-submodules, and moves on only when asked (`run.sh cloudberry update`).  The
-port's images are built from it (`test/clickbench/run.sh images`), and so are
-its modules (`portbuild`) and gp_orca built alone (`orcabuild`); a phase that
-changes the port gives its worktree of the port as `VEXEC_PORT_SRC`.  The
-port's fork of PostgreSQL is a checkout the same way, in
-`~/.cache/pg_accel/postgres` (`PG_SRC`, `run.sh postgres`): its
-[`REL_19_STABLE_CLOUDBERRY`](https://github.com/igor-suhorukov/postgres/tree/REL_19_STABLE_CLOUDBERRY),
-the core series the port's servers are built from, and `REL_19_STABLE`,
-from which the images take PostgreSQL's regression suite at their servers'
-commits.
 
 The port's legs install the port's modules over the image's own, from the
 stage `portbuild` makes (`~/.cache/pg_vexec/vexec/portbuild/stage`), as the
