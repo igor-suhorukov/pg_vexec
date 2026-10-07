@@ -48,7 +48,7 @@ The plan's phases land here in order, each on a branch of its own:
   the function itself where it never raises or where the pack's check
   passes, the pack's prefilter's answer where it decides; and the test pack
   `vexec_testpack`.  The packs themselves, `vexec_pgvector` and
-  `vexec_postgis`, are repositories of their own beside this one.  Nothing
+  `vexec_postgis`, are extensions of their own, in `modules/`.  Nothing
   of the port changes.
 - **V7_0, Arrow IPC messages** (`v7_0`, and `v10` after it; the plan's
   §5): the codec V7's frames and V10's egress share, which `vexec` writes
@@ -57,7 +57,7 @@ The plan's phases land here in order, each on a branch of its own:
   where its arrays lie, a message coming in checked as a client's input.
 - **V10, the Flight SQL endpoint's half in `vexec`** (`v10`; the plan's §5
   and §3.15): the egress API, `vexec/egress_v1`, by which an extension of
-  its own, `vexec_flight` (`github/vexec_flight`), serves Arrow to clients
+  its own, `vexec_flight` (`modules/vexec_flight`), serves Arrow to clients
   only while the vector executor is active -- a statement's result as IPC
   messages, from a vector node's batches where one is at the top of the
   plan, and a client's parameter batches read as values.
@@ -81,12 +81,34 @@ The plan's phases land here in order, each on a branch of its own:
 | `modules/vexec/sql`, `expected` | `vexec`'s own regression suite, and the layouts' semantics corpus |
 | `modules/vexec_test/` | a module of the tests alone: round trips through every layout, the export check with nanoarrow, vendored there only, the IPC codec's checks, and a query through the egress's receiver |
 | `modules/vexec_testpack/` | a kernel pack of the tests alone: an extension's functions and a pack's declarations of them in one library, preloaded before `vexec` by the suite (`vexec_packs`) |
+| `modules/vexec_flight/` | Arrow Flight SQL while the vector executor is active (V10, VI): an extension of its own, with its own dependencies (nghttp2, protobuf-c, OpenSSL), dev image and legs (`test/run.sh`) |
+| `modules/vexec_pgvector/`, `modules/vexec_postgis/` | the kernel packs for pgvector and PostGIS (VK): extensions of their own, each with its legs (`test/run.sh`) |
+| `Makefile` | the four extensions built by PGXS from the top (below) |
 | `test/vexec/` | `vexec`'s legs: `run.sh` on the host, the scripts each leg runs in a container, the differential runner, the checks |
 | `test/tpc/` | the port's tpc suite, with `TPC_STORAGE` (heap, `ao_column`, PAX porc and porc_vec) and `vexec` preloaded |
 | `docker/vexec.yml`, `docker/Dockerfile.vexec` | `vexec`'s images and containers: a server image with a C toolchain, vanilla or the port's |
 | `docker/Dockerfile.arrow` | pyarrow on those images, against which the IPC codec and the egress are checked |
 | `docker/compose.yml`, `docker/Dockerfile.clickbench` | ClickBench's images and containers (VB) |
 | `test/clickbench/` | ClickBench's suite and its baseline (VB) |
+
+## Building
+
+The four extensions are built by PGXS from the top, one after another,
+against an installed PostgreSQL 19 -- vanilla `REL_19_STABLE` or the port's
+server:
+
+```sh
+make PG_CONFIG=/usr/local/pgsql/bin/pg_config      # vexec, vexec_pgvector, vexec_postgis, vexec_flight
+make PG_CONFIG=... install
+make PG_CONFIG=... EXTENSIONS="vexec vexec_pgvector vexec_postgis"   # without vexec_flight's dependencies
+```
+
+The packs and `vexec_flight` compile against `include/` here, not against
+`vexec`'s installed headers, so that a commit builds as one.
+`vexec_flight` needs nghttp2, protobuf-c and its compiler, protobuf's
+well-known `.proto` files and OpenSSL.  Each extension is preloaded beside
+`vexec`, in any order, and is built and tested on its own too, by its
+directory's `Makefile` and `test/run.sh`.
 
 ## vexec
 
@@ -123,11 +145,16 @@ Their results go to a run of the cache, `~/.cache/pg_vexec/vexec/runs`.
 `pg_vexec_default`, which VB's containers make (`docker/compose.yml`);
 the other legs' servers listen on sockets only, with no network.
 
-The suite preloads `vexec_testpack` before `vexec`; the packs' own legs are
-their repositories' (`test/run.sh test|corpus|cluster` in
-`github/vexec_pgvector` and `github/vexec_postgis`), and the differential
-runner takes pgvector's own tests as a corpus (`VEXEC_CORPORA=pgvector`), its
-`postgres-packs` and `arrow-packs` sessions preloading `VEXEC_PACKS`.
+The legs build the kernel packs with `vexec`, and `vexec_flight` on the
+images that have its dependencies, so a change to `vexec`'s headers that
+breaks a pack fails every leg, and one that breaks `vexec_flight` its legs.
+The suite preloads `vexec_testpack` before `vexec`.  The packs' own legs are
+their modules' (`test/run.sh test|corpus|cluster` in `modules/vexec_pgvector`
+and `modules/vexec_postgis`), `vexec_flight`'s are its own
+(`modules/vexec_flight/test/run.sh images|test|bench|ingest`), and the
+differential runner takes pgvector's own tests as a corpus
+(`VEXEC_CORPORA=pgvector`), its `postgres-packs` and `arrow-packs` sessions
+preloading `VEXEC_PACKS`.
 
 `vexec` is preloaded (`shared_preload_libraries = 'vexec'`), and with
 `vexec.mode = off`, its default, every hook adds nothing.
@@ -162,6 +189,9 @@ hash (`oss_databases/ClickBench` at `dfe44c96`).
 
 pg_vexec's files are Apache-2.0. Three others' are here with their own
 notices: Arrow's C Data Interface definitions (`modules/vexec/batch/arrow_abi.h`,
-copied as Arrow asks), the port's headers (`modules/vexec/pgxs/include/`, its
-`test/tpc/` suite), and nanoarrow (`modules/vexec_test/nanoarrow/`, for the
-tests only), all Apache-2.0.
+`modules/vexec_flight/src/arrow_abi.h`, copied as Arrow asks) and Flight's and
+Flight SQL's protocols (`modules/vexec_flight/proto/`), the port's headers
+(`modules/vexec/pgxs/include/`, its `test/tpc/` suite), and nanoarrow
+(`modules/vexec_test/nanoarrow/`, for the tests only), all Apache-2.0.
+`modules/vexec_flight/src/hba.c` is Apache-2.0 AND PostgreSQL: it carries
+copies of PostgreSQL's `hba.c` functions under PostgreSQL's notice.

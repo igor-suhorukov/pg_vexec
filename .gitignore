@@ -1,3 +1,11 @@
 __pycache__/
 *.pyc
 *.new
+# what a build in the tree makes (Makefile): the objects, the libraries,
+# the bitcode; and an installcheck's outputs
+*.o
+*.so
+*.bc
+results/
+regression.diffs
+regression.out

@@ -24,6 +24,9 @@ CMD="${1:-test}"
 SEGMENTS="${FLIGHT_SEGMENTS:-0}"
 [ "${FLIGHT_LEG:-vanilla}" = vanilla ] && SEGMENTS=0
 
+# vexec_flight is built from /flight below, once: vexec's build leaves it out,
+# here and in every leg's build this container runs.
+export VEXEC_SKIP_MODULES=vexec_flight
 /src/test/vexec/build.sh || exit 1
 rm -rf /tmp/flight-build
 cp -a /flight /tmp/flight-build

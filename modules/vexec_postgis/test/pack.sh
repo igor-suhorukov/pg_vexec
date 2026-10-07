@@ -18,6 +18,9 @@
 # The servers' logs and the suites' outputs go to RESULTS_DIR.
 set -u
 CMD="${1:-test}"
+# vexec_postgis is built from /pack below, once: vexec's build leaves it out,
+# here and in every leg's build this container runs.
+export VEXEC_SKIP_MODULES=vexec_postgis
 /src/test/vexec/build.sh || exit 1
 PG_CONFIG="$(command -v pg_config)"
 rm -rf /tmp/pack-build

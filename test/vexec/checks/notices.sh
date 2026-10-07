@@ -10,6 +10,17 @@
 #                                       asks projects to copy (Apache-2.0)
 #   modules/vexec/pgxs/include/*.h      the port's headers (Apache-2.0)
 #   modules/vexec_test/nanoarrow/*      nanoarrow, the tests' alone (Apache-2.0)
+#   modules/vexec_flight/src/arrow_abi.h, modules/vexec_flight/proto/*.proto
+#                                       Arrow's C Data Interface, and Flight's
+#                                       and Flight SQL's protocols, with
+#                                       Arrow's NOTICE in proto/README
+#                                       (Apache-2.0)
+#
+# and one file of both notices, Apache-2.0 AND PostgreSQL, PostgreSQL's
+# functions copied into it carrying PostgreSQL's:
+#
+#   modules/vexec_flight/src/hba.c      hba.c's matching of a login against
+#                                       pg_hba.conf's lines (PostgreSQL)
 #
 # No file may carry another's copyright or licence: openGauss, Hydra's and
 # Citus's columnar and TimescaleDB's tsl/ are read for ideas, never copied
@@ -22,8 +33,13 @@ cd "$ROOT" || exit 1
 third_party() {
 	case "$1" in
 		modules/vexec/batch/arrow_abi.h|modules/vexec/pgxs/include/*.h|modules/vexec_test/nanoarrow/*) return 0 ;;
+		modules/vexec_flight/src/arrow_abi.h|modules/vexec_flight/proto/*.proto|modules/vexec_flight/proto/README) return 0 ;;
 	esac
 	return 1
+}
+
+postgresql_portions() {
+	[ "$1" = modules/vexec_flight/src/hba.c ]
 }
 
 fail=0
@@ -33,6 +49,14 @@ while IFS= read -r f; do
 	if third_party "$f"; then
 		if ! grep -q "Licensed to the Apache Software Foundation" "$f" && [ "$(basename "$f")" != README ]; then
 			echo "  $f: a copied file without its Apache-2.0 notice"
+			fail=1
+		fi
+		continue
+	fi
+	if postgresql_portions "$f"; then
+		if ! head -5 "$f" | grep -q "SPDX-License-Identifier: Apache-2.0 AND PostgreSQL" \
+			|| ! grep -q "Portions Copyright (c) 1996-[0-9]*, PostgreSQL Global Development Group" "$f"; then
+			echo "  $f: PostgreSQL's portions without both notices"
 			fail=1
 		fi
 		continue
@@ -49,6 +73,6 @@ while IFS= read -r f; do
 		fail=1
 	fi
 done < <(git ls-files --cached --others --exclude-standard modules include test/vexec docker/Dockerfile.vexec docker/Dockerfile.vanillaorca docker/vexec.yml \
-	| grep -v -E '/(expected|results)/|\.out$|/kept/')
+	| grep -v -E '/(expected|results)/|\.out$|/(corpus-)?kept/|/(README\.md|\.gitignore)$')
 echo "notices: $n files, $([ $fail -eq 0 ] && echo "each with its notice and no other" || echo "some failed")"
 exit $fail

@@ -1,6 +1,6 @@
 # vexec_postgis
 
-[vexec](../pg_accel)'s kernel pack for [PostGIS](https://postgis.net)
+[vexec](../../README.md)'s kernel pack for [PostGIS](https://postgis.net)
 (`pg_vector_executor.md` §3.17, phase VK).  An extension of its own: it
 declares, in vexec's registry of kernel packs, what vexec cannot know of
 PostGIS's geometry functions, so that a qual or a target over them runs a

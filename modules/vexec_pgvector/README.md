@@ -1,6 +1,6 @@
 # vexec_pgvector
 
-[vexec](../pg_accel)'s kernel pack for [pgvector](https://github.com/pgvector/pgvector)
+[vexec](../../README.md)'s kernel pack for [pgvector](https://github.com/pgvector/pgvector)
 (`pg_vector_executor.md` §3.17, phase VK).  An extension of its own: it
 declares, in vexec's registry of kernel packs, what vexec cannot know of
 pgvector's distances, so that a qual or a target over them runs a batch's
@@ -43,8 +43,8 @@ test/run.sh cluster    # a coordinator and its segments of the Cloudberry port
 ```
 
 The legs run in containers of pg_accel's port image, which carries pgvector
-0.8.6 as the port pins it; `VEXEC_SRC` names pg_accel's tree
-(`../pg_accel-vk`) and `VEXEC_PORT_STAGE` the port's modules.  The suites:
+0.8.6 as the port pins it; vexec is built from the tree this pack is in,
+`../..` (`VEXEC_SRC`), and `VEXEC_PORT_STAGE` names the port's modules.  The suites:
 
 - `declarations` -- pgvector's own functions against the check, called
   directly, without vexec, over random vectors of 1 to 16,000 dimensions and

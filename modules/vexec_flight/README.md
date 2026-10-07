@@ -1,7 +1,7 @@
 # vexec_flight
 
 Arrow Flight SQL for PostgreSQL 19, served only while
-[vexec](../pg_accel)'s vector executor is active
+[vexec](../../README.md)'s vector executor is active
 (`pg_vector_executor.md` §3.15, phase V10).  An extension of its own, with its
 own dependencies; it needs nothing of the Cloudberry port's tree, and runs on
 vanilla PostgreSQL 19 and on the port's coordinator.
@@ -74,8 +74,8 @@ test/run.sh serve [vanilla|port]                       # the tests' server, left
 It needs nghttp2, protobuf-c and its compiler, protobuf's well-known
 `.proto` files, and OpenSSL; the tests need pyarrow, the ADBC drivers for
 Flight SQL and PostgreSQL, and the Flight SQL JDBC driver
-(`docker/Dockerfile`, which pins each).  `VEXEC_SRC` names pg_accel's tree,
-whose vexec the legs build.
+(`docker/Dockerfile`, which pins each).  The legs build vexec from the tree
+this module is in, `../..`, or from `VEXEC_SRC`.
 
 ## Licences
 

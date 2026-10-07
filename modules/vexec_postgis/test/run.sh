@@ -16,7 +16,7 @@
 #   run.sh all       the three
 #
 # Settings, from the environment:
-#   VEXEC_SRC         pg_accel's tree, whose vexec the legs build: ../pg_accel-vk
+#   VEXEC_SRC         the tree whose vexec the legs build: the pack's own, ../..
 #   CB_COMMIT         the port's build: the newest pg_accel/cb-ext image's
 #   VEXEC_PORT_STAGE  the port's modules the legs install:
 #                     ~/.cache/pg_accel/vexec/portbuild-vk/stage
@@ -31,7 +31,7 @@ set -u -o pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$here/.." && pwd)"
-VEXEC_SRC="${VEXEC_SRC:-$(cd "$ROOT/.." && pwd)/pg_accel-vk}"
+VEXEC_SRC="${VEXEC_SRC:-$(cd "$ROOT/../.." && pwd)}"
 VEXEC_PORT_STAGE="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/portbuild-vk/stage}"
 PACK_CACHE="${PACK_CACHE:-$HOME/.cache/pg_accel/vexec_postgis}"
 if [ -z "${CB_COMMIT:-}" ]; then
@@ -47,7 +47,7 @@ leg() {						# leg <name>: in a container, its run's output
 	local run="$PACK_CACHE/runs/$(date +%Y%m%dT%H%M%S)-$1"
 	mkdir -p "$run" || die "cannot make $run"
 	echo "== $1: $run"
-	echo "  vexec from $VEXEC_SRC at $(git -C "$VEXEC_SRC" rev-parse --short HEAD)$( [ -n "$(git -C "$VEXEC_SRC" status --porcelain 2> /dev/null)" ] && echo '+changes'), the pack at $(git -C "$ROOT" rev-parse --short HEAD 2> /dev/null || echo 'no commit')$( [ -n "$(git -C "$ROOT" status --porcelain 2> /dev/null)" ] && echo '+changes')"
+	echo "  vexec from $VEXEC_SRC at $(git -C "$VEXEC_SRC" rev-parse --short HEAD)$( [ -n "$(git -C "$VEXEC_SRC" status --porcelain 2> /dev/null)" ] && echo '+changes'), the pack at $(git -C "$ROOT" rev-parse --short HEAD 2> /dev/null || echo 'no commit')$( [ -n "$(git -C "$ROOT" status --porcelain -- . 2> /dev/null)" ] && echo '+changes')"
 	docker run --rm --network none --cpus "${PACK_CPUS:-4}" -m "${PACK_MEM:-8g}" --memory-swap "${PACK_MEM:-8g}" \
 		--shm-size 2g --tmpfs /tmp:exec --user postgres \
 		-v "$ROOT:/pack:ro" -v "$VEXEC_SRC:/src:ro" -v "$VEXEC_PORT_STAGE:/cbstage:ro" -v "$run:/work" \

@@ -28,7 +28,7 @@
 # port's modules); both when not given.
 #
 # Settings, from the environment:
-#   VEXEC_SRC         pg_accel's tree, whose vexec the legs build: ../pg_accel-v10
+#   VEXEC_SRC         the tree whose vexec the legs build: vexec_flight's own, ../..
 #   CB_COMMIT         the port's build: the newest pg_accel/cb-ext image's
 #   VEXEC_PORT_STAGE  the port's modules the port leg installs (pg_accel's
 #                     test/vexec/run.sh portbuild): ~/.cache/pg_accel/vexec/portbuild-v10/stage,
@@ -57,7 +57,7 @@ set -u -o pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$here/.." && pwd)"
-VEXEC_SRC="${VEXEC_SRC:-$(cd "$ROOT/.." && pwd)/pg_accel-v10}"
+VEXEC_SRC="${VEXEC_SRC:-$(cd "$ROOT/../.." && pwd)}"
 FLIGHT_CACHE="${FLIGHT_CACHE:-$HOME/.cache/pg_accel/flight}"
 FLIGHT_CPUS="${FLIGHT_CPUS:-4}"
 FLIGHT_MEM="${FLIGHT_MEM:-8g}"
