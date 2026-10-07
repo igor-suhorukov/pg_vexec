@@ -1,9 +1,22 @@
 # pg_vexec
 
-The home of `vexec`, the vectorized planner and executor for PostgreSQL 19
-that `pg_vector_executor.md` plans: one extension on the hooks PostgreSQL
-already has, which also runs inside the Cloudberry port's servers
-(`github/cloudberry`, branch `extension_postgresql_19`).
+pg_vexec is a vectorized query planner and executor for PostgreSQL 19. It is
+built as extensions on the hooks PostgreSQL already has, with no fork and no
+core patches. Instead of pulling rows through the plan one at a time, it
+processes columnar batches stored either in PostgreSQL's own format or as
+Apache Arrow. Vector operators aren't patched into a finished plan. They
+compete on cost with row-based operators inside the planner, both
+PostgreSQL's planner and ORCA, the Greenplum/Cloudberry optimizer, which also
+runs on vanilla PostgreSQL. PostgreSQL's semantics are kept: anything a
+vector kernel can't compute falls back to PostgreSQL's own expression
+evaluation, and one setting brings back vanilla behaviour. Companion
+extensions add an Arrow Flight SQL endpoint that returns query results and
+accepts data as Arrow alongside regular PostgreSQL clients, plus kernel packs
+that let pgvector and PostGIS functions run over batches. On the Apache
+Cloudberry MPP port, vexec also reads and writes the columnar PAX and
+ao_column tables without turning them into rows, and passes batches between
+segments as Arrow IPC frames.
+
 
 The plan's phases land here in order, each on a branch of its own:
 
