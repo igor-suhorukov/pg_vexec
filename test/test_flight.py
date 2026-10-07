@@ -10,6 +10,12 @@
 #               and psql's; pyarrow.flight listing catalogs, schemas and
 #               tables; prepared statements with DoPut parameters; a Flight
 #               transaction that rolls back
+#   ingest      adbc_ingest's modes through CommandStatementIngest, as
+#               adbc_driver_postgresql's COPY loads the same table; in a
+#               transaction; a client's malformed Arrow, and a client that
+#               dies mid-stream, loading nothing; executemany of a prepared
+#               INSERT as one INSERT ... SELECT, and a row at a time into a
+#               table with a trigger
 #   logins      reject and hostssl lines, rolcanlogin, an expired
 #               rolvaliduntil, rolconnlimit, with the client's address
 #   sessions    pg_stat_activity, pg_stat_ssl; pg_cancel_backend(),
@@ -402,6 +408,189 @@ def prepared_statements_with_doput_parameters():
     with adbc() as conn:
         t = fetch(conn, 'SELECT $1::date + 1 AS d', ('2026-10-06',))
     assert str(t.column('d')[0].as_py()) == '2026-10-07'
+
+
+@test
+def ingest_into_tables():
+    """adbc_ingest's modes through CommandStatementIngest: a table created,
+    appended to, replaced, refused; its rows the client's, as
+    adbc_driver_postgresql's COPY loads them"""
+    import datetime
+    n = 3000
+    data = pa.table({
+        'i8': pa.array(range(n), pa.int64()),
+        'i4': pa.array([None if i % 7 == 0 else i for i in range(n)], pa.int32()),
+        'tx': pa.array([None if i % 11 == 0 else 'row %d é' % i for i in range(n)], pa.string()),
+        'd': pa.array([datetime.date(2020, 1, 1) + datetime.timedelta(days=i % 900) for i in range(n)],
+                      pa.date32()),
+        'n': pa.array([decimal.Decimal(i) / 100 for i in range(n)], pa.decimal128(15, 2)),
+        'f': pa.array([i / 3 for i in range(n)], pa.float64()),
+        'b': pa.array([i % 2 == 0 for i in range(n)], pa.bool_()),
+        'ts': pa.array([datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc) +
+                        datetime.timedelta(seconds=i) for i in range(n)], pa.timestamp('us', tz='UTC')),
+        'bin': pa.array([bytes([i % 256]) * (i % 5) for i in range(n)], pa.binary()),
+    })
+    psql('DROP TABLE IF EXISTS ing_flight, ing_pg')
+    with adbc() as conn, conn.cursor() as cur:
+        got = cur.adbc_ingest('ing_flight', data, mode='create')
+    assert got in (n, -1), got
+    with pgdb.connect(PG_URI, autocommit=True) as conn, conn.cursor() as cur:
+        cur.adbc_ingest('ing_pg', data, mode='create')
+    assert psql('SELECT count(*) FROM ing_flight') == str(n)
+    diff = psql('SELECT count(*) FROM ((SELECT * FROM ing_flight EXCEPT ALL SELECT * FROM ing_pg) '
+                'UNION ALL (SELECT * FROM ing_pg EXCEPT ALL SELECT * FROM ing_flight)) x')
+    assert diff == '0', diff
+    with adbc() as conn, conn.cursor() as cur:
+        cur.adbc_ingest('ing_flight', data, mode='append')
+    assert psql('SELECT count(*) FROM ing_flight') == str(2 * n)
+    with adbc() as conn, conn.cursor() as cur:
+        cur.adbc_ingest('ing_flight', data.slice(0, 10), mode='replace')
+    assert psql('SELECT count(*) FROM ing_flight') == '10'
+    with adbc() as conn, conn.cursor() as cur:
+        expect_error(lambda: cur.adbc_ingest('ing_flight', data, mode='create'), 'already exists')
+    with adbc() as conn, conn.cursor() as cur:
+        expect_error(lambda: cur.adbc_ingest('ing_missing', data, mode='append'), 'does not exist')
+
+
+def pb_fields(b):
+    """a protobuf message's length-delimited fields, {number: bytes}"""
+    def rd(i):
+        n = shift = 0
+        while True:
+            c = b[i]
+            i += 1
+            n |= (c & 0x7f) << shift
+            shift += 7
+            if not c & 0x80:
+                return n, i
+    out, i = {}, 0
+    while i < len(b):
+        key, i = rd(i)
+        if key & 7 == 2:
+            n, i = rd(i)
+            out[key >> 3] = b[i:i + n]
+            i += n
+        elif key & 7 == 0:
+            _, i = rd(i)
+        else:
+            raise ValueError('wire type %d' % (key & 7))
+    return out
+
+
+@test
+def ingest_in_a_transaction():
+    """an ingest in a Flight transaction, by its transaction_id: gone with
+    its rollback, kept with its commit; without the id while one is open,
+    refused as any statement is -- as adbc_driver_flightsql sends it"""
+    psql('DROP TABLE IF EXISTS ing_tx; CREATE TABLE ing_tx (a int8); GRANT ALL ON ing_tx TO flight')
+    table = pa.table({'a': pa.array(range(100), pa.int64())})
+    client, opts = flight_client()
+    for end, want in ((2, '0'), (1, '100')):       # END_TRANSACTION_ROLLBACK, _COMMIT
+        res = list(client.do_action(fl.Action('BeginTransaction', any_cmd('ActionBeginTransactionRequest')),
+                                    opts))
+        txn = pb_fields(pb_fields(res[0].body.to_pybytes())[2])[1]
+        options = varint(1 << 3) + varint(2) + varint(2 << 3) + varint(2)
+        cmd = any_cmd('CommandStatementIngest', fbytes(1, options) + fstr(2, 'ing_tx') + fbytes(6, txn))
+        writer, reader = client.do_put(fl.FlightDescriptor.for_command(cmd), table.schema, opts)
+        writer.write_table(table)
+        writer.done_writing()
+        reader.read()
+        writer.close()
+        assert psql('SELECT count(*) FROM ing_tx') == '0'     # not before the transaction ends
+        list(client.do_action(fl.Action('EndTransaction', any_cmd(
+            'ActionEndTransactionRequest', fbytes(1, txn) + varint(2 << 3) + varint(end))), opts))
+        assert psql('SELECT count(*) FROM ing_tx') == want
+    client.close()
+    with adbc(autocommit=False) as conn:
+        with conn.cursor() as cur:
+            expect_error(lambda: cur.adbc_ingest('ing_tx', table, mode='append'), 'must name it')
+        conn.rollback()
+
+
+def ingest_descriptor(table):
+    """CommandStatementIngest of a table that must exist, appended to"""
+    options = varint(1 << 3) + varint(2) + varint(2 << 3) + varint(2)
+    return fl.FlightDescriptor.for_command(
+        any_cmd('CommandStatementIngest', fbytes(1, options) + fstr(2, table)))
+
+
+@test
+def ingest_refuses_malformed_arrow():
+    """a client's invalid UTF-8 fails the ingest, which loads nothing"""
+    import struct
+    psql('DROP TABLE IF EXISTS ing_bad; CREATE TABLE ing_bad (s text); GRANT ALL ON ing_bad TO flight')
+    good = pa.array(['fine'] * 2000, pa.string())
+    bad = pa.Array.from_buffers(pa.string(), 2, [None, pa.py_buffer(struct.pack('<3i', 0, 2, 4)),
+                                                pa.py_buffer(b'ok\xff\xfe')])
+    client, opts = flight_client()
+    writer, reader = client.do_put(ingest_descriptor('ing_bad'), pa.schema([('s', pa.string())]), opts)
+
+    def run():
+        writer.write_table(pa.Table.from_arrays([good], names=['s']))
+        writer.write_table(pa.Table.from_arrays([bad], names=['s']))
+        writer.done_writing()
+        reader.read()
+        writer.close()
+    expect_error(run, 'UTF-8')
+    client.close()
+    assert psql('SELECT count(*) FROM ing_bad') == '0'
+
+
+@test
+def ingest_from_a_client_that_dies():
+    """a client killed in the middle of its stream loads nothing"""
+    psql('DROP TABLE IF EXISTS ing_die; CREATE TABLE ing_die (a int8); GRANT ALL ON ing_die TO flight')
+    code = r"""
+import os, sys, pyarrow as pa, pyarrow.flight as fl
+client = fl.FlightClient('grpc://127.0.0.1:%s' % os.environ['FLIGHT_PORT'])
+token = client.authenticate_basic_token('flight', sys.argv[1],
+                                        fl.FlightCallOptions(headers=[(b'database', b'flight')]))
+opts = fl.FlightCallOptions(headers=[token])
+cmd = bytes.fromhex(sys.argv[2])
+writer, reader = client.do_put(fl.FlightDescriptor.for_command(cmd), pa.schema([('a', pa.int64())]), opts)
+for i in range(20):
+    writer.write_table(pa.table({'a': pa.array(range(1000), pa.int64())}))
+os._exit(0)
+"""
+    cmd = ingest_descriptor('ing_die').command
+    subprocess.run([sys.executable, '-c', code, PASSWORD, cmd.hex()], check=True, timeout=60)
+    time.sleep(2)
+    assert psql('SELECT count(*) FROM ing_die') == '0'
+
+
+@test
+def prepared_insert_batches():
+    """executemany of a prepared INSERT of parameters: its batches as one
+    INSERT ... SELECT, and into a table with a trigger a row at a time; the
+    same rows, the columns not given their defaults, either way"""
+    import datetime
+    psql('DROP TABLE IF EXISTS pins, pins_trig; DROP FUNCTION IF EXISTS pins_noop(); '
+         'CREATE TABLE pins (id int8, s varchar(20), d date, n numeric(10,2), k int DEFAULT 7); '
+         'CREATE TABLE pins_trig (LIKE pins INCLUDING DEFAULTS); '
+         'CREATE FUNCTION pins_noop() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$; '
+         'CREATE TRIGGER t BEFORE INSERT ON pins_trig FOR EACH ROW EXECUTE FUNCTION pins_noop(); '
+         'GRANT ALL ON pins, pins_trig TO flight')
+    n = 2500
+    data = pa.table({
+        'id': pa.array(range(n), pa.int64()),
+        's': pa.array([None if i % 13 == 0 else 's%d' % i for i in range(n)], pa.string()),
+        'd': pa.array([datetime.date(2001, 2, 3) + datetime.timedelta(days=i) for i in range(n)], pa.date32()),
+        'n': pa.array([decimal.Decimal(i) / 4 for i in range(n)], pa.decimal128(10, 2)),
+    })
+    with adbc() as conn, conn.cursor() as cur:
+        cur.executemany('INSERT INTO pins (id, s, d, n) VALUES ($1, $2, $3, $4)', data)
+        cur.executemany('INSERT INTO pins_trig (id, s, d, n) VALUES ($1, $2, $3, $4)', data)
+    assert psql('SELECT count(*), sum(k) FROM pins') == '%d|%d' % (n, 7 * n)
+    diff = psql('SELECT count(*) FROM ((TABLE pins EXCEPT ALL TABLE pins_trig) '
+                'UNION ALL (TABLE pins_trig EXCEPT ALL TABLE pins)) x')
+    assert diff == '0', diff
+    # a value too long for its column fails the whole statement, as it would a row at a time
+    with adbc() as conn, conn.cursor() as cur:
+        expect_error(lambda: cur.executemany('INSERT INTO pins (id, s) VALUES ($1, $2)',
+                                             pa.table({'id': pa.array([1, 2], pa.int64()),
+                                                       's': pa.array(['ok', 'x' * 30])})),
+                     'value too long')
+    assert psql('SELECT count(*) FROM pins') == str(n)
 
 
 @test

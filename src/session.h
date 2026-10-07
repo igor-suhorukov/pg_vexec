@@ -103,6 +103,12 @@ extern void flight_statement_bind(FlightCall *call, FlightStatement *stmt,
 								  const ProtobufCBinaryData *schema_header);
 extern void flight_check_transaction(bool has_id, const ProtobufCBinaryData *id);
 extern void flight_sql_command(const char *sql);
+
+/* ingest.c */
+extern void flight_ingest(FlightCall *call, const ProtobufCBinaryData *command,
+						  const ProtobufCBinaryData *first_header);
+extern bool flight_ingest_prepared(FlightCall *call, FlightStatement *stmt,
+								   const ProtobufCBinaryData *first_header);
 extern void flight_run_sql(FlightCall *call, const char *sql, int nargs, const Oid *argtypes,
 						   const Datum *args, const bool *nulls,
 						   const VexecEgressField *fields, int nfields,

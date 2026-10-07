@@ -13,6 +13,12 @@
 #                            coordinator with FLIGHT_SEGMENTS segments
 #   run.sh bench [leg...]    TPC-H Q1 through adbc_driver_flightsql, against
 #                            adbc_driver_postgresql over the same server
+#   run.sh ingest [leg...]   lineitem into tables through the paths a client
+#                            with Arrow has (ingest.py): Flight SQL's
+#                            ingest, DoPut's parameters to a prepared
+#                            INSERT, adbc_driver_postgresql's binary COPY
+#                            and a CSV file's COPY; the port leg by default,
+#                            as PAX is the port's
 #   run.sh serve [leg]       the test's server with its corpus, left running
 #                            in container vexec_flight-serve-<leg> for
 #                            docker exec (. /work/env first); stopped by
@@ -33,6 +39,12 @@
 #   FLIGHT_SF         the bench's TPC-H scale factor: 1
 #   FLIGHT_RUNS       the bench's timed runs of each query: 5
 #   FLIGHT_ROWS       the bench's large result, in rows: 1000000
+#   FLIGHT_INGEST_ROWS, FLIGHT_INGEST_BATCH, FLIGHT_INGEST_WARM,
+#   FLIGHT_INGEST_FORMATS, FLIGHT_INGEST_PATHS
+#                     ingest's rows (1000000), Arrow batch (65536), warm
+#                     load's rows (10000), tables ("porc_vec porc"; also
+#                     aoco, heap) and paths ("csv copy flight"; also
+#                     ingest); its loads of each are FLIGHT_RUNS
 #   FLIGHT_TESTS      test_flight.py's tests to run, by name: all
 #   FLIGHT_CACHE      the runs: ~/.cache/pg_accel/flight
 #   FLIGHT_NOASSERT   1: the servers without their assertions, as a timed run
@@ -99,6 +111,9 @@ in_leg() {					# in_leg <leg> <run dir> <command...>
 		-v "$ROOT:/flight:ro" -v "$VEXEC_SRC:/src:ro" -v "$run:/work" "${stage[@]}" \
 		-e RESULTS_DIR=/work -e "FLIGHT_SF=${FLIGHT_SF:-1}" -e "FLIGHT_RUNS=${FLIGHT_RUNS:-5}" \
 		-e "FLIGHT_ROWS=${FLIGHT_ROWS:-1000000}" -e "FLIGHT_LEG=$leg" -e "FLIGHT_TESTS=${FLIGHT_TESTS:-}" \
+		-e "FLIGHT_INGEST_ROWS=${FLIGHT_INGEST_ROWS:-1000000}" -e "FLIGHT_INGEST_BATCH=${FLIGHT_INGEST_BATCH:-65536}" \
+		-e "FLIGHT_INGEST_WARM=${FLIGHT_INGEST_WARM:-10000}" -e "FLIGHT_INGEST_FORMATS=${FLIGHT_INGEST_FORMATS:-porc_vec porc}" \
+		-e "FLIGHT_INGEST_PATHS=${FLIGHT_INGEST_PATHS:-csv copy flight}" \
 		"$(image "$leg")" "$@"
 }
 
@@ -114,8 +129,9 @@ case "$cmd" in
 				-t "$(image "$leg")" "$ROOT/docker" || exit 1
 		done
 		;;
-	test|bench)
+	test|bench|ingest)
 		rc=0
+		[ "$cmd" = ingest ] && [ $# -eq 0 ] && set -- port
 		for leg in $(legs "$@"); do
 			run="$(new_run "$leg-$cmd")"
 			echo "== $cmd on the $leg leg: $run"
@@ -136,7 +152,7 @@ case "$cmd" in
 		tail -3 "$run/output"
 		;;
 	*)
-		sed -n '3,42p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '3,53p' "$0" | sed 's/^# \{0,1\}//'
 		exit 2
 		;;
 esac

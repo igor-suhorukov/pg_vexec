@@ -16,7 +16,9 @@
  *	DoGet			the ticket's statement runs, its result to vexec's
  *					receiver, each message written as FlightData
  *	DoPut			an update returns its row count; a prepared
- *					statement's parameter batches are bound
+ *					statement's parameter batches are bound, or, for a
+ *					prepared INSERT of parameters, go in as one INSERT ...
+ *					SELECT, as an ingest's batches do (ingest.c)
  *	DoAction		prepared statements, transactions and savepoints,
  *					session options, cancels
  *
@@ -785,12 +787,14 @@ do_put(FlightCall *call)
 		stmt = flight_statement_find(&handle, true);
 		if (stmt == NULL)
 			flight_error(GRPC_NOT_FOUND, ERRCODE_UNDEFINED_PSTATEMENT, "no such prepared statement");
-		flight_statement_bind(call, stmt, &first->data_header);
-		if (update)
+		if (update && flight_ingest_prepared(call, stmt, &first->data_header))
+			;					/* one INSERT ... SELECT over its batches (ingest.c) */
+		else if (update)
 		{
 			Arrow__Flight__Protocol__Sql__DoPutUpdateResult r =
 				ARROW__FLIGHT__PROTOCOL__SQL__DO_PUT_UPDATE_RESULT__INIT;
 
+			flight_statement_bind(call, stmt, &first->data_header);
 			r.record_count = flight_statement_update(stmt);
 			flight_finish_xact();
 			put_result(call, type, &r.base);
@@ -800,6 +804,7 @@ do_put(FlightCall *call)
 			Arrow__Flight__Protocol__Sql__DoPutPreparedStatementResult r =
 				ARROW__FLIGHT__PROTOCOL__SQL__DO_PUT_PREPARED_STATEMENT_RESULT__INIT;
 
+			flight_statement_bind(call, stmt, &first->data_header);
 			flight_finish_xact();
 			r._prepared_statement_handle_case =
 				ARROW__FLIGHT__PROTOCOL__SQL__DO_PUT_PREPARED_STATEMENT_RESULT___PREPARED_STATEMENT_HANDLE_PREPARED_STATEMENT_HANDLE;
@@ -808,8 +813,7 @@ do_put(FlightCall *call)
 		}
 	}
 	else if (strcmp(type, "CommandStatementIngest") == 0)
-		flight_error(GRPC_UNIMPLEMENTED, ERRCODE_FEATURE_NOT_SUPPORTED,
-					 "bulk ingestion waits for vexec's batch sink (pg_vector_executor.md §3.16, VI)");
+		flight_ingest(call, &value, &first->data_header);	/* ingest.c */
 	else
 		flight_error(GRPC_INVALID_ARGUMENT, ERRCODE_FEATURE_NOT_SUPPORTED,
 					 "unknown Flight SQL command \"%s\" for DoPut", type);

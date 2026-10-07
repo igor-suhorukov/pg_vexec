@@ -488,8 +488,8 @@ static const InfoValue sql_info[] = {
 	{5, INFO_BOOL, NULL, 0},
 	{8, INFO_INT32, NULL, 2},	/* SQL_SUPPORTED_TRANSACTION_SAVEPOINT */
 	{9, INFO_BOOL, NULL, 1},
-	{10, INFO_BOOL, NULL, 0},	/* bulk ingestion: with vexec's batch sink (VI) */
-	{11, INFO_BOOL, NULL, 0},
+	{10, INFO_BOOL, NULL, 1},	/* bulk ingestion: CommandStatementIngest (ingest.c) */
+	{11, INFO_BOOL, NULL, 1},	/* ingest in a transaction: its transaction_id */
 	{100, INFO_INT32, NULL, 0},
 	{101, INFO_INT32, NULL, 0},
 	{500, INFO_BOOL, NULL, 1},

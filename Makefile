@@ -22,6 +22,7 @@ OBJS = \
 	src/h2.o \
 	src/hba.o \
 	src/login.o \
+	src/ingest.o \
 	src/rpc.o \
 	src/session.o \
 	src/sql.o \

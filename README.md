@@ -34,15 +34,15 @@ vanilla PostgreSQL 19 and on the port's coordinator.
 | Flight SQL | Here |
 |---|---|
 | `CommandStatementQuery`, `CommandPreparedStatementQuery` | parsed and analysed at `GetFlightInfo`, planned and run at `DoGet`; a statement that returns no rows runs at `GetFlightInfo`, whose FlightInfo then has no endpoint and its row count as `total_records` |
-| `CommandStatementUpdate`, `CommandPreparedStatementUpdate` | their row counts, a prepared one's once for each parameter set, in one transaction |
+| `CommandStatementUpdate`, `CommandPreparedStatementUpdate` | their row counts, a prepared one's once for each parameter set, in one transaction; a prepared `INSERT ... VALUES` of parameters alone, into a table without triggers or rules, once for all its sets, as an ingest's (below) |
 | `DoPut` parameters | a set a row, read by vexec's IPC reader, as values of the parameters' types |
+| `CommandStatementIngest` | the client's batches into a table, as `INSERT INTO t SELECT ... FROM vexec.ingest_stream(handle)`: the stream read off the socket as the statement runs, through vexec's egress API (minor 1); each batch a batch of vexec's `VecIngest`, its buffers taken as they lie where a column's Arrow type is its column's, written by `VecInsert` through the table's sink or `table_multi_insert()` (§3.16, VI).  The table made, appended to or replaced as the command's options say, in its transaction or the client's.  A client that ends its call before its stream's end loads nothing |
 | `CreatePreparedStatement`, `ClosePreparedStatement` | a saved plan source, as `Parse` makes one |
 | `BeginTransaction`, `EndTransaction`, `BeginSavepoint`, `EndSavepoint` | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO` |
 | `CommandGetCatalogs`, `...DbSchemas`, `...Tables`, `...TableTypes`, `...PrimaryKeys`, `...ExportedKeys`, `...ImportedKeys`, `...CrossReference` | SQL over `pg_catalog`, with the caller's privileges |
 | `CommandGetSqlInfo`, `CommandGetXdbcTypeInfo` | arrays of the endpoint's own |
 | `SetSessionOptions`, `GetSessionOptions`, `CloseSession` | `SET`, the settings, the session's end |
 | `CancelFlightInfo`, `CancelQuery` | the statement's session signalled, as `pg_cancel_backend()` does |
-| `CommandStatementIngest` | not yet: it waits for vexec's batch sink (§3.16, VI) |
 | `CommandStatementSubstraitPlan`, `DoExchange` | not served |
 
 ## Settings
@@ -66,6 +66,8 @@ make PG_CONFIG=... install
 test/run.sh images [vanilla|port]                      # vexec_flight/dev:<leg>
 test/run.sh test [vanilla|port]                        # the clients' tests
 test/run.sh bench [vanilla|port]                       # TPC-H Q1, Flight SQL against libpq's binary COPY
+test/run.sh ingest [vanilla|port]                      # lineitem into tables: Flight's ingest and prepared
+                                                       # INSERT, against COPY of CSV and adbc's binary COPY
 test/run.sh serve [vanilla|port]                       # the tests' server, left running for docker exec
 ```
 

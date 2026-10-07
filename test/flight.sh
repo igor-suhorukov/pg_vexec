@@ -11,6 +11,9 @@
 #   flight.sh test    the clients' tests (test_flight.py, FlightJdbcTest.java)
 #   flight.sh bench   TPC-H Q1 at FLIGHT_SF, through adbc_driver_flightsql and
 #                     adbc_driver_postgresql (bench.py)
+#   flight.sh ingest  lineitem into PAX tables, through DoPut's parameters,
+#                     adbc_driver_postgresql's binary COPY and a CSV file's
+#                     COPY (ingest.py)
 #   flight.sh serve   the test's server and corpus, its environment in
 #                     RESULTS_DIR/env, until the container is stopped
 #
@@ -183,8 +186,12 @@ case "$CMD" in
 		python3 /flight/test/bench.py
 		exit $?
 		;;
+	ingest)
+		python3 /flight/test/ingest.py
+		exit $?
+		;;
 	*)
-		echo "flight.sh: test or bench"
+		echo "flight.sh: test, bench, ingest or serve"
 		exit 2
 		;;
 esac

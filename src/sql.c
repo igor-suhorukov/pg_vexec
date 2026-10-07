@@ -647,6 +647,15 @@ flight_statement_bind(FlightCall *call, FlightStatement *stmt, const ProtobufCBi
 		(void) eg->params_batch(state, (const char *) fd->data_header.data, fd->data_header.len,
 								(const char *) fd->data_body.data, fd->data_body.len, bind_row, &bs);
 	}
+
+	/*
+	 * h2_call_read() ends the same way for the end of the stream and for a
+	 * call the client cancelled or lost: the latter binds nothing, so that no
+	 * part of its rows is run and committed.
+	 */
+	if (h2_call_gone(call))
+		flight_error(GRPC_CANCELLED, ERRCODE_QUERY_CANCELED,
+					 "the client ended the call before its parameters' end; nothing was run");
 	if (state)
 		eg->params_end(state);
 	if (stmt->paramsets != NIL)
