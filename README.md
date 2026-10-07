@@ -1,4 +1,4 @@
-# pg_accel
+# pg_vexec
 
 The home of `vexec`, the vectorized planner and executor for PostgreSQL 19
 that `pg_vector_executor.md` plans: one extension on the hooks PostgreSQL
@@ -91,7 +91,7 @@ The plan's phases land here in order, each on a branch of its own:
 ## vexec
 
 ```sh
-test/vexec/run.sh images           # the dev images: vanilla, and the port's (from VB's pg_accel/cb-ext)
+test/vexec/run.sh images           # the dev images: vanilla, and the port's (from VB's pg_vexec/cb-ext)
 test/vexec/run.sh checks           # the header copies, the notices, the tree check
 test/vexec/run.sh suite            # vexec's own suite, on the vanilla leg and the port
 test/vexec/run.sh states           # §1.2's states: installed and not preloaded, objects without the library, library removed
@@ -110,17 +110,17 @@ test/vexec/run.sh portsuites       # the port's singlenode and greenplum suites,
 
 From V1 the port's legs install the port's modules of V1's worktree over
 the image's own, from the stage `portbuild` makes
-(`~/.cache/pg_accel/vexec/portbuild/stage`); `VEXEC_PORT_STAGE=none` runs
+(`~/.cache/pg_vexec/vexec/portbuild/stage`); `VEXEC_PORT_STAGE=none` runs
 them on the image's own. `TPC_VEXEC_MODE` and `TPC_VEXEC_FORMAT` set the tpc
 leg's `vexec.mode` and format, and `TPC_WORKERS` its parallel workers a
 segment, each query run once with each of them ("0 4").
 
 Every leg runs in a container; nothing is installed on the host. The legs
 build `vexec` from the tree by PGXS into a copy, with warnings as errors.
-Their results go to a run of the cache, `~/.cache/pg_accel/vexec/runs`.
+Their results go to a run of the cache, `~/.cache/pg_vexec/vexec/runs`.
 `VEXEC_CPUS=1` keeps a leg to one CPU beside a timed run; `tpc` and
 `fullrun` want the whole machine. `fullrun`'s container joins the network
-`pg_accel_default`, which VB's containers make (`docker/compose.yml`);
+`pg_vexec_default`, which VB's containers make (`docker/compose.yml`);
 the other legs' servers listen on sockets only, with no network.
 
 The suite preloads `vexec_testpack` before `vexec`; the packs' own legs are
@@ -153,14 +153,14 @@ container as it starts, with the port's modules of V1's worktree on the
 port's route.
 
 The data, DuckDB's answers and every answer PostgreSQL gave stay in the cache
-(`~/.cache/pg_accel/clickbench`), outside the tree: ClickBench is
+(`~/.cache/pg_vexec/clickbench`), outside the tree: ClickBench is
 CC BY-NC-SA 4.0, and nothing of it is copied here. The queries and the
 table's definition are read from a ClickBench checkout pinned by the queries'
 hash (`oss_databases/ClickBench` at `dfe44c96`).
 
 ## Licences
 
-pg_accel's files are Apache-2.0. Three others' are here with their own
+pg_vexec's files are Apache-2.0. Three others' are here with their own
 notices: Arrow's C Data Interface definitions (`modules/vexec/batch/arrow_abi.h`,
 copied as Arrow asks), the port's headers (`modules/vexec/pgxs/include/`, its
 `test/tpc/` suite), and nanoarrow (`modules/vexec_test/nanoarrow/`, for the
