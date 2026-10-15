@@ -184,6 +184,8 @@ _PG_init(void)
 	vexec_source_registry_install();
 	vexec_kernel_packs_install();
 	vexec_exec_install();
+	/* pg_otel_probe's spans of vector nodes and statements, where it is loaded */
+	vexec_report_install();
 	vexec_planner_install();
 	vexec_orca_install();
 	vexec_explain_install();

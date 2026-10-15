@@ -59,6 +59,13 @@ static const CustomExecMethods ingest_exec_methods = {
 	.ExplainCustomScan = ingest_explain,
 };
 
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_ingest_exec_methods(void)
+{
+	return &ingest_exec_methods;
+}
+
 Node *
 vexec_create_ingest_state(CustomScan *cscan)
 {

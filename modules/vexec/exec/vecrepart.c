@@ -144,6 +144,13 @@ static const CustomExecMethods repart_exec_methods = {
 	.ExplainCustomScan = repart_explain,
 };
 
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_repart_exec_methods(void)
+{
+	return &repart_exec_methods;
+}
+
 Node *
 vexec_create_repart_state(CustomScan *cscan)
 {

@@ -20,9 +20,12 @@
 #include "commands/explain.h"
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/value.h"
 
 #include "vexec.h"
+#include "pg_otel_probe_api.h"
+#include "exec/exec.h"
 #include "plan/plan.h"
 
 typedef struct VexecExplainOptions
@@ -37,6 +40,7 @@ static void vexec_explain_option(ExplainState *es, DefElem *opt, ParseState *pst
 static void vexec_explain_per_plan(PlannedStmt *pstmt, IntoClause *into, ExplainState *es,
 								   const char *queryString, ParamListInfo params,
 								   QueryEnvironment *queryEnv);
+static void vexec_statement_report(QueryDesc *queryDesc, PgOtelProbeAttrs *attrs, int when);
 
 void
 vexec_explain_install(void)
@@ -46,6 +50,9 @@ vexec_explain_install(void)
 								   GUCCheckBooleanExplainOption);
 	prev_explain_per_plan = explain_per_plan_hook;
 	explain_per_plan_hook = vexec_explain_per_plan;
+
+	/* pg_otel_probe's span of a statement, where it is loaded (§4.7.4) */
+	pg_otel_probe_register_statement_reporter(vexec_statement_report, PG_OTEL_PROBE_ABORT_SAFE);
 }
 
 static void
@@ -254,4 +261,107 @@ vexec_explain_per_plan(PlannedStmt *pstmt, IntoClause *into, ExplainState *es,
 
 	if (prev_explain_per_plan)
 		prev_explain_per_plan(pstmt, into, es, queryString, params, queryEnv);
+}
+
+/* ---------------------------------------------------------------------
+ * pg_otel_probe's span of a statement
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * The vector nodes of a plan tree, the fragments below a Motion included:
+ * on the port's coordinator those are only described, never initialised.
+ */
+static int
+count_vector_nodes(Plan *plan)
+{
+	ListCell   *lc;
+	int			n;
+
+	if (plan == NULL)
+		return 0;
+	check_stack_depth();
+	n = vexec_is_vector_node(plan) ? 1 : 0;
+	n += count_vector_nodes(plan->lefttree) + count_vector_nodes(plan->righttree);
+	switch (nodeTag(plan))
+	{
+		case T_Append:
+			foreach(lc, ((Append *) plan)->appendplans)
+				n += count_vector_nodes(lfirst(lc));
+			break;
+		case T_MergeAppend:
+			foreach(lc, ((MergeAppend *) plan)->mergeplans)
+				n += count_vector_nodes(lfirst(lc));
+			break;
+		case T_BitmapAnd:
+			foreach(lc, ((BitmapAnd *) plan)->bitmapplans)
+				n += count_vector_nodes(lfirst(lc));
+			break;
+		case T_BitmapOr:
+			foreach(lc, ((BitmapOr *) plan)->bitmapplans)
+				n += count_vector_nodes(lfirst(lc));
+			break;
+		case T_SubqueryScan:
+			n += count_vector_nodes(((SubqueryScan *) plan)->subplan);
+			break;
+		case T_CustomScan:
+			foreach(lc, ((CustomScan *) plan)->custom_plans)
+				n += count_vector_nodes(lfirst(lc));
+			break;
+		default:
+			break;
+	}
+	return n;
+}
+
+/*
+ * What a statement's span carries in pg_otel_probe's traces (its PLAN.md
+ * §4.7.4, pg_otel_probe_api.h): the mode and the batch format it was
+ * planned in, whether the gate let the vectorized planner in and why not,
+ * the vector nodes its plan has, and the alternatives the planners priced
+ * and did not take -- the record EXPLAIN (VEXEC) prints.  A segment's
+ * fragment, a part of a plan made on the coordinator, carries no record:
+ * its span has its vector nodes alone.  It reads the plan, and so is safe on
+ * a failed statement's error path.
+ */
+static void
+vexec_statement_report(QueryDesc *queryDesc, PgOtelProbeAttrs *attrs, int when)
+{
+	PlannedStmt *pstmt = queryDesc->plannedstmt;
+	List	   *items = NIL;
+	ListCell   *lc;
+	int			nodes = 0;
+	const char *gate;
+	Node	   *dropped;
+
+	if (pstmt == NULL || pstmt->commandType == CMD_UTILITY)
+		return;
+	foreach(lc, pstmt->extension_state)
+	{
+		DefElem    *d = lfirst_node(DefElem, lc);
+
+		if (strcmp(d->defname, "vexec") == 0)
+			items = (List *) d->arg;
+	}
+	nodes = count_vector_nodes(pstmt->planTree);
+	foreach(lc, pstmt->subplans)
+		nodes += count_vector_nodes(lfirst(lc));
+	if (items == NIL && nodes == 0 && vexec_mode == VEXEC_MODE_OFF)
+		return;
+	/* the record is kept in explain mode; else the mode the session runs in */
+	if (items == NIL)
+		attrs->add_string(attrs, "vexec.mode", vexec_mode_name(vexec_mode));
+	if (items != NIL)
+	{
+		attrs->add_string(attrs, "vexec.mode", item_str(items, "mode"));
+		attrs->add_string(attrs, "vexec.batch_format", item_str(items, "format"));
+		gate = item_str(items, "gate");
+		if (gate != NULL && strcmp(gate, "open") != 0)
+			attrs->add_string(attrs, "vexec.gate", gate);
+		dropped = item(items, "dropped");
+		attrs->add_int(attrs, "vexec.alternatives_not_taken",
+					   list_length((List *) item(items, "alternatives")) +
+					   (dropped != NULL && IsA(dropped, Integer) ? intVal(dropped) : 0));
+	}
+	attrs->add_int(attrs, "vexec.vector_nodes", nodes);
 }

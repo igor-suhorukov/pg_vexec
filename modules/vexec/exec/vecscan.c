@@ -165,6 +165,13 @@ static const CustomExecMethods bitmapscan_exec_methods = {
 	.ExplainCustomScan = scan_explain,
 };
 
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_bitmapscan_exec_methods(void)
+{
+	return &bitmapscan_exec_methods;
+}
+
 static const CustomExecMethods scan_exec_methods = {
 	.CustomName = VEXEC_SCAN_NAME,
 	.BeginCustomScan = scan_begin,
@@ -177,6 +184,13 @@ static const CustomExecMethods scan_exec_methods = {
 	.InitializeWorkerCustomScan = scan_initialize_worker,
 	.ExplainCustomScan = scan_explain,
 };
+
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_scan_exec_methods(void)
+{
+	return &scan_exec_methods;
+}
 
 Node *
 vexec_create_scan_state(CustomScan *cscan)

@@ -77,6 +77,7 @@
 #include "flight.h"
 #include "h2.h"
 #include "session.h"
+#include "pg_otel_probe_api.h"
 
 FlightSession *flight_session = NULL;
 
@@ -217,6 +218,28 @@ take_client_socket(int slot, uint64 token, int *link_out)
  */
 
 /*
+ * The caller's trace context, where pg_otel_probe is loaded (its PLAN.md
+ * §4.7.4): a call's gRPC metadata may carry a W3C traceparent and
+ * tracestate, as OpenTelemetry's gRPC instrumentation and a Flight SQL
+ * client's call headers send them; the statements the call runs become
+ * children of that span, through pg_otel_probe/context_v1's set_parent(),
+ * for the transaction command alone.  A malformed one is ignored.
+ */
+static void
+caller_trace_context(void)
+{
+	const PgOtelProbeContextApi *otel = pg_otel_probe_context_api();
+	const char *traceparent;
+
+	if (otel == NULL || flight_session->call == NULL)
+		return;
+	traceparent = h2_call_header(flight_session->call, "traceparent");
+	if (traceparent != NULL)
+		(void) otel->set_parent(traceparent,
+								h2_call_header(flight_session->call, "tracestate"), true);
+}
+
+/*
  * A transaction command begun, as postgres.c's start_xact_command() begins
  * one; the memory context current before it stays current, so that what a
  * call builds for its response outlives the command's commit.
@@ -231,6 +254,7 @@ flight_start_xact(void)
 		StartTransactionCommand();
 		MemoryContextSwitchTo(old);
 		flight_session->xact_started = true;
+		caller_trace_context();
 	}
 	if (StatementTimeout > 0 && (StatementTimeout < TransactionTimeout || TransactionTimeout == 0))
 	{

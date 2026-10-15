@@ -375,6 +375,24 @@ extern const CustomScanMethods *vexec_ingest_methods(void);
 extern const CustomScanMethods *vexec_motion_send_methods(void);
 extern const CustomScanMethods *vexec_motion_recv_methods(void);
 
+/*
+ * Each kind's exec methods, which pg_otel_probe's reporter of vector nodes
+ * is registered for (vexec_report_install(), node.c).
+ */
+extern const CustomExecMethods *vexec_scan_exec_methods(void);
+extern const CustomExecMethods *vexec_bitmapscan_exec_methods(void);
+extern const CustomExecMethods *vexec_result_exec_methods(void);
+extern const CustomExecMethods *vexec_agg_exec_methods(void);
+extern const CustomExecMethods *vexec_hashjoin_exec_methods(void);
+extern const CustomExecMethods *vexec_sort_exec_methods(void);
+extern const CustomExecMethods *vexec_repart_exec_methods(void);
+extern const CustomExecMethods *vexec_window_exec_methods(void);
+extern const CustomExecMethods *vexec_insert_exec_methods(void);
+extern const CustomExecMethods *vexec_ingest_exec_methods(void);
+extern const CustomExecMethods *vexec_motion_send_exec_methods(void);
+extern const CustomExecMethods *vexec_motion_recv_exec_methods(void);
+extern void vexec_report_install(void);
+
 /* node.c: what every node shares */
 extern void vexec_node_begin(VexecNode *node, EState *estate);
 extern void vexec_node_compile(VexecNode *node, List *quals, List *tlist);

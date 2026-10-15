@@ -238,6 +238,13 @@ static const CustomExecMethods window_exec_methods = {
 	.ExplainCustomScan = window_explain,
 };
 
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_window_exec_methods(void)
+{
+	return &window_exec_methods;
+}
+
 Node *
 vexec_create_window_state(CustomScan *cscan)
 {
