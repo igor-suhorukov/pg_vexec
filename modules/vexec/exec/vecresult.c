@@ -56,6 +56,13 @@ static const CustomExecMethods result_exec_methods = {
 	.ExplainCustomScan = result_explain,
 };
 
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_result_exec_methods(void)
+{
+	return &result_exec_methods;
+}
+
 Node *
 vexec_create_result_state(CustomScan *cscan)
 {

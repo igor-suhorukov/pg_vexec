@@ -373,6 +373,13 @@ static const CustomExecMethods hj_exec_methods = {
 	.ExplainCustomScan = hj_explain,
 };
 
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_hashjoin_exec_methods(void)
+{
+	return &hj_exec_methods;
+}
+
 Node *
 vexec_create_hashjoin_state(CustomScan *cscan)
 {

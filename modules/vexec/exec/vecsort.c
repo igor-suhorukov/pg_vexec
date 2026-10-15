@@ -150,6 +150,13 @@ static const CustomExecMethods sort_exec_methods = {
 	.ExplainCustomScan = sort_explain,
 };
 
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_sort_exec_methods(void)
+{
+	return &sort_exec_methods;
+}
+
 Node *
 vexec_create_sort_state(CustomScan *cscan)
 {

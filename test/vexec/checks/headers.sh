@@ -10,7 +10,10 @@
 #     which V1 adds to the port;
 #   - vexec's own batch-source contract, include/vexec_source.h, whose copy
 #     the port's storage modules compile against in pg19/include (V1), and
-#     its batch-sink contract, include/vexec_sink.h, the same way (VI).
+#     its batch-sink contract, include/vexec_sink.h, the same way (VI);
+#   - pg_otel_probe's API, pg_otel_probe_api.h, whose copy in the port's
+#     pg19/include vexec's (in pgxs/include, above) and vexec_flight's
+#     (modules/vexec_flight/src) equal.
 #
 # A change to one fails here until its copy is refreshed in the same commit.
 # On the host.  The port's sources to compare with are VEXEC_PORT_SRC, a
@@ -41,6 +44,14 @@ for copy in "$COPIES"/*.h; do
 		fail=1
 	fi
 done
+if [ -f "$CB_SRC/pg19/include/pg_otel_probe_api.h" ]; then
+	if cmp -s "$ROOT/modules/vexec_flight/src/pg_otel_probe_api.h" "$CB_SRC/pg19/include/pg_otel_probe_api.h"; then
+		echo "  ok pg_otel_probe_api.h, vexec_flight's copy"
+	else
+		echo "  DIFFERS pg_otel_probe_api.h: refresh modules/vexec_flight/src's copy from pg19/include/pg_otel_probe_api.h"
+		fail=1
+	fi
+fi
 for contract in vexec_source.h vexec_sink.h; do
 	[ -f "$CB_SRC/pg19/include/$contract" ] || continue
 	if cmp -s "$ROOT/include/$contract" "$CB_SRC/pg19/include/$contract"; then

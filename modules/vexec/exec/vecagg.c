@@ -265,6 +265,13 @@ static const CustomExecMethods agg_exec_methods = {
 	.ExplainCustomScan = agg_explain,
 };
 
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_agg_exec_methods(void)
+{
+	return &agg_exec_methods;
+}
+
 Node *
 vexec_create_agg_state(CustomScan *cscan)
 {

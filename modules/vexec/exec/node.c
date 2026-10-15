@@ -49,6 +49,7 @@
 #include "vexec_kernels.h"
 
 #include "vexec.h"
+#include "pg_otel_probe_api.h"
 #include "batch/batch.h"
 #include "exec/exec.h"
 #include "expr/expr.h"
@@ -832,4 +833,91 @@ vexec_node_explain_declared(VexecNode *node, ExplainState *es)
 										e->pack->name, vexec_decl_kind_name(e->decl->kind)));
 	}
 	ExplainPropertyList("Declared Calls", names, es);
+}
+
+/* ---------------------------------------------------------------------
+ * pg_otel_probe's spans of vector nodes
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * What a vector node's span carries in pg_otel_probe's traces (its PLAN.md
+ * §4.7.4, pg_otel_probe_api.h): the batches it read and the rows in them,
+ * its kernels' steps against the rows the fallback evaluated -- and those
+ * PostgreSQL's evaluator ran lazily, a kernel sent it, a kernel pack's
+ * declared calls answered -- its batch format, and the share of its input
+ * rows its quals passed.  A VecMotion's also its frames, their bytes and
+ * the schema frames among them.  On the coordinator, a node the segments
+ * ran carries their sums, as EXPLAIN ANALYZE prints them.  It reads the
+ * node's fields alone, and so is safe on a failed statement's error path.
+ */
+static void
+vexec_node_report(PlanState *ps, PgOtelProbeAttrs *attrs, int when)
+{
+	VexecNode  *node = (VexecNode *) ps;
+	const VexecNodeStats *st = node->ran ? &node->stats : &node->segment_stats;
+
+	attrs->add_string(attrs, "vexec.batch_format",
+					  node->layout.format == VEXEC_FORMAT_ARROW ? "arrow" : "postgres");
+	attrs->add_int(attrs, "vexec.kernels", node->nkernels);
+	attrs->add_int(attrs, "vexec.fallbacks", node->nfallbacks);
+	if (!node->ran && node->segments_seen == 0)
+		return;
+	attrs->add_int(attrs, "vexec.batches", st->batches);
+	attrs->add_int(attrs, "vexec.rows_in", st->rows_in);
+	if (st->batches > 0)
+		attrs->add_double(attrs, "vexec.rows_per_batch", (double) st->rows_in / (double) st->batches);
+	attrs->add_int(attrs, "vexec.kernel_steps", st->kernel_steps);
+	attrs->add_int(attrs, "vexec.fallback_rows", st->fallback_rows);
+	if (st->lazy_rows > 0)
+		attrs->add_int(attrs, "vexec.lazy_rows", st->lazy_rows);
+	if (st->redo_rows > 0)
+		attrs->add_int(attrs, "vexec.redo_rows", st->redo_rows);
+	if (st->declared_rows > 0)
+		attrs->add_int(attrs, "vexec.declared_rows", st->declared_rows);
+	if (st->batches_out > 0)
+		attrs->add_int(attrs, "vexec.batches_out", st->batches_out);
+	if (node->ran && node->nquals > 0 && ps->instrument != NULL && st->rows_in > 0)
+		attrs->add_double(attrs, "vexec.selection_density",
+						  ps->instrument->ntuples / (double) st->rows_in);
+	if (!node->ran)
+		attrs->add_int(attrs, "vexec.segments_reporting", node->segments_seen);
+	if (node->kind == VEXEC_NODE_MOTION_SEND || node->kind == VEXEC_NODE_MOTION_RECV)
+	{
+		const VexecMotionStats *m = vexec_motion_stats(node);
+
+		attrs->add_int(attrs, "vexec.motion.frames", m->frames);
+		attrs->add_int(attrs, "vexec.motion.schema_frames", m->schema_frames);
+		attrs->add_int(attrs, "vexec.motion.bytes", m->bytes);
+		attrs->add_int(attrs, "vexec.motion.rows", m->rows);
+		if (m->rows_by_postgres > 0)
+			attrs->add_int(attrs, "vexec.motion.rows_by_postgres", m->rows_by_postgres);
+	}
+}
+
+/*
+ * The reporter of every kind of vector node, from _PG_init: an entry of
+ * pg_otel_probe's registry, unused where pg_otel_probe is not loaded.
+ */
+void
+vexec_report_install(void)
+{
+	const CustomExecMethods *(*const kinds[]) (void) = {
+		vexec_scan_exec_methods,
+		vexec_bitmapscan_exec_methods,
+		vexec_result_exec_methods,
+		vexec_agg_exec_methods,
+		vexec_hashjoin_exec_methods,
+		vexec_sort_exec_methods,
+		vexec_repart_exec_methods,
+		vexec_window_exec_methods,
+		vexec_insert_exec_methods,
+		vexec_ingest_exec_methods,
+		vexec_motion_send_exec_methods,
+		vexec_motion_recv_exec_methods,
+	};
+
+	for (int i = 0; i < lengthof(kinds); i++)
+		pg_otel_probe_register_node_reporter(kinds[i](), vexec_node_report,
+											 PG_OTEL_PROBE_ABORT_SAFE);
 }

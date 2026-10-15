@@ -182,6 +182,13 @@ static const CustomExecMethods send_exec_methods = {
 	.ExplainCustomScan = send_explain,
 };
 
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_motion_send_exec_methods(void)
+{
+	return &send_exec_methods;
+}
+
 Node *
 vexec_create_motion_send_state(CustomScan *cscan)
 {
@@ -740,6 +747,13 @@ static const CustomExecMethods recv_exec_methods = {
 	.ReScanCustomScan = recv_rescan,
 	.ExplainCustomScan = recv_explain,
 };
+
+/* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
+const CustomExecMethods *
+vexec_motion_recv_exec_methods(void)
+{
+	return &recv_exec_methods;
+}
 
 Node *
 vexec_create_motion_recv_state(CustomScan *cscan)

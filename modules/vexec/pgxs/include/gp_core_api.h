@@ -40,7 +40,7 @@
  * here changes meaning or moves.
  */
 #define GP_CORE_API_VERSION_MAJOR	1
-#define GP_CORE_API_VERSION_MINOR	15
+#define GP_CORE_API_VERSION_MINOR	16
 
 struct Node;
 struct List;
@@ -51,6 +51,92 @@ struct Query;
 struct FileSet;
 struct TableAmRoutine;
 struct StringInfoData;
+
+/*
+ * Since 1.16, what slice_info() says of the fragment a segment's process
+ * runs: the slice, the slice that receives its rows -- 0, the root slice,
+ * where the coordinator does -- the gang its process is of, and the content
+ * of the process of the receiving slice that is this one's own receiver:
+ * this segment's where the receiving slice runs here too, else the first
+ * that receives its rows; -1 for the coordinator.
+ */
+#define GP_GANG_WRITER	0		/* the session's backend on the segment */
+#define GP_GANG_READER	1		/* one that runs a slice that streams */
+
+typedef struct GpCoreSliceInfo
+{
+	int			slice;
+	int			parent;
+	int			gang;
+	int			receiver;
+} GpCoreSliceInfo;
+
+/*
+ * Since 1.16, a node of the cluster as cluster_nodes() gives it: the columns
+ * of Cloudberry's gp_segment_configuration, with what FTS last published of
+ * its role, mode and status.  The host name points into gp_core's copy of
+ * the nodes, valid until the next call.
+ */
+typedef struct GpCoreNode
+{
+	int			dbid;
+	int			content;		/* -1 the coordinator, 0..n-1 a segment */
+	char		role;			/* 'p' primary, 'm' mirror: what it is now */
+	char		preferred_role; /* what the file says it is */
+	char		mode;			/* 's' in sync with its peer, 'n' not */
+	char		status;			/* 'u' up, 'd' down */
+	const char *hostname;
+	int			port;
+} GpCoreNode;
+
+/*
+ * Since 1.16, the dispatcher's figures, the node's since it started, over
+ * every backend: gangs made, and statements that took one already there;
+ * connections opened to the segments and the time that took; dispatches,
+ * the client's statements and their parts sent to the segments -- a
+ * gather's statement, a slice's fragment, a write, a utility statement, a
+ * COPY -- each once whatever the number of segments it went to, and not a
+ * module's own commands nor the dispatcher's settings, transaction control
+ * and snapshots; and the errors a segment's answer raised, once for each
+ * statement they ended.
+ */
+typedef struct GpCoreDispatchCounters
+{
+	uint64		gangs_created;
+	uint64		gangs_reused;
+	uint64		connections;
+	uint64		connect_us;
+	uint64		dispatches;
+	uint64		errors;
+} GpCoreDispatchCounters;
+
+/*
+ * Since 1.16, a transport's figures, the node's since it started: what
+ * Motions sent and received through it, as rows and as their bytes as a
+ * Motion encodes them -- a row sent to every receiver, a Broadcast's, once
+ * for each -- and the packets it sent again where it acknowledges them:
+ * udpifc's; udp2 resends inside its own library, and its count stays 0.
+ */
+typedef struct GpCoreIcCounters
+{
+	const char *transport;		/* tcp, udpifc, udp2, proxy, shm, relay */
+	uint64		bytes_sent;
+	uint64		bytes_received;
+	uint64		tuples_sent;
+	uint64		tuples_received;
+	uint64		retransmissions;
+} GpCoreIcCounters;
+
+/*
+ * Since 1.16 (its meaning older): the bit of a statement's instrument_options
+ * that says it is instrumented for a module's own figures -- query metrics,
+ * a tracer -- rather than for EXPLAIN ANALYZE.  gp_core then asks the
+ * segments nothing for it, and does not describe the fragments it sends; a
+ * module that instruments a statement EXPLAIN ANALYZE does not sets it.
+ * PostgreSQL's instrumentation reads its own bits only.  gp_metrics.h's
+ * GP_INSTR_METRICS_ONLY is this bit.
+ */
+#define GP_INSTR_MODULE_ONLY	(1 << 30)
 
 /*
  * What the rendezvous variable points at.  It is the first thing a module
@@ -317,6 +403,35 @@ typedef struct GpCoreApi
 													  int content,
 													  const char *data,
 													  int len));
+
+	/*
+	 * Since 1.16, for a module that follows a statement through the cluster
+	 * -- pg_otel_probe, which hangs each slice's span under the Motion that
+	 * receives it -- and reports the cluster's figures, without linking to
+	 * gp_core.
+	 *
+	 * slice_info()		on a segment, the slice of the fragment "stmt" a
+	 *					process runs (GpCoreSliceInfo above); false where
+	 *					"stmt" is no fragment.
+	 * coordinator_statement()	on a segment, the coordinator's statement the
+	 *					message this dispatched backend runs is part of, as
+	 *					what it was sent names it: a gather's cursor, its
+	 *					FETCHes and CLOSE, a reader's slice, a write, a DDL
+	 *					tree (gp_log.c).  NULL where it is none of these --
+	 *					the dispatcher's own settings, transaction control
+	 *					and snapshots -- and on the coordinator.
+	 * cluster_nodes()	every node of the cluster, up to "max" of them into
+	 *					"nodes"; how many there are.  0 on one node.
+	 * dispatch_counters(), interconnect_counters()	the node's figures
+	 *					(GpCoreDispatchCounters, GpCoreIcCounters above),
+	 *					one entry a transport, up to "max"; how many there
+	 *					are.
+	 */
+	bool		(*slice_info) (struct PlannedStmt *stmt, GpCoreSliceInfo *info);
+	const char *(*coordinator_statement) (void);
+	int			(*cluster_nodes) (GpCoreNode *nodes, int max);
+	void		(*dispatch_counters) (GpCoreDispatchCounters *counters);
+	int			(*interconnect_counters) (GpCoreIcCounters *counters, int max);
 } GpCoreApi;
 
 /*
