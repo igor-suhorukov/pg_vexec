@@ -237,21 +237,24 @@ vexec_frame_writer_create(MemoryContext parent, int ncols, VexecType *const *typ
 	return w;
 }
 
-/* The message's bytes behind a header, as a bytea: the one copy of them. */
-static bytea *
-message_frame(const VexecIpcMessage *msg, uint64 schema)
+/*
+ * The message's bytes behind a header, behind `prefix` bytes left for the
+ * caller: the one copy of them.  Its length, the prefix's not counted, in
+ * *len; NULL where it would be longer than an allocation may be.
+ */
+static char *
+message_bytes(const VexecIpcMessage *msg, uint64 schema, Size prefix, Size *lenp)
 {
 	Size		len = VEXEC_FRAME_HEADER + 8 + msg->metadata_len + (Size) msg->body_len;
-	bytea	   *frame;
+	char	   *buf;
 	char	   *p;
 	FrameHeader hdr;
 	int			i;
 
-	if (len > MaxAllocSize - VARHDRSZ)
+	if (len > MaxAllocSize - prefix)
 		return NULL;
-	frame = palloc(VARHDRSZ + len);
-	SET_VARSIZE(frame, VARHDRSZ + len);
-	p = VARDATA(frame);
+	buf = palloc(prefix + len);
+	p = buf + prefix;
 	hdr.magic = VEXEC_FRAME_MAGIC;
 	hdr.reserved = 0;
 	hdr.schema = schema;
@@ -266,7 +269,20 @@ message_frame(const VexecIpcMessage *msg, uint64 schema)
 		memcpy(p, msg->pieces[i].data, msg->pieces[i].len);
 		p += msg->pieces[i].len;
 	}
-	Assert(p == VARDATA(frame) + len);
+	Assert(p == buf + prefix + len);
+	*lenp = len;
+	return buf;
+}
+
+/* The message's bytes behind a header, as a bytea. */
+static bytea *
+message_frame(const VexecIpcMessage *msg, uint64 schema)
+{
+	Size		len;
+	bytea	   *frame = (bytea *) message_bytes(msg, schema, VARHDRSZ, &len);
+
+	if (frame != NULL)
+		SET_VARSIZE(frame, VARHDRSZ + len);
 	return frame;
 }
 
@@ -659,14 +675,29 @@ vexec_frame_begin(VexecFrameWriter *w, VexecBatch *batch, uint64 *schema, bytea 
 	*schema_frame = w->schema->frame;
 }
 
+static const VexecIpcMessage *frame_message(VexecFrameWriter *w, const int *rows, int nrows);
+
 bytea *
 vexec_frame_rows(VexecFrameWriter *w, const int *rows, int nrows)
+{
+	return message_frame(frame_message(w, rows, nrows), w->schema->hash);
+}
+
+char *
+vexec_frame_rows_after(VexecFrameWriter *w, const int *rows, int nrows, Size prefix, Size *len)
+{
+	Assert(prefix % 8 == 0);
+	return message_bytes(frame_message(w, rows, nrows), w->schema->hash, prefix, len);
+}
+
+/* The record batch message of the batch's rows rows[0 .. nrows). */
+static const VexecIpcMessage *
+frame_message(VexecFrameWriter *w, const int *rows, int nrows)
 {
 	ColOut	   *outs = palloc(sizeof(ColOut) * Max(w->ncols, 1));
 	struct ArrowArray **children = palloc(sizeof(struct ArrowArray *) * Max(w->ncols, 1));
 	struct ArrowArray array;
 	const void *nobuf[1] = {NULL};
-	const VexecIpcMessage *msg;
 	bool		all;
 	int			i;
 
@@ -688,8 +719,7 @@ vexec_frame_rows(VexecFrameWriter *w, const int *rows, int nrows)
 	array.n_children = w->ncols;
 	array.children = children;
 	array.release = release_noop_array;
-	msg = vexec_ipc_write_batch(w->ipc, &w->schema->arrow, &array);
-	return message_frame(msg, w->schema->hash);
+	return vexec_ipc_write_batch(w->ipc, &w->schema->arrow, &array);
 }
 
 /* ---------------------------------------------------------------------

@@ -103,6 +103,7 @@
 #include "vexec.h"
 #include "batch/batch.h"
 #include "exec/exec.h"
+#include "plan/plan.h"
 #include "expr/expr.h"
 #include "source/source.h"
 
@@ -134,6 +135,16 @@ typedef struct VexecScanState
 	/* H2: the units, and their rows, a source answered from statistics */
 	int64		stats_units;
 	int64		stats_rows;
+
+	/*
+	 * X3: the leading quals heap's page reader checks on a tuple before
+	 * deforming it (source/prefilter.c): the checks, how many of the quals
+	 * they stand for, and the rows they dropped that EXPLAIN ANALYZE counted
+	 */
+	VexecHeapCheck *checks;
+	int			nchecks;
+	int			nchecked_quals;
+	int64		prefiltered_counted;
 
 	/*
 	 * A VecSort's running bound as a source's key (H6; vexec_source.h,
@@ -315,6 +326,11 @@ scan_begin(CustomScanState *css, EState *estate, int eflags)
 	}
 	else
 		vexec_node_compile(node, cscan->scan.plan.qual, cscan->scan.plan.targetlist);
+
+	/* X3: the quals heap's page reader checks before deforming a tuple */
+	if (s->heap_pages && !s->bitmap && vexec_enable_prefilter && cscan->scan.plan.qual != NIL)
+		s->checks = vexec_heap_checks(s->rel, cscan->scan.scanrelid, cscan->scan.plan.qual,
+									  &s->nchecks, &s->nchecked_quals);
 }
 
 /* The quals a source may prune by: no parameter, no SubPlan, nothing volatile. */
@@ -465,6 +481,60 @@ vexec_scan_set_bound(PlanState *ps, VexecSortBound *bound)
 	return true;
 }
 
+/*
+ * X6: the join's inner keys checked by heap's page reader, on a tuple first,
+ * where they come before the quals; else among a batch's rows (node.c).
+ */
+static void
+join_filter_to_reader(VexecScanState *s)
+{
+	VexecJoinFilter *f = s->node.jfilter;
+
+	if (f != NULL && f->before_quals && s->heap != NULL && !s->bitmap)
+	{
+		vexec_heap_reader_set_join_filter(s->heap, f, f->attno);
+		s->node.jfilter_in_source = true;
+	}
+}
+
+/*
+ * A VecHashJoin's inner keys lent to this scan, the vector scan on its outer
+ * side (X6, exec.h): the scan drops a row whose key no inner row has.
+ * Before the quals where none of them may raise, else after them, where
+ * every one is eager; never where the target list may raise, which
+ * PostgreSQL computes for every row the quals pass.  False where the node
+ * is no vector scan, reads no column of the key's, or cannot take it.
+ */
+bool
+vexec_scan_set_join_filter(PlanState *ps, VexecJoinFilter *filter)
+{
+	VexecScanState *s;
+	Plan	   *plan;
+	int			col;
+
+	if (!IsA(ps, CustomScanState) ||
+		(((CustomScanState *) ps)->methods != &scan_exec_methods &&
+		 ((CustomScanState *) ps)->methods != &bitmapscan_exec_methods))
+		return false;
+	s = (VexecScanState *) ps;
+	plan = ps->plan;
+	for (col = 0; col < s->nattrs; col++)
+		if (s->attrs[col] == filter->attno)
+			break;
+	if (col >= s->nattrs || vexec_expr_may_raise((Node *) plan->targetlist))
+		return false;
+	filter->before_quals = !vexec_expr_may_raise((Node *) plan->qual) &&
+		!vexec_expr_may_raise((Node *) ((CustomScan *) plan)->custom_exprs);
+	if (!filter->before_quals && s->node.first_lazy < s->node.nquals)
+		return false;
+	s->node.jfilter = filter;
+	s->node.jfilter_col = col;
+	s->node.jfilter_in_source = false;
+	if (s->scan != NULL)
+		join_filter_to_reader(s);
+	return true;
+}
+
 static void
 begin_scan(VexecScanState *s)
 {
@@ -509,7 +579,10 @@ begin_scan(VexecScanState *s)
 										  s->need_tid);
 	if (s->heap == NULL)
 		s->amslot = table_slot_create(s->rel, NULL);
+	else if (s->nchecks > 0)
+		vexec_heap_reader_set_checks(s->heap, s->checks, s->nchecks);
 	bound_to_reader(s);
+	join_filter_to_reader(s);
 }
 
 /*
@@ -585,8 +658,17 @@ static bool
 fetch_heap(VexecScanState *s)
 {
 	VexecBatch *in = s->node.in;
+	bool		ok = vexec_heap_reader_next(s->heap, in);
 
-	if (!vexec_heap_reader_next(s->heap, in))
+	/* the rows the reader's checks dropped, which the quals remove (X3) */
+	if (s->nchecks > 0)
+	{
+		int64		prefiltered = vexec_heap_reader_prefiltered(s->heap);
+
+		InstrCountFiltered1(&s->node.css, prefiltered - s->prefiltered_counted);
+		s->prefiltered_counted = prefiltered;
+	}
+	if (!ok)
 	{
 		s->done = true;
 		return false;
@@ -901,6 +983,10 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		(void) vexec_source_for(s->rel, &how);
 		ExplainPropertyText("Source", s->src != NULL ? how :
 							s->heap_pages ? "heap's pages" : "the slot path", es);
+		if (s->nchecks > 0)
+			ExplainPropertyText("Prefilter",
+								psprintf("%d of %d quals", s->nchecked_quals,
+										 list_length(css->ss.ps.plan->qual)), es);
 	}
 	if (es->analyze && s->bitmap && s->scan != NULL)
 	{
@@ -922,7 +1008,29 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		}
 	}
 	if (es->analyze && es->verbose && s->heap != NULL)
+	{
+		int			maxpins;
+		int64		copied;
+
 		ExplainPropertyInteger("Heap Pages", NULL, vexec_heap_reader_pages(s->heap), es);
+		if (s->nchecks > 0)
+			ExplainPropertyInteger("Rows Prefiltered", NULL,
+								   vexec_heap_reader_prefiltered(s->heap), es);
+		vexec_heap_reader_pin_stats(s->heap, &maxpins, &copied);
+		ExplainPropertyInteger("Heap Pins per Batch", NULL, maxpins, es);
+		if (copied > 0 || es->format != EXPLAIN_FORMAT_TEXT)
+			ExplainPropertyInteger("Heap Pages Copied", NULL, copied, es);
+	}
+	/* a VecHashJoin's inner keys (X6): text gives no zero, as for a filter */
+	if (es->analyze && s->node.ran && s->node.jfilter != NULL)
+	{
+		if (s->node.jfilter->removed > 0 || es->format != EXPLAIN_FORMAT_TEXT)
+			ExplainPropertyInteger("Rows Removed by Join Keys", NULL,
+								   s->node.jfilter->removed, es);
+		if (s->node.jfilter->off_batches > 0 || es->format != EXPLAIN_FORMAT_TEXT)
+			ExplainPropertyInteger("Batches Join Keys Were Off", NULL,
+								   s->node.jfilter->off_batches, es);
+	}
 	/* a VecSort's running bound (H6): text gives no zero, as for a filter */
 	if (es->analyze && s->node.ran && s->node.bound != NULL &&
 		(s->node.bound->removed > 0 || es->format != EXPLAIN_FORMAT_TEXT))

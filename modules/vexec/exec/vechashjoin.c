@@ -106,6 +106,7 @@
 #include "vexec.h"
 #include "batch/batch.h"
 #include "exec/exec.h"
+#include "exec/keyhash.h"
 #include "expr/expr.h"
 #include "motion/motion.h"
 
@@ -301,6 +302,16 @@ typedef struct HjState
 									 * Hash node's own chgParam */
 	bool		outer_not_empty;	/* hj_OuterNotEmpty */
 	Size		peak_memory;
+
+	/*
+	 * X6: the inner keys lent to the vector scan on the outer side
+	 * (exec.h): key jf_key, the scan's relation's column jf_attno; -1 where
+	 * none can be lent
+	 */
+	int			jf_key;
+	AttrNumber	jf_attno;
+	VexecJoinFilter *jfilter;
+	bool		jf_lent;
 
 	/* the grace join */
 	bool		spilled;
@@ -651,7 +662,7 @@ key_hash(HjKey *k, int sidx, const HjKeyVal *v)
 		case HJ_KEY_BITS:
 			return (uint32) murmurhash64((uint64) v->u.i);
 		case HJ_KEY_BYTES:
-			return hash_bytes((const unsigned char *) v->u.p, v->len);
+			return vexec_hash_bytes(v->u.p, v->len);	/* C4 */
 		default:
 			return DatumGetUInt32(FunctionCall1Coll(&k->hash[sidx], k->collation, v->u.d));
 	}
@@ -2266,6 +2277,138 @@ spill_outer(HjState *s)
  * side's first row where PostgreSQL fetches one, then the table.  False
  * where the join gives no row; the side it leaves unread is drained.
  */
+/*
+ * X6: whether the join can lend the vector scan on its outer side its inner
+ * keys (exec.h): an inner, semi or right join, which meets an outer row of
+ * no inner row's key with none and keeps none such; an integer key, each
+ * side's compared by value, the outer side's a column of the scan's
+ * relation as it is.
+ */
+static void
+join_filter_setup(HjState *s, List *okeys)
+{
+	Plan	   *outer = s->side[0].ps->plan;
+
+	s->jf_key = -1;
+	if (!vexec_enable_join_filter || !s->simple ||
+		!(s->jointype == JOIN_INNER || s->jointype == JOIN_SEMI || s->jointype == JOIN_RIGHT) ||
+		!IsA(outer, CustomScan) || ((Scan *) outer)->scanrelid == 0 ||
+		!vexec_is_vector_node(outer))
+		return;
+	for (int k = 0; k < s->nkeys && s->jf_key < 0; k++)
+	{
+		Var		   *v = (Var *) list_nth(okeys, k);
+		TargetEntry *tle;
+		Var		   *sv;
+
+		if (s->keys[k].kind != HJ_KEY_INT || !IsA(v, Var) || v->varno != INDEX_VAR ||
+			v->varattno < 1 || v->varattno > s->plan.nouter ||
+			v->varattno > list_length(outer->targetlist))
+			continue;
+		tle = list_nth_node(TargetEntry, outer->targetlist, v->varattno - 1);
+		sv = (Var *) tle->expr;
+		if (!IsA(sv, Var) || sv->varno != ((Scan *) outer)->scanrelid || sv->varattno < 1 ||
+			sv->varlevelsup != 0)
+			continue;
+		s->jf_key = k;
+		s->jf_attno = sv->varattno;
+	}
+	if (s->jf_key >= 0)
+	{
+		s->jfilter = palloc0(sizeof(VexecJoinFilter));
+		s->jfilter->attno = s->jf_attno;
+	}
+}
+
+/*
+ * X6: the table built, its rows' key jf_key as the filter -- their range,
+ * and a bit a value where the range has at most VEXEC_JOIN_FILTER_BITS
+ * values, else a Bloom filter of VEXEC_JOIN_BLOOM_BITS -- lent to the outer
+ * scan the first time; none where the table spilled, which holds a part of
+ * the keys.
+ */
+#define VEXEC_JOIN_FILTER_BITS	(UINT64CONST(1) << 23)
+#define VEXEC_JOIN_BLOOM_BITS	(UINT64CONST(1) << 22)
+
+static void
+join_filter_lend(HjState *s)
+{
+	VexecJoinFilter *f = s->jfilter;
+	int64		lo = PG_INT64_MAX;
+	int64		hi = PG_INT64_MIN;
+
+	if (f == NULL)
+		return;
+	f->active = false;
+	if (s->spilled || s->nrows == 0)
+		return;
+	for (int c = 0; c < s->nchunks; c++)
+	{
+		HjChunk    *ch = s->chunks[c];
+
+		for (int r = 0; r < ch->nrows; r++)
+		{
+			int64		v = ch->keys[r * s->nkeys + s->jf_key].u.i;
+
+			lo = Min(lo, v);
+			hi = Max(hi, v);
+		}
+	}
+	f->min = lo;
+	f->max = hi;
+	if (f->bits != NULL)
+		pfree(f->bits);
+	if (f->bloom != NULL)
+		pfree(f->bloom);
+	f->bits = NULL;
+	f->bloom = NULL;
+	if ((uint64) hi - (uint64) lo < VEXEC_JOIN_FILTER_BITS)
+		f->bits = MemoryContextAllocZero(s->node.mcxt,
+										 sizeof(uint64) * VEXEC_WORDS((int) ((uint64) hi - (uint64) lo + 1)));
+	else
+	{
+		f->bloom = MemoryContextAllocZero(s->node.mcxt, VEXEC_JOIN_BLOOM_BITS / 8);
+		f->bloom_mask = (uint32) (VEXEC_JOIN_BLOOM_BITS - 1);
+	}
+	for (int c = 0; c < s->nchunks; c++)
+	{
+		HjChunk    *ch = s->chunks[c];
+
+		for (int r = 0; r < ch->nrows; r++)
+		{
+			int64		v = ch->keys[r * s->nkeys + s->jf_key].u.i;
+
+			if (f->bits != NULL)
+			{
+				uint64		i = (uint64) v - (uint64) lo;
+
+				f->bits[i / 64] |= UINT64CONST(1) << (i % 64);
+			}
+			else
+			{
+				uint64		h = (uint64) v * UINT64CONST(0x9E3779B97F4A7C15);
+				uint32		a = (uint32) (h >> 32) & f->bloom_mask;
+				uint32		b = (uint32) h & f->bloom_mask;
+
+				f->bloom[a / 64] |= UINT64CONST(1) << (a % 64);
+				f->bloom[b / 64] |= UINT64CONST(1) << (b % 64);
+			}
+		}
+	}
+	f->off = 0;
+	f->active = true;
+	if (!s->jf_lent)
+	{
+		s->jf_lent = vexec_scan_set_join_filter(s->side[0].ps, f);
+		if (!s->jf_lent)
+		{
+			/* the scan cannot take it: none from now on */
+			s->jfilter = NULL;
+			f->active = false;
+		}
+	}
+}
+
 static bool
 build_phase(HjState *s)
 {
@@ -2286,6 +2429,7 @@ build_phase(HjState *s)
 	}
 
 	build(s);
+	join_filter_lend(s);
 
 	/* an inner side with nothing to match: the outer side is not read */
 	if (s->nrows == 0 && !s->spilled && s->side[1].nullrows == NULL && !s->fill_outer)
@@ -2540,6 +2684,34 @@ make_join_rows(HjState *s)
  * still resolves, or whose keys PostgreSQL's evaluator computes.  False at
  * the outer side's end.
  */
+/*
+ * X5: the outer rows' probes in a window, as Velox's (velox/exec/
+ * HashTable.cpp): the bucket of the row 16 on fetched, and the first row of
+ * the bucket of the row 8 on -- its hash, its link and its keys, which the
+ * walk reads in turn, each a miss of its own in a table past the caches.
+ * A row ahead the round never reaches costs a fetch for nothing.
+ */
+static inline void
+probe_ahead(HjState *s, HjBatch *ob, int row)
+{
+	if (row + 16 < ob->nrows)
+		__builtin_prefetch(&s->heads[ob->hashes[row + 16] & s->mask]);
+	if (row + 8 < ob->nrows)
+	{
+		uint32		head = s->heads[ob->hashes[row + 8] & s->mask];
+
+		if (head != 0)
+		{
+			HjChunk    *ch = s->chunks[(head - 1) >> HJ_CHUNK_SHIFT];
+			int			cr = (head - 1) & (HJ_CHUNK_ROWS - 1);
+
+			__builtin_prefetch(&ch->hashes[cr]);
+			__builtin_prefetch(&ch->next[cr]);
+			__builtin_prefetch(&ch->keys[cr * s->nkeys]);
+		}
+	}
+}
+
 static bool
 probe_round(HjState *s)
 {
@@ -2643,6 +2815,7 @@ probe_round(HjState *s)
 				break;
 			s->opos = row + 1;
 			s->outer_not_empty = true;
+			probe_ahead(s, ob, row);
 			s->inprog = row;
 			s->inprog_next = s->heads[ob->hashes[row] & s->mask];
 			if (s->r_n == 0)
@@ -3259,6 +3432,7 @@ hj_begin(CustomScanState *css, EState *estate, int eflags)
 	side_init(s, &s->side[0], outerPlanState(css), 0, 1, s->plan.nouter, okeys, estate);
 	side_init(s, &s->side[1], innerPlanState(css), 1, s->plan.nouter + 1, s->plan.ninner,
 			  ikeys, estate);
+	join_filter_setup(s, okeys);
 
 	/* the first level: the hash clauses the keys do not decide, the join quals */
 	l1exprs = list_concat(s->simple ? NIL : list_copy(s->hashclauses), list_copy(s->joinqual));
@@ -3358,6 +3532,9 @@ hj_rescan(CustomScanState *css)
 		spill_close_all(s);
 		s->spilled = false;
 		s->built = false;
+		/* X6: the keys of the table made again, once it is */
+		if (s->jfilter != NULL)
+			s->jfilter->active = false;
 		if (s->side[1].nullrows != NULL)
 		{
 			tuplestore_end(s->side[1].nullrows);
@@ -3467,6 +3644,12 @@ hj_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 								psprintf("%d of %d", s->l1_first_lazy, s->nl1), es);
 		ExplainPropertyText("Outer Input", side_input(&s->side[0]), es);
 		ExplainPropertyText("Inner Input", side_input(&s->side[1]), es);
+		/* X6: the inner keys lent to the outer scan */
+		if (s->jf_lent && s->jfilter != NULL)
+			ExplainPropertyText("Keys Lent to Outer Scan",
+								s->jfilter->bits != NULL ? "range and bitmap" :
+								s->jfilter->bloom != NULL ? "range and Bloom filter" : "range",
+								es);
 	}
 	/*
 	 * the sides it left unread: its own, or where the segments ran it, theirs

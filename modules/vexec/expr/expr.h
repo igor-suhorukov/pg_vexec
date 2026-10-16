@@ -117,6 +117,17 @@ typedef struct VexecExpr
 	int			testtype;
 	/* VE_FALLBACK */
 	ExprState  *state;
+
+	/*
+	 * X10: a subtree several of the node's eager targets share, computed
+	 * once a batch where it is asked over the same rows: its result, in the
+	 * work batch of the generation it was computed in, and those rows
+	 */
+	bool		shared;
+	VexecBatch *memo_work;
+	uint64		memo_generation;
+	const uint64 *memo_active;
+	VexecVec   *memo;
 } VexecExpr;
 
 /* A top-level qual or target entry: eager, or lazy. */
@@ -167,6 +178,27 @@ extern VexecExpr *vexec_compile_expr(VexecCompileContext *cc, Expr *expr);
 extern void vexec_compile_top(VexecCompileContext *cc, Expr *expr, bool is_qual,
 							  VexecTop *top);
 extern Oid	vexec_collation_class(Oid collation);
+
+/* k_text.c: a LIKE pattern's kind (H7, §3.14) */
+typedef enum VexecLikeKind
+{
+	VEXEC_LIKE_EXACT,			/* 'abc' */
+	VEXEC_LIKE_PREFIX,			/* 'abc%' */
+	VEXEC_LIKE_SUFFIX,			/* '%abc' */
+	VEXEC_LIKE_CONTAINS,		/* '%abc%' */
+	VEXEC_LIKE_ANY,				/* '%' */
+	VEXEC_LIKE_GENERAL			/* anything else: textlike() */
+} VexecLikeKind;
+
+extern bool vexec_like_classify(const char *p, int plen, int *kind, char **lit,
+								int *litlen);
+
+/* strsearch.c: a literal's search in text (X4, §3.18) */
+extern void vexec_contains_rows(const VexecVec *v, const uint64 *active, int nrows,
+								const char *lit, int litlen, uint64 *matches);
+extern const char *vexec_find_bytes(const char *s, size_t len, const char *lit,
+									size_t litlen);
+extern const char *vexec_find_bytes_kind(void);
 
 /* eval.c */
 extern VexecVec *vexec_eval(VexecEval *ev, VexecExpr *e, const uint64 *active);

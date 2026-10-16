@@ -78,6 +78,16 @@ extern VEXEC_API void vexec_frame_begin(VexecFrameWriter *w, VexecBatch *batch,
  */
 extern VEXEC_API bytea *vexec_frame_rows(VexecFrameWriter *w, const int *rows, int nrows);
 
+/*
+ * The same frame behind `prefix` bytes left for the caller, a multiple of 8,
+ * as one allocation: the frame lies as aligned as the memory does.  Its
+ * length, the prefix's not counted, in *len; NULL as above.  For a record
+ * of the caller's own around the frame, as VecRepartition's partitions hold
+ * them (exec/vecrepart.c).
+ */
+extern VEXEC_API char *vexec_frame_rows_after(VexecFrameWriter *w, const int *rows, int nrows,
+											  Size prefix, Size *len);
+
 /* frame.c, the receiver's side */
 extern VEXEC_API VexecFrameReader *vexec_frame_reader_create(MemoryContext parent, int ncols,
 															 VexecType *const *types);

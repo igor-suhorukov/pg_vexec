@@ -188,6 +188,60 @@ RESET vexec.batch_numeric_layout;
 -- EXPLAIN ANALYZE: the pages read
 SELECT heap_explain('SELECT id, t FROM hp WHERE id % 100 = 0', 'Vec Seq Scan|Source|Heap Pages');
 
+-- X3: the leading quals that cannot raise, checked on a tuple before it is
+-- deformed (source/prefilter.c) -- comparisons with constants, = ANY of
+-- constants, LIKE literals, NULL tests -- the node evaluating every qual
+-- again on the rows that pass.  A value the reader cannot read as it lies
+-- passes the check, and the node decides it.
+SELECT heap_check('SELECT id, s, b FROM hp WHERE s = 7');
+SELECT heap_check('SELECT id FROM hp WHERE s <> 7 AND b >= 5000015 AND b < 900000000');
+SELECT heap_check($$SELECT id, d, ts FROM hp WHERE d BETWEEN '2020-03-01' AND '2020-03-05' AND ts > '2021-07-01'$$);
+SELECT heap_check('SELECT id FROM hp WHERE bo = false AND 50 > id');
+SELECT heap_check($$SELECT id, t FROM hp WHERE t = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'$$);
+SELECT heap_check($$SELECT id FROM hp WHERE t <> 'late9001' AND id > 9000$$);
+SELECT heap_check($$SELECT id, v FROM hp WHERE v = 'v12' AND c = '12'$$);
+SELECT heap_check('SELECT id FROM hp WHERE s = ANY (ARRAY[1, 5, NULL, 299])');
+SELECT heap_check($$SELECT id FROM hp WHERE t IN ('ccc', 'late9100', NULL)$$);
+SELECT heap_check($$SELECT id FROM hp WHERE t LIKE 'ddd%' AND t NOT LIKE '%dddddddddddddddd%'$$);
+SELECT heap_check($$SELECT id FROM hp WHERE t LIKE '%e' AND t LIKE 'eee'$$);
+SELECT heap_check('SELECT id FROM hp WHERE f IS NULL');
+SELECT heap_check('SELECT id FROM hp WHERE t IS NOT NULL AND f IS NULL');
+-- the walk passes a run of fixed-length attributes no column reads in one
+-- step, by their alignments from where it begins (source/heap.c): columns
+-- past runs of mixed alignments -- float8, bool, date, timestamp, interval,
+-- uuid -- a check inside such a run, and the rows with a NULL before the
+-- columns read, which are walked an attribute at a time
+SELECT heap_check('SELECT id, t, c FROM hp');
+SELECT heap_check($$SELECT id, t FROM hp WHERE d > '2020-06-01'$$);
+SELECT heap_check($$SELECT u, nn FROM hp WHERE ts < '2021-08-01' AND bo$$);
+-- attributes the old rows lack, whose missing values the node decides
+SELECT heap_check('SELECT id, added FROM hp WHERE added = 42');
+SELECT heap_check($$SELECT id FROM hp WHERE added_t = 'dflt' AND id > 8990$$);
+-- compressed and out-of-line values
+SELECT heap_check($$SELECT id FROM hp WHERE t LIKE '%a87ff%' AND id > 99999$$);
+SELECT heap_check($$SELECT id FROM hp WHERE t = repeat(md5('3'), 400)$$);
+-- an oid compares unsigned
+CREATE TABLE ho (id int4, o oid);
+INSERT INTO ho SELECT g, (g * 400000037::int8 % 4294967296)::oid FROM generate_series(1, 3000) g;
+ANALYZE ho;
+SELECT heap_check('SELECT id, o FROM ho WHERE o > 3000000000');
+SELECT heap_check('SELECT count(*) FROM ho WHERE o <= 2147483648');
+DROP TABLE ho;
+-- a qual that may raise ends the prefix: the checks before it drop only
+-- rows PostgreSQL would not evaluate it for, and the rows they keep raise
+SELECT count(*) FROM hp WHERE id < 0 AND 1 / (s - s) > 0;
+SELECT count(*) FROM hp WHERE id = 3 AND 1 / (s - s) > 0;
+-- the rows the checks drop are counted as the filter's, as off
+SELECT heap_removed('SELECT id FROM hp WHERE s = 7 AND d > ''2020-02-01'' AND id % 2 = 0');
+SELECT heap_explain('SELECT id FROM hp WHERE s = 7 AND d > ''2020-02-01'' AND id % 2 = 0',
+                    'Vec Seq Scan|Filter|Prefilter');
+-- vexec.enable_prefilter off: every tuple deformed, then the quals
+SET vexec.enable_prefilter = off;
+SELECT heap_explain('SELECT id FROM hp WHERE s = 7 AND d > ''2020-02-01'' AND id % 2 = 0',
+                    'Vec Seq Scan|Filter|Prefilter');
+SELECT heap_check('SELECT id FROM hp WHERE s = 7');
+RESET vexec.enable_prefilter;
+
 -- in parallel: partial VecScans, each participant's share of the pages;
 -- partial VecHashJoins over them, the inner side read whole by each; the
 -- partial and final VecAggs; every row read once
@@ -207,6 +261,8 @@ SELECT heap_check('SELECT hp.id, hw.w FROM hp LEFT JOIN hw ON hp.id = hw.id AND 
 SELECT heap_check('SELECT hp.id FROM hp WHERE EXISTS (SELECT 1 FROM hw WHERE hw.id = hp.s)');
 SELECT heap_check('SELECT hp.id FROM hp WHERE NOT EXISTS (SELECT 1 FROM hw WHERE hw.id = hp.s)');
 SELECT heap_check('SELECT t, count(*), max(id) FROM hp GROUP BY t');
+SELECT heap_check($$SELECT count(*), sum(id) FROM hp WHERE s = 7 AND t LIKE '%h%'$$);
+SELECT heap_removed($$SELECT count(*), sum(id) FROM hp WHERE s = 7 AND t LIKE '%h%'$$);
 SELECT heap_explain('SELECT count(*), sum(id) FROM hp', 'Parallel|Gather|Workers Planned');
 -- a Gather rescanned: its participants' shares made again
 SELECT heap_check($$SELECT o.k, (SELECT count(*) FROM hp WHERE hp.s = o.k) FROM

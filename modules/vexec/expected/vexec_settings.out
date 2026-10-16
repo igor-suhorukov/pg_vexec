@@ -28,12 +28,16 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.debug_require_vector  | off                       |      | superuser  | bool    |         |              |                             | f
  vexec.enable_agg            | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_bitmapscan     | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_group_topk     | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_hashjoin       | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_insert         | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_join_filter    | on                        |      | user       | bool    |         |              |                             | f
  vexec.enable_motion_frames  | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_prefilter      | on                        |      | user       | bool    |         |              |                             | f
  vexec.enable_repartition    | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_running_bound  | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_scan           | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_shared_exprs   | on                        |      | user       | bool    |         |              |                             | f
  vexec.enable_sort           | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_window         | on                        |      | user       | bool    |         |              |                             | t
  vexec.gpu                   | off                       |      | user       | enum    |         |              | {off,auto,force}            | t
@@ -50,7 +54,9 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.orca                  | on                        |      | user       | bool    |         |              |                             | t
  vexec.orca_cost_model       | on                        |      | user       | bool    |         |              |                             | t
  vexec.orca_settings         |                           |      | user       | string  |         |              |                             | t
-(39 rows)
+ vexec.partial_agg_limit     | 16384                     |      | user       | integer | 0       | 2147483647   |                             | f
+ vexec.remember_agg_sizes    | on                        |      | user       | bool    |         |              |                             | f
+(45 rows)
 
 -- the modes
 SET vexec.mode = explain;

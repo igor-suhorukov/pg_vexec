@@ -1009,8 +1009,41 @@ eval_saop(VexecEval *ev, VexecExpr *e, const uint64 *active)
  * Evaluate a compiled expression over the active rows (NULL: every row of
  * the batch).  Its column is valid at the active rows not in redo.
  */
+static VexecVec *eval_step(VexecEval *ev, VexecExpr *e, const uint64 *active);
+
+/*
+ * X10 (§3.18): a shared subtree's result, kept for the batch: again where
+ * it is asked over the rows it was computed over, else computed again.
+ */
+static VexecVec *
+eval_shared(VexecEval *ev, VexecExpr *e, const uint64 *active)
+{
+	VexecVec   *v;
+
+	if (e->memo != NULL && e->memo_work == ev->work &&
+		e->memo_generation == ev->work->generation &&
+		(e->memo_active == active ||
+		 (active != NULL && e->memo_active != NULL &&
+		  memcmp(e->memo_active, active, sizeof(uint64) * VEXEC_WORDS(ev->nrows)) == 0)))
+		return e->memo;
+	v = eval_step(ev, e, active);
+	e->memo = v;
+	e->memo_work = ev->work;
+	e->memo_generation = ev->work->generation;
+	e->memo_active = active == NULL ? NULL : vexec_bits_copy(ev->work, active, ev->nrows);
+	return v;
+}
+
 VexecVec *
 vexec_eval(VexecEval *ev, VexecExpr *e, const uint64 *active)
+{
+	if (e->shared)
+		return eval_shared(ev, e, active);
+	return eval_step(ev, e, active);
+}
+
+static VexecVec *
+eval_step(VexecEval *ev, VexecExpr *e, const uint64 *active)
 {
 	check_stack_depth();
 

@@ -1,6 +1,6 @@
 --- reference
 +++ session
-@@ -59,43 +59,49 @@
+@@ -59,43 +59,50 @@
  
  select explain_filter('explain select * from int8_tbl i8');
 -                     explain_filter                      
@@ -37,6 +37,7 @@
 +   Batches: N
 +   Fallback Steps: N
 +   Heap Pages: N
++   Heap Pins per Batch: N
 +   Kernel Steps: N
     Output: q1, q2
 - Execution Time: N.N ms
@@ -49,7 +50,7 @@
 + Optimizer: Postgres query optimizer
 + Planning Time: N.N ms
 + Vec Seq Scan on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
-+(11 rows)
++(12 rows)
  
  select explain_filter('explain (analyze, buffers, format text) select * from int8_tbl i8');
 -                                         explain_filter                                          
@@ -77,7 +78,7 @@
 + Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
  (2 rows)
  
-@@ -106,5 +112,6 @@
+@@ -106,5 +113,6 @@
    <Query>
      <Plan>
 -      <Node-Type>Seq Scan</Node-Type>
@@ -85,7 +86,7 @@
 +      <Custom-Plan-Provider>VecScan</Custom-Plan-Provider>
        <Parallel-Aware>false</Parallel-Aware>
        <Async-Capable>false</Async-Capable>
-@@ -120,11 +127,4 @@
+@@ -120,11 +128,4 @@
        <Actual-Loops>N</Actual-Loops>
        <Disabled>false</Disabled>
 -      <Average-Prefetch-Distance>N.N</Average-Prefetch-Distance>
@@ -97,7 +98,7 @@
 -      <Average-I-Os-In-Progress>N.N</Average-I-Os-In-Progress>
        <Shared-Hit-Blocks>N</Shared-Hit-Blocks>
        <Shared-Read-Blocks>N</Shared-Read-Blocks>
-@@ -160,5 +160,6 @@
+@@ -160,5 +161,6 @@
  explain_filter
  - Plan: 
 -    Node Type: "Seq Scan"
@@ -105,7 +106,7 @@
 +    Custom Plan Provider: "VecScan"
      Parallel Aware: false
      Async Capable: false
-@@ -174,11 +175,4 @@
+@@ -174,11 +176,4 @@
      Actual Loops: N
      Disabled: false
 -    Average Prefetch Distance: N.N
@@ -117,7 +118,7 @@
 -    Average I/Os In Progress: N.N
      Shared Hit Blocks: N
      Shared Read Blocks: N
-@@ -225,5 +219,6 @@
+@@ -225,5 +220,6 @@
    {
      "Plan": {
 -      "Node Type": "Seq Scan",
@@ -125,7 +126,7 @@
 +      "Custom Plan Provider": "VecScan",
        "Parallel Aware": false,
        "Async Capable": false,
-@@ -266,6 +261,10 @@
+@@ -266,6 +262,10 @@
                                              explain_filter                                             
  -------------------------------------------------------------------------------------------------------
 +                     Batch Format: postgres
@@ -137,7 +138,7 @@
 +               ->  Vec Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
                 Output: ten, hundred, unique1, unique2, tenthous
                 Sort Key: tenk1.ten, tenk1.hundred
-@@ -278,11 +277,15 @@
+@@ -278,11 +278,15 @@
   Optimizer: Postgres query optimizer
   WindowAgg  (cost=N.N..N.N rows=N width=N)
 -(12 rows)
@@ -155,14 +156,14 @@
 +                     ->  Vec Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
                       Output: ten, hundred, unique1, unique2, tenthous
                       Sort Key: tenk1.ten, tenk1.hundred
-@@ -298,5 +301,5 @@
+@@ -298,5 +302,5 @@
   Optimizer: Postgres query optimizer
   WindowAgg  (cost=N.N..N.N rows=N width=N)
 -(15 rows)
 +(19 rows)
  
  -- Check output including I/O timings.  These fields are conditional
-@@ -304,7 +307,7 @@
+@@ -304,7 +308,7 @@
  set track_io_timing = on;
  select explain_filter('explain (analyze, buffers, format json) select * from int8_tbl i8');
 -           explain_filter            
@@ -288,7 +289,7 @@
  ]
  (1 row)
  
-@@ -337,6 +340,6 @@
+@@ -337,6 +341,6 @@
     ->  Bitmap Index Scan on tenk1_thous_tenthous  (cost=N.N..N.N rows=N width=N)
     Recheck Cond: (thousand = $N)
 - Bitmap Heap Scan on tenk1  (cost=N.N..N.N rows=N width=N)
@@ -297,7 +298,7 @@
 + Vec Bitmap Heap Scan on tenk1  (cost=N.N..N.N rows=N width=N)
  (5 rows)
  
-@@ -347,40 +350,40 @@
+@@ -347,40 +351,40 @@
  -- MEMORY option
  select explain_filter('explain (memory) select * from int8_tbl i8');
 -                     explain_filter                      
@@ -477,7 +478,7 @@
 + Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
  (3 rows)
  
-@@ -403,10 +406,10 @@
+@@ -403,10 +407,10 @@
  -- should scan gen_part_1_1 and gen_part_1_2, but not gen_part_2
  select explain_filter('explain (generic_plan) select key1, key2 from gen_part where key1 = 1 and key2 = $1');
 -                              explain_filter                               
@@ -492,7 +493,7 @@
 +   ->  Vec Seq Scan on gen_part_1_2 gen_part_2  (cost=N.N..N.N rows=N width=N)
   Append  (cost=N.N..N.N rows=N width=N)
   Optimizer: Postgres query optimizer
-@@ -438,7 +441,7 @@
+@@ -438,7 +442,7 @@
    #- '{0,Plan,Plans,0,Sort Space Type}'
  );
 -                        jsonb_pretty                         
@@ -708,10 +709,12 @@
                              "Local Hit Blocks": 0,            +
                              "Temp Read Blocks": 0,            +
                              "Actual Total Time": 0.0,         +
+                             "Heap Pages Copied": 0,           +
                              "Local Read Blocks": 0,           +
                              "Shared Hit Blocks": 0,           +
                              "Shared Read Blocks": 0,          +
                              "Actual Startup Time": 0.0,       +
+                             "Heap Pins per Batch": 0,         +
                              "Parent Relationship": "Outer",   +
                              "Temp Written Blocks": 0,         +
                              "Custom Plan Provider": "VecScan",+
@@ -837,7 +840,7 @@
  ]
  (1 row)
  
-@@ -451,20 +454,30 @@
+@@ -451,20 +455,30 @@
                         explain_filter                       
  ------------------------------------------------------------
 +   Batch Format: postgres
@@ -875,7 +878,7 @@
 +(8 rows)
  
  -- Test compute_query_id with utility statements containing plannable query
-@@ -489,42 +502,42 @@
+@@ -489,42 +503,42 @@
  -- Test SERIALIZE option
  select explain_filter('explain (analyze,buffers off,serialize) select * from int8_tbl i8');
 -                                         explain_filter                                          

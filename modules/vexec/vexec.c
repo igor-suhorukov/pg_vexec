@@ -30,6 +30,7 @@
 
 #include "vexec.h"
 #include "egress/egress.h"
+#include "exec/exec.h"
 #include "plan/plan.h"
 
 PG_MODULE_MAGIC_EXT(
@@ -50,11 +51,17 @@ int			vexec_min_rows = 10000;
 /* per node kind */
 bool		vexec_enable_scan = true;
 bool		vexec_heap_page_reader = true;
+bool		vexec_enable_prefilter = true;
 bool		vexec_enable_bitmapscan = true;
 bool		vexec_enable_agg = true;
 bool		vexec_enable_repartition = true;
+int			vexec_partial_agg_limit = 16384;
+bool		vexec_remember_agg_sizes = true;
+bool		vexec_enable_group_topk = true;
+bool		vexec_enable_shared_exprs = true;
 bool		vexec_aggregate_statistics = true;
 bool		vexec_enable_hashjoin = true;
+bool		vexec_enable_join_filter = true;
 bool		vexec_enable_sort = true;
 bool		vexec_enable_running_bound = true;
 bool		vexec_enable_window = true;
@@ -184,6 +191,8 @@ _PG_init(void)
 	vexec_source_registry_install();
 	vexec_kernel_packs_install();
 	vexec_exec_install();
+	/* the groups VecAgg's tables reached, in shared memory (C6) */
+	vexec_aggsize_install();
 	/* pg_otel_probe's spans of vector nodes and statements, where it is loaded */
 	vexec_report_install();
 	vexec_planner_install();
@@ -261,6 +270,13 @@ define_settings(void)
 							 "through the table's slots, as it reads any other access method's.",
 							 &vexec_heap_page_reader, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_prefilter",
+							 "Checks a heap scan's leading quals on a tuple before deforming it.",
+							 "Heap's page reader walks a tuple only as far as the attributes of the quals "
+							 "that cannot raise -- comparisons with constants, IN lists, LIKE literals, "
+							 "NULL tests -- and drops it at the first that fails.",
+							 &vexec_enable_prefilter, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_bitmapscan",
 							 "Enables vector bitmap heap scans.",
 							 "The pages a bitmap index scan selects, read a batch at a time.",
@@ -273,9 +289,37 @@ define_settings(void)
 	DefineCustomBoolVariable("vexec.enable_repartition",
 							 "Enables parallel vector aggregation that finalizes in every participant.",
 							 "Each participant's partial groups are dealt out among them by their keys' hash, "
-							 "and each finalizes its own; the Gather receives final groups.",
+							 "and each finalizes its own; the Gather receives final groups.  A count(DISTINCT) "
+							 "runs in parallel the same way, its pairs of keys and argument dealt out first.",
 							 &vexec_enable_repartition, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomIntVariable("vexec.partial_agg_limit",
+							"The groups a parallel aggregation's first stage keeps before it hands new keys on.",
+							"Past them, the first stage under a repartition updates only the groups it holds, "
+							"and hands each batch's others on as partial states, until the keys it hands on "
+							"repeat; 0 keeps every group.",
+							&vexec_partial_agg_limit, 16384, 0, INT_MAX,
+							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_shared_exprs",
+							 "Computes once a batch the subexpressions a vector node's targets share.",
+							 "Equal subtrees of kernels, over columns and constants, are one, and its "
+							 "column is kept for the batch for each target that asks for the same rows.",
+							 &vexec_enable_shared_exprs, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_group_topk",
+							 "Lets a vector aggregation under a LIMIT without ORDER BY keep only the groups it returns.",
+							 "Any n groups are the answer of GROUP BY ... LIMIT n: the aggregation keeps "
+							 "those of the n smallest hashes of their keys, and passes over the rows of a "
+							 "key past them.  Read when a statement is planned.",
+							 &vexec_enable_group_topk, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.remember_agg_sizes",
+							 "Sizes a vector aggregation's hash table by the groups the same node held before.",
+							 "The groups each node's table reached are kept in shared memory by the statement's "
+							 "query id, or its text, and the node; off, a table begins at the planner's estimate "
+							 "and grows as it fills.",
+							 &vexec_remember_agg_sizes, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.aggregate_statistics",
 							 "Lets a batch source answer a vector aggregate from the statistics it keeps.",
 							 "A plain aggregate over a scan with no qual takes a unit of rows -- "
@@ -286,6 +330,13 @@ define_settings(void)
 							 "Enables vector hash joins.",
 							 NULL, &vexec_enable_hashjoin, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_join_filter",
+							 "Lets a vector hash join lend the scan on its outer side its inner keys.",
+							 "Once its table is built, an inner, semi or right join's integer key "
+							 "-- its range, and its values as a bitmap or a Bloom filter -- goes to the "
+							 "vector scan below it, which drops the rows no inner row can match.",
+							 &vexec_enable_join_filter, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_sort",
 							 "Enables vector sorts.",
 							 NULL, &vexec_enable_sort, true,
@@ -305,11 +356,14 @@ define_settings(void)
 							 NULL, &vexec_enable_insert, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_motion_frames",
-							 "Sends batches across ORCA's Motions as Arrow IPC frames.",
+							 "Sends batches across ORCA's Motions, and through a parallel aggregation's "
+							 "partitions, as Arrow IPC frames.",
 							 "Where a Motion's fragment's top is a vector node, it sends its batches "
 							 "as frames, and a vector node above the Motion takes them; off, rows, one "
 							 "a row.  Read when a statement is planned: a change of its value has the "
-							 "session's cached plans planned again.",
+							 "session's cached plans planned again.  A VecRepartition's partitions hold "
+							 "frames of the groups its partial aggregation hands it as batches; off, "
+							 "tuples.",
 							 &vexec_enable_motion_frames, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, assign_enable_motion_frames, NULL);
 	DefineCustomBoolVariable("vexec.orca",

@@ -277,6 +277,15 @@ EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM ah GROUP BY k;
 SELECT agg_check('SELECT k, count(*), sum(id), sum(n), max(t), min(d) FROM ah GROUP BY k');
 SELECT agg_check('SELECT t, k % 3, count(*), sum(n) FROM ah GROUP BY 1, 2 HAVING count(*) > 1');
 SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'Repartition|^ *Partitions:');
+-- X9: the partial VecAgg hands its groups up as batches, dealt into the
+-- partitions, which hold them as Arrow IPC frames; vexec.enable_motion_frames
+-- off, the partitions hold tuples made from the batches
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'Repartition|Input|Partition Format');
+SET vexec.enable_motion_frames = off;
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'Repartition|Input|Partition Format');
+SELECT agg_check('SELECT k, count(*), sum(id), sum(n), max(t), min(d) FROM ah GROUP BY k');
+SELECT agg_check('SELECT t, k % 3, count(*), sum(n) FROM ah GROUP BY 1, 2 HAVING count(*) > 1');
+RESET vexec.enable_motion_frames;
 -- ordered: sorted in each participant too, under a Gather Merge
 EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM ah GROUP BY k ORDER BY 3 DESC, 1;
 SELECT agg_check('SELECT k, count(*), sum(n) FROM ah GROUP BY k ORDER BY 3 DESC, 1 LIMIT 7 OFFSET 3');
@@ -310,6 +319,94 @@ RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_material;
 RESET enable_memoize;
+-- C1: the final stage combines the partial states by kernels -- counts,
+-- integer sums, avg's arrays, int8's serialized sums, min, max, bool_and
+-- -- floats' and numerics' through fmgr
+SELECT agg_explain($$SELECT k, count(*), sum(id::int4), avg((id % 100)::int2), avg(id::int8), max(d), bool_or(id > 3)
+       FROM ah GROUP BY k$$, 'Aggregate|Transitions:');
+SELECT agg_check($$SELECT k % 7, count(*), count(n), sum(id::int4), avg((id % 100)::int2), sum(id::int8),
+       avg(id::int8), min(t), max(d), min(id), bool_and(id > 3), bool_or(id > 119990), sum(n), max(k)
+       FROM ah GROUP BY 1$$);
+-- C2: a first stage under a VecRepartition stops taking new keys past
+-- vexec.partial_agg_limit groups, and hands a batch's others on, as
+-- partial states the final stage combines: by-reference states, FILTERs,
+-- NULL keys
+SET vexec.partial_agg_limit = 100;
+SELECT agg_check('SELECT k, count(*), sum(id), sum(n), max(t), min(d) FROM ah GROUP BY k');
+SELECT agg_check($$SELECT k % 997, count(*) FILTER (WHERE id % 2 = 0), avg(n), min(t), max(t),
+       bool_or(d > '2020-03-01') FROM ah GROUP BY 1$$);
+SELECT agg_check('SELECT nullif(k % 300, 7), count(*), sum(id) FROM ah GROUP BY 1');
+SELECT agg_check('SELECT k % 50, count(DISTINCT t), sum(id) FROM ah GROUP BY 1');
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'Partial|Frozen|Handed On');
+-- the frozen table thaws where the groups it hands on repeat their keys:
+-- the leader alone reads ah's 40,000 keys three times over, and thaws once
+-- it has handed on 1.5 groups a key; past 50 frequent keys, a key a row,
+-- it stays frozen
+SET max_parallel_workers = 0;
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'Frozen|Handed On|Thawed');
+SELECT agg_check('SELECT k, count(*), sum(id), sum(n), max(t), min(d) FROM ah GROUP BY k');
+SELECT agg_check($$SELECT k % 20000, avg(n), min(t), count(*) FILTER (WHERE id % 3 = 0)
+       FROM ah GROUP BY 1$$);
+CREATE TABLE af AS
+  SELECT g AS id, CASE WHEN g % 4 = 0 THEN g ELSE g % 50 END AS c FROM generate_series(1, 120000) g;
+ANALYZE af;
+SELECT agg_explain('SELECT c, count(*) FROM af GROUP BY c', 'Frozen|Thawed');
+SELECT agg_check('SELECT c, count(*), sum(id) FROM af GROUP BY c');
+DROP TABLE af;
+RESET max_parallel_workers;
+RESET vexec.partial_agg_limit;
+-- C3: a bounded VecSort lends the final VecAgg below it its keys and bound,
+-- and the aggregation keeps its n best groups, ranked after HAVING, finishing
+-- only those; not where the output holds a volatile function
+SELECT agg_check('SELECT k, count(*), sum(n) FROM ah GROUP BY k ORDER BY 3 DESC, 1 LIMIT 7');
+SELECT agg_check('SELECT k, avg(n) a FROM ah GROUP BY k HAVING count(*) > 2 ORDER BY a DESC, k LIMIT 5 OFFSET 2');
+SELECT agg_check($$SELECT t, sum(id)::float8 / count(*) r FROM ah GROUP BY t ORDER BY r DESC NULLS FIRST, t LIMIT 6$$);
+SELECT agg_check($$SELECT k % 1000, min(nullif(id % 13, 0)) m FROM ah GROUP BY 1 ORDER BY m NULLS FIRST, 1 LIMIT 9$$);
+SELECT agg_check($$SELECT k % 1000, min(nullif(id % 13, 0)) m FROM ah GROUP BY 1 ORDER BY m ASC NULLS LAST, 1 DESC LIMIT 9$$);
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k ORDER BY 3 DESC, 1 LIMIT 7', 'Finalize|Top N|Ranked');
+SELECT agg_explain('SELECT k, count(*) + random() * 0 c FROM ah GROUP BY k ORDER BY 2 DESC, 1 LIMIT 7',
+                   'Vec [A-Za-z ]*Aggregate|Top N|Ranked');
+-- C5: GROUP BY ... LIMIT n without ORDER BY, whose answer is any n groups:
+-- each stage keeps those of the n smallest hashes of their keys and passes
+-- over the rows of keys past them, the participants sharing the boundary;
+-- the final stage returns only groups within it, each with every one of its
+-- rows -- checked against PostgreSQL's whole aggregation
+CREATE FUNCTION agg_topk(q text, whole text, keys text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+BEGIN
+	PERFORM set_config('vexec.mode', 'force', true);
+	EXECUTE 'CREATE TEMP TABLE agg_topk_r AS ' || q;
+	PERFORM set_config('vexec.mode', 'off', true);
+	EXECUTE format('SELECT count(*) || '' returned, '' || count(w.*) || '' whole'' FROM agg_topk_r r '
+				   'LEFT JOIN (%s) w ON (%s) IS NOT DISTINCT FROM (%s) AND r::text = w::text',
+				   whole, 'ROW(' || regexp_replace(keys, '([a-z]+)', 'r.\1', 'g') || ')',
+				   'ROW(' || regexp_replace(keys, '([a-z]+)', 'w.\1', 'g') || ')')
+	INTO r;
+	DROP TABLE agg_topk_r;
+	PERFORM set_config('vexec.mode', 'force', true);
+	RETURN r;
+END $$;
+SELECT agg_topk('SELECT k, count(*), sum(n) FROM ah GROUP BY k LIMIT 7',
+                'SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'k');
+SELECT agg_topk('SELECT t, k % 3 AS m, count(*), max(id) FROM ah GROUP BY 1, 2 LIMIT 5 OFFSET 3',
+                'SELECT t, k % 3 AS m, count(*), max(id) FROM ah GROUP BY 1, 2', 't, m');
+SELECT agg_topk('SELECT nullif(k % 5, 0) AS z, count(*) FROM ah GROUP BY 1 LIMIT 3',
+                'SELECT nullif(k % 5, 0) AS z, count(*) FROM ah GROUP BY 1', 'z');
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k LIMIT 7', 'Aggregate|Kept by Hash');
+SET max_parallel_workers_per_gather = 0;
+SELECT agg_topk('SELECT k, count(*), sum(n) FROM ah GROUP BY k LIMIT 7',
+                'SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'k');
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k LIMIT 7', 'Aggregate|Kept by Hash');
+SET max_parallel_workers_per_gather = 2;
+-- not under ORDER BY, HAVING, a raising argument, or the setting off
+SELECT agg_explain('SELECT k, count(*) FROM ah GROUP BY k ORDER BY k LIMIT 7', 'Kept by Hash');
+SELECT agg_explain('SELECT k, count(*) FROM ah GROUP BY k HAVING count(*) > 1 LIMIT 7', 'Kept by Hash');
+SELECT agg_explain('SELECT k, sum(100 / (id % 7 + 1)) FROM ah GROUP BY k LIMIT 7', 'Kept by Hash');
+SET vexec.enable_group_topk = off;
+SELECT agg_explain('SELECT k, count(*) FROM ah GROUP BY k LIMIT 7', 'Kept by Hash');
+RESET vexec.enable_group_topk;
+DROP FUNCTION agg_topk(text, text, text);
 -- vexec.enable_repartition off: the plans without it
 SET vexec.enable_repartition = off;
 EXPLAIN (COSTS OFF) SELECT k, count(*), sum(n) FROM ah GROUP BY k;
@@ -317,6 +414,56 @@ RESET vexec.enable_repartition;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+
+-- X10: a subtree of kernels the aggregates' arguments share, computed once
+-- a batch -- TPC-H Q1's l_extendedprice * (1 - l_discount) -- and again
+-- where an argument asks for other rows, under its FILTER
+SELECT agg_check($$SELECT k, sum(n * (1 - n)), sum(n * (1 - n) * (1 + n)), avg(n * (1 - n)),
+       sum(n * (1 - n)) FILTER (WHERE id % 3 = 0), count(*) FROM at GROUP BY k$$);
+SELECT agg_explain('SELECT k, sum(n * (1 - n)), sum(n * (1 - n) * (1 + n)) FROM at GROUP BY k',
+                   'Shared Steps');
+SET vexec.enable_shared_exprs = off;
+SELECT agg_explain('SELECT k, sum(n * (1 - n)), sum(n * (1 - n) * (1 + n)) FROM at GROUP BY k',
+                   'Shared Steps');
+RESET vexec.enable_shared_exprs;
+
+-- X5: a table whose keys are all integers in a small range is an array of
+-- groups, indexed by the keys (vecagg.c): its range taken from the first
+-- batch, half its width again on either side, a slot for NULL.  A key past
+-- the range later -- here the rows after the first thousand -- turns it into
+-- the hash table; and so does the table's memory, before it spills
+CREATE TABLE aa AS
+  SELECT g AS id, CASE WHEN g % 97 = 0 THEN NULL ELSE (g % 41 - 20)::int2 END AS k1,
+         CASE WHEN g <= 1000 THEN g % 13 ELSE g END::int8 AS k2,
+         date '2021-01-01' + g % 30 AS d, (g % 7)::numeric AS n
+  FROM generate_series(1, 20000) g;
+ANALYZE aa;
+SET max_parallel_workers_per_gather = 0;
+SELECT agg_check('SELECT k1, count(*), sum(n), min(id) FROM aa GROUP BY k1');
+SELECT agg_check('SELECT k1, d, count(*), max(id) FROM aa GROUP BY k1, d');
+SELECT agg_explain('SELECT k1, d, count(*), max(id) FROM aa GROUP BY k1, d', 'Group Table');
+SELECT agg_check('SELECT k1, k2, count(*), sum(id) FROM aa GROUP BY k1, k2');
+SELECT agg_explain('SELECT k1, k2, count(*), sum(id) FROM aa GROUP BY k1, k2', 'Group Table');
+SET work_mem = '64kB';
+SELECT agg_check('SELECT k2, count(*), sum(id) FROM aa WHERE id <= 1000 OR id % 3 = 0 GROUP BY k2');
+SELECT agg_explain('SELECT id % 30000, count(*) FROM aa GROUP BY 1', 'Group Table|Spill Depth');
+SELECT agg_check('SELECT id % 30000, count(*) FROM aa GROUP BY 1');
+RESET work_mem;
+RESET max_parallel_workers_per_gather;
+
+-- C6: a hashed VecAgg's table begins as large as the same node's grew to
+-- the last time (exec/aggsizes.c): the planner's estimate of the rows a
+-- filter on an expression passes, 0.5%, is 66 times low here.  Off, the
+-- table begins at the estimate and grows every time.
+SET max_parallel_workers_per_gather = 0;
+SET vexec.remember_agg_sizes = off;
+SELECT agg_explain('SELECT id, count(*) FROM ah WHERE id % 3 = 0 GROUP BY id', 'Vec|Buckets');
+SELECT agg_explain('SELECT id, count(*) FROM ah WHERE id % 3 = 0 GROUP BY id', 'Buckets');
+RESET vexec.remember_agg_sizes;
+SELECT count(*) FROM agg_explain('SELECT id, count(*) FROM ah WHERE id % 3 = 0 GROUP BY id', 'Buckets');
+SELECT agg_explain('SELECT id, count(*) FROM ah WHERE id % 3 = 0 GROUP BY id', 'Buckets');
+SELECT agg_check('SELECT id, count(*) FROM ah WHERE id % 3 = 0 GROUP BY id');
 RESET max_parallel_workers_per_gather;
 
 -- rescanned: in a correlated subquery, a parameter changing each time
@@ -356,6 +503,58 @@ SELECT agg_check('SELECT k, string_agg(t, '','' ORDER BY id) FROM at GROUP BY k'
 SELECT agg_check('SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY id) FROM at');
 SELECT agg_check('SELECT k, s, count(*) FROM at GROUP BY GROUPING SETS ((k), (s))');
 
+-- X1: H3's stages in every participant of a parallel plan.  The lower
+-- stage partial, its pairs dealt out by the keys and x (VecRepartition) and
+-- combined where they meet; the upper stage partial, a count of the
+-- participant's distinct values, which are no other participant's; the
+-- counts added above the Gather, or, with keys, in each participant over a
+-- second VecRepartition by the keys.  Integer and numeric sums are the
+-- same bits whichever participants add them.
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0.01;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 4;
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT t) FROM ah;
+EXPLAIN (COSTS OFF) SELECT k % 100, count(DISTINCT t), sum(n) FROM ah GROUP BY 1;
+SELECT agg_check('SELECT count(DISTINCT t), count(*), sum(n), max(t), min(d) FROM ah');
+SELECT agg_check('SELECT k % 100, count(DISTINCT t), sum(n), count(*), avg(id), max(t), min(d) FROM ah GROUP BY 1');
+SELECT agg_check('SELECT k % 100, count(DISTINCT t) FROM ah GROUP BY 1 HAVING count(DISTINCT t) > 1190');
+SELECT agg_check('SELECT d, count(DISTINCT k), count(DISTINCT k) * 2 FROM ah GROUP BY d');
+-- NULL arguments and keys, and an empty input
+SELECT agg_check('SELECT t, count(DISTINCT u), count(*), sum(b) FROM at GROUP BY t');
+SELECT agg_check('SELECT count(DISTINCT u), sum(u), max(t) FROM at');
+SELECT agg_check('SELECT k, count(DISTINCT t) FROM at WHERE id < 0 GROUP BY k');
+SELECT agg_check('SELECT count(DISTINCT t), count(*) FROM at WHERE id < 0');
+-- ordered with a LIMIT: sorted in each participant too, under a Gather Merge
+EXPLAIN (COSTS OFF) SELECT k % 100, count(DISTINCT t) AS u FROM ah GROUP BY 1 ORDER BY u DESC, 1 LIMIT 5;
+SELECT agg_check('SELECT k % 100, count(DISTINCT t) AS u FROM ah GROUP BY 1 ORDER BY u DESC, 1 LIMIT 5');
+-- no worker launched: the leader deals out every pair and reads them
+SET max_parallel_workers = 0;
+SELECT agg_check('SELECT k % 100, count(DISTINCT t), sum(n) FROM ah GROUP BY 1');
+SELECT agg_check('SELECT count(DISTINCT t), sum(id) FROM ah');
+RESET max_parallel_workers;
+-- rescanned: the Gather a nested loop's inner, both repartitions' files
+-- made again
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+SET enable_memoize = off;
+SELECT agg_check($$WITH o AS MATERIALIZED (SELECT i FROM generate_series(0, 3) i)
+SELECT o.i, count(x.k), sum(x.c) FROM o LEFT JOIN (SELECT k % 50 AS k, count(DISTINCT t) c FROM ah GROUP BY 1) x
+  ON x.c >= o.i + 2398 GROUP BY o.i$$);
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
+RESET enable_memoize;
+-- vexec.enable_repartition off: H3's stages, serial
+SET vexec.enable_repartition = off;
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT t) FROM ah;
+RESET vexec.enable_repartition;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+
 -- explain mode: costed, recorded, never built
 SET vexec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM at GROUP BY k;
@@ -363,5 +562,5 @@ EXPLAIN (COSTS OFF) SELECT k, count(*) FROM at GROUP BY k;
 DROP FUNCTION agg_check(text);
 DROP FUNCTION agg_error(text);
 DROP FUNCTION agg_explain(text, text);
-DROP TABLE at, ae, an, ak, ah;
+DROP TABLE at, ae, an, ak, ah, aa;
 DROP SEQUENCE aseq;

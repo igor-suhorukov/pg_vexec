@@ -27,6 +27,7 @@ OBJS = \
 	egress/receiver.o \
 	egress/routine.o \
 	egress/run.o \
+	exec/aggsizes.o \
 	exec/aggtrans.o \
 	exec/methods.o \
 	exec/node.o \
@@ -49,6 +50,7 @@ OBJS = \
 	expr/k_text.o \
 	expr/kernels.o \
 	expr/packs.o \
+	expr/strsearch.o \
 	ipc/flatbuf.o \
 	ipc/read.o \
 	ipc/write.o \
@@ -71,6 +73,7 @@ OBJS = \
 	plan/sort.o \
 	plan/window.o \
 	source/heap.o \
+	source/prefilter.o \
 	source/registry.o
 PGFILEDESC = "vexec - a vectorized planner and executor for PostgreSQL 19"
 

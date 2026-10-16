@@ -82,7 +82,19 @@ typedef struct AggPathInfo
 	List	   *having;
 	Index		distinct_ref;	/* H3's upper stage: the sortgroupref of the
 								 * DISTINCT argument in its input; else 0 */
+	bool		distinct_combine;	/* X1's final stage: the DISTINCT
+									 * aggregate's input is a count of the
+									 * distinct values a participant was
+									 * dealt, which it combines as count's */
 } AggPathInfo;
+
+/*
+ * A stage that combines partial states and hands them on partial (X1):
+ * nodeAgg.c names no such split, and its flags allow it.
+ */
+#define VEXEC_AGGSPLIT_INTERMEDIATE \
+	((AggSplit) (AGGSPLITOP_COMBINE | AGGSPLITOP_SKIPFINAL | \
+				 AGGSPLITOP_SERIALIZE | AGGSPLITOP_DESERIALIZE))
 
 static Plan *plan_vecagg(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 						 List *tlist, List *clauses, List *custom_plans);
@@ -355,10 +367,12 @@ agg_path(PlannerInfo *root, RelOptInfo *rel, Path *input, PathTarget *target,
 	cp->path.pathkeys = NIL;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = list_make1(input);
-	cp->custom_private = lappend(list_make5(makeInteger(info->strategy), makeInteger(info->split),
-											makeFloat(psprintf("%.1f", info->numgroups)),
-											info->groupclause, info->having),
-								 makeInteger(info->distinct_ref));
+	cp->custom_private = list_make2(makeInteger(info->distinct_ref),
+									makeInteger(info->distinct_combine ? 1 : 0));
+	cp->custom_private = list_concat(list_make5(makeInteger(info->strategy), makeInteger(info->split),
+												makeFloat(psprintf("%.1f", info->numgroups)),
+												info->groupclause, info->having),
+									 cp->custom_private);
 	cp->methods = &vecagg_path_methods;
 	return &cp->path;
 }
@@ -571,10 +585,205 @@ distinct_refusal(AggScan *as, PathTarget *input_target, Aggref **dp)
 }
 
 /*
+ * X1 (§3.18): H3's stages in every participant of a parallel plan, over the
+ * input's cheapest partial path:
+ *
+ *	1. the lower VecAgg, partial, by the keys and the argument, the other
+ *	   aggregates' partial states beside;
+ *	2. a VecRepartition by the keys and the argument, so that each pair's
+ *	   states meet in one participant;
+ *	3. there, a VecAgg by the keys and the argument that combines them and
+ *	   hands them on partial: a row a distinct pair;
+ *	4. the upper VecAgg by the keys, partial: a count of the participant's
+ *	   distinct values a key, the other states combined;
+ *	5. a Gather and the final stage, which adds the counts and finalizes the
+ *	   other states; or, with keys, H5's shape: a VecRepartition by the keys
+ *	   and the final stage in each participant, under a Gather.
+ *
+ * A pair's distinct values are disjoint between participants, so the counts
+ * add up to PostgreSQL's count(DISTINCT).  The other aggregates are those
+ * H3 takes, which split and combine to the bits of one pass.  The paths are
+ * the grouped relation's, and the final stage in each participant one of
+ * its partial paths too, which create_ordered_paths() sorts in each
+ * participant under a Gather Merge, as H5's.  NIL where the input has no
+ * partial path, or VecRepartition is off.
+ */
+static List *
+distinct_parallel_paths(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
+						VexecPlanState *ps, VexecAlt *alt, AggScan *as, Aggref *d,
+						List *groupclause, List *having, double numgroups, PathTarget *lt,
+						List *lgroupclause, List *gexprs, Index xref, bool add)
+{
+	Path	   *input = input_rel->cheapest_total_path;
+	Path	   *pinput;
+	AggStrategy strategy = root->parse->groupClause != NIL ? AGG_HASHED : AGG_PLAIN;
+	AggSplit	isplit = VEXEC_AGGSPLIT_INTERMEDIATE;
+	int			nkeys_kernel = count_kernel_keys(groupclause, as->groupexprs);
+	int			lkeys_kernel = count_kernel_keys(lgroupclause, gexprs);
+	List	   *others = NIL;
+	PathTarget *ut;
+	double		divisor;
+	double		lgroups_each;	/* a participant's pairs, before the
+								 * repartition */
+	double		pairs_each;		/* and after it */
+	double		ugroups_each;	/* a participant's keys */
+	double		gathered;
+	AggClauseCosts pcosts;
+	AggClauseCosts icosts;
+	AggClauseCosts fcosts;
+	AggPath    *row;
+	VexecCost	cost;
+	AggPathInfo info;
+	Path	   *lpart;
+	Path	   *lmid;
+	Path	   *upart;
+	Path	   *gather;
+	List	   *paths = NIL;
+	ListCell   *lc;
+
+	if (!vexec_enable_repartition || input_rel->partial_pathlist == NIL ||
+		!output_rel->consider_parallel)
+		return NIL;
+	pinput = linitial(input_rel->partial_pathlist);
+
+	/* the stages read the columns the serial pair reads */
+	if (pinput->parallel_workers <= 0 || PATH_REQ_OUTER(pinput) != NULL ||
+		!equal(pinput->pathtarget->exprs, input->pathtarget->exprs))
+		return NIL;
+
+	foreach(lc, as->aggrefs)
+		if (lfirst(lc) != d && !equal(lfirst(lc), d))
+			others = lappend(others, lfirst(lc));
+	divisor = vexec_parallel_divisor(pinput);
+	lgroups_each = Min(estimate_num_groups(root, gexprs, pinput->rows, NULL, NULL), pinput->rows);
+	pairs_each = clamp_row_est(Min(estimate_num_groups(root, gexprs, input->rows, NULL, NULL),
+								   input->rows) / divisor);
+	ugroups_each = strategy == AGG_PLAIN ? 1 : Min(numgroups, pairs_each);
+
+	MemSet(&pcosts, 0, sizeof(AggClauseCosts));
+	get_agg_clause_costs(root, AGGSPLIT_INITIAL_SERIAL, &pcosts);
+	MemSet(&icosts, 0, sizeof(AggClauseCosts));
+	get_agg_clause_costs(root, isplit, &icosts);
+	MemSet(&fcosts, 0, sizeof(AggClauseCosts));
+	get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &fcosts);
+
+	/* 1: the lower stage, partial, over each participant's share of the input */
+	row = create_agg_path(root, output_rel, pinput, lt, AGG_HASHED, AGGSPLIT_INITIAL_SERIAL,
+						  lgroupclause, NIL, &pcosts, lgroups_each);
+	vexec_cost_agg(root, &row->path, pinput, vexec_is_vector_path(pinput),
+				   list_length(lgroupclause), lkeys_kernel,
+				   count_vector_aggs(others, AGGSPLIT_INITIAL_SERIAL, NULL), lgroups_each, &cost);
+	memset(&info, 0, sizeof(info));
+	info.strategy = AGG_HASHED;
+	info.split = AGGSPLIT_INITIAL_SERIAL;
+	info.numgroups = lgroups_each;
+	info.groupclause = lgroupclause;
+	lpart = agg_path(root, output_rel, pinput, lt, &info, &cost);
+
+	/* 2 and 3: dealt out by the keys and the argument, and combined */
+	lmid = repart_path(root, output_rel, lpart, lgroupclause);
+	row = create_agg_path(root, output_rel, lmid, lt, AGG_HASHED, isplit, lgroupclause, NIL,
+						  &icosts, pairs_each);
+	vexec_cost_agg(root, &row->path, lmid, true, list_length(lgroupclause), lkeys_kernel, 0,
+				   pairs_each, &cost);
+	info.split = isplit;
+	info.numgroups = pairs_each;
+	lmid = agg_path(root, output_rel, lmid, lt, &info, &cost);
+
+	/*
+	 * 4: the upper stage, partial: the keys, the first row's columns, the
+	 * DISTINCT aggregate's partial form -- a count of x, a value a row --
+	 * and the other aggregates' states, combined.
+	 */
+	ut = create_empty_pathtarget();
+	foreach(lc, groupclause)
+		add_column_to_pathtarget(ut, (Expr *) list_nth(as->groupexprs, foreach_current_index(lc)),
+								 lfirst_node(SortGroupClause, lc)->tleSortGroupRef);
+	foreach(lc, as->extras)
+		add_column_to_pathtarget(ut, lfirst(lc), 0);
+	foreach(lc, as->aggrefs)
+	{
+		Aggref	   *pa = makeNode(Aggref);
+
+		memcpy(pa, lfirst(lc), sizeof(Aggref));
+		mark_partial_aggref(pa, AGGSPLIT_INITIAL_SERIAL);
+		add_column_to_pathtarget(ut, (Expr *) pa, 0);
+	}
+	set_pathtarget_cost_width(root, ut);
+	row = create_agg_path(root, output_rel, lmid, ut, strategy, isplit, groupclause, NIL,
+						  &icosts, ugroups_each);
+	vexec_cost_agg(root, &row->path, lmid, true, list_length(groupclause), nkeys_kernel, 1,
+				   ugroups_each, &cost);
+	memset(&info, 0, sizeof(info));
+	info.strategy = strategy;
+	info.split = isplit;
+	info.numgroups = ugroups_each;
+	info.groupclause = groupclause;
+	info.distinct_ref = xref;
+	upart = agg_path(root, output_rel, lmid, ut, &info, &cost);
+
+	/* 5: the participants' counts gathered, and added in the final stage */
+	gathered = clamp_row_est(ugroups_each * divisor);
+	gather = (Path *) create_gather_path(root, output_rel, upart, ut, NULL, &gathered);
+	row = create_agg_path(root, output_rel, gather, output_rel->reltarget, strategy,
+						  AGGSPLIT_FINAL_DESERIAL, groupclause, having, &fcosts,
+						  strategy == AGG_PLAIN ? 1 : numgroups);
+	vexec_cost_agg(root, &row->path, gather, false, list_length(groupclause), nkeys_kernel, 0,
+				   strategy == AGG_PLAIN ? 1 : numgroups, &cost);
+	memset(&info, 0, sizeof(info));
+	info.strategy = strategy;
+	info.split = AGGSPLIT_FINAL_DESERIAL;
+	info.numgroups = strategy == AGG_PLAIN ? 1 : numgroups;
+	info.groupclause = groupclause;
+	info.having = having;
+	info.distinct_combine = true;
+	paths = lappend(paths, agg_path(root, output_rel, gather, output_rel->reltarget, &info, &cost));
+	vexec_alt_costed(ps, alt, &cost,
+					 psprintf("count(DISTINCT) in %d workers: %s, the lower stage's pairs dealt out by them and the argument; %s",
+							  upart->parallel_workers,
+							  count_of(list_length(groupclause), "grouping column", "grouping columns"),
+							  count_of(list_length(as->aggrefs), "aggregate", "aggregates")));
+
+	/* 5, with keys: the final stage in each participant too (H5) */
+	if (strategy == AGG_HASHED && groupclause != NIL)
+	{
+		Path	   *rep = repart_path(root, output_rel, upart, groupclause);
+		double		each = clamp_row_est(numgroups / divisor);
+		Path	   *pfinal;
+		VexecCost	gcost;
+
+		row = create_agg_path(root, output_rel, rep, output_rel->reltarget, strategy,
+							  AGGSPLIT_FINAL_DESERIAL, groupclause, having, &fcosts, each);
+		vexec_cost_agg(root, &row->path, rep, true, list_length(groupclause), nkeys_kernel, 0,
+					   each, &cost);
+		info.numgroups = each;
+		pfinal = agg_path(root, output_rel, rep, output_rel->reltarget, &info, &cost);
+		pfinal->parallel_safe = true;
+		pfinal->parallel_workers = upart->parallel_workers;
+		if (add)
+			add_partial_path(output_rel, pfinal);
+		gather = (Path *) create_gather_path(root, output_rel, pfinal, output_rel->reltarget,
+											 NULL, &numgroups);
+		paths = lappend(paths, gather);
+		gcost = cost;
+		gcost.startup = gather->startup_cost;
+		gcost.total = gather->total_cost;
+		vexec_alt_costed(ps, alt, &gcost,
+						 psprintf("count(DISTINCT) in %d workers, finalized in each: %s, the pairs dealt out by them and the argument, the groups by their keys; %s",
+								  upart->parallel_workers,
+								  count_of(list_length(groupclause), "grouping column", "grouping columns"),
+								  count_of(list_length(as->aggrefs), "aggregate", "aggregates")));
+	}
+	if (add)
+		ps->sorts_built = true; /* VecRepartition's scan tuple finished (join.c) */
+	return paths;
+}
+
+/*
  * H3's two stages: a lower VecAgg grouping by the keys and the DISTINCT
  * argument, the other aggregates' partial states beside, and an upper one
  * grouping by the keys, which counts the argument once a distinct value and
- * combines the other states.
+ * combines the other states.  X1 runs them in parallel (above).
  */
 static void
 consider_distinct_pair(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
@@ -602,6 +811,7 @@ consider_distinct_pair(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *out
 	AggPathInfo linfo;
 	AggPathInfo uinfo;
 	Path	   *lower;
+	List	   *newpaths;
 	AggStrategy strategy = root->parse->groupClause != NIL ? AGG_HASHED : AGG_PLAIN;
 
 	if ((refusal = distinct_refusal(as, input->pathtarget, &d)) != NULL)
@@ -691,8 +901,6 @@ consider_distinct_pair(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *out
 					 psprintf("two stages for count(DISTINCT): %s, the argument a key of the lower one; %s",
 							  count_of(list_length(groupclause), "grouping column", "grouping columns"),
 							  count_of(list_length(as->aggrefs), "aggregate", "aggregates")));
-	if (!add)
-		return;
 	memset(&uinfo, 0, sizeof(uinfo));
 	uinfo.strategy = strategy;
 	uinfo.split = AGGSPLIT_FINAL_DESERIAL;
@@ -700,9 +908,19 @@ consider_distinct_pair(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *out
 	uinfo.groupclause = groupclause;
 	uinfo.having = having;
 	uinfo.distinct_ref = xref;
+	newpaths = list_make1(agg_path(root, output_rel, lower, output_rel->reltarget, &uinfo, &ucost));
+
+	/* X1: the same stages in every participant of a parallel plan */
+	newpaths = list_concat(newpaths,
+						   distinct_parallel_paths(root, input_rel, output_rel, ps, alt, as, d,
+												   groupclause, having, numgroups, lt,
+												   lgroupclause, gexprs, xref, add));
+	if (!add)
+		return;
 	if (ps->mode == VEXEC_MODE_FORCE)
 		output_rel->pathlist = NIL;
-	add_path(output_rel, agg_path(root, output_rel, lower, output_rel->reltarget, &uinfo, &ucost));
+	foreach(lc, newpaths)
+		add_path(output_rel, lfirst(lc));
 	ps->npossible++;
 }
 
@@ -831,6 +1049,7 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 	if (!add)
 		return;
 
+	memset(&info, 0, sizeof(info));
 	info.strategy = strategy;
 	info.split = AGGSPLIT_SIMPLE;
 	info.numgroups = numgroups;
@@ -943,6 +1162,26 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 	ps->npossible++;
 }
 
+/*
+ * C3 (§3.19): whether a path is a VecAgg that a bounded VecSort above may
+ * lend its bound to, which then finishes and hands up only the bound's
+ * groups (exec/vecagg.c): a hashed aggregation that finalizes.
+ */
+bool
+vexec_agg_path_ranks(Path *path)
+{
+	CustomPath *cp;
+	AggStrategy strategy;
+	AggSplit	split;
+
+	if (!IsA(path, CustomPath) || ((CustomPath *) path)->methods != &vecagg_path_methods)
+		return false;
+	cp = (CustomPath *) path;
+	strategy = intVal(linitial(cp->custom_private));
+	split = intVal(lsecond(cp->custom_private));
+	return strategy == AGG_HASHED && !DO_AGGSPLIT_SKIPFINAL(split);
+}
+
 /* ---------------------------------------------------------------------
  * Plans
  * ---------------------------------------------------------------------
@@ -998,7 +1237,10 @@ to_outer(Node *node, List *child_tlist)
 /*
  * The executor's Aggref of a planner's one: its arguments and FILTER over
  * the child, or, combining, its one argument the partial state the child
- * gives (convert_combining_aggrefs(), setrefs.c).
+ * gives (convert_combining_aggrefs(), setrefs.c).  An Aggref of a stage
+ * between two others (X1) is already the partial one the child gives, and
+ * its output keeps the partial type: the state, serialized where it is
+ * internal, as the child hands it on.
  */
 static Aggref *
 exec_aggref(Aggref *aggref, AggSplit split, List *child_tlist)
@@ -1008,14 +1250,24 @@ exec_aggref(Aggref *aggref, AggSplit split, List *child_tlist)
 	memcpy(a, aggref, sizeof(Aggref));
 	if (DO_AGGSPLIT_COMBINE(split))
 	{
-		Aggref	   *child = makeNode(Aggref);
+		Aggref	   *child = aggref;
 
-		memcpy(child, aggref, sizeof(Aggref));
-		mark_partial_aggref(child, AGGSPLIT_INITIAL_SERIAL);
+		if (aggref->aggsplit == AGGSPLIT_SIMPLE)
+		{
+			child = makeNode(Aggref);
+			memcpy(child, aggref, sizeof(Aggref));
+			mark_partial_aggref(child, AGGSPLIT_INITIAL_SERIAL);
+		}
 		a->args = list_make1(makeTargetEntry((Expr *) to_outer((Node *) child, child_tlist),
 											 1, NULL, false));
 		a->aggfilter = NULL;
-		mark_partial_aggref(a, split);
+		if (aggref->aggsplit == AGGSPLIT_SIMPLE)
+			mark_partial_aggref(a, split);
+		else
+		{
+			Assert(DO_AGGSPLIT_SKIPFINAL(split) && DO_AGGSPLIT_SKIPFINAL(aggref->aggsplit));
+			a->aggsplit = split;
+		}
 	}
 	else
 	{
@@ -1096,6 +1348,63 @@ get_sortgroupref_tle_or_expr(Index ref, PathTarget *target, List *child_tlist)
 	return NULL;
 }
 
+/*
+ * C5 (§3.19): the groups a LIMIT without ORDER BY takes from the query's
+ * aggregation -- its count and offset, both constants -- which the VecAgg
+ * then keeps by the K smallest hashes of their keys (vecagg.c): any K
+ * groups are an answer.  0 where it may not: an ORDER BY, a HAVING,
+ * DISTINCT, window functions, grouping sets or set-returning functions
+ * after the aggregation; a DISTINCT aggregate's stage, which groups by more
+ * than the query's keys; an aggregate with an ORDER BY; or an aggregate's
+ * argument or FILTER that may raise, which a skipped row would leave
+ * unevaluated where PostgreSQL evaluates it.  As ClickHouse turns its top-K
+ * off (enable_group_by_top_k_optimization, CH:src/Processors/QueryPlan/
+ * Optimizations/optimizeGroupByTopK.cpp).
+ */
+#define VEXEC_AGG_TOPK_MAX	100000
+
+static int64
+query_topk(PlannerInfo *root, List *aggrefs, Index distinct_ref, bool distinct_combine)
+{
+	Query	   *parse = root->parse;
+	Const	   *count = (Const *) parse->limitCount;
+	int64		n;
+	int64		offset = 0;
+	ListCell   *lc;
+
+	if (!vexec_enable_group_topk || count == NULL || !IsA(count, Const) ||
+		count->constisnull || parse->limitOption != LIMIT_OPTION_COUNT ||
+		parse->sortClause != NIL || parse->havingQual != NULL ||
+		parse->distinctClause != NIL || parse->hasWindowFuncs ||
+		parse->groupingSets != NIL || parse->hasTargetSRFs || parse->groupClause == NIL ||
+		distinct_ref > 0 || distinct_combine)
+		return 0;
+	n = DatumGetInt64(count->constvalue);
+	if (n <= 0)
+		return 0;
+	if (parse->limitOffset != NULL)
+	{
+		Const	   *off = (Const *) parse->limitOffset;
+
+		if (!IsA(off, Const))
+			return 0;
+		if (!off->constisnull)
+			offset = Max(DatumGetInt64(off->constvalue), 0);
+	}
+	if (n > VEXEC_AGG_TOPK_MAX || offset > VEXEC_AGG_TOPK_MAX - n)
+		return 0;
+	foreach(lc, aggrefs)
+	{
+		Aggref	   *aggref = lfirst_node(Aggref, lc);
+
+		if (aggref->aggdistinct != NIL || aggref->aggorder != NIL ||
+			vexec_expr_may_raise((Node *) aggref->args) ||
+			vexec_expr_may_raise((Node *) aggref->aggfilter))
+			return 0;
+	}
+	return n + offset;
+}
+
 /* The plan of a VecAgg path. */
 static Plan *
 plan_vecagg(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
@@ -1108,6 +1417,7 @@ plan_vecagg(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *groupclause = lfourth(priv);
 	List	   *having = list_nth(priv, 4);
 	Index		distinct_ref = list_length(priv) > 5 ? intVal(list_nth(priv, 5)) : 0;
+	bool		distinct_combine = list_length(priv) > 6 && intVal(list_nth(priv, 6)) != 0;
 	PathTarget *target = best_path->path.pathtarget;
 	List	   *scan_tlist = NIL;
 	List	   *transnos = NIL;
@@ -1180,10 +1490,27 @@ plan_vecagg(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			plan.aggrefs = lappend(plan.aggrefs, a);
 		}
 		else
-			plan.aggrefs = lappend(plan.aggrefs, exec_aggref(aggref, plan.split, child->targetlist));
+		{
+			Aggref	   *a = exec_aggref(aggref, plan.split, child->targetlist);
+
+			if (distinct_combine && a->aggdistinct != NIL)
+			{
+				/*
+				 * X1's final stage: count(DISTINCT x)'s input is a count of
+				 * the distinct values each participant was dealt -- disjoint
+				 * sets, the repartition by the keys and x saw to it --
+				 * combined as count's are.
+				 */
+				a->aggdistinct = NIL;
+				a->aggpresorted = false;
+			}
+			plan.aggrefs = lappend(plan.aggrefs, a);
+		}
 		transnos = lappend_int(transnos, aggref->aggtransno);
 	}
 	number_aggrefs(plan.aggrefs, transnos, &plan.ntrans);
+	if (plan.strategy == AGG_HASHED)
+		plan.topk = query_topk(root, as.aggrefs, distinct_ref, distinct_combine);
 
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = having;

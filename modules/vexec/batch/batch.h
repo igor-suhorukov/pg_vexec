@@ -188,6 +188,8 @@ typedef struct VexecBatch
 								 * VEXEC_BATCH_ROWS */
 	MemoryContext mcxt;			/* the batch's memory, reset with it */
 	VexecArena	arena;
+	uint64		generation;		/* its resets: what was computed into it
+								 * since is of its rows (X10) */
 } VexecBatch;
 
 /* An Arrow view (Columnar.rst:492-524): 16 bytes. */

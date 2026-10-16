@@ -30,9 +30,17 @@
  * partition, which one participant reads: so the final VecAgg in each
  * participant finalizes groups no other one has, and the Gather receives
  * final groups only -- and under ORDER BY ... LIMIT, a Gather Merge each
- * participant's first rows.  The hash is the keys' hash functions of the
- * grouping's equality operators (get_op_hash_functions()), so keys a
- * grouping takes for equal meet in one partition.
+ * participant's first rows.
+ *
+ * The hash is VecAgg's own of the keys (vecagg.c, C4 in §3.19), which hashes
+ * equal what the grouping's equality operators take for equal, so keys a
+ * grouping takes for equal meet in one partition.  A partial VecAgg below
+ * that groups by the same keys hands each group's hash on, and the node
+ * computes none; it keeps each row's hash beside it in the partition, and
+ * hands it up with the batch to the VecAgg above, which groups by the same
+ * keys and takes it as the row's.  A partition is chosen by the hash mixed
+ * again, so that the bits the VecAgg above takes its buckets and its spill
+ * files by stay spread in each partition.
  *
  * A participant that comes once the barrier has passed on -- a worker that
  * started late, or the leader, which first reads the workers' queues --
@@ -45,6 +53,22 @@
  * parallel mode runs its child -- the node passes its child's groups on as
  * they come: there is one participant.
  *
+ * Batches and frames (X9, §3.18).  A partial VecAgg below that hands up
+ * its groups as batches, with their hashes (vecagg.c), gives the node a
+ * batch at a time, not a row; and the partitions then hold Arrow IPC
+ * frames, V7's format (motion/frame.c), not tuples: the VecAgg deals its
+ * groups into a batch a partition as they go out, their hashes a last
+ * column (vexec_agg_deal()), and hands each up as it fills; the node writes
+ * it as one frame -- one record of the SharedTuplestore, behind 8 bytes
+ * whose first 4 are the record's length, as a MinimalTuple's t_len is,
+ * which is all the store reads of a tuple -- and the participant that
+ * claims the partition reads each frame back as a batch, its columns
+ * pointing into the frame.  Every participant's frames are in one schema,
+ * the columns' build shapes, which each one's reader knows from the start.
+ * vexec.enable_motion_frames off, the partitions hold tuples.  Velox passes its batches among a pipeline's
+ * drivers in memory (LocalPartition); here they go through the store's
+ * files, which a parallel hash join's batches go through too.
+ *
  * Its scan tuple, which custom_scan_tlist describes, is its child's row, as
  * VecSort's (vecsort.c); its keys are columns of it.
  *
@@ -52,7 +76,9 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/parallel.h"
+#include "catalog/pg_type.h"
 #include "common/hashfn.h"
 #include "commands/explain_format.h"
 #include "executor/executor.h"
@@ -64,6 +90,7 @@
 #include "port/atomics.h"
 #include "port/pg_bitutils.h"
 #include "storage/barrier.h"
+#include "storage/buffile.h"
 #include "storage/dsm.h"
 #include "storage/sharedfileset.h"
 #include "utils/lsyscache.h"
@@ -76,9 +103,15 @@
 #include "vexec.h"
 #include "batch/batch.h"
 #include "exec/exec.h"
+#include "exec/keyhash.h"
+#include "expr/kernel.h"
+#include "motion/frame.h"
 
 #define REPART_WRITING	0		/* the barrier's phases */
 #define REPART_READING	1
+
+/* X9: a frame's record: its length, then 4 bytes, then the frame */
+#define REPART_FRAME_PREFIX	8
 
 /* the wait at the barrier, as pg_stat_activity names it */
 static uint32 repart_wait_event = 0;
@@ -93,6 +126,8 @@ typedef struct RepartShared
 	pg_atomic_uint32 next_partition;
 	int			nparticipants;	/* the leader and the workers planned */
 	int			npartitions;
+	bool		frames;			/* the partitions hold frames (X9) */
+	pg_atomic_uint32 topk_bound;	/* C5: the first stages' boundary */
 	Size		sts_size;		/* each partition's SharedTuplestore */
 	char		stores[FLEXIBLE_ARRAY_MEMBER];
 } RepartShared;
@@ -105,12 +140,31 @@ typedef struct VexecRepartState
 	TupleDesc	desc;			/* the child's rows */
 	int			nkeys;
 	AttrNumber *keycols;
-	FmgrInfo   *hashfns;
-	Oid		   *collations;
+	VexecKeyHash *keyhash;		/* the keys' hash, VecAgg's */
+	bool		hashes_from_child;	/* a partial VecAgg below hands its
+									 * groups' hashes on */
+	MemoryContext hashcxt;		/* a row's detoasted keys */
+	uint32	   *rowhash;		/* the batch's rows' hashes */
 
 	RepartShared *shared;		/* NULL: no DSM, one participant */
 	SharedTuplestoreAccessor **parts;
 	TupleTableSlot *read_slot;
+	VexecBatch *own_in;			/* the input batch the node fills */
+	const uint32 *hashes;		/* the hashes of the input batch's rows */
+
+	/*
+	 * X9 (above): the child hands up batches of its groups with their
+	 * hashes; the partitions hold frames of them, each row's hash a last
+	 * column
+	 */
+	bool		child_batches;
+	bool		frames;
+	VexecType **ftypes;			/* the frames' columns */
+	VexecFrameWriter *fw;
+	VexecFrameReader *fr;
+	VexecBatch *frame_in;		/* a frame read back */
+	int		   *allrows;		/* 0, 1, ...: a batch's rows */
+	MemoryContext framecxt;		/* a frame being written */
 	bool		written;		/* this participant's groups are written, or
 								 * it came too late to write */
 	int			reading;		/* the partition being read, or -1 */
@@ -119,6 +173,7 @@ typedef struct VexecRepartState
 } VexecRepartState;
 
 static bool repart_fetch(VexecNode *node);
+static void frames_begin(VexecRepartState *s, VexecType **types);
 static void repart_begin(CustomScanState *css, EState *estate, int eflags);
 static TupleTableSlot *repart_exec(CustomScanState *css);
 static void repart_end(CustomScanState *css);
@@ -209,22 +264,34 @@ repart_begin(CustomScanState *css, EState *estate, int eflags)
 		elog(ERROR, "vexec: a VecRepartition's scan tuple of %d columns, its child's %d",
 			 scandesc->natts, s->desc->natts);
 
-	/* the keys' hash functions, those of the grouping's equality operators */
+	/*
+	 * The keys' hash: VecAgg's, taken from a partial VecAgg below that
+	 * groups by the same keys where there is one (C4)
+	 */
 	s->nkeys = list_length(s->plan.keycols);
 	s->keycols = palloc(sizeof(AttrNumber) * Max(s->nkeys, 1));
-	s->hashfns = palloc(sizeof(FmgrInfo) * Max(s->nkeys, 1));
-	s->collations = palloc(sizeof(Oid) * Max(s->nkeys, 1));
 	for (i = 0; i < s->nkeys; i++)
-	{
-		RegProcedure lhs;
-		RegProcedure rhs;
-
 		s->keycols[i] = (AttrNumber) list_nth_int(s->plan.keycols, i);
-		if (!get_op_hash_functions(list_nth_oid(s->plan.eqops, i), &lhs, &rhs))
-			elog(ERROR, "vexec: no hash function for operator %u", list_nth_oid(s->plan.eqops, i));
-		fmgr_info(lhs, &s->hashfns[i]);
-		s->collations[i] = list_nth_oid(s->plan.collations, i);
-	}
+	s->keyhash = vexec_key_hash_create(s->desc, s->plan.keycols, s->plan.eqops,
+									   s->plan.collations);
+	s->hashes_from_child = vexec_is_vector_state(s->child) &&
+		vexec_agg_hashes_keys((VexecNode *) s->child, s->plan.keycols, s->plan.eqops,
+							  s->plan.collations);
+
+	/*
+	 * C2: the partial aggregation below may freeze its table, the stage
+	 * above combining whatever states it is dealt (vecagg.c)
+	 */
+	if (vexec_is_vector_state(s->child))
+		vexec_agg_allow_freeze((VexecNode *) s->child);
+
+	/* X9: its groups as batches, with their hashes; the partitions as frames */
+	s->child_batches = s->hashes_from_child &&
+		vexec_node_batchable((VexecNode *) s->child) &&
+		vexec_agg_batch_hashes((VexecNode *) s->child) != NULL;
+	s->frames = s->child_batches && vexec_enable_motion_frames;
+	s->hashcxt = AllocSetContextCreate(node->mcxt, "VecRepartition keys", ALLOCSET_SMALL_SIZES);
+	s->rowhash = palloc0_array(uint32, VEXEC_BATCH_ROWS);
 
 	/* the scan tuple: the child's row */
 	types = palloc(sizeof(VexecType *) * Max(scandesc->natts, 1));
@@ -239,32 +306,189 @@ repart_begin(CustomScanState *css, EState *estate, int eflags)
 	node->input_varno = INDEX_VAR;
 	node->ninput = scandesc->natts;
 	node->input_slot = css->ss.ss_ScanTupleSlot;
-	node->in = vexec_batch_create(node->mcxt, scandesc->natts, types);
+	s->own_in = vexec_batch_create(node->mcxt, scandesc->natts, types);
+	node->in = s->own_in;
 	vexec_node_compile(node, cscan->scan.plan.qual, cscan->scan.plan.targetlist);
 
 	s->read_slot = ExecInitExtraTupleSlot(estate, s->desc, &TTSOpsMinimalTuple);
 	s->reading = -1;
+	if (s->frames)
+		frames_begin(s, types);
 }
 
-/* A row's partition: the hash of its keys, as a grouping hashes them. */
-static int
-row_partition(VexecRepartState *s, TupleTableSlot *slot)
+/*
+ * X9: the frames' writer and reader, over the child's columns and an int4
+ * of each row's hash.  The schema is the columns' build shapes, the
+ * batches' the VecAgg below deals its groups into, every participant's
+ * alike: the reader is given it now, as no frame of a partition carries it.
+ */
+static void
+frames_begin(VexecRepartState *s, VexecType **types)
 {
-	uint32		hash = 0;
+	MemoryContext mcxt = s->node.mcxt;
+	int			natts = s->desc->natts;
+	VexecBatch *empty;
+	uint64		schema;
+	bytea	   *schema_frame;
 	int			i;
 
-	slot_getallattrs(slot);
-	for (i = 0; i < s->nkeys; i++)
-	{
-		int			a = s->keycols[i] - 1;
+	s->ftypes = MemoryContextAlloc(mcxt, sizeof(VexecType *) * (natts + 1));
+	memcpy(s->ftypes, types, sizeof(VexecType *) * natts);
+	s->ftypes[natts] = vexec_type_make(INT4OID, -1, InvalidOid);
+	s->fw = vexec_frame_writer_create(mcxt, natts + 1, s->ftypes);
+	s->fr = vexec_frame_reader_create(mcxt, natts + 1, s->ftypes);
+	s->frame_in = vexec_batch_create(mcxt, natts + 1, s->ftypes);
+	s->allrows = MemoryContextAlloc(mcxt, sizeof(int) * VEXEC_BATCH_ROWS);
+	for (i = 0; i < VEXEC_BATCH_ROWS; i++)
+		s->allrows[i] = i;
+	s->framecxt = AllocSetContextCreate(mcxt, "VecRepartition frame", ALLOCSET_DEFAULT_SIZES);
 
-		hash = pg_rotate_left32(hash, 1);
-		if (!slot->tts_isnull[a])
-			hash ^= DatumGetUInt32(FunctionCall1Coll(&s->hashfns[i], s->collations[i],
-													 slot->tts_values[a]));
+	empty = vexec_batch_create(s->framecxt, natts + 1, s->ftypes);
+	vexec_batch_begin_rows(empty);
+	vexec_frame_begin(s->fw, empty, &schema, &schema_frame);
+	if (vexec_frame_decode(s->fr, VARDATA(schema_frame), VARSIZE(schema_frame) - VARHDRSZ,
+						   s->frame_in))
+		elog(ERROR, "vexec: a VecRepartition's schema is no schema frame");
+	MemoryContextReset(s->framecxt);
+}
+
+/*
+ * A row's hash: its group's, which the partial VecAgg below handed on, or
+ * VecAgg's of its keys.
+ */
+static uint32
+row_hash(VexecRepartState *s, TupleTableSlot *slot)
+{
+	MemoryContext old;
+	uint32		hash;
+
+	if (s->hashes_from_child)
+		return vexec_agg_last_hash((VexecNode *) s->child);
+	slot_getallattrs(slot);
+	MemoryContextReset(s->hashcxt);
+	old = MemoryContextSwitchTo(s->hashcxt);
+	hash = vexec_key_hash_slot(s->keyhash, slot);
+	MemoryContextSwitchTo(old);
+	return hash;
+}
+
+/* A hash's partition: by the hash mixed again (above). */
+static int
+hash_partition(VexecRepartState *s, uint32 hash)
+{
+	return (int) (murmurhash32(hash ^ 0x9E3779B9) % (uint32) s->shared->npartitions);
+}
+
+/* X9: the partition a hash's row goes to, for the VecAgg that deals them. */
+static int
+deal_partition(void *arg, uint32 hash)
+{
+	return hash_partition((VexecRepartState *) arg, hash);
+}
+
+/*
+ * X9: a batch's rows rows[first .. first + n) as one frame, a record of the
+ * partition's store; in halves where the frame would be longer than an
+ * allocation may be.
+ */
+static void
+write_frame_rows(VexecRepartState *s, int p, int first, int n)
+{
+	Size		len;
+	char	   *rec;
+	uint32		nrows = (uint32) n;
+
+	rec = vexec_frame_rows_after(s->fw, s->allrows + first, n, REPART_FRAME_PREFIX, &len);
+	if (rec == NULL)
+	{
+		if (n == 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("a group too long for a parallel aggregation's partition")));
+		write_frame_rows(s, p, first, n / 2);
+		write_frame_rows(s, p, first + n / 2, n - n / 2);
+		return;
 	}
-	hash = murmurhash32(hash);
-	return (int) (hash % (uint32) s->shared->npartitions);
+	memset(rec, 0, REPART_FRAME_PREFIX);
+	*(uint32 *) rec = (uint32) (REPART_FRAME_PREFIX + len);
+	sts_puttuple(s->parts[p], &nrows, (MinimalTuple) rec);
+	pfree(rec);
+}
+
+/*
+ * X9: this participant's groups, dealt into the partitions by the partial
+ * VecAgg below as they go out, a batch of one partition's at a time, each
+ * written as one frame.
+ */
+static void
+write_frames(VexecRepartState *s)
+{
+	VexecNode  *child = (VexecNode *) s->child;
+	VexecBatch *b;
+
+	vexec_agg_deal(child, s->shared->npartitions, deal_partition, s);
+	while ((b = vexec_next_batch(s->child)) != NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(s->framecxt);
+		uint64		schema;
+		bytea	   *schema_frame;
+
+		vexec_frame_begin(s->fw, b, &schema, &schema_frame);
+		write_frame_rows(s, vexec_agg_dealt_partition(child), 0, b->nrows);
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(s->framecxt);
+	}
+}
+
+/*
+ * This participant's groups, each a tuple of its partition: a batch's rows
+ * at a time where the child hands up batches, else a row at a time.
+ */
+static void
+write_tuples(VexecRepartState *s)
+{
+	if (s->child_batches)
+	{
+		int			natts = s->desc->natts;
+		Datum	   *values = palloc(sizeof(Datum) * Max(natts, 1));
+		bool	   *isnull = palloc(sizeof(bool) * Max(natts, 1));
+		VexecBatch *b;
+
+		while ((b = vexec_next_batch(s->child)) != NULL)
+		{
+			const uint32 *hashes = vexec_agg_batch_hashes((VexecNode *) s->child);
+
+			VEXEC_FOREACH_ROW(b->selection, b->nrows, r)
+			{
+				uint32		hash = hashes[r];
+				MinimalTuple tuple;
+
+				for (int c = 0; c < natts; c++)
+					values[c] = vexec_vec_datum(b, &b->cols[c], r, &isnull[c]);
+				tuple = heap_form_minimal_tuple(s->desc, values, isnull, 0);
+				sts_puttuple(s->parts[hash_partition(s, hash)], &hash, tuple);
+				pfree(tuple);
+			}
+		}
+		pfree(values);
+		pfree(isnull);
+		return;
+	}
+	for (;;)
+	{
+		TupleTableSlot *slot = ExecProcNode(s->child);
+		MinimalTuple tuple;
+		bool		should_free;
+		uint32		hash;
+
+		if (TupIsNull(slot))
+			break;
+		hash = row_hash(s, slot);
+		tuple = ExecFetchSlotMinimalTuple(slot, &should_free);
+		sts_puttuple(s->parts[hash_partition(s, hash)], &hash, tuple);
+		if (should_free)
+			heap_free_minimal_tuple(tuple);
+	}
 }
 
 /*
@@ -280,20 +504,10 @@ write_groups(VexecRepartState *s)
 
 	if (BarrierAttach(&sh->barrier) == REPART_WRITING)
 	{
-		for (;;)
-		{
-			TupleTableSlot *slot = ExecProcNode(s->child);
-			MinimalTuple tuple;
-			bool		should_free;
-
-			if (TupIsNull(slot))
-				break;
-			p = row_partition(s, slot);
-			tuple = ExecFetchSlotMinimalTuple(slot, &should_free);
-			sts_puttuple(s->parts[p], NULL, tuple);
-			if (should_free)
-				heap_free_minimal_tuple(tuple);
-		}
+		if (s->frames)
+			write_frames(s);
+		else
+			write_tuples(s);
 		for (p = 0; p < sh->npartitions; p++)
 			sts_end_write(s->parts[p]);
 		if (repart_wait_event == 0)
@@ -317,13 +531,64 @@ claim_partition(VexecRepartState *s)
 	return true;
 }
 
-/* The partition being read, if any, closed: this participant's own file. */
+/* A partition's store's name, which its files' names begin with. */
+static void
+partition_name(VexecRepartState *s, int p, char *name)
+{
+	snprintf(name, MAXPGPATH, "vexec-repart-%d-%d", s->node.css.ss.ps.plan->plan_node_id, p);
+}
+
+/*
+ * The partition being read, if any, closed, and its files deleted: one
+ * participant reads a partition, so none reads them again.  Left to the
+ * file set, they would go as the last participant detaches it, an exit the
+ * Gather waits for at the end, where deleting the hundreds of megabytes a
+ * grouping of millions writes takes tens of milliseconds; here they go as
+ * the participants read, each its own.  The store names a participant's
+ * file of it "<name>.p<participant>" (sharedtuplestore.c, sts_filename()).
+ */
 static void
 end_reading(VexecRepartState *s)
 {
 	if (s->shared != NULL && s->reading >= 0)
+	{
+		char		name[MAXPGPATH];
+		char		file[MAXPGPATH];
+
 		sts_end_parallel_scan(s->parts[s->reading]);
+		partition_name(s, s->reading, name);
+		for (int i = 0; i < s->shared->nparticipants; i++)
+		{
+			snprintf(file, sizeof(file), "%s.p%d", name, i);
+			BufFileDeleteFileSet(&s->shared->fileset.fs, file, true);
+		}
+	}
 	s->reading = -1;
+}
+
+/*
+ * X9: a frame of a partition, read back: the node's input batch, its
+ * columns pointing into the frame, which stays as it is until the next one
+ * is read; the hashes from its last column.
+ */
+static void
+read_frame(VexecRepartState *s, const char *rec, Size len)
+{
+	VexecNode  *node = &s->node;
+	VexecBatch *in = s->own_in;
+	int			natts = s->desc->natts;
+
+	if (len < REPART_FRAME_PREFIX ||
+		!vexec_frame_decode(s->fr, rec + REPART_FRAME_PREFIX, len - REPART_FRAME_PREFIX,
+							s->frame_in))
+		elog(ERROR, "vexec: a parallel aggregation's partition holds a record that is no batch's frame");
+	vexec_batch_reset(in);
+	for (int c = 0; c < natts; c++)
+		in->cols[c] = s->frame_in->cols[c];
+	in->nrows = s->frame_in->nrows;
+	s->hashes = (const uint32 *) s->frame_in->cols[natts].values;
+	node->in = in;
+	vexec_batch_apply_config(in, &node->layout);
 }
 
 /* The next batch of groups: from the partitions this participant claims. */
@@ -331,8 +596,43 @@ static bool
 repart_fetch(VexecNode *node)
 {
 	VexecRepartState *s = (VexecRepartState *) node;
-	VexecBatch *in = node->in;
+	VexecBatch *in = s->own_in;
 
+	if (s->child_batches && s->shared == NULL)
+	{
+		/* X9: one participant, the child's batches as they come */
+		VexecBatch *b = vexec_next_batch(s->child);
+
+		if (b == NULL)
+			return false;
+		node->in = b;
+		s->hashes = vexec_agg_batch_hashes((VexecNode *) s->child);
+		return true;
+	}
+	if (s->frames && s->shared != NULL)
+	{
+		if (!s->written)
+			write_groups(s);
+		for (;;)
+		{
+			MinimalTuple rec;
+			uint32		nrows;
+
+			if (s->reading < 0 && !claim_partition(s))
+				return false;
+			rec = sts_parallel_scan_next(s->parts[s->reading], &nrows);
+			if (rec == NULL)
+			{
+				end_reading(s);
+				continue;
+			}
+			read_frame(s, (const char *) rec, rec->t_len);
+			return true;
+		}
+	}
+
+	node->in = in;
+	s->hashes = s->rowhash;
 	vexec_batch_reset(in);
 	vexec_batch_begin_rows(in);
 
@@ -345,6 +645,7 @@ repart_fetch(VexecNode *node)
 
 			if (TupIsNull(slot))
 				break;
+			s->rowhash[in->nrows] = row_hash(s, slot);
 			vexec_batch_add_slot(in, slot, NULL);
 		}
 	}
@@ -355,16 +656,18 @@ repart_fetch(VexecNode *node)
 		while (in->nrows < VEXEC_BATCH_ROWS)
 		{
 			MinimalTuple tuple;
+			uint32		hash;
 
 			if (s->reading < 0 && !claim_partition(s))
 				break;
-			tuple = sts_parallel_scan_next(s->parts[s->reading], NULL);
+			tuple = sts_parallel_scan_next(s->parts[s->reading], &hash);
 			if (tuple == NULL)
 			{
 				end_reading(s);
 				continue;
 			}
 			ExecStoreMinimalTuple(tuple, s->read_slot, false);
+			s->rowhash[in->nrows] = hash;
 			vexec_batch_add_slot(in, s->read_slot, NULL);
 		}
 		ExecClearTuple(s->read_slot);
@@ -379,6 +682,63 @@ static TupleTableSlot *
 repart_exec(CustomScanState *css)
 {
 	return vexec_node_exec(&((VexecRepartState *) css)->node);
+}
+
+/*
+ * C4: whether the node's batches carry the hashes a VecAgg grouping by these
+ * keys -- columns of the node's output from 1, with these equality
+ * operators and collations -- would compute: its own keys, in their order,
+ * each a column of its scan tuple as it is.  vexec_repart_batch_hashes()
+ * then gives each row's of the batch last handed up.
+ */
+bool
+vexec_repart_hashes_keys(VexecNode *node, List *keycols, List *eqops, List *collations)
+{
+	VexecRepartState *s = (VexecRepartState *) node;
+	List	   *tlist = node->css.ss.ps.plan->targetlist;
+
+	if (node->kind != VEXEC_NODE_REPART || list_length(keycols) != s->nkeys)
+		return false;
+	for (int i = 0; i < s->nkeys; i++)
+	{
+		int			col = list_nth_int(keycols, i);
+		TargetEntry *tle;
+		Var		   *v;
+
+		if (col < 1 || col > list_length(tlist))
+			return false;
+		tle = list_nth_node(TargetEntry, tlist, col - 1);
+		if (!IsA(tle->expr, Var))
+			return false;
+		v = (Var *) tle->expr;
+		if (v->varno != INDEX_VAR || v->varattno != s->keycols[i] ||
+			list_nth_oid(s->plan.eqops, i) != list_nth_oid(eqops, i) ||
+			list_nth_oid(s->plan.collations, i) != list_nth_oid(collations, i))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * C5: the first stages' boundary, which the final stage above takes: the
+ * participants', in the DSM, or, with no DSM, the one first stage's.
+ */
+uint32
+vexec_repart_topk_bound(VexecNode *node)
+{
+	VexecRepartState *s = (VexecRepartState *) node;
+
+	if (s->shared != NULL)
+		return pg_atomic_read_u32(&s->shared->topk_bound);
+	if (vexec_is_vector_state(s->child))
+		return vexec_agg_topk_bound((VexecNode *) s->child);
+	return PG_UINT32_MAX;
+}
+
+const uint32 *
+vexec_repart_batch_hashes(VexecNode *node)
+{
+	return ((VexecRepartState *) node)->hashes;
 }
 
 /* ---------------------------------------------------------------------
@@ -413,10 +773,10 @@ make_stores(VexecRepartState *s)
 	{
 		char		name[MAXPGPATH];
 
-		snprintf(name, sizeof(name), "vexec-repart-%d-%d", s->node.css.ss.ps.plan->plan_node_id, p);
+		partition_name(s, p, name);
 		s->parts[p] = sts_initialize((SharedTuplestore *) (sh->stores + p * sh->sts_size),
-									 sh->nparticipants, 0, 0, SHARED_TUPLESTORE_SINGLE_PASS,
-									 &sh->fileset, name);
+									 sh->nparticipants, 0, sizeof(uint32),
+									 SHARED_TUPLESTORE_SINGLE_PASS, &sh->fileset, name);
 	}
 }
 
@@ -428,6 +788,10 @@ repart_initialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordin
 
 	sh->nparticipants = pcxt->nworkers + 1;
 	sh->npartitions = repart_partitions(sh->nparticipants);
+	sh->frames = s->frames;
+	pg_atomic_init_u32(&sh->topk_bound, PG_UINT32_MAX);
+	if (vexec_is_vector_state(s->child))
+		vexec_agg_set_topk_shared((VexecNode *) s->child, &sh->topk_bound);
 	sh->sts_size = MAXALIGN(sts_estimate(sh->nparticipants));
 	sh->seg = dsm_segment_handle(pcxt->seg);
 	SharedFileSetInit(&sh->fileset, pcxt->seg);
@@ -457,6 +821,7 @@ repart_reinitialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coord
 	SharedFileSetDeleteAll(&sh->fileset);
 	BarrierInit(&sh->barrier, 0);
 	pg_atomic_write_u32(&sh->next_partition, 0);
+	pg_atomic_write_u32(&sh->topk_bound, PG_UINT32_MAX);
 	make_stores(s);
 	s->written = false;
 }
@@ -472,6 +837,10 @@ repart_initialize_worker(CustomScanState *css, shm_toc *toc, void *coordinate)
 	(void) toc;
 	if (seg == NULL)
 		elog(ERROR, "vexec: a worker has no mapping of its parallel query's segment");
+	if (sh->frames != s->frames)
+		elog(ERROR, "vexec: a VecRepartition's participants differ on its partitions' format");
+	if (vexec_is_vector_state(s->child))
+		vexec_agg_set_topk_shared((VexecNode *) s->child, &sh->topk_bound);
 	SharedFileSetAttach(&sh->fileset, seg);
 	s->shared = sh;
 	s->npartitions = sh->npartitions;
@@ -543,6 +912,12 @@ repart_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		keys = lappend(keys, deparse_expression((Node *) v, context, es->verbose, false));
 	}
 	ExplainPropertyList("Partition Key", keys, es);
+	if (es->verbose)
+	{
+		ExplainPropertyText("Key Hashes", s->hashes_from_child ? "the child's" : "computed", es);
+		ExplainPropertyText("Input", s->child_batches ? "batches" : "rows", es);
+		ExplainPropertyText("Partition Format", s->frames ? "frames" : "tuples", es);
+	}
 	vexec_node_explain_properties(&s->node, ancestors, es);
 	if (es->analyze && s->npartitions > 0)
 		ExplainPropertyInteger("Partitions", NULL, s->npartitions, es);

@@ -298,6 +298,34 @@ SET vexec.batch_numeric_layout = varlena;
 SELECT join_check('SELECT jo.id, jo.n, ji.n FROM jo JOIN ji ON jo.n = ji.n AND jo.k = ji.k');
 RESET vexec.batch_numeric_layout;
 
+-- X6: an inner, semi or right join lends the vector scan on its outer side
+-- its inner keys once its table is built -- an integer key's range, and its
+-- values as a bitmap of the range, or past 2^23 values of range as a Bloom
+-- filter -- and the scan drops the rows no inner row can match; a left or
+-- anti join lends none.  Before the scan's quals where none may raise, else
+-- after them.  Where it keeps more than 70% of a batch's rows, it is off for
+-- the next 30 batches
+CREATE TABLE jx AS SELECT g AS id, (g % 1000)::int2 AS s, g::int8 * 7919 AS w, g % 3000 AS k
+  FROM generate_series(1, 30000) g;
+CREATE TABLE jy AS SELECT g AS id, (g * 37 % 1000)::int4 AS s, g::int8 * 7919 * 13 AS w
+  FROM generate_series(1, 400) g;
+ANALYZE jx, jy;
+SELECT join_check('SELECT jx.id, jy.id FROM jx JOIN jy ON jx.s = jy.s');
+SELECT join_explain('SELECT jx.id, jy.id FROM jx JOIN jy ON jx.s = jy.s', 'Keys Lent|Join Keys');
+SELECT join_check('SELECT jx.id, jy.id FROM jx JOIN jy ON jx.w = jy.w');
+SELECT join_explain('SELECT jx.id, jy.id FROM jx JOIN jy ON jx.w = jy.w', 'Keys Lent|Join Keys');
+SELECT join_check('SELECT jx.id FROM jx WHERE EXISTS (SELECT 1 FROM jy WHERE jy.s = jx.s)');
+SELECT join_check('SELECT jx.id, jy.id FROM jx RIGHT JOIN jy ON jx.s = jy.s');
+SELECT join_explain('SELECT jx.id, jy.id FROM jx LEFT JOIN jy ON jx.s = jy.s', 'Keys Lent|Join Keys');
+SELECT join_check('SELECT jx.id, jy.id FROM jx JOIN jy ON jx.s = jy.s WHERE 1000 / (jx.k + 1) > 0');
+SELECT join_check('SELECT count(*) FROM jx JOIN (SELECT DISTINCT s FROM jx) d ON jx.s = d.s');
+SELECT join_explain('SELECT count(*) FROM jx JOIN (SELECT DISTINCT s FROM jx) d ON jx.s = d.s',
+                    'Keys Lent|Join Keys');
+SET vexec.enable_join_filter = off;
+SELECT join_explain('SELECT jx.id, jy.id FROM jx JOIN jy ON jx.s = jy.s', 'Keys Lent|Join Keys');
+RESET vexec.enable_join_filter;
+DROP TABLE jx, jy;
+
 -- EXPLAIN ANALYZE: the inner rows, the join filter's
 SELECT join_explain('SELECT jo.id FROM jo JOIN ji ON jo.k = ji.k AND jo.id < ji.id', 'Vec Hash|Inner Rows|Join Filter|Input');
 

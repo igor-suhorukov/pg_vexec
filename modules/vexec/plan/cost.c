@@ -55,8 +55,8 @@
  * computes it, which is static there: the workers, and the leader's part
  * where it takes one.
  */
-static double
-parallel_divisor(Path *path)
+double
+vexec_parallel_divisor(Path *path)
 {
 	double		divisor = path->parallel_workers;
 
@@ -88,7 +88,7 @@ vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 {
 	double		tuples = rel->tuples;
 	double		rows = rowpath->rows;
-	double		divisor = rowpath->parallel_workers > 0 ? parallel_divisor(rowpath) : 1.0;
+	double		divisor = rowpath->parallel_workers > 0 ? vexec_parallel_divisor(rowpath) : 1.0;
 	Cost		qual_total = rel->baserestrictcost.per_tuple;
 	Cost		qual_kernel = Min(quals->kernel_cost, qual_total);
 	Cost		target_total = rowpath->pathtarget->cost.per_tuple;
@@ -275,6 +275,23 @@ vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, bool input_vector
 	cost->rowout = vexec_convert_cost * path_width_cols(rowpath) * rowpath->rows;
 	cost->startup = rowpath->startup_cost + vexec_batch_setup_cost + cost->convert_in;
 	cost->total = rowpath->total_cost + vexec_batch_setup_cost + cost->convert_in + cost->rowout;
+}
+
+/*
+ * C3 (§3.19): a bounded VecSort over a VecAgg that finalizes, which keeps
+ * the bound's best groups inside (vexec_agg_set_topn()): every group is
+ * still ranked, and the others are neither handed up nor projected, nor
+ * sorted.  So the sort's cost, PostgreSQL's over every group, gives back a
+ * tuple's cost and the projection's for each group past the bound.
+ */
+void
+vexec_cost_topn(VexecCost *cost, Path *input, int64 bound)
+{
+	double		skipped = Max(input->rows - (double) bound, 0);
+	Cost		save = skipped * (cpu_tuple_cost + input->pathtarget->cost.per_tuple);
+
+	cost->startup = Max(cost->startup - save, 0);
+	cost->total = Max(cost->total - save, cost->startup);
 }
 
 /*

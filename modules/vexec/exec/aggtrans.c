@@ -30,6 +30,18 @@
  *						value as they do; text by its collation (varstr_cmp)
  *	bool_and, bool_or	a bool
  *
+ * A stage that combines partial states (C1, §3.19) keeps the same states,
+ * and its kinds add what the first stage's handed on: counts and the sums
+ * of integers as int8pl adds them, its overflow error kept, which no table
+ * reaches; avg's {count, sum} arrays as int4_avg_combine adds them; the
+ * serialized Int128AggStates of sum and avg over int8 as
+ * int8_avg_combine adds them, read straight from their bytes; and min,
+ * max, bool_and and bool_or by their transitions, which are their combine
+ * functions.  A group a first partial state makes takes it as it is, the
+ * state starting empty.  Floats' sums, whose bits follow the order the
+ * states come in, and numerics' stay with their combine functions,
+ * through fmgr.
+ *
  * Where a state leaves the node it becomes PostgreSQL's -- the int8, the
  * array, or the internal state that the aggregate's own deserialization
  * function builds from the bytes its serialization function would have
@@ -472,12 +484,94 @@ set_kind(VexecAggTrans *t, VexecAggKind kind, const char *name, Size size)
  * hands it on unserialized stays PostgreSQL's, since nothing but the
  * function's own memory can hold it.
  */
+static void choose_minmax(VexecAggTrans *t, Oid fn, Oid argtype);
+
+/*
+ * A combining stage's kind (C1): by the aggregate's transition function,
+ * whose states the combine function adds, so that the kind knows what they
+ * hold and how they start; the input, its partial state's type.
+ */
+static void
+choose_combine_kind(VexecAggTrans *t, Oid transfn, Oid combinefn, Oid transtype,
+					Oid collation, AggSplit split, Oid argtype)
+{
+	switch (transfn)
+	{
+		case F_INT8INC:
+		case F_INT8INC_ANY:
+			if (combinefn == F_INT8PL && transtype == INT8OID && argtype == INT8OID)
+				set_kind(t, VEXEC_AGG_COMBINE_COUNT, "combine count", sizeof(CountState));
+			break;
+		case F_INT2_SUM:
+		case F_INT4_SUM:
+			if (combinefn == F_INT8PL && transtype == INT8OID && argtype == INT8OID)
+				set_kind(t, VEXEC_AGG_COMBINE_SUM_INT, "combine sum", sizeof(SumIntState));
+			break;
+		case F_INT2_AVG_ACCUM:
+		case F_INT4_AVG_ACCUM:
+			if (combinefn == F_INT4_AVG_COMBINE && transtype == INT8ARRAYOID &&
+				argtype == INT8ARRAYOID)
+				set_kind(t, VEXEC_AGG_COMBINE_AVG_INT, "combine avg", sizeof(AvgIntState));
+			break;
+		case F_INT8_AVG_ACCUM:
+			if (combinefn == F_INT8_AVG_COMBINE && transtype == INTERNALOID &&
+				DO_AGGSPLIT_DESERIALIZE(split) && argtype == BYTEAOID &&
+				(!DO_AGGSPLIT_SKIPFINAL(split) || DO_AGGSPLIT_SERIALIZE(split)))
+				set_kind(t, VEXEC_AGG_COMBINE_INT128, "combine int128 sum",
+						 sizeof(Int128State));
+			break;
+		case F_BOOLAND_STATEFUNC:
+		case F_BOOLOR_STATEFUNC:
+			if (combinefn == transfn && argtype == BOOLOID)
+			{
+				set_kind(t, VEXEC_AGG_BOOL, transfn == F_BOOLAND_STATEFUNC ?
+						 "combine bool_and" : "combine bool_or", sizeof(BoolState));
+				t->is_and = transfn == F_BOOLAND_STATEFUNC;
+			}
+			break;
+		case F_TEXT_LARGER:
+		case F_TEXT_SMALLER:
+			if (combinefn == transfn && (argtype == TEXTOID || argtype == VARCHAROID))
+			{
+				set_kind(t, VEXEC_AGG_MINMAX_TEXT, transfn == F_TEXT_LARGER ?
+						 "combine max" : "combine min", sizeof(MinMaxState));
+				t->larger = transfn == F_TEXT_LARGER;
+				t->collation = collation;
+				t->c_collation = OidIsValid(collation) &&
+					pg_newlocale_from_collation(collation)->collate_is_c;
+			}
+			break;
+		default:
+			if (combinefn == transfn)
+			{
+				choose_minmax(t, transfn, argtype);
+				if (t->kind == VEXEC_AGG_MINMAX)
+					t->kindname = t->larger ? "combine max" : "combine min";
+			}
+			break;
+	}
+}
+
+/* The aggregate's transition function, whatever stage runs it. */
+static Oid
+aggregate_transfn(Oid aggfnoid)
+{
+	HeapTuple	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
+	Oid			fn;
+
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for aggregate %u", aggfnoid);
+	fn = ((Form_pg_aggregate) GETSTRUCT(tup))->aggtransfn;
+	ReleaseSysCache(tup);
+	return fn;
+}
+
 static void
 choose_kind(VexecAggTrans *t, Oid fn, Oid transtype, Oid collation, AggSplit split,
 			Oid argtype)
 {
 	if (DO_AGGSPLIT_COMBINE(split))
-		return;
+		return;					/* choose_combine_kind()'s */
 	if (transtype == INTERNALOID &&
 		DO_AGGSPLIT_SKIPFINAL(split) && !DO_AGGSPLIT_SERIALIZE(split))
 		return;
@@ -552,44 +646,48 @@ choose_kind(VexecAggTrans *t, Oid fn, Oid transtype, Oid collation, AggSplit spl
 				pg_newlocale_from_collation(collation)->collate_is_c;
 			break;
 		default:
-			{
-				/* larger and smaller over by-value types */
-				static const struct
-				{
-					Oid			larger;
-					Oid			smaller;
-					Oid			type;
-					VexecAggCmp cmp;
-					int16		width;
-				}			mm[] =
-				{
-					{F_INT2LARGER, F_INT2SMALLER, INT2OID, VEXEC_CMP_INT, 2},
-					{F_INT4LARGER, F_INT4SMALLER, INT4OID, VEXEC_CMP_INT, 4},
-					{F_INT8LARGER, F_INT8SMALLER, INT8OID, VEXEC_CMP_INT, 8},
-					{F_OIDLARGER, F_OIDSMALLER, OIDOID, VEXEC_CMP_UINT, 4},
-					{F_FLOAT4LARGER, F_FLOAT4SMALLER, FLOAT4OID, VEXEC_CMP_FLOAT4, 4},
-					{F_FLOAT8LARGER, F_FLOAT8SMALLER, FLOAT8OID, VEXEC_CMP_FLOAT8, 8},
-					{F_DATE_LARGER, F_DATE_SMALLER, DATEOID, VEXEC_CMP_INT, 4},
-					{F_TIME_LARGER, F_TIME_SMALLER, TIMEOID, VEXEC_CMP_INT, 8},
-					{F_TIMESTAMP_LARGER, F_TIMESTAMP_SMALLER, TIMESTAMPOID, VEXEC_CMP_INT, 8},
-					{F_TIMESTAMPTZ_LARGER, F_TIMESTAMPTZ_SMALLER, TIMESTAMPTZOID, VEXEC_CMP_INT, 8},
-					{F_CASHLARGER, F_CASHSMALLER, MONEYOID, VEXEC_CMP_INT, 8},
-				};
-
-				for (int i = 0; i < lengthof(mm); i++)
-				{
-					if ((fn == mm[i].larger || fn == mm[i].smaller) && argtype == mm[i].type)
-					{
-						set_kind(t, VEXEC_AGG_MINMAX, fn == mm[i].larger ? "max" : "min",
-								 sizeof(MinMaxState));
-						t->larger = fn == mm[i].larger;
-						t->cmp = mm[i].cmp;
-						t->width = mm[i].width;
-						break;
-					}
-				}
-			}
+			choose_minmax(t, fn, argtype);
 			break;
+	}
+}
+
+/* larger and smaller over by-value types, whose states are their values */
+static void
+choose_minmax(VexecAggTrans *t, Oid fn, Oid argtype)
+{
+	static const struct
+	{
+		Oid			larger;
+		Oid			smaller;
+		Oid			type;
+		VexecAggCmp cmp;
+		int16		width;
+	}			mm[] =
+	{
+		{F_INT2LARGER, F_INT2SMALLER, INT2OID, VEXEC_CMP_INT, 2},
+		{F_INT4LARGER, F_INT4SMALLER, INT4OID, VEXEC_CMP_INT, 4},
+		{F_INT8LARGER, F_INT8SMALLER, INT8OID, VEXEC_CMP_INT, 8},
+		{F_OIDLARGER, F_OIDSMALLER, OIDOID, VEXEC_CMP_UINT, 4},
+		{F_FLOAT4LARGER, F_FLOAT4SMALLER, FLOAT4OID, VEXEC_CMP_FLOAT4, 4},
+		{F_FLOAT8LARGER, F_FLOAT8SMALLER, FLOAT8OID, VEXEC_CMP_FLOAT8, 8},
+		{F_DATE_LARGER, F_DATE_SMALLER, DATEOID, VEXEC_CMP_INT, 4},
+		{F_TIME_LARGER, F_TIME_SMALLER, TIMEOID, VEXEC_CMP_INT, 8},
+		{F_TIMESTAMP_LARGER, F_TIMESTAMP_SMALLER, TIMESTAMPOID, VEXEC_CMP_INT, 8},
+		{F_TIMESTAMPTZ_LARGER, F_TIMESTAMPTZ_SMALLER, TIMESTAMPTZOID, VEXEC_CMP_INT, 8},
+		{F_CASHLARGER, F_CASHSMALLER, MONEYOID, VEXEC_CMP_INT, 8},
+	};
+
+	for (int i = 0; i < lengthof(mm); i++)
+	{
+		if ((fn == mm[i].larger || fn == mm[i].smaller) && argtype == mm[i].type)
+		{
+			set_kind(t, VEXEC_AGG_MINMAX, fn == mm[i].larger ? "max" : "min",
+					 sizeof(MinMaxState));
+			t->larger = fn == mm[i].larger;
+			t->cmp = mm[i].cmp;
+			t->width = mm[i].width;
+			break;
+		}
 	}
 }
 
@@ -597,8 +695,13 @@ void
 vexec_aggtrans_choose(VexecAggTrans *t, AggSplit split, Oid argtype, int32 argtypmod)
 {
 	(void) argtypmod;
-	choose_kind(t, t->pertrans->transfn_oid, t->pertrans->aggtranstype,
-				t->pertrans->aggCollation, split, argtype);
+	if (DO_AGGSPLIT_COMBINE(split))
+		choose_combine_kind(t, aggregate_transfn(t->aggref->aggfnoid),
+							t->pertrans->transfn_oid, t->pertrans->aggtranstype,
+							t->pertrans->aggCollation, split, argtype);
+	else
+		choose_kind(t, t->pertrans->transfn_oid, t->pertrans->aggtranstype,
+					t->pertrans->aggCollation, split, argtype);
 }
 
 bool
@@ -615,7 +718,17 @@ vexec_agg_vectorized(Oid aggfnoid, AggSplit split, Oid argtype, const char **nam
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for aggregate %u", aggfnoid);
 	aggform = (Form_pg_aggregate) GETSTRUCT(tup);
-	choose_kind(&t, aggform->aggtransfn, aggform->aggtranstype, InvalidOid, split, argtype);
+	if (DO_AGGSPLIT_COMBINE(split))
+	{
+		/* its input is the state, serialized where it is internal */
+		Oid			statetype = aggform->aggtranstype == INTERNALOID ? BYTEAOID :
+			aggform->aggtranstype;
+
+		choose_combine_kind(&t, aggform->aggtransfn, aggform->aggcombinefn,
+							aggform->aggtranstype, InvalidOid, split, statetype);
+	}
+	else
+		choose_kind(&t, aggform->aggtransfn, aggform->aggtranstype, InvalidOid, split, argtype);
 	ReleaseSysCache(tup);
 	if (name)
 		*name = t.kindname;
@@ -764,6 +877,8 @@ wrap_add64(int64 a, int64 b)
 {
 	return (int64) ((uint64) a + (uint64) b);
 }
+
+static void count_add(CountState *s, int64 k);
 
 static void
 count_one(CountState *s)
@@ -1052,6 +1167,85 @@ numeric_accum_datum(AggState *aggstate, NumericState *s, Datum d)
 		numeric_overflow_add(aggstate, s, d);
 }
 
+/* int8pl's addition of two partial states: its overflow error kept */
+static inline int64
+add_states(int64 a, int64 b)
+{
+	int64		r;
+
+	if (unlikely(pg_add_s64_overflow(a, b, &r)))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("bigint out of range")));
+	return r;
+}
+
+/*
+ * avg's partial state, an int8[2] {count, sum}, from its bytes after the
+ * varlena header -- the same in a short header and a long one -- as
+ * int4_avg_combine() checks and reads it (PG19:src/backend/utils/adt/
+ * numeric.c:6511-6540).
+ */
+static void
+avg_state_values(const char *p, Size len, int64 *count, int64 *sum)
+{
+	const Size	data = ARR_OVERHEAD_NONULLS(1) - VARHDRSZ;
+	int32		dataoffset;
+
+	memcpy(&dataoffset, p + sizeof(int32), sizeof(int32));
+	if (len != data + 2 * sizeof(int64) || dataoffset != 0)
+		elog(ERROR, "expected 2-element int8 array");
+	memcpy(count, p + data, sizeof(int64));
+	memcpy(sum, p + data + sizeof(int64), sizeof(int64));
+}
+
+/*
+ * int8_avg_serialize()'s bytes -- N, then sumX's high and low halves, in
+ * network order -- as int8_avg_deserialize() reads them (numeric.c:5797-5857).
+ */
+static void
+int128_state_values(const char *p, Size len, int64 *n, int128 *sum)
+{
+	uint64		w[3];
+
+	if (len != sizeof(w))
+		elog(ERROR, "vexec: a serialized bigint sum of %zu bytes", len);
+	memcpy(w, p, sizeof(w));
+	*n = (int64) pg_ntoh64(w[0]);
+	*sum = (int128) ((uint128) pg_ntoh64(w[1]) << 64 | (uint128) pg_ntoh64(w[2]));
+}
+
+/* A partial state's bytes into a combining kind's state (C1). */
+static void
+combine_bytes(VexecAggTrans *t, void *state, const char *p, Size len)
+{
+	if (t->kind == VEXEC_AGG_COMBINE_AVG_INT)
+	{
+		AvgIntState *s = state;
+		int64		count;
+		int64		sum;
+
+		avg_state_values(p, len, &count, &sum);
+		/* int4_avg_combine() adds them unchecked */
+		s->count = wrap_add64(s->count, count);
+		s->sum = wrap_add64(s->sum, sum);
+	}
+	else
+	{
+		Int128State *s = state;
+		int64		n;
+		int128		sum;
+
+		int128_state_values(p, len, &n, &sum);
+		s->called = true;
+		if (n > 0)
+		{
+			s->n += n;
+			s->sum += sum;
+		}
+	}
+}
+
 void
 vexec_aggtrans_advance(VexecAggTrans *t, AggState *aggstate, void *state,
 					   const Datum *args, const bool *nulls)
@@ -1161,6 +1355,31 @@ vexec_aggtrans_advance(VexecAggTrans *t, AggState *aggstate, void *state,
 
 				s->sum = wrap_add64(s->sum, DatumGetInt16(args[0]));
 				s->count++;
+			}
+			break;
+		case VEXEC_AGG_COMBINE_COUNT:
+			if (!nulls[0])
+				count_add((CountState *) state, DatumGetInt64(args[0]));
+			break;
+		case VEXEC_AGG_COMBINE_SUM_INT:
+			if (!nulls[0])
+			{
+				SumIntState *s = state;
+
+				s->sum = s->any ? add_states(s->sum, DatumGetInt64(args[0])) :
+					DatumGetInt64(args[0]);
+				s->any = true;
+			}
+			break;
+		case VEXEC_AGG_COMBINE_AVG_INT:
+		case VEXEC_AGG_COMBINE_INT128:
+			if (!nulls[0])
+			{
+				varlena    *vl = (varlena *) DatumGetPointer(args[0]);
+
+				if (VARATT_IS_EXTENDED(vl) && !VARATT_IS_SHORT(vl))
+					vl = pg_detoast_datum_packed(vl);
+				combine_bytes(t, state, VARDATA_ANY(vl), VARSIZE_ANY_EXHDR(vl));
 			}
 			break;
 	}
@@ -1281,6 +1500,60 @@ int_at(const VexecVec *v, int width, int i)
 	return ((const int64 *) v->values)[i];
 }
 
+/*
+ * X7 (§3.18): the sum, wrapping, of an integer column's rows of `rows`, and
+ * their count: a whole word of selected rows by a loop of its width, which
+ * the compiler vectorizes, as Velox runs a dense loop where every row is
+ * selected (velox/vector/SelectivityVector.h); the others as the bits give
+ * them.
+ */
+static inline uint64
+sum_rows(const VexecVec *v, int width, const uint64 *rows, int nrows, int64 *count)
+{
+	uint64		sum = 0;
+	int64		c = 0;
+
+	for (int w = 0; w < VEXEC_WORDS(nrows); w++)
+	{
+		uint64		word = rows[w];
+		int			base = w * 64;
+
+		if (word == ~UINT64CONST(0) && base + 64 <= nrows)
+		{
+			if (width == 2)
+			{
+				const int16 *p = (const int16 *) v->values + base;
+
+				for (int j = 0; j < 64; j++)
+					sum += (uint64) (int64) p[j];
+			}
+			else if (width == 4)
+			{
+				const int32 *p = (const int32 *) v->values + base;
+
+				for (int j = 0; j < 64; j++)
+					sum += (uint64) (int64) p[j];
+			}
+			else
+			{
+				const int64 *p = (const int64 *) v->values + base;
+
+				for (int j = 0; j < 64; j++)
+					sum += (uint64) p[j];
+			}
+			c += 64;
+			continue;
+		}
+		for (; word != 0; word &= word - 1)
+		{
+			sum += (uint64) int_at(v, width, base + pg_rightmost_one_pos64(word));
+			c++;
+		}
+	}
+	*count = c;
+	return sum;
+}
+
 static void
 batch_sum_int(VexecAggTrans *t, char **groups, Size off, char *plain,
 			  const uint64 *rows, int nrows, const VexecVec *v)
@@ -1290,15 +1563,11 @@ batch_sum_int(VexecAggTrans *t, char **groups, Size off, char *plain,
 	if (groups == NULL)
 	{
 		SumIntState *s = (SumIntState *) plain;
-		uint64		sum = (uint64) s->sum;
-		bool		any = s->any;
+		int64		count;
+		uint64		sum = (uint64) s->sum + sum_rows(v, width, rows, nrows, &count);
+		bool		any = s->any || count > 0;
 
-		VEXEC_FOREACH_ROW(rows, nrows, i)
-		{
-			sum += (uint64) int_at(v, width, i);
-			any = true;
-		}
-		s->sum = s->any || any ? (int64) sum : 0;
+		s->sum = any ? (int64) sum : 0;
 		s->any = any;
 		return;
 	}
@@ -1320,14 +1589,9 @@ batch_avg_int(VexecAggTrans *t, char **groups, Size off, char *plain,
 	if (groups == NULL)
 	{
 		AvgIntState *s = (AvgIntState *) plain;
-		uint64		sum = (uint64) s->sum;
-		int64		count = 0;
+		int64		count;
+		uint64		sum = (uint64) s->sum + sum_rows(v, width, rows, nrows, &count);
 
-		VEXEC_FOREACH_ROW(rows, nrows, i)
-		{
-			sum += (uint64) int_at(v, width, i);
-			count++;
-		}
 		s->sum = (int64) sum;
 		s->count += count;
 		return;
@@ -1602,6 +1866,53 @@ batch_bool(VexecAggTrans *t, char **groups, Size off, char *plain,
 	}
 }
 
+/* Counts' and integer sums' partial states added (C1). */
+static void
+batch_combine_int(VexecAggTrans *t, char **groups, Size off, char *plain,
+				  const uint64 *rows, int nrows, const VexecVec *v)
+{
+	const int64 *vals = (const int64 *) v->values;
+
+	if (t->kind == VEXEC_AGG_COMBINE_COUNT)
+	{
+		VEXEC_FOREACH_ROW(rows, nrows, i)
+			count_add(STATE(CountState), vals[i]);
+		return;
+	}
+	VEXEC_FOREACH_ROW(rows, nrows, i)
+	{
+		SumIntState *s = STATE(SumIntState);
+
+		s->sum = s->any ? add_states(s->sum, vals[i]) : vals[i];
+		s->any = true;
+	}
+}
+
+/* avg's arrays and serialized int128 sums, read where they lie (C1). */
+static void
+batch_combine_bytes(VexecAggTrans *t, char **groups, Size off, char *plain,
+					const uint64 *rows, int nrows, const VexecVec *v)
+{
+	VEXEC_FOREACH_ROW(rows, nrows, i)
+	{
+		const char *p;
+		Size		len;
+
+		if (v->shape.layout == VEXEC_DATUM)
+		{
+			varlena    *vl = (varlena *) DatumGetPointer(((const Datum *) v->values)[i]);
+
+			if (VARATT_IS_EXTENDED(vl) && !VARATT_IS_SHORT(vl))
+				vl = pg_detoast_datum_packed(vl);
+			p = VARDATA_ANY(vl);
+			len = VARSIZE_ANY_EXHDR(vl);
+		}
+		else
+			vexec_vec_value_bytes(v, i, &p, &len);
+		combine_bytes(t, STATE(void), p, len);
+	}
+}
+
 void
 vexec_aggtrans_batch(VexecAggTrans *t, AggState *aggstate, VexecBatch *work,
 					 char **groups, Size off, char *plain,
@@ -1633,6 +1944,16 @@ vexec_aggtrans_batch(VexecAggTrans *t, AggState *aggstate, VexecBatch *work,
 		take = vexec_bits_copy(work, called, nrows);
 	drop_nulls(take, nrows, arg);
 
+	if (t->kind == VEXEC_AGG_COMBINE_AVG_INT || t->kind == VEXEC_AGG_COMBINE_INT128)
+	{
+		if (arg->encoding == VEXEC_FLAT &&
+			(arg->shape.layout == VEXEC_DATUM || arg->shape.layout == VEXEC_VIEW ||
+			 arg->shape.layout == VEXEC_OFFSETS))
+			batch_combine_bytes(t, groups, off, plain, take, nrows, arg);
+		else
+			batch_by_datum(t, aggstate, work, groups, off, plain, take, nrows, arg);
+		return;
+	}
 	if (t->kind == VEXEC_AGG_MINMAX_TEXT)
 	{
 		/* a constant or a dictionary: its values a row at a time */
@@ -1682,6 +2003,10 @@ vexec_aggtrans_batch(VexecAggTrans *t, AggState *aggstate, VexecBatch *work,
 		case VEXEC_AGG_SUM_OFFSET:
 			if (t->share < 0)
 				batch_offset(groups, off, plain, take, nrows, v);
+			break;
+		case VEXEC_AGG_COMBINE_COUNT:
+		case VEXEC_AGG_COMBINE_SUM_INT:
+			batch_combine_int(t, groups, off, plain, take, nrows, v);
 			break;
 		default:
 			batch_by_datum(t, aggstate, work, groups, off, plain, take, nrows, arg);
@@ -1921,10 +2246,12 @@ pg_state(VexecAggTrans *t, AggState *aggstate, void *state, bool internal,
 			break;
 		case VEXEC_AGG_COUNT_STAR:
 		case VEXEC_AGG_COUNT:
+		case VEXEC_AGG_COMBINE_COUNT:
 			*value = Int64GetDatum(((CountState *) state)->n);
 			*isnull = false;
 			break;
 		case VEXEC_AGG_SUM_INT:
+		case VEXEC_AGG_COMBINE_SUM_INT:
 			if (((SumIntState *) state)->any)
 			{
 				*value = Int64GetDatum(((SumIntState *) state)->sum);
@@ -1932,6 +2259,7 @@ pg_state(VexecAggTrans *t, AggState *aggstate, void *state, bool internal,
 			}
 			break;
 		case VEXEC_AGG_AVG_INT:
+		case VEXEC_AGG_COMBINE_AVG_INT:
 			{
 				Datum		d[2];
 
@@ -1942,6 +2270,7 @@ pg_state(VexecAggTrans *t, AggState *aggstate, void *state, bool internal,
 			}
 			break;
 		case VEXEC_AGG_SUM_INT128:
+		case VEXEC_AGG_COMBINE_INT128:
 			if (((Int128State *) state)->called)
 			{
 				*bytes = int128_serialized((Int128State *) state);
@@ -2048,7 +2377,9 @@ vexec_aggtrans_result(VexecAggTrans *t, AggState *aggstate, int aggno, void *sta
 					bytea	   *theirs;
 
 					fcinfo->args[0].value =
-						internal_state(aggstate, t->kind == VEXEC_AGG_SUM_INT128 ?
+						internal_state(aggstate,
+									   t->kind == VEXEC_AGG_SUM_INT128 ||
+									   t->kind == VEXEC_AGG_COMBINE_INT128 ?
 									   F_INT8_AVG_DESERIALIZE : F_NUMERIC_AVG_DESERIALIZE,
 									   bytes);
 					fcinfo->args[0].isnull = false;

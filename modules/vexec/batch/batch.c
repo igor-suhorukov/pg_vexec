@@ -52,6 +52,7 @@ vexec_batch_reset(VexecBatch *batch)
 	int			i;
 
 	MemoryContextReset(batch->mcxt);
+	batch->generation++;
 	batch->nrows = 0;
 	batch->selection = NULL;
 	batch->filling = false;

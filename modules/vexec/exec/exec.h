@@ -34,6 +34,7 @@
 #define VEXEC_EXEC_H
 
 #include "access/tableam.h"
+#include "port/atomics.h"
 #include "nodes/execnodes.h"
 #include "nodes/extensible.h"
 #include "utils/sortsupport.h"
@@ -96,6 +97,8 @@ typedef struct VexecAggPlan
 	List	   *outsrc;
 	List	   *aggrefs;		/* each aggno once, in aggno order */
 	int			ntrans;			/* transition states: aggtransno's range */
+	int64		topk;			/* C5: the groups a LIMIT without ORDER BY
+								 * takes, kept by their hashes; 0: all */
 } VexecAggPlan;
 
 /*
@@ -180,6 +183,60 @@ typedef struct VexecSortBound
 	int64		removed;		/* rows the scan dropped, EXPLAIN ANALYZE's */
 	MemoryContext tmpcxt;		/* the comparisons' detoasted values */
 } VexecSortBound;
+
+/*
+ * X6 (§3.18): a VecHashJoin's inner keys, lent to the vector scan on its
+ * outer side once the table is built: the range of one integer key's
+ * values, and the values themselves -- as a bitmap of the range where it
+ * is small enough, else as a Bloom filter.  The scan drops a row whose key
+ * no inner row has, which the join would meet with none: only on the outer
+ * side of an inner, semi or right join.  Before the scan's quals where
+ * none may raise, else after them, as H6's bound.  Off for
+ * VEXEC_JOIN_FILTER_OFF batches where it kept more than 70% of a batch's
+ * rows, as ClickHouse turns its join's runtime filter off.
+ */
+#define VEXEC_JOIN_FILTER_OFF	30
+
+typedef struct VexecJoinFilter
+{
+	AttrNumber	attno;			/* the scan's relation's column */
+	bool		before_quals;	/* checked before the scan's quals */
+	bool		active;			/* the table is built */
+	int64		min;			/* the inner keys' range */
+	int64		max;
+	uint64	   *bits;			/* a bit a value of the range, or NULL */
+	uint64	   *bloom;			/* else a Bloom filter's bits */
+	uint32		bloom_mask;		/* its bits less one */
+	int			off;			/* batches left with the filter off */
+	int64		removed;		/* rows dropped, EXPLAIN ANALYZE's */
+	int64		off_batches;	/* batches the filter was off for */
+} VexecJoinFilter;
+
+/*
+ * Whether an inner row may have key v: within the range, and its bit set,
+ * or both of its Bloom bits, two of its hash's.
+ */
+static inline bool
+vexec_join_filter_has(const VexecJoinFilter *f, int64 v)
+{
+	if (v < f->min || v > f->max)
+		return false;
+	if (f->bits != NULL)
+	{
+		uint64		i = (uint64) (v - f->min);
+
+		return (f->bits[i / 64] >> (i % 64)) & 1;
+	}
+	if (f->bloom != NULL)
+	{
+		uint64		h = (uint64) v * UINT64CONST(0x9E3779B97F4A7C15);
+		uint32		a = (uint32) (h >> 32) & f->bloom_mask;
+		uint32		b = (uint32) h & f->bloom_mask;
+
+		return ((f->bloom[a / 64] >> (a % 64)) & 1) && ((f->bloom[b / 64] >> (b % 64)) & 1);
+	}
+	return true;
+}
 
 /*
  * VecRepartition's plan (vecrepart.c): the keys its child's rows are dealt
@@ -267,6 +324,14 @@ struct VexecNode
 	/* the input: its batch, and where a row of it is loaded */
 	bool		(*fetch) (VexecNode *node);	/* the next input batch into in;
 											 * false at the end */
+
+	/*
+	 * X9: a node whose output is not its input's rows -- VecAgg's groups --
+	 * makes its batches for a vector parent itself: the next one, every row
+	 * of it selected and none to redo, or NULL at the end; NULL where the
+	 * node hands up rows alone, or batches of its input's rows
+	 */
+	VexecBatch *(*next_out) (VexecNode *node);
 	bool		row_input;		/* reads its child's rows, a VecResult over a
 								 * child that hands up no batches: it has
 								 * none to hand up either */
@@ -289,6 +354,7 @@ struct VexecNode
 								 * an aggregate's argument under a FILTER */
 	int			nkernels;		/* compiled */
 	int			nfallbacks;
+	int			nshared;		/* X10: subtrees the targets share */
 	List	   *declared;		/* compiled calls bound to kernel packs'
 								 * declarations, VexecExpr *, for EXPLAIN */
 	ExprContext *eager_econtext;	/* the fallback's and parameters' */
@@ -337,6 +403,14 @@ struct VexecNode
 	VexecSortBound *bound;
 	int			bound_col;
 	bool		bound_in_source;
+
+	/*
+	 * X6: a VecHashJoin's inner keys over this scan's rows: the input column
+	 * jfilter_col holds the key; NULL: none
+	 */
+	VexecJoinFilter *jfilter;
+	int			jfilter_col;
+	bool		jfilter_in_source;	/* heap's page reader checks it */
 
 	/*
 	 * The node read its input in this process.  On a cluster the node a
@@ -425,6 +499,35 @@ extern Node *vexec_create_agg_state(CustomScan *cscan);
 extern List *vexec_agg_plan_encode(const VexecAggPlan *plan);
 extern void vexec_agg_plan_decode(CustomScan *cscan, VexecAggPlan *plan);
 
+/*
+ * vecagg.c: VecAgg's hash of a row's keys (C4, §3.19), which VecRepartition
+ * deals rows out by and hands up, and a partial VecAgg's groups' hashes,
+ * which VecRepartition takes from it.
+ */
+typedef struct VexecKeyHash VexecKeyHash;
+extern VexecKeyHash *vexec_key_hash_create(TupleDesc desc, List *keycols, List *eqops,
+										   List *collations);
+extern uint32 vexec_key_hash_slot(VexecKeyHash *kh, TupleTableSlot *slot);
+extern bool vexec_agg_hashes_keys(VexecNode *node, List *keycols, List *eqops,
+								  List *collations);
+extern uint32 vexec_agg_last_hash(VexecNode *node);
+extern const uint32 *vexec_agg_batch_hashes(VexecNode *node);
+extern void vexec_agg_set_topk_shared(VexecNode *node, pg_atomic_uint32 *shared);
+extern uint32 vexec_agg_topk_bound(VexecNode *node);
+extern uint32 vexec_repart_topk_bound(VexecNode *node);
+extern void vexec_agg_deal(VexecNode *node, int npartitions,
+						   int (*deal) (void *arg, uint32 hash), void *arg);
+extern int	vexec_agg_dealt_partition(VexecNode *node);
+extern void vexec_agg_allow_freeze(VexecNode *node);
+
+/* aggsizes.c: the groups VecAgg's tables reached, in shared memory (C6) */
+extern void vexec_aggsize_install(void);
+extern uint64 vexec_aggsize_key(EState *estate, int plan_node_id);
+extern int64 vexec_aggsize_get(uint64 key);
+extern void vexec_aggsize_put(uint64 key, int64 groups);
+extern bool vexec_agg_set_topn(VexecNode *node, int64 bound, List *keycols, List *sortops,
+							   List *collations, List *nullsfirst);
+
 /* vecsort.c */
 extern Node *vexec_create_sort_state(CustomScan *cscan);
 extern List *vexec_sort_plan_encode(const VexecSortPlan *plan);
@@ -433,11 +536,15 @@ extern void vexec_sort_set_bound(CustomScan *cscan, int64 bound);
 extern bool vexec_sort_make_late(CustomScan *cscan);
 extern bool vexec_sort_plan_running_bound(CustomScan *cscan);
 extern bool vexec_scan_set_bound(PlanState *ps, VexecSortBound *bound);
+extern bool vexec_scan_set_join_filter(PlanState *ps, VexecJoinFilter *filter);
 
 /* vecrepart.c */
 extern Node *vexec_create_repart_state(CustomScan *cscan);
 extern List *vexec_repart_plan_encode(const VexecRepartPlan *plan);
 extern void vexec_repart_plan_decode(CustomScan *cscan, VexecRepartPlan *plan);
+extern bool vexec_repart_hashes_keys(VexecNode *node, List *keycols, List *eqops,
+									 List *collations);
+extern const uint32 *vexec_repart_batch_hashes(VexecNode *node);
 
 /* vecwindow.c */
 extern Node *vexec_create_window_state(CustomScan *cscan);

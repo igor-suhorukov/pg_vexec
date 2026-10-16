@@ -37,8 +37,12 @@
 
 /*
  * The vectorized transitions, by the transition function they compute
- * (pg_aggregate.dat).  Only the first stage, which reads rows, has them;
- * a stage that combines states calls the combine function through fmgr.
+ * (pg_aggregate.dat).  A stage that combines states has its own kinds, by
+ * the combine function (C1, §3.19): counts' and integer sums' int8pl,
+ * int4_avg_combine, int8_avg_combine over serialized states, and the
+ * transitions of min, max, bool_and and bool_or, which combine as they
+ * advance.  The others' combine functions -- floats', whose sums follow
+ * the order, numerics' -- run through fmgr.
  */
 typedef enum VexecAggKind
 {
@@ -59,8 +63,15 @@ typedef enum VexecAggKind
 	VEXEC_AGG_MINMAX_TEXT,		/* text_larger, text_smaller, by the
 								 * collation */
 	VEXEC_AGG_BOOL,				/* booland_statefunc, boolor_statefunc */
-	VEXEC_AGG_SUM_OFFSET		/* int4_sum of x + k, an int2 x: SUM(x) and
+	VEXEC_AGG_SUM_OFFSET,		/* int4_sum of x + k, an int2 x: SUM(x) and
 								 * COUNT(x), and k * COUNT(x) added (H8) */
+	/* combining stages' (C1) */
+	VEXEC_AGG_COMBINE_COUNT,	/* int8pl over counts: an int64 */
+	VEXEC_AGG_COMBINE_SUM_INT,	/* int8pl over sum(int2/int4)'s: an int8,
+								 * NULL until a state */
+	VEXEC_AGG_COMBINE_AVG_INT,	/* int4_avg_combine over int8[2] states */
+	VEXEC_AGG_COMBINE_INT128	/* int8_avg_combine over Int128AggStates,
+								 * serialized */
 } VexecAggKind;
 
 /* MINMAX: how the values compare. */

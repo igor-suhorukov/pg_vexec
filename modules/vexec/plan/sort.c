@@ -265,6 +265,8 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 	rowpath = create_sort_path(root, output_rel, input, root->sort_pathkeys,
 							   bound > 0 ? (double) bound : -1.0);
 	vexec_cost_sort(root, &rowpath->path, input, vexec_is_vector_path(input), &cost);
+	if (bound > 0 && vexec_agg_path_ranks(input))
+		vexec_cost_topn(&cost, input, bound);	/* C3 */
 	vexec_alt_costed(ps, alt, &cost,
 					 psprintf("%s%s", count_of(list_length(root->sort_pathkeys), "sort key", "sort keys"),
 							  bound > 0 ? psprintf(", bounded at " INT64_FORMAT, bound) : ""));
@@ -287,6 +289,8 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 			double		total;
 
 			vexec_cost_sort(root, &prow->path, pinput, vexec_is_vector_path(pinput), &pcost);
+			if (bound > 0 && vexec_agg_path_ranks(pinput))
+				vexec_cost_topn(&pcost, pinput, bound);	/* C3 */
 			psort = vecsort_path(output_rel, target, prow, &pcost, bound);
 			total = compute_gather_rows(psort);
 			newpaths = lappend(newpaths,
@@ -539,6 +543,17 @@ may_raise_walker(Node *node, void *context)
 			return true;
 	}
 	return expression_tree_walker(node, may_raise_walker, context);
+}
+
+/*
+ * Whether an expression may raise an error for some row's values (above):
+ * for a filter lent to a scan, H6's and X6's, which drops rows before or
+ * without the expressions PostgreSQL would compute for them.
+ */
+bool
+vexec_expr_may_raise(Node *node)
+{
+	return may_raise_walker(node, NULL);
 }
 
 /*

@@ -34,6 +34,10 @@
 
 #include <math.h>
 
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
+
 #include "catalog/pg_type.h"
 #include "datatype/timestamp.h"
 #include "utils/date.h"
@@ -90,11 +94,76 @@ typedef struct CmpInfo
 	 (op) == OP_LT ? float8_lt(a, b) : (op) == OP_LE ? float8_le(a, b) : \
 	 (op) == OP_GT ? float8_gt(a, b) : float8_ge(a, b))
 
+/* each operator as a macro of its own, for loops whose operator is fixed */
+#define I_EQ(a, b)	((a) == (b))
+#define I_NE(a, b)	((a) != (b))
+#define I_LT(a, b)	((a) < (b))
+#define I_LE(a, b)	((a) <= (b))
+#define I_GT(a, b)	((a) > (b))
+#define I_GE(a, b)	((a) >= (b))
+#define F_EQ(a, b)	float8_eq(a, b)
+#define F_NE(a, b)	float8_ne(a, b)
+#define F_LT(a, b)	float8_lt(a, b)
+#define F_LE(a, b)	float8_le(a, b)
+#define F_GT(a, b)	float8_gt(a, b)
+#define F_GE(a, b)	float8_ge(a, b)
+
+/*
+ * X7 (§3.18): a word's 64 rows compared into a byte each, 0 or all ones --
+ * a loop the compiler vectorizes, its operator fixed when it is compiled,
+ * where a loop choosing the operator at each row was vectorized by none --
+ * then the bytes packed into the word's bits, 16 at a time by SSE2's
+ * movemask on x86-64, as Velox's simd::toBitMask packs its lanes
+ * (velox/common/base/SimdUtil.h); elsewhere a byte at a time.
+ */
+static inline uint64
+pack_bytes64(const uint8 *t)
+{
+#ifdef __SSE2__
+	uint64		r = 0;
+
+	for (int k = 0; k < 4; k++)
+		r |= (uint64) (uint32) _mm_movemask_epi8(_mm_loadu_si128((const __m128i *) (t + 16 * k)))
+			<< (16 * k);
+	return r;
+#else
+	uint64		r = 0;
+
+	for (int j = 0; j < 64; j++)
+		r |= (uint64) (t[j] & 1) << j;
+	return r;
+#endif
+}
+
+/* The whole words: both sides columns, a column and a constant, or the reverse. */
+#define CMP_WORDS(OPX, XV, YV) \
+	for (w = 0; w < nfull; w++) \
+	{ \
+		uint8		t[64]; \
+		const int	base = w * 64; \
+		\
+		for (int j = 0; j < 64; j++) \
+			t[j] = OPX(XV, YV) ? 0xFF : 0; \
+		out[w] = pack_bytes64(t); \
+	}
+
+#define CMP_SWITCH(F, XV, YV) \
+	switch (op) \
+	{ \
+		case OP_EQ: CMP_WORDS(F##_EQ, XV, YV); break; \
+		case OP_NE: CMP_WORDS(F##_NE, XV, YV); break; \
+		case OP_LT: CMP_WORDS(F##_LT, XV, YV); break; \
+		case OP_LE: CMP_WORDS(F##_LE, XV, YV); break; \
+		case OP_GT: CMP_WORDS(F##_GT, XV, YV); break; \
+		default: CMP_WORDS(F##_GE, XV, YV); break; \
+	}
+
 /*
  * One loop per pair of C types and operator, computing every row of the
  * batch 64 at a time into the result's bits; a constant side read once.
+ * The last word, part of one, row by row.
  */
-#define DEFINE_CMP(NAME, LT, RT, CT, CMP) \
+#define DEFINE_CMP(NAME, LT, RT, CT, CMP, F) \
 static void \
 NAME(VexecKernelCall *kc) \
 { \
@@ -105,27 +174,10 @@ NAME(VexecKernelCall *kc) \
 	uint64	   *out = (uint64 *) kc->result->values; \
 	int			op = ((const CmpInfo *) kc->call->extra)->op; \
 	int			n = kc->nrows; \
+	int			nfull = n / 64; \
 	int			w; \
 	\
-	if (l->encoding != VEXEC_CONST && r->encoding != VEXEC_CONST) \
-	{ \
-		for (w = 0; w < VEXEC_WORDS(n); w++) \
-		{ \
-			uint64		word = 0; \
-			int			base = w * 64; \
-			int			m = Min(64, n - base); \
-			\
-			for (int j = 0; j < m; j++) \
-			{ \
-				CT			x = (CT) a[base + j]; \
-				CT			y = (CT) b[base + j]; \
-				\
-				word |= (uint64) CMP(x, y, op) << j; \
-			} \
-			out[w] = word; \
-		} \
-	} \
-	else if (l->encoding == VEXEC_CONST && r->encoding == VEXEC_CONST) \
+	if (l->encoding == VEXEC_CONST && r->encoding == VEXEC_CONST) \
 	{ \
 		/* two constants -- a missing value against a literal: one answer */ \
 		uint64		word = CMP((CT) a[0], (CT) b[0], op) ? ~UINT64CONST(0) : 0; \
@@ -136,62 +188,59 @@ NAME(VexecKernelCall *kc) \
 			\
 			out[w] = m == 64 ? word : word & ((UINT64CONST(1) << m) - 1); \
 		} \
+		return; \
+	} \
+	if (l->encoding != VEXEC_CONST && r->encoding != VEXEC_CONST) \
+	{ \
+		CMP_SWITCH(F, (CT) a[base + j], (CT) b[base + j]); \
 	} \
 	else if (r->encoding == VEXEC_CONST) \
 	{ \
-		CT			y = (CT) b[0]; \
+		const CT	y = (CT) b[0]; \
 		\
-		for (w = 0; w < VEXEC_WORDS(n); w++) \
-		{ \
-			uint64		word = 0; \
-			int			base = w * 64; \
-			int			m = Min(64, n - base); \
-			\
-			for (int j = 0; j < m; j++) \
-			{ \
-				CT			x = (CT) a[base + j]; \
-				\
-				word |= (uint64) CMP(x, y, op) << j; \
-			} \
-			out[w] = word; \
-		} \
+		CMP_SWITCH(F, (CT) a[base + j], y); \
 	} \
 	else \
 	{ \
-		CT			x = (CT) a[0]; \
+		const CT	x = (CT) a[0]; \
 		\
-		for (w = 0; w < VEXEC_WORDS(n); w++) \
+		CMP_SWITCH(F, x, (CT) b[base + j]); \
+	} \
+	if (nfull * 64 < n) \
+	{ \
+		uint64		word = 0; \
+		const int	base = nfull * 64; \
+		\
+		for (int j = 0; j < n - base; j++) \
 		{ \
-			uint64		word = 0; \
-			int			base = w * 64; \
-			int			m = Min(64, n - base); \
+			CT			x = (CT) a[l->encoding == VEXEC_CONST ? 0 : base + j]; \
+			CT			y = (CT) b[r->encoding == VEXEC_CONST ? 0 : base + j]; \
 			\
-			for (int j = 0; j < m; j++) \
-			{ \
-				CT			y = (CT) b[base + j]; \
-				\
-				word |= (uint64) CMP(x, y, op) << j; \
-			} \
-			out[w] = word; \
+			word |= (uint64) CMP(x, y, op) << j; \
 		} \
+		out[nfull] = word; \
 	} \
 }
 
-DEFINE_CMP(cmp_i2_i2, int16, int16, int64, INT_CMP)
-DEFINE_CMP(cmp_i2_i4, int16, int32, int64, INT_CMP)
-DEFINE_CMP(cmp_i2_i8, int16, int64, int64, INT_CMP)
-DEFINE_CMP(cmp_i4_i2, int32, int16, int64, INT_CMP)
-DEFINE_CMP(cmp_i4_i4, int32, int32, int64, INT_CMP)
-DEFINE_CMP(cmp_i4_i8, int32, int64, int64, INT_CMP)
-DEFINE_CMP(cmp_i8_i2, int64, int16, int64, INT_CMP)
-DEFINE_CMP(cmp_i8_i4, int64, int32, int64, INT_CMP)
-DEFINE_CMP(cmp_i8_i8, int64, int64, int64, INT_CMP)
-DEFINE_CMP(cmp_f4_f4, float4, float4, float8, FLT_CMP)
-DEFINE_CMP(cmp_f4_f8, float4, float8, float8, FLT_CMP)
-DEFINE_CMP(cmp_f8_f4, float8, float4, float8, FLT_CMP)
-DEFINE_CMP(cmp_f8_f8, float8, float8, float8, FLT_CMP)
-DEFINE_CMP(cmp_oid, uint32, uint32, uint32, INT_CMP)
-DEFINE_CMP(cmp_char, uint8, uint8, uint8, INT_CMP)
+/*
+ * The integers compared in the narrower common width where both fit it, the
+ * comparison the same: a wider lane fits fewer to an instruction
+ */
+DEFINE_CMP(cmp_i2_i2, int16, int16, int16, INT_CMP, I)
+DEFINE_CMP(cmp_i2_i4, int16, int32, int32, INT_CMP, I)
+DEFINE_CMP(cmp_i2_i8, int16, int64, int64, INT_CMP, I)
+DEFINE_CMP(cmp_i4_i2, int32, int16, int32, INT_CMP, I)
+DEFINE_CMP(cmp_i4_i4, int32, int32, int32, INT_CMP, I)
+DEFINE_CMP(cmp_i4_i8, int32, int64, int64, INT_CMP, I)
+DEFINE_CMP(cmp_i8_i2, int64, int16, int64, INT_CMP, I)
+DEFINE_CMP(cmp_i8_i4, int64, int32, int64, INT_CMP, I)
+DEFINE_CMP(cmp_i8_i8, int64, int64, int64, INT_CMP, I)
+DEFINE_CMP(cmp_f4_f4, float4, float4, float8, FLT_CMP, F)
+DEFINE_CMP(cmp_f4_f8, float4, float8, float8, FLT_CMP, F)
+DEFINE_CMP(cmp_f8_f4, float8, float4, float8, FLT_CMP, F)
+DEFINE_CMP(cmp_f8_f8, float8, float8, float8, FLT_CMP, F)
+DEFINE_CMP(cmp_oid, uint32, uint32, uint32, INT_CMP, I)
+DEFINE_CMP(cmp_char, uint8, uint8, uint8, INT_CMP, I)
 
 /* bool: false < true, a word at a time over the bits */
 static void

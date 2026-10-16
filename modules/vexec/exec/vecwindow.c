@@ -84,6 +84,7 @@
 #include "vexec.h"
 #include "batch/batch.h"
 #include "exec/exec.h"
+#include "exec/keyhash.h"
 
 /* How a partition key is hashed and compared, as VecAgg's keys are. */
 typedef enum WinKeyKind
@@ -422,7 +423,7 @@ probe_row(VexecWindowState *s, TupleTableSlot *slot)
 					}
 					p->bytes = VARDATA_ANY(vl);
 					p->len = VARSIZE_ANY_EXHDR(vl);
-					h ^= hash_bytes((const unsigned char *) p->bytes, p->len);
+					h ^= vexec_hash_bytes(p->bytes, p->len);	/* C4 */
 				}
 				break;
 			case WKEY_FMGR:

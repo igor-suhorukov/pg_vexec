@@ -121,6 +121,7 @@ extern void vexec_oracle_exprs(PlannerInfo *root, List *exprs, VexecSteps *steps
 extern bool vexec_kernel_bound(Oid funcid, Oid inputtype, Oid collation);
 
 /* cost.c */
+extern double vexec_parallel_divisor(Path *path);
 extern void vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 							const VexecSteps *quals, const VexecSteps *target,
 							int ncols_in, int ncols_out, double source_bytes,
@@ -139,6 +140,7 @@ extern void vexec_cost_plan_agg(Plan *agg, int ngroupcols, int naggs, int naggs_
 extern void vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, bool input_vector,
 							VexecCost *cost);
 extern void vexec_cost_plan_sort(Plan *sort, bool input_vector, VexecCost *cost);
+extern void vexec_cost_topn(VexecCost *cost, Path *input, int64 bound);
 extern void vexec_cost_bitmapscan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 								  const VexecSteps *quals, const VexecSteps *target,
 								  VexecCost *cost);
@@ -170,6 +172,7 @@ extern void vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel,
 extern const char *vexec_orca_agg_refusal(Agg *agg);
 extern Plan *vexec_build_agg_from_agg(Agg *agg);
 extern Agg *vexec_agg_describe(CustomScan *cscan);
+extern bool vexec_agg_path_ranks(Path *path);
 
 /* join.c */
 extern bool vexec_is_vector_path(Path *path);
@@ -182,6 +185,7 @@ extern void vexec_join_finish_plan(PlannedStmt *pstmt);
 extern Plan *vexec_build_hashjoin_from_hashjoin(HashJoin *hj);
 
 /* sort.c */
+extern bool vexec_expr_may_raise(Node *node);
 extern void vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel,
 								RelOptInfo *output_rel, VexecPlanState *ps,
 								const char *target_name);

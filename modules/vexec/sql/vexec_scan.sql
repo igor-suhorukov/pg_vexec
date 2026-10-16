@@ -198,6 +198,47 @@ SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''te#%%'' ESCAPE ''#'''
 SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''text 1\''');
 SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''xyz\''');
 
+-- X4: a substring searched a batch at a time, with AVX2 where the CPU has
+-- it (expr/strsearch.c), and, where the values lie end to end, the
+-- column's bytes at once, a hit across two values none: literals of one
+-- byte and around the search's 32, multibyte characters, values shorter
+-- than the literal, empty ones and NULLs.  The heap reader's checks off,
+-- so that the kernel decides every row; then on, the reader's search.
+CREATE TABLE vlk (id int, s text);
+INSERT INTO vlk SELECT g, CASE g % 9
+	WHEN 0 THEN NULL
+	WHEN 1 THEN repeat('ab', g % 40) || 'needle' || repeat('cd', g % 23)
+	WHEN 2 THEN 'goo'
+	WHEN 3 THEN 'gle' || repeat('x', g % 70)
+	WHEN 4 THEN repeat('é', g % 50) || 'n' || repeat('ü', g % 30)
+	WHEN 5 THEN ''
+	WHEN 6 THEN repeat('y', g % 100) || 'needl'
+	WHEN 7 THEN 'eedle' || repeat('z', g % 33) || 'needle'
+	ELSE md5(g::text) || md5((g * 7)::text) END
+FROM generate_series(1, 5000) g;
+ANALYZE vlk;
+SET vexec.enable_prefilter = off;
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%needle%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s NOT LIKE ''%needle%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%google%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%n%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%ü%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%éé%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%cdcdcdcdcdcdcdcdcdcdcdcdcdcdcd%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%abababababababababababababababab%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%ababababababababababababababababa%''');
+SELECT vexec_check('SELECT id FROM vlk WHERE s LIKE ''%eedle%ne%'' AND id < 200');
+SET vexec.batch_varlena_layout = offsets;
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%needle%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%google%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%gle%'' OR s LIKE ''%oog%''');
+SELECT vexec_check('SELECT sum(id) FROM vlk WHERE s NOT LIKE ''%dle%'' AND id % 3 = 0');
+RESET vexec.batch_varlena_layout;
+RESET vexec.enable_prefilter;
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%needle%''');
+SELECT vexec_check('SELECT count(*) FROM vlk WHERE s LIKE ''%google%''');
+DROP TABLE vlk;
+
 -- numerics: the scaled layout's edges, and what it cannot hold
 CREATE TABLE vnum (n numeric(18,0), m numeric(38,2), k numeric(10,4), f numeric);
 INSERT INTO vnum VALUES (999999999999999999, 999999999999999999999999999999999999.99, 123456.7891, 1.5),

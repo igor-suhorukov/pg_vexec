@@ -23,8 +23,9 @@
  * equality, a prefix, a suffix or a substring test on the value's bytes:
  * exact there, since PostgreSQL's LIKE compares a deterministic
  * collation's characters byte for byte (like_match.c), and in UTF8 a run
- * of whole characters matches only at a character's start.  Any other
- * pattern is matched by textlike() itself, a value at a time.  A pattern
+ * of whole characters matches only at a character's start.  A substring is
+ * searched a batch at a time (X4, strsearch.c).  Any other pattern is
+ * matched by textlike() itself, a value at a time.  A pattern
  * that ends in its escape character binds no kernel: PostgreSQL raises on
  * it only when matching reaches the end, which depends on the value.
  *
@@ -237,16 +238,6 @@ static const VexecKernelDef text_cmp_def = {"text compare", false, text_bind, te
 
 /* ---- LIKE ---- */
 
-typedef enum LikeKind
-{
-	LIKE_EXACT,					/* 'abc' */
-	LIKE_PREFIX,				/* 'abc%' */
-	LIKE_SUFFIX,				/* '%abc' */
-	LIKE_CONTAINS,				/* '%abc%' */
-	LIKE_ANY,					/* '%' */
-	LIKE_GENERAL				/* anything else: textlike() */
-} LikeKind;
-
 typedef struct LikeInfo
 {
 	bool		negate;
@@ -258,7 +249,7 @@ typedef struct LikePattern
 	int			kind;
 	char	   *lit;			/* the literal, escapes removed */
 	int			litlen;
-	Datum		pattern;		/* LIKE_GENERAL's, as textlike() takes it */
+	Datum		pattern;		/* VEXEC_LIKE_GENERAL's, as textlike() takes it */
 } LikePattern;
 
 /*
@@ -294,7 +285,7 @@ classify(const char *p, int plen, LikePattern *lp)
 	}
 	if (start == end)
 	{
-		lp->kind = lead ? LIKE_ANY : LIKE_EXACT;
+		lp->kind = lead ? VEXEC_LIKE_ANY : VEXEC_LIKE_EXACT;
 		lp->lit = "";
 		lp->litlen = 0;
 		return true;
@@ -323,7 +314,7 @@ classify(const char *p, int plen, LikePattern *lp)
 		}
 		if (p[i] == '%' || p[i] == '_')
 		{
-			lp->kind = LIKE_GENERAL;
+			lp->kind = VEXEC_LIKE_GENERAL;
 			return true;
 		}
 		lit[n++] = p[i];
@@ -331,7 +322,27 @@ classify(const char *p, int plen, LikePattern *lp)
 	lit[n] = '\0';
 	lp->lit = lit;
 	lp->litlen = n;
-	lp->kind = lead ? (trail ? LIKE_CONTAINS : LIKE_SUFFIX) : (trail ? LIKE_PREFIX : LIKE_EXACT);
+	lp->kind = lead ? (trail ? VEXEC_LIKE_CONTAINS : VEXEC_LIKE_SUFFIX) :
+		(trail ? VEXEC_LIKE_PREFIX : VEXEC_LIKE_EXACT);
+	return true;
+}
+
+/*
+ * A pattern's kind and its literal, escapes removed, for the reader that
+ * checks a LIKE on a tuple before deforming it (X3, source/prefilter.c).
+ * False for a pattern that ends in its escape.
+ */
+bool
+vexec_like_classify(const char *p, int plen, int *kind, char **lit, int *litlen)
+{
+	LikePattern lp;
+
+	memset(&lp, 0, sizeof(lp));
+	if (!classify(p, plen, &lp))
+		return false;
+	*kind = lp.kind;
+	*lit = lp.lit;
+	*litlen = lp.litlen;
 	return true;
 }
 
@@ -360,9 +371,9 @@ like_bind(VexecExpr *call, const void *info)
 	if (!classify(VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t), lp))
 		return false;
 	/* byte tests only where whole characters match at their starts */
-	if (lp->kind != LIKE_GENERAL && lp->kind != LIKE_ANY &&
+	if (lp->kind != VEXEC_LIKE_GENERAL && lp->kind != VEXEC_LIKE_ANY &&
 		GetDatabaseEncoding() != PG_UTF8 && pg_database_encoding_max_length() != 1)
-		lp->kind = LIKE_GENERAL;
+		lp->kind = VEXEC_LIKE_GENERAL;
 	lp->pattern = PointerGetDatum(t);
 	call->extra = lp;
 	return true;
@@ -375,6 +386,17 @@ like_kernel(VexecKernelCall *kc)
 	const VexecVec *s = kc->args[0];
 	int			ll = lp->litlen;
 
+	/* a substring: the batch's rows searched by one search (X4, strsearch.c) */
+	if (lp->kind == VEXEC_LIKE_CONTAINS && ll > 0)
+	{
+		uint64	   *matches = vexec_bitmap_alloc(kc->work, kc->nrows, false);
+
+		vexec_contains_rows(s, kc->active, kc->nrows, lp->lit, ll, matches);
+		VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+			vexec_result_bit(kc->result, i, vexec_bit(matches, i) != lp->negate);
+		return;
+	}
+
 	VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
 	{
 		const char *a;
@@ -384,19 +406,19 @@ like_kernel(VexecKernelCall *kc)
 		bytes_at(s, i, &a, &alen);
 		switch (lp->kind)
 		{
-			case LIKE_EXACT:
+			case VEXEC_LIKE_EXACT:
 				m = alen == ll && memcmp(a, lp->lit, ll) == 0;
 				break;
-			case LIKE_PREFIX:
+			case VEXEC_LIKE_PREFIX:
 				m = alen >= ll && memcmp(a, lp->lit, ll) == 0;
 				break;
-			case LIKE_SUFFIX:
+			case VEXEC_LIKE_SUFFIX:
 				m = alen >= ll && memcmp(a + alen - ll, lp->lit, ll) == 0;
 				break;
-			case LIKE_CONTAINS:
+			case VEXEC_LIKE_CONTAINS:
 				m = ll == 0 || (alen >= ll && memmem(a, alen, lp->lit, ll) != NULL);
 				break;
-			case LIKE_ANY:
+			case VEXEC_LIKE_ANY:
 				m = true;
 				break;
 			default:

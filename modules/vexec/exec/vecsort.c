@@ -304,6 +304,15 @@ sort_begin(CustomScanState *css, EState *estate, int eflags)
 	s->get_slot = ExecInitExtraTupleSlot(estate, s->desc, &TTSOpsMinimalTuple);
 	if (s->plan.bound_attno > 0 && s->plan.bound > 0)
 		bound_begin(s);
+
+	/*
+	 * C3: a bounded sort over a VecAgg lends it its keys and bound; the
+	 * aggregation keeps its n best groups, which this sort orders
+	 * (vecagg.c).  Its keys are columns of the child's rows, the scan tuple.
+	 */
+	if (s->plan.bound > 0 && s->plan.late_tidcol == 0 && vexec_is_vector_state(s->child))
+		(void) vexec_agg_set_topn((VexecNode *) s->child, s->plan.bound, s->plan.keycols,
+								  s->plan.operators, s->plan.collations, s->plan.nullsfirst);
 }
 
 /* ---------------------------------------------------------------------

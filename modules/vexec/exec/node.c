@@ -77,6 +77,67 @@ vexec_node_begin(VexecNode *node, EState *estate)
 }
 
 /*
+ * X10: whether a subtree is kernels' alone, over columns and constants,
+ * which compute every row they are asked for and raise nothing.
+ */
+static bool
+kernels_only(const VexecExpr *e)
+{
+	if (e->kind == VE_VAR || e->kind == VE_CONST)
+		return true;
+	if (e->kind != VE_CALL && e->kind != VE_RELABEL)
+		return false;
+	for (int i = 0; i < e->nargs; i++)
+		if (!kernels_only(e->args[i]))
+			return false;
+	return true;
+}
+
+static VexecExpr *
+share_walk(VexecNode *node, VexecExpr *e, List **seen)
+{
+	bool		candidate = e->kind == VE_CALL && kernels_only(e);
+
+	if (candidate)
+	{
+		foreach_ptr(VexecExpr, s, *seen)
+		{
+			if (s->type->typid == e->type->typid && s->type->typmod == e->type->typmod &&
+				s->type->collation == e->type->collation && equal(s->expr, e->expr))
+			{
+				if (!s->shared)
+					node->nshared++;
+				s->shared = true;
+				return s;
+			}
+		}
+	}
+	for (int i = 0; i < e->nargs; i++)
+		e->args[i] = share_walk(node, e->args[i], seen);
+	if (candidate)
+		*seen = lappend(*seen, e);
+	return e;
+}
+
+/*
+ * X10 (§3.18): equal subtrees of the node's eager targets, kernels' alone,
+ * made one, computed once a batch for each that asks over the same rows,
+ * as Velox computes an expression several of an operator's share once
+ * (velox/expression/Expr.h) -- TPC-H Q1's l_extendedprice * (1 - l_discount)
+ * in two of its sums.
+ */
+static void
+share_subtrees(VexecNode *node)
+{
+	List	   *seen = NIL;
+
+	for (int i = 0; i < node->ntargets; i++)
+		if (node->targets[i].eager != NULL)
+			node->targets[i].eager = share_walk(node, node->targets[i].eager, &seen);
+	list_free(seen);
+}
+
+/*
  * Compile the node's quals and target list against its input: a Var of
  * input_varno reads the input column whose attno it is.
  */
@@ -133,6 +194,8 @@ vexec_node_compile(VexecNode *node, List *quals, List *tlist)
 	node->nkernels = cc.nkernels;
 	node->nfallbacks = cc.nfallbacks;
 	node->declared = list_concat(node->declared, cc.declared);
+	if (vexec_enable_shared_exprs)
+		share_subtrees(node);
 
 	/* the output batch, its columns the targets' */
 	{
@@ -247,6 +310,66 @@ apply_bound(VexecNode *node, uint64 *active, const uint64 *redo, int n)
 	return removed;
 }
 
+/*
+ * X6: a VecHashJoin's inner keys over the rows of `active` (exec.h): a row
+ * whose key no inner row has, or NULL, leaves `active`; a row PostgreSQL's
+ * evaluator is to decide, in `redo`, stays.  How many left.  Where it keeps
+ * more than 70% of the rows it checks, it is off for the next
+ * VEXEC_JOIN_FILTER_OFF batches, as ClickHouse's runtime filter is.
+ */
+static int
+apply_join_filter(VexecNode *node, uint64 *active, const uint64 *redo, int n)
+{
+	VexecJoinFilter *f = node->jfilter;
+	const VexecVec *v = &node->in->cols[node->jfilter_col];
+	int			width = v->encoding == VEXEC_FLAT && v->shape.layout == VEXEC_FIXED &&
+		!v->shape.arrow_values && v->shape.stride == v->shape.width ? v->shape.width : 0;
+	int16		typlen = v->type->typlen;
+	int			checked = 0;
+	int			removed = 0;
+
+	if (!f->active)
+		return 0;
+	if (f->off > 0)
+	{
+		f->off--;
+		f->off_batches++;
+		return 0;
+	}
+	VEXEC_FOREACH_ROW(active, n, row)
+	{
+		int64		key;
+		bool		isnull;
+
+		if (redo != NULL && vexec_bit(redo, row))
+			continue;
+		checked++;
+		if (width == 8 || width == 4 || width == 2)
+		{
+			isnull = v->validity != NULL && !vexec_bit(v->validity, row);
+			key = width == 8 ? ((const int64 *) v->values)[row] :
+				width == 4 ? ((const int32 *) v->values)[row] :
+				((const int16 *) v->values)[row];
+		}
+		else
+		{
+			Datum		d = vexec_vec_datum(node->in, v, row, &isnull);
+
+			key = typlen == 8 ? DatumGetInt64(d) :
+				typlen == 4 ? DatumGetInt32(d) : DatumGetInt16(d);
+		}
+		if (isnull || !vexec_join_filter_has(f, key))
+		{
+			vexec_bit_clear(active, row);
+			removed++;
+		}
+	}
+	f->removed += removed;
+	if (checked > 0 && (int64) (checked - removed) * 10 > (int64) checked * 7)
+		f->off = VEXEC_JOIN_FILTER_OFF;
+	return removed;
+}
+
 /* Whether one row is past the running bound, after the lazy quals (H6). */
 static bool
 row_past_bound(VexecNode *node, int row)
@@ -307,6 +430,9 @@ eval_batch(VexecNode *node)
 	/* a VecSort's running bound before the quals, where no source checked it */
 	if (node->bound != NULL && node->bound->before_quals && !node->bound_in_source)
 		(void) apply_bound(node, active, NULL, n);
+	/* a VecHashJoin's inner keys before the quals, where none may raise (X6) */
+	if (node->jfilter != NULL && node->jfilter->before_quals && !node->jfilter_in_source)
+		(void) apply_join_filter(node, active, NULL, n);
 	selected = vexec_bits_count(active, n);
 
 	/*
@@ -327,6 +453,9 @@ eval_batch(VexecNode *node)
 	 */
 	if (node->bound != NULL && !node->bound->before_quals && node->first_lazy == node->nquals)
 		bounded = apply_bound(node, active, ev.redo, n);
+	/* or after them (X6; vexec_scan_set_join_filter() asks every one eager) */
+	if (node->jfilter != NULL && !node->jfilter->before_quals)
+		bounded += apply_join_filter(node, active, ev.redo, n);
 
 	/* the eager quals after the first lazy one, over the same rows */
 	ev.exact = false;
@@ -620,15 +749,45 @@ vexec_node_exec(VexecNode *node)
  * Whether the node can hand batches to a vector parent: every qual and
  * target of it eager, and its input batches -- a VecResult's child hands
  * them up too.  A VecAgg's targets are its aggregates' inputs, not its
- * output: it hands up rows.
+ * output: it hands up batches it makes itself (next_out), where it can.
  */
 bool
 vexec_node_batchable(VexecNode *node)
 {
+	if (node->next_out != NULL)
+		return true;
 	return node->kind != VEXEC_NODE_AGG && node->kind != VEXEC_NODE_WINDOW &&
 		node->kind != VEXEC_NODE_MOTION_SEND &&
 		node->first_lazy == node->nquals && !node->any_lazy_target &&
 		!node->row_input;
+}
+
+/* X9: the batch the node made itself, as vexec_next_batch() hands it up. */
+static VexecBatch *
+next_made_batch(PlanState *ps)
+{
+	VexecNode  *node = (VexecNode *) ps;
+	VexecBatch *out;
+
+	node->ran = true;
+	out = node->finished ? NULL : node->next_out(node);
+	node->candidates = NULL;
+	node->child_redo = NULL;
+	if (out == NULL)
+	{
+		node->finished = true;
+		node->redo = NULL;
+		if (ps->instrument)
+			InstrStopNode(ps->instrument, 0);
+		return NULL;
+	}
+	out->selection = vexec_bitmap_alloc(out, out->nrows, true);
+	/* none to redo: a NULL bitmap would be every row */
+	node->redo = vexec_bitmap_alloc(out, out->nrows, false);
+	node->stats.batches_out++;
+	if (ps->instrument)
+		InstrStopNode(ps->instrument, out->nrows);
+	return out;
 }
 
 /*
@@ -652,6 +811,8 @@ vexec_next_batch(PlanState *ps)
 	CHECK_FOR_INTERRUPTS();
 	if (ps->instrument)
 		InstrStartNode(ps->instrument);
+	if (node->next_out != NULL)
+		return next_made_batch(ps);
 
 	ok = !node->finished && next_batch(node);
 	node->have_batch = false;
@@ -777,6 +938,8 @@ vexec_node_explain_properties(VexecNode *node, List *ancestors, ExplainState *es
 								psprintf("%d of %d", eager, node->nquals), es);
 		ExplainPropertyInteger("Kernel Steps", NULL, node->nkernels, es);
 		ExplainPropertyInteger("Fallback Steps", NULL, node->nfallbacks, es);
+		if (node->nshared > 0)
+			ExplainPropertyInteger("Shared Steps", NULL, node->nshared, es);
 		vexec_node_explain_declared(node, es);
 		if (lazy_targets > 0)
 			ExplainPropertyInteger("Row-by-Row Targets", NULL, lazy_targets, es);
