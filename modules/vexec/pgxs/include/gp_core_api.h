@@ -92,8 +92,13 @@ typedef struct GpCoreNode
 /*
  * Since 1.16, the dispatcher's figures, the node's since it started, over
  * every backend: gangs made, and statements that took one already there;
- * connections opened to the segments and the time that took; statements
- * and fragments sent; and dispatches a segment failed.
+ * connections opened to the segments and the time that took; dispatches,
+ * the client's statements and their parts sent to the segments -- a
+ * gather's statement, a slice's fragment, a write, a utility statement, a
+ * COPY -- each once whatever the number of segments it went to, and not a
+ * module's own commands nor the dispatcher's settings, transaction control
+ * and snapshots; and the errors a segment's answer raised, once for each
+ * statement they ended.
  */
 typedef struct GpCoreDispatchCounters
 {
@@ -107,8 +112,10 @@ typedef struct GpCoreDispatchCounters
 
 /*
  * Since 1.16, a transport's figures, the node's since it started: what
- * Motions sent and received through it, as rows and as bytes on the wire,
- * and the packets it sent again where it acknowledges them.
+ * Motions sent and received through it, as rows and as their bytes as a
+ * Motion encodes them -- a row sent to every receiver, a Broadcast's, once
+ * for each -- and the packets it sent again where it acknowledges them:
+ * udpifc's; udp2 resends inside its own library, and its count stays 0.
  */
 typedef struct GpCoreIcCounters
 {
