@@ -61,6 +61,8 @@ x-run: &run
     - ${CLICKBENCH_CACHE:-/nonexistent}:/cache
     - ${CLICKBENCH_WORK:-/nonexistent}:/work
     - ${CLICKBENCH_RUNS:-/nonexistent}:/runs
+    # ch_table_engines' engine library, for the mergetree loads
+    - ${CHTE_ENGINE_LIB:-/nonexistent}:/engine:ro
   environment:
     CLICKBENCH_HOST: ${CLICKBENCH_HOST:-}
 

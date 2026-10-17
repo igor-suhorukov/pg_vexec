@@ -10,6 +10,7 @@
 #                       with VEXEC_NOASSERT=1, its build without assertions,
 #                       cloudberry/pg19-vanilla-noassert, under the tag
 #                       vanilla-noassert
+#   chte                ch_table_engines' leg, on the extension's own dev image
 #   vexec-dev-port      the port: pg_accel/cb-ext at CB_COMMIT, VB's build of
 #                       the port's modules on the patched server, with a C
 #                       toolchain; with VEXEC_NOASSERT=1 (run.sh), for timed
@@ -50,9 +51,16 @@ x-run: &run
     - ${VEXEC_PORT_STAGE:-/nonexistent}:/cbstage:ro
     # the port's sources, whose own tests a leg may run (shm.sh: pg19/test/ic)
     - ${VEXEC_PORT_SRC:-/nonexistent}:/cbsrc:ro
+    # ch_table_engines' tree and its engine library, for the legs that load
+    # the extension (ch_table_engines.md §3, VC10): chte.sh, sources.sh,
+    # sinks.sh
+    - ${CHTE_SRC:-/nonexistent}:/chte:ro
+    - ${CHTE_ENGINE_LIB:-/nonexistent}:/engine:ro
   environment:
     VEXEC_SRC: /src
     VEXEC_WORK: /work
+    CHTE_ENGINE: /engine/libchte_engine.so
+    CHTE_PARTS: ${CHTE_PARTS:-}
     CB_SRC_MOUNT: ${CB_SRC_MOUNT:-}
     VEXEC_ORCA_SECTIONS: ${VEXEC_ORCA_SECTIONS:-}
     # the legs' own settings, passed through when the host sets them
@@ -205,6 +213,15 @@ services:
   port:
     <<: *run
     image: pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-${CB_COMMIT:-unset}
+    profiles: ["run"]
+
+  # ch_table_engines' leg (ch_table_engines.md §3, VC10; test/vexec/chte.sh):
+  # vanilla PostgreSQL 19 on the extension's dev image, pg_chte/dev:vanilla
+  # (pg_ch_table_engines' docker/Dockerfile.dev, on this project's
+  # vexec-dev:vanilla), its tree and engine library mounted as every leg's.
+  chte:
+    <<: *run
+    image: pg_chte/dev:${CHTE_VANILLA_FLAVOR:-vanilla}
     profiles: ["run"]
 
   # The two legs with pyarrow (V7_0, V10).

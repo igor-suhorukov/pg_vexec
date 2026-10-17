@@ -28,6 +28,17 @@
 #   pgvector  pgvector's own regression tests, where the image carries them
 #             (the port's, in /pgvector/test, of the pgvector it installs;
 #             VEXEC_PGVECTOR_TESTS), every one, with the extension loaded
+#   pg_mergetree, vexec_mergetree
+#             pg's and vexec's corpora over ch_table_engines' tables
+#             (ch_table_engines.md §3, VC10): the extension preloaded beside
+#             vexec and created in every database, and
+#             default_table_access_method = mergetree in every session, so
+#             that the tables the tests make are its own; the off session's
+#             answers are PostgreSQL's over them, which differ from heap's
+#             expected output where the access method refuses what its later
+#             phases bring (DELETE, UPDATE, indexes), and every other session
+#             must answer as it does.  Run where the extension is installed
+#             (chte.sh).
 #
 # Each session runs in a temporary instance pg_regress makes, with vexec
 # preloaded and the session's settings in PGOPTIONS, so that every
@@ -88,9 +99,35 @@ fail=0
 for corpus in ${VEXEC_CORPORA:-pg vexec}; do
 	extra=()
 	rundir=""
+	session_extra=""
+	reference_expected=1
+	corpus_preload=""
+	corpus_conf=""
+	corpus_maxconn="${VEXEC_PG_MAXCONN:-0}"
 	case "$corpus" in
 		pg) schedule="$W/pg_schedule"; inputdir="$PGSUITE"; dlpath="$PGSUITE" ;;
 		vexec) schedule="$here/differential/vexec_schedule"; inputdir="$BUILD/modules/vexec"; dlpath="$PGSUITE" ;;
+		pg_mergetree|vexec_mergetree)
+			if [ "$corpus" = pg_mergetree ]; then
+				schedule="$W/pg_schedule"; inputdir="$PGSUITE"
+			else
+				schedule="$here/differential/vexec_schedule"; inputdir="$BUILD/modules/vexec"
+			fi
+			dlpath="$PGSUITE"
+			extra=(--load-extension=ch_table_engines)
+			corpus_preload=",ch_table_engines"
+			# the instance's, accepted unchecked as the server starts: in
+			# PGOPTIONS it would be checked in pg_regress's first database,
+			# which the extension's access methods are not in
+			corpus_conf="default_table_access_method = mergetree"
+			# a prepared transaction a test leaves holds its relation-level
+			# predicate locks: a session waits a minute for them, not forever
+			session_extra="-c lock_timeout=60s"
+			# a test of a group fails where it would make what another of
+			# the group reads (an index, an UPDATE): run apart, each test
+			# meets the same leftovers in every session
+			corpus_maxconn=1
+			reference_expected=0 ;;
 		pgvector)
 			[ -f "$W/pgvector_schedule" ] || { echo "no pgvector tests at $PGVECTOR_TESTS"; exit 1; }
 			schedule="$W/pgvector_schedule"; inputdir="$PGVECTOR_TESTS"; dlpath="$PGSUITE"
@@ -105,7 +142,7 @@ for corpus in ${VEXEC_CORPORA:-pg vexec}; do
 	echo "  $corpus: $(grep -c '^test:' "$schedule") groups of tests"
 	for s in ${VEXEC_SESSIONS:-off postgres arrow random}; do
 		conf="$W/$corpus-$s.conf"
-		preload="${VEXEC_PRELOAD:-vexec}"
+		preload="${VEXEC_PRELOAD:-vexec}$corpus_preload"
 		if [[ "$s" == *-packs ]]; then
 			[ -n "${VEXEC_PACKS:-}" ] || { echo "session $s: no VEXEC_PACKS"; exit 1; }
 			preload="$VEXEC_PACKS,$preload"
@@ -114,20 +151,21 @@ for corpus in ${VEXEC_CORPORA:-pg vexec}; do
 			echo "shared_preload_libraries = '$preload'"
 			echo "log_line_prefix = '%a|%e|'"
 			echo "log_min_messages = warning"
+			[ -n "$corpus_conf" ] && echo "$corpus_conf"
 		} > "$conf"
 		start=$(date +%s)
 		mkdir -p "$W/$corpus/$s"
 		( cd "$([ "$rundir" = output ] && echo "$W/$corpus/$s" || echo "$inputdir")" &&
-		  PGOPTIONS="$(session_options "$s")" "$PG_REGRESS" \
+		  PGOPTIONS="$(session_options "$s") $session_extra" "$PG_REGRESS" \
 			--temp-instance="$W/$corpus-$s-instance" --temp-config="$conf" \
 			--bindir="$BINDIR" --dlpath="$dlpath" --inputdir="$inputdir" --expecteddir="$inputdir" \
 			--outputdir="$W/$corpus/$s" --schedule="$schedule" --encoding=UTF8 --no-locale \
-			--max-connections="${VEXEC_PG_MAXCONN:-0}" "${extra[@]}" > "$W/$corpus/$s.out" 2>&1 )
+			--max-connections="$corpus_maxconn" "${extra[@]}" > "$W/$corpus/$s.out" 2>&1 )
 		rc=$?
 		cp "$W/$corpus/$s/log/postmaster.log" "$W/$corpus/$s/postmaster.log" 2>/dev/null
 		summary=$(grep -E "^# (All|[0-9]+ of [0-9]+)" "$W/$corpus/$s.out" | tail -1)
 		echo "    $s: ${summary:-no summary} against the expected output ($(( $(date +%s) - start )) s)"
-		if [ "$s" = off ] && [ $rc -ne 0 ]; then
+		if [ "$s" = off ] && [ $rc -ne 0 ] && [ $reference_expected = 1 ]; then
 			fail=1
 			grep -E "^not ok" "$W/$corpus/$s.out" | head -20
 		fi

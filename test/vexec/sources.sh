@@ -48,9 +48,19 @@
 # it drops by the bound -- are then fewer than two groups', where the other
 # storages hand the table's and the scan drops nearly all of them.
 #
+# ch_table_engines' mergetree, in its pages store and its files store
+# (ch_table_engines.md §3, VC10), where the extension's tree is mounted at
+# /chte and its engine library at /engine: built and preloaded, its source
+# named MergeTree.  It has no DELETE before its CH2, so its tables are
+# loaded without the rows the others delete; nor is ORCA's route over its
+# access methods decided (its decision 7): the plans' checks under ORCA are
+# left out for it, and its answers under ORCA compared as every storage's.
+#
 #   VEXEC_ROWS        the table's rows: 30000
-#   VEXEC_STORAGES    "heap ao_row ao_column pax pax_porc_vec"
-#   VEXEC_SOURCES     "ao_row=gp_ao ao_column=gp_ao pax=pax pax_porc_vec=pax":
+#   VEXEC_STORAGES    "heap ao_row ao_column pax pax_porc_vec", and
+#                     "mergetree mergetree_files" where the extension is
+#   VEXEC_SOURCES     "ao_row=gp_ao ao_column=gp_ao pax=pax pax_porc_vec=pax",
+#                     and mergetree's and mergetree_files' MergeTree:
 #                     the source each storage's VecScan must name (heap's
 #                     "heap's pages", and "the slot path" for one not listed)
 #   VEXEC_SEED        the random session's seed: drawn and printed
@@ -59,19 +69,31 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$here/build.sh" || exit 1
 . "$here/lib.sh"
 
-ROWS="${VEXEC_ROWS:-30000}"
-STORAGES="${VEXEC_STORAGES:-heap ao_row ao_column pax pax_porc_vec}"
-SOURCES="${VEXEC_SOURCES:-ao_row=gp_ao ao_column=gp_ao pax=pax pax_porc_vec=pax}"
-SEED="${VEXEC_SEED:-$(( (RANDOM << 15 | RANDOM) % 2147483646 + 1 ))}"
 D="$(mktemp -d "${TMPDIR:-/tmp}/vexec-sources-XXXXXX")"
+chte_preload=""
+chte_create=""
+chte_storages=""
+chte_sources=""
+if [ -d /chte/include/vexec ] && [ -f /engine/libchte_engine.so ]; then
+	CHTE_SRC=/chte /chte/test/build.sh > "$D/chte-build.log" 2>&1 || { tail -20 "$D/chte-build.log"; exit 1; }
+	echo "ch_table_engines $(git -C /chte rev-parse --short HEAD 2> /dev/null || echo '?'): mergetree in both stores"
+	chte_preload=",ch_table_engines"
+	chte_create="; CREATE EXTENSION ch_table_engines"
+	chte_storages=" mergetree mergetree_files"
+	chte_sources=" mergetree=MergeTree mergetree_files=MergeTree"
+fi
+ROWS="${VEXEC_ROWS:-30000}"
+STORAGES="${VEXEC_STORAGES:-heap ao_row ao_column pax pax_porc_vec$chte_storages}"
+SOURCES="${VEXEC_SOURCES:-ao_row=gp_ao ao_column=gp_ao pax=pax pax_porc_vec=pax$chte_sources}"
+SEED="${VEXEC_SEED:-$(( (RANDOM << 15 | RANDOM) % 2147483646 + 1 ))}"
 fail=0
 
-server_init "$D" "shared_preload_libraries = 'gp_core,gp_orca,gp_sql,gp_ao,pax,vexec'" \
+server_init "$D" "shared_preload_libraries = 'gp_core,gp_orca,gp_sql,gp_ao,pax,vexec$chte_preload'" \
 	"max_parallel_workers_per_gather = 0" || exit 1
 server_start "$D" || { echo "the server did not start"; tail -20 "$D/log"; exit 1; }
 trap 'server_stop "$D"; [ -n "${RESULTS_DIR:-}" ] && cp "$D/log" "$RESULTS_DIR/sources-server.log"' EXIT
 
-out=$(q "$D" postgres "SET client_min_messages = warning; CREATE EXTENSION gp_ao CASCADE; CREATE EXTENSION gp_orca; CREATE EXTENSION gp_sql; CREATE EXTENSION pax; CREATE EXTENSION vexec")
+out=$(q "$D" postgres "SET client_min_messages = warning; CREATE EXTENSION gp_ao CASCADE; CREATE EXTENSION gp_orca; CREATE EXTENSION gp_sql; CREATE EXTENSION pax; CREATE EXTENSION vexec$chte_create")
 case "$out" in *ERROR*) echo "the extensions: $out"; exit 1 ;; esac
 echo "the batch sources: $(q "$D" postgres "SELECT string_agg(source || ' for ' || coalesce(access_method, '?'), ', ' ORDER BY source) FROM vexec.sources()")"
 echo "  random session's seed: $SEED (VEXEC_SEED=$SEED reruns it)"
@@ -83,6 +105,8 @@ storage_clause() {
 		ao_column) echo "USING ao_column WITH (compresstype=zstd, blocksize=32768)" ;;
 		pax) echo "USING pax WITH (storage_format=porc)" ;;
 		pax_porc_vec) echo "USING pax WITH (storage_format=porc_vec)" ;;
+		mergetree) echo "USING mergetree WITH (order_by = 'id')" ;;
+		mergetree_files) echo "USING mergetree WITH (order_by = 'id', storage = 'files')" ;;
 	esac
 }
 
@@ -120,13 +144,17 @@ q "$D" postgres "$(cat "$D/data.sql")" > /dev/null
 for s in $STORAGES; do
 	from=src
 	[ "$s" = pax_porc_vec ] && from=src_pv
+	# the rows the others delete, never loaded into a mergetree table
+	keep="true"
+	case "$s" in mergetree*) keep="id % 97 <> 0" ;; esac
 	out=$(q "$D" postgres "SET client_min_messages = warning;
 		CREATE TABLE t_$s (LIKE $from) $(storage_clause "$s");
-		INSERT INTO t_$s SELECT * FROM $from;
+		INSERT INTO t_$s SELECT * FROM $from WHERE $keep;
 		ALTER TABLE t_$s DROP COLUMN gone;
 		ALTER TABLE t_$s ADD COLUMN later int DEFAULT 42;
-		INSERT INTO t_$s (id, i4, t) SELECT $ROWS + g, g, 'late ' || g FROM generate_series(1, 100) g;
-		DELETE FROM t_$s WHERE id % 97 = 0;
+		INSERT INTO t_$s (id, i4, t) SELECT $ROWS + g, g, 'late ' || g FROM generate_series(1, 100) g
+			WHERE $( [ "$keep" = true ] && echo true || echo "($ROWS + g) % 97 <> 0");
+		$( [ "$keep" = true ] && echo "DELETE FROM t_$s WHERE id % 97 = 0;")
 		ANALYZE t_$s;")
 	case "$out" in *ERROR*) echo "the table in $s: $out"; fail=1 ;; esac
 done
@@ -207,7 +235,10 @@ PARALLEL_QUERIES=(
 	"SELECT id, t, n, d FROM %t ORDER BY n DESC NULLS LAST, d, id LIMIT 25"
 	"SELECT count(*), sum(i4) FROM %t WHERE 100 / (id % 97) >= 0"
 )
-# and each storage module's own, a query a line, from sources/*.queries
+# and each storage module's own, a query a line, from sources/*.queries:
+# they make tables of their own with DELETEs, which ch_table_engines' tables
+# take from its CH2 on -- until then they skip them
+NSHARED=${#QUERIES[@]}
 for f in "$here"/sources/*.queries; do
 	[ -f "$f" ] || continue
 	while IFS= read -r line; do
@@ -274,9 +305,15 @@ for s in $STORAGES; do
 		echo "  FAILED $s: its VecScan reads through [$got], not [$want]"
 		fail=1
 	fi
+	# ORCA's route over ch_table_engines' access methods is undecided: its
+	# plans' checks are left out for them
+	orca_plans=1
+	case "$s" in mergetree*) orca_plans=0 ;; esac
 	# under ORCA: a VecResult over the VecScan's batches, from the source
 	plan=$(q "$D" postgres "SET gp.optimizer = on; SET vexec.mode = force; EXPLAIN (VERBOSE, COSTS OFF) SELECT id, i2 + 1::int2 FROM $t WHERE i4 > 0")
-	if echo "$plan" | grep -q "Optimizer: GPORCA" && echo "$plan" | grep -q "Vec Result" &&
+	if [ $orca_plans = 0 ]; then
+		:
+	elif echo "$plan" | grep -q "Optimizer: GPORCA" && echo "$plan" | grep -q "Vec Result" &&
 		echo "$plan" | grep -q "Input: batches" && echo "$plan" | grep -q "Source: $want"; then
 		echo "  ok $s: under ORCA a VecResult reads its VecScan's batches"
 	else
@@ -287,6 +324,7 @@ for s in $STORAGES; do
 	# V3: under each planner a hash join of the table with itself, a
 	# VecHashJoin reading both its VecScans' batches, from the source
 	for o in off on; do
+		[ $o = on ] && [ $orca_plans = 0 ] && continue
 		route="under $( [ $o = on ] && echo ORCA || echo "the planner")"
 		plan=$(q "$D" postgres "SET gp.optimizer = $o; SET vexec.mode = force; EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*), sum(a.id), sum(b.id) FROM $t a JOIN $t b ON a.i2 = b.i4")
 		if echo "$plan" | grep -q "Vec Hash Join" && echo "$plan" | grep -q "Outer Input: batches" &&
@@ -313,6 +351,7 @@ for s in $STORAGES; do
 	# V4: under each planner a VecSort over the VecScan's batches, bounded by
 	# the LIMIT -- under ORCA by the Limit of its plan
 	for o in off on; do
+		[ $o = on ] && [ $orca_plans = 0 ] && continue
 		route="under $( [ $o = on ] && echo ORCA || echo "the planner")"
 		plan=$(q "$D" postgres "SET gp.optimizer = $o; SET vexec.mode = force; EXPLAIN (VERBOSE, COSTS OFF) SELECT id, t FROM $t ORDER BY t, id LIMIT 10")
 		if echo "$plan" | grep -q "Vec Sort" && echo "$plan" | grep -q "Bound: 10" &&
@@ -324,7 +363,9 @@ for s in $STORAGES; do
 			fail=1
 		fi
 	done
-	for qt in "${QUERIES[@]}"; do
+	nqueries=${#QUERIES[@]}
+	case "$s" in mergetree*) nqueries=$NSHARED ;; esac
+	for qt in "${QUERIES[@]:0:$nqueries}"; do
 		sql="${qt//%t/$t}"
 		ref=""
 		for sess in "${SESSIONS[@]}"; do
@@ -350,6 +391,23 @@ for s in $STORAGES; do
 		done
 	done
 done
+# ch_table_engines' aggregates from its parts' statistics (its source's
+# aggregate(): rows from the catalog, NULLs, least and greatest values from
+# ClickHouse's "basic" statistics): VecAgg answers count(*), count() and the
+# integers' and dates' min and max of each part unread
+for s in $STORAGES; do
+	case "$s" in mergetree*) ;; *) continue ;; esac
+	plan=$(q "$D" postgres "SET vexec.mode = force; EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*), count(i2), min(i4), max(i8), min(d), max(ts) FROM t_$s")
+	units=$(echo "$plan" | sed -n 's/^ *Units From Statistics: //p' | head -1)
+	if [ -n "$units" ] && [ "$units" -gt 0 ]; then
+		echo "  ok $s: VecAgg's count, min and max answered from $units parts' statistics"
+	else
+		echo "  FAILED $s: no part's statistics answered VecAgg's aggregates:"
+		echo "$plan" | sed 's/^/      /'
+		fail=1
+	fi
+done
+
 # V4: each storage's tables scanned in parallel: off with workers, then
 # force with workers, against off serial
 for s in $STORAGES; do
@@ -504,6 +562,7 @@ for s in $STORAGES; do
 		ANALYZE $t;")
 	case "$out" in *ERROR*) echo "the H6 table in $s: $out"; fail=1; continue ;; esac
 	for orca in off on; do
+		case "$s" in mergetree*) [ $orca = on ] && continue ;; esac
 		read -r handed removed <<< "$(h6_rows "$t" $orca)"
 		planner="$([ $orca = on ] && echo ORCA || echo the planner)"
 		case "$s" in

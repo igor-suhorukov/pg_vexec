@@ -28,9 +28,21 @@
 # and a dropped column.  A table is compared through each row's text, ordered
 # by its key: json has no equality.
 #
+# ch_table_engines' mergetree, in its pages store and its files store
+# (ch_table_engines.md §3, VC10), where the extension's tree is mounted at
+# /chte and its engine library at /engine: built and preloaded, its sink
+# named MergeTree.  It has no index before its CH2, so its tables are made
+# without the unique index, and the checks of one -- a unique violation,
+# the entries made from the sink's TIDs -- are left out for it; nor is
+# ORCA's route over its access methods decided (its decision 7): the check
+# of ORCA's VecInsert is left out for it, its loads under ORCA compared as
+# every storage's.
+#
 #   VEXEC_ROWS        the table's rows: 30000
-#   VEXEC_STORAGES    "heap ao_row ao_column pax pax_porc_vec"
-#   VEXEC_SINKS       "ao_column=gp_ao pax=pax pax_porc_vec=pax": the sink
+#   VEXEC_STORAGES    "heap ao_row ao_column pax pax_porc_vec", and
+#                     "mergetree mergetree_files" where the extension is
+#   VEXEC_SINKS       "ao_column=gp_ao pax=pax pax_porc_vec=pax", and
+#                     mergetree's and mergetree_files' MergeTree: the sink
 #                     each storage's VecInsert must name, table_multi_insert
 #                     for one not listed
 set -u
@@ -38,18 +50,30 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$here/build.sh" || exit 1
 . "$here/lib.sh"
 
-ROWS="${VEXEC_ROWS:-30000}"
-STORAGES="${VEXEC_STORAGES:-heap ao_row ao_column pax pax_porc_vec}"
-SINKS="${VEXEC_SINKS:-ao_column=gp_ao pax=pax pax_porc_vec=pax}"
 D="$(mktemp -d "${TMPDIR:-/tmp}/vexec-sinks-XXXXXX")"
+chte_preload=""
+chte_create=""
+chte_storages=""
+chte_sinks=""
+if [ -d /chte/include/vexec ] && [ -f /engine/libchte_engine.so ]; then
+	CHTE_SRC=/chte /chte/test/build.sh > "$D/chte-build.log" 2>&1 || { tail -20 "$D/chte-build.log"; exit 1; }
+	echo "ch_table_engines $(git -C /chte rev-parse --short HEAD 2> /dev/null || echo '?'): mergetree in both stores"
+	chte_preload=",ch_table_engines"
+	chte_create="; CREATE EXTENSION ch_table_engines"
+	chte_storages=" mergetree mergetree_files"
+	chte_sinks=" mergetree=MergeTree mergetree_files=MergeTree"
+fi
+ROWS="${VEXEC_ROWS:-30000}"
+STORAGES="${VEXEC_STORAGES:-heap ao_row ao_column pax pax_porc_vec$chte_storages}"
+SINKS="${VEXEC_SINKS:-ao_column=gp_ao pax=pax pax_porc_vec=pax$chte_sinks}"
 fail=0
 
-server_init "$D" "shared_preload_libraries = 'gp_core,gp_orca,gp_sql,gp_ao,pax,vexec'" \
+server_init "$D" "shared_preload_libraries = 'gp_core,gp_orca,gp_sql,gp_ao,pax,vexec$chte_preload'" \
 	"max_parallel_workers_per_gather = 0" || exit 1
 server_start "$D" || { echo "the server did not start"; tail -20 "$D/log"; exit 1; }
 trap 'server_stop "$D"; [ -n "${RESULTS_DIR:-}" ] && cp "$D/log" "$RESULTS_DIR/sinks-server.log"' EXIT
 
-out=$(q "$D" postgres "SET client_min_messages = warning; CREATE EXTENSION gp_ao CASCADE; CREATE EXTENSION gp_orca; CREATE EXTENSION gp_sql; CREATE EXTENSION pax; CREATE EXTENSION vexec; CREATE EXTENSION vexec_test")
+out=$(q "$D" postgres "SET client_min_messages = warning; CREATE EXTENSION gp_ao CASCADE; CREATE EXTENSION gp_orca; CREATE EXTENSION gp_sql; CREATE EXTENSION pax; CREATE EXTENSION vexec; CREATE EXTENSION vexec_test$chte_create")
 case "$out" in *ERROR*) echo "the extensions: $out"; exit 1 ;; esac
 echo "the batch sinks: $(q "$D" postgres "SELECT string_agg(sink || ' for ' || coalesce(access_method, '?'), ', ' ORDER BY sink) FROM vexec.sinks()")"
 
@@ -63,6 +87,8 @@ storage_clause() {
 		ao_column) echo "USING ao_column WITH (compresstype=zstd, blocksize=32768)" ;;
 		pax) echo "USING pax WITH (storage_format=porc)" ;;
 		pax_porc_vec) echo "USING pax WITH (storage_format=porc_vec)" ;;
+		mergetree) echo "USING mergetree WITH (order_by = 'id')" ;;
+		mergetree_files) echo "USING mergetree WITH (order_by = 'id', storage = 'files')" ;;
 	esac
 }
 
@@ -168,9 +194,14 @@ INSERT INTO $t SELECT id, i2, i4, i8, f4, f8, n, nfree::numeric, t, v, bp, d, ts
 			notok "$s, $l: VecInsert's load differs from COPY's"
 		fi
 	done
+	# ch_table_engines' tables: no index before its CH2, ORCA's route undecided
+	indexed=1
+	case "$s" in mergetree*) indexed=0 ;; esac
 	# under ORCA, its translation's VecInsert, with its sink
 	plan=$(PGOPTIONS="$(load_opts orca-postgres)" q "$D" postgres "EXPLAIN (COSTS OFF) INSERT INTO ref_mt_$s SELECT $cols FROM $from")
-	if echo "$plan" | grep -q "Optimizer: GPORCA" && echo "$plan" | grep -q "Vec Insert on ref_mt_$s" &&
+	if [ $indexed = 0 ]; then
+		:
+	elif echo "$plan" | grep -q "Optimizer: GPORCA" && echo "$plan" | grep -q "Vec Insert on ref_mt_$s" &&
 		echo "$plan" | grep -q "Write: $want"; then
 		ok "$s: under ORCA, its translation's VecInsert writes through $want"
 	else
@@ -185,7 +216,7 @@ INSERT INTO $t SELECT id, i2, i4, i8, f4, f8, n, nfree::numeric, t, v, bp, d, ts
 		q "$D" postgres "SET client_min_messages = warning;
 			DROP TABLE IF EXISTS $1;
 			CREATE TABLE $1 (id int4 NOT NULL, a int4 CHECK (a < 900), k dpos_$s, t text) $(storage_clause "$s");
-			CREATE UNIQUE INDEX ON $1 (id);" > /dev/null
+			$( [ $indexed = 1 ] && echo "CREATE UNIQUE INDEX ON $1 (id);")" > /dev/null
 	}
 	errors() {					# errors <options> <sql>: SQLSTATE, message, detail
 		PGOPTIONS="$1 -c client_min_messages=warning" "$BINDIR/psql" -X -q -At -h "$D/sock" -U postgres -d postgres \
@@ -200,6 +231,8 @@ INSERT INTO $t SELECT id, i2, i4, i8, f4, f8, n, nfree::numeric, t, v, bp, d, ts
 		"INSERT INTO %e SELECT g % 2500, 1, 1, 'x' FROM generate_series(1, 3000) g" \
 		"INSERT INTO %e SELECT g, 1, 1, repeat('y', 100) || (g / (g - 1600)) FROM generate_series(1, 3000) g"; do
 		n=$((n + 1))
+		# a unique violation needs the index
+		[ $indexed = 0 ] && [ $n = 4 ] && continue
 		errtable "e_mt_$s"
 		errtable "e_vec_$s"
 		ref_err=$(errors "$(load_opts off)" "${sql//%e/e_mt_$s}" | sed "s/e_mt_$s/%e/g")
@@ -229,6 +262,7 @@ rows left: $count"
 	esac
 
 	# the unique index's entries, made from the sink's TIDs, find each row
+	[ $indexed = 0 ] && continue
 	errtable "e_vec_$s"
 	PGOPTIONS="-c gp.optimizer=off -c vexec.mode=force" q "$D" postgres "INSERT INTO e_vec_$s SELECT g, 1, 1, 'r' || g FROM generate_series(1, 5000) g" > /dev/null
 	got=$(q "$D" postgres "SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT count(*) FROM generate_series(1, 5000) g WHERE (SELECT t FROM e_vec_$s WHERE id = g) = 'r' || g")

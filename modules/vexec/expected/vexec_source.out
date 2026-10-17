@@ -1,0 +1,265 @@
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- The batch-source and batch-sink contracts (vexec_source.h at minor 2,
+-- vexec_sink.h) on vanilla PostgreSQL, through vexec_test's access method,
+-- heap's with a source and a sink of every member
+-- (modules/vexec_test/source_test.c): each query run with vexec.mode off,
+-- and in force mode in both formats, and source_check() printing
+-- PostgreSQL's answer where every run gives it, as vexec_scan's
+-- vexec_check() does.  Then which of the members vexec calls.
+--
+-- The source reads units of 1,000 rows ahead and keeps their statistics:
+-- vexec's aggregates over a scan with no qual are answered from them, a
+-- running bound passes the units it rules out over, and estimate() prices
+-- the scan.  A column of type xml it does not support: a scan reading one
+-- stays on the slot path.  The sink takes every type but xml.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec;
+CREATE EXTENSION IF NOT EXISTS vexec_test;
+RESET client_min_messages;
+-- the source and the sink, with their members
+SELECT * FROM vexec.sources() WHERE source = 'vexec_test';
+   source   | access_method | minor | estimates | aggregates | bounds 
+------------+---------------+-------+-----------+------------+--------
+ vexec_test | vexec_test_am |     2 | t         | t          | t
+(1 row)
+
+SELECT * FROM vexec.sinks() WHERE sink = 'vexec_test';
+    sink    | access_method | minor 
+------------+---------------+-------
+ vexec_test | vexec_test_am |     0
+(1 row)
+
+CREATE FUNCTION source_run(q text, m text, f text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+	n int8;
+BEGIN
+	PERFORM set_config('vexec.mode', m, true);
+	PERFORM set_config('vexec.batch_format', f, true);
+	BEGIN
+		EXECUTE format('SELECT coalesce(string_agg(x::text, %L ORDER BY x::text COLLATE "C"), %L), count(*) FROM (%s) x',
+					   ' | ', '(none)', q) INTO r, n;
+		IF length(r) > 200 THEN
+			r := format('%s rows, md5 %s', n, md5(r));
+		END IF;
+	EXCEPTION WHEN OTHERS THEN
+		r := 'ERROR ' || SQLSTATE || ': ' || SQLERRM;
+	END;
+	RETURN r;
+END
+$$;
+CREATE FUNCTION source_check(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ref text := source_run(q, 'off', 'postgres');
+	got text;
+	f text;
+BEGIN
+	FOREACH f IN ARRAY ARRAY['postgres', 'arrow'] LOOP
+		got := source_run(q, 'force', f);
+		IF got IS DISTINCT FROM ref THEN
+			RETURN format('DIFFERS in the %s format: off gives [%s], force gives [%s]', f, ref, got);
+		END IF;
+	END LOOP;
+	RETURN ref;
+END
+$$;
+CREATE TABLE src (a int4, b int8, c text, d date, e bool, f numeric(10,2), g int2, u uuid, x xml)
+  USING vexec_test_am;
+INSERT INTO src
+SELECT i, i * 7, CASE WHEN i % 5 = 0 THEN NULL ELSE 'v' || i END, DATE '2024-01-01' + i % 365,
+	   i % 2 = 0, CASE WHEN i % 11 = 0 THEN NULL ELSE i / 3.0 END, (i % 1000 - 500)::int2,
+	   md5(i::text)::uuid, ('<x>' || i || '</x>')::xml
+FROM generate_series(1, 10000) i;
+ANALYZE src;
+SET vexec.min_rows = 0;
+-- the plan reads through the source, and with an xml column through the slot path
+SET vexec.mode = force;
+EXPLAIN (COSTS OFF, VERBOSE) SELECT a, c FROM src WHERE a % 10 = 3;
+          QUERY PLAN          
+------------------------------
+ Vec Seq Scan on public.src
+   Output: a, c
+   Filter: ((src.a % 10) = 3)
+   Batch Format: postgres
+   Vector Quals: 1 of 1
+   Kernel Steps: 2
+   Fallback Steps: 0
+   Source: vexec_test
+(8 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE) SELECT a, x FROM src WHERE a < 3;
+         QUERY PLAN         
+----------------------------
+ Vec Seq Scan on public.src
+   Output: a, x
+   Filter: (src.a < 3)
+   Batch Format: postgres
+   Vector Quals: 1 of 1
+   Kernel Steps: 1
+   Fallback Steps: 0
+   Source: the slot path
+(8 rows)
+
+RESET vexec.mode;
+-- every column's batches, the TIDs, quals
+SELECT source_check('SELECT a, b, c, d, e, f, g, u FROM src');
+                   source_check                   
+--------------------------------------------------
+ 10000 rows, md5 6526d196482b79da3a79331d5a70cd20
+(1 row)
+
+SELECT source_check('SELECT ctid, a FROM src WHERE a % 997 = 1');
+                                                                                             source_check                                                                                              
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ ("(0,1)",1) | ("(108,4)",8974) | ("(11,79)",998) | ("(120,5)",9971) | ("(23,80)",1995) | ("(35,81)",2992) | ("(47,82)",3989) | ("(59,83)",4986) | ("(72,1)",5983) | ("(84,2)",6980) | ("(96,3)",7977)
+(1 row)
+
+SELECT source_check('SELECT a, c FROM src WHERE c LIKE ''v1%'' AND e');
+                  source_check                  
+------------------------------------------------
+ 444 rows, md5 b16207ca70bb21f7606c6f776bcf9642
+(1 row)
+
+SELECT source_check('SELECT count(*), sum(f), min(c), max(u::text) FROM src WHERE d > DATE ''2024-06-01''');
+                         source_check                         
+--------------------------------------------------------------
+ (5724,8681095.32,v1001,ffeabd22-3de0-d4ea-cb9a-3e6e53e5448d)
+(1 row)
+
+SELECT source_check('SELECT a, x::text FROM src WHERE a < 3');
+    source_check     
+---------------------
+ <x>1</x> | <x>2</x>
+(1 row)
+
+-- aggregates answered from the units' statistics
+SET vexec.mode = force;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT count(*), count(c), min(a), max(b), sum(g) FROM src;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Vec Aggregate (actual rows=1.00 loops=1)
+   ->  Vec Seq Scan on src (actual rows=10000.00 loops=1)
+         Units From Statistics: 10
+         Rows From Statistics: 10000
+(4 rows)
+
+RESET vexec.mode;
+SELECT source_check('SELECT count(*), count(c), min(a), max(b), sum(g) FROM src');
+        source_check        
+----------------------------
+ (10000,8000,1,70000,-5000)
+(1 row)
+
+-- not all of them: the units read
+SELECT source_check('SELECT count(*), sum(f) FROM src');
+    source_check     
+---------------------
+ (10000,15151818.33)
+(1 row)
+
+-- a running bound passes over the units none of whose rows is within it
+SET vexec.mode = force;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT a, c FROM src ORDER BY a LIMIT 3;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Limit (actual rows=3.00 loops=1)
+   ->  Vec Sort (actual rows=3.00 loops=1)
+         Sort Key: a
+         Bound: 3
+         Columns: the keys and TIDs sorted, the rest fetched by TID
+         Sort Method: top-N heapsort  Memory: 25kB
+         ->  Vec Seq Scan on src (actual rows=1000.00 loops=1)
+(7 rows)
+
+RESET vexec.mode;
+SELECT source_check('SELECT a, c FROM src ORDER BY a LIMIT 3');
+       source_check       
+--------------------------
+ (1,v1) | (2,v2) | (3,v3)
+(1 row)
+
+SELECT source_check('SELECT a, c FROM src ORDER BY a DESC LIMIT 3');
+              source_check              
+----------------------------------------
+ (10000,) | (9998,v9998) | (9999,v9999)
+(1 row)
+
+-- rescans: a subquery's scan, for each outer row
+CREATE TABLE src_outer (k int4);
+INSERT INTO src_outer VALUES (3), (5000), (9999);
+SELECT source_check('SELECT k, (SELECT c FROM src WHERE a = k) FROM src_outer');
+          source_check           
+---------------------------------
+ (3,v3) | (5000,) | (9999,v9999)
+(1 row)
+
+-- the sink: every type but xml; a table with an xml column is written by rows
+CREATE TABLE src_copy (a int4, b int8, c text, d date, e bool, f numeric(10,2), g int2, u uuid)
+  USING vexec_test_am;
+SET vexec.mode = force;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  INSERT INTO src_copy SELECT a, b, c, d, e, f, g, u FROM src;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Vec Insert on src_copy (actual rows=0.00 loops=1)
+   Write: sink vexec_test
+   Rows Inserted: 10000
+   Batches Through the Sink: 10
+   ->  Vec Seq Scan on src (actual rows=10000.00 loops=1)
+(5 rows)
+
+RESET vexec.mode;
+SELECT (SELECT md5(string_agg(t::text, '|' ORDER BY a)) FROM src_copy t) =
+	   (SELECT md5(string_agg(t::text, '|' ORDER BY a)) FROM (SELECT a, b, c, d, e, f, g, u FROM src) t) AS copied;
+ copied 
+--------
+ t
+(1 row)
+
+CREATE TABLE src_xml (LIKE src) USING vexec_test_am;
+SET vexec.mode = force;
+EXPLAIN (COSTS OFF) INSERT INTO src_xml SELECT * FROM src;
+        QUERY PLAN         
+---------------------------
+ Vec Insert on src_xml
+   Write: sink vexec_test
+   ->  Vec Seq Scan on src
+(3 rows)
+
+INSERT INTO src_xml SELECT * FROM src;
+RESET vexec.mode;
+SELECT count(*) FROM src_xml;
+ count 
+-------
+ 10000
+(1 row)
+
+-- which members vexec called: every one but retain and release, which it never asks for
+SELECT member, calls > 0 AS called FROM vexec_test.source_calls();
+        member        | called 
+----------------------+--------
+ supports             | t
+ begin                | t
+ next                 | t
+ retain               | f
+ release              | f
+ rescan               | t
+ end                  | t
+ estimate             | t
+ aggregate            | t
+ aggregate answered   | t
+ set_keys             | t
+ units passed by keys | t
+ sink supports        | t
+ sink begin           | t
+ sink put             | t
+ sink end             | t
+(16 rows)
+
+DROP TABLE src, src_outer, src_copy, src_xml;
+DROP FUNCTION source_check(text), source_run(text, text, text);

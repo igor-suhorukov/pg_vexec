@@ -64,7 +64,9 @@
 #                                gp_orca's API in place and no engine
 #   run.sh tpc [storage...]      the tpc suite on four segments (CB_TPC=check)
 #                                in each storage: heap ao_column pax
-#                                pax_porc_vec, vexec preloaded in
+#                                pax_porc_vec, or ch_table_engines' mergetree
+#                                and mergetree_files where CHTE_SRC is, built
+#                                from it; vexec preloaded in
 #                                TPC_VEXEC_MODE (off) and TPC_VEXEC_FORMAT,
 #                                with TPC_WORKERS parallel workers a
 #                                segment ("0"); TPC_INTERCONNECT tcp or
@@ -73,6 +75,13 @@
 #   run.sh fullrun [suite...]    the port's full run with vexec on every
 #                                node, and without it, compared: each
 #                                run's latest of VEXEC_FULLRUN_RUNS
+#   run.sh chte                  ch_table_engines' leg (ch_table_engines.md
+#                                §3, VC10), on the extension's dev image:
+#                                vexec's suite with the extension preloaded,
+#                                the extension's suite with vexec preloaded,
+#                                the differential runner's sessions over
+#                                mergetree tables, and loads into them in both
+#                                of its stores (chte.sh; CHTE_PARTS)
 #   run.sh v0                    V0's "done when": checks; the suite, the
 #                                states, pgregress and differential on both
 #                                legs; the cluster leg
@@ -101,6 +110,11 @@
 #                 when it has one; "none" for the image's own modules
 #   VEXEC_PAX_CONTRIB  PAX's two submodules at the commits the port pins,
 #                 mounted over a worktree's empty directories: CB_SRC's
+#   CHTE_SRC      ch_table_engines' tree, for the legs that load the
+#                 extension (chte; sources and sinks add mergetree where it
+#                 is): pg_ch_table_engines beside this checkout
+#   CHTE_ENGINE_LIB  its engine library's directory, which its own
+#                 test/run.sh engine builds: ~/.cache/pg_accel/chte/engine/lib
 #
 # Timed runs measure the host: ClickBench's time mode (test/clickbench) asks
 # for nothing else to run.  Beside one, give VEXEC_CPUS=1, and leave tpc and
@@ -117,6 +131,8 @@ export CB_SRC="${CB_SRC:-$HOME/.cache/pg_accel/cloudberry}"
 export PG_SRC="${PG_SRC:-$HOME/.cache/pg_accel/postgres}"
 export VEXEC_CPUS="${VEXEC_CPUS:-0}"
 export VEXEC_PORT_SRC="${VEXEC_PORT_SRC:-$CB_SRC}"
+export CHTE_SRC="${CHTE_SRC:-$(cd "$here/../../.." && pwd)/pg_ch_table_engines}"
+export CHTE_ENGINE_LIB="${CHTE_ENGINE_LIB:-$HOME/.cache/pg_accel/chte/engine/lib}"
 # A timed run measures the server without its assertions (§6.3): the port's
 # images built without them, and the port's modules built against those.
 [ "${CB_TPC:-}" = time ] && [ -z "${VEXEC_NOASSERT:-}" ] && VEXEC_NOASSERT=1
@@ -180,6 +196,8 @@ case "$cmd" in
 	*)
 		[ -d "$VEXEC_PORT_SRC" ] || export VEXEC_PORT_SRC=/nonexistent
 		[ -d "$VEXEC_PAX_CONTRIB" ] || export VEXEC_PAX_CONTRIB=/nonexistent
+		[ -d "$CHTE_SRC" ] || export CHTE_SRC=/nonexistent
+		[ -f "$CHTE_ENGINE_LIB/libchte_engine.so" ] || export CHTE_ENGINE_LIB=/nonexistent
 		;;
 esac
 
@@ -306,7 +324,7 @@ case "$cmd" in
 			else
 				echo "  image pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-$CB_COMMIT, the port's modules from $(cat "${VEXEC_PORT_STAGE:-/nonexistent}/COMMIT" 2> /dev/null || echo 'the image')"
 			fi
-			in_leg "$tpc_leg" "$run" "/src/test/vexec/build.sh > /dev/null && { grep -q '^#define USE_ASSERT_CHECKING' \"\$(pg_config --includedir-server)/pg_config.h\" && echo '  server with assertions' || echo '  server without assertions'; } && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} TPC_VEXEC_NUMERIC=${TPC_VEXEC_NUMERIC:-} TPC_VEXEC_SETTINGS='${TPC_VEXEC_SETTINGS:-}' TPC_PLANNER_ROUTE=${TPC_PLANNER_ROUTE:-1} TPC_SEGMENTS=${TPC_SEGMENTS:-$( [ "$tpc_leg" = vanilla-orca ] && echo 0 || echo 4)} TPC_ROUNDS=${TPC_ROUNDS:-1} TPC_WORKERS='${TPC_WORKERS:-0}' TPC_KINDS='${TPC_KINDS:-h ds}' TPC_QUERIES='${TPC_QUERIES:-}' TPC_SF=${TPC_SF:-1} TPC_TIMEOUT=${TPC_TIMEOUT:-120} TPC_PLANNING=${TPC_PLANNING:-0} TPC_PLANS=${TPC_PLANS:-0} TPC_INTERCONNECT=${TPC_INTERCONNECT:-} /src/test/tpc/run.sh" \
+			in_leg "$tpc_leg" "$run" "/src/test/vexec/build.sh > /dev/null && { case $storage in mergetree*) CHTE_SRC=/chte /chte/test/build.sh > /dev/null || exit 1 ;; esac; } && { grep -q '^#define USE_ASSERT_CHECKING' \"\$(pg_config --includedir-server)/pg_config.h\" && echo '  server with assertions' || echo '  server without assertions'; } && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} TPC_VEXEC_NUMERIC=${TPC_VEXEC_NUMERIC:-} TPC_VEXEC_SETTINGS='${TPC_VEXEC_SETTINGS:-}' TPC_PLANNER_ROUTE=${TPC_PLANNER_ROUTE:-1} TPC_SEGMENTS=${TPC_SEGMENTS:-$( [ "$tpc_leg" = vanilla-orca ] && echo 0 || echo 4)} TPC_ROUNDS=${TPC_ROUNDS:-1} TPC_WORKERS='${TPC_WORKERS:-0}' TPC_KINDS='${TPC_KINDS:-h ds}' TPC_QUERIES='${TPC_QUERIES:-}' TPC_SF=${TPC_SF:-1} TPC_TIMEOUT=${TPC_TIMEOUT:-120} TPC_PLANNING=${TPC_PLANNING:-0} TPC_PLANS=${TPC_PLANS:-0} TPC_INTERCONNECT=${TPC_INTERCONNECT:-} /src/test/tpc/run.sh" \
 				| tee "$run/output" || rc=1
 		done
 		exit $rc
@@ -322,6 +340,15 @@ case "$cmd" in
 		python3 "$here/fullrun_compare.py" "$(ls -d "$VEXEC_CACHE"/runs/*-fullrun-0 | tail -1)/output" \
 			"$(ls -d "$VEXEC_CACHE"/runs/*-fullrun-1 | tail -1)/output" || rc=1
 		exit $rc
+		;;
+	chte)
+		[ "$CHTE_SRC" != /nonexistent ] || die "no ch_table_engines tree: CHTE_SRC"
+		[ "$CHTE_ENGINE_LIB" != /nonexistent ] || die "no engine library: pg_ch_table_engines' test/run.sh engine, or CHTE_ENGINE_LIB"
+		run="$(new_run chte)"
+		echo "== ch_table_engines' leg: $run"
+		echo "  the extension's tree $CHTE_SRC at $(git -C "$CHTE_SRC" rev-parse --short HEAD 2> /dev/null || echo '?')$( [ -n "$(git -C "$CHTE_SRC" status --porcelain 2> /dev/null)" ] && echo ' +changes')"
+		in_leg chte "$run" "/src/test/vexec/chte.sh" | tee "$run/output"
+		exit "${PIPESTATUS[0]}"
 		;;
 	v0)
 		rc=0

@@ -63,6 +63,7 @@
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #include "vexec.h"
 #include "plan/plan.h"
@@ -256,6 +257,81 @@ needed_attrs(RelOptInfo *rel)
 }
 
 /*
+ * VC1: a registered source's estimate of what the scan reads -- the needed
+ * attributes' bytes in what the quals leave once the source prunes by them
+ * -- which the cost model takes in place of the relation's pages (cost.c).
+ * The spec is the one begin_scan() would give (exec/vecscan.c): the
+ * attributes in order, the TIDs where ctid is read, the restrictions that
+ * may prune -- over the relation's own columns alone, with no parameter,
+ * subplan or volatile function -- and a batch's rows.  -1 where the source
+ * gives no estimate.
+ */
+static bool
+estimate_prunable_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param) || IsA(node, SubPlan) || IsA(node, AlternativeSubPlan))
+		return true;
+	return expression_tree_walker(node, estimate_prunable_walker, context);
+}
+
+static double
+source_estimate(RelOptInfo *rel, Relation relation, const VexecSourceRoutine *src, Bitmapset *attrs)
+{
+	VexecSourceSpec spec;
+	TupleDesc	desc = RelationGetDescr(relation);
+	AttrNumber *attnums = palloc(sizeof(AttrNumber) * Max(desc->natts, 1));
+	bool		whole_row = false;
+	bool		need_tid = false;
+	List	   *quals = NIL;
+	double		rows = -1;
+	double		bytes = -1;
+	int			n = 0;
+	int			i = -1;
+	ListCell   *lc;
+
+	while ((i = bms_next_member(attrs, i)) >= 0)
+	{
+		AttrNumber	attno = i + FirstLowInvalidHeapAttributeNumber;
+
+		if (attno == 0)
+			whole_row = true;
+		else if (attno == SelfItemPointerAttributeNumber)
+			need_tid = true;
+		else if (attno > 0)
+			attnums[n++] = attno;
+	}
+	if (whole_row)
+	{
+		n = 0;
+		for (i = 0; i < desc->natts; i++)
+			if (!TupleDescAttr(desc, i)->attisdropped)
+				attnums[n++] = i + 1;
+	}
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst(lc);
+
+		if (bms_is_subset(rinfo->clause_relids, rel->relids) &&
+			!estimate_prunable_walker((Node *) rinfo->clause, NULL) &&
+			!contain_volatile_functions((Node *) rinfo->clause))
+			quals = lappend(quals, rinfo->clause);
+	}
+
+	memset(&spec, 0, sizeof(spec));
+	spec.size = sizeof(VexecSourceSpec);
+	spec.ncolumns = n;
+	spec.attnums = attnums;
+	spec.layouts = NULL;
+	spec.quals = quals;
+	spec.max_rows = VEXEC_BATCH_ROWS;
+	spec.flags = need_tid ? VEXEC_SRC_TIDS : 0;
+	src->estimate(relation, ActiveSnapshotSet() ? GetActiveSnapshot() : NULL, &spec, &rows, &bytes);
+	return bytes;
+}
+
+/*
  * A system column the scan cannot give: VecScan gives ctid, from each row's
  * TID, and tableoid; xmin and its kind are heap's tuple header.
  */
@@ -352,6 +428,8 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 	}
 	if (src == NULL && vexec_heap_page_reader && vexec_heap_reader_possible(relation))
 		how = "heap's pages";
+	if (src != NULL && VEXEC_SOURCE_HAS(src, estimate))
+		source_bytes = source_estimate(rel, relation, src, attrs);
 	table_close(relation, NoLock);
 
 	/*

@@ -12,7 +12,9 @@
 #               transaction that rolls back
 #   ingest      adbc_ingest's modes through CommandStatementIngest, as
 #               adbc_driver_postgresql's COPY loads the same table; in a
-#               transaction; a client's malformed Arrow, and a client that
+#               transaction; the access method and storage parameters of the
+#               table it makes, from its options, ch_table_engines' tables
+#               where it is installed; a client's malformed Arrow, and a client that
 #               dies mid-stream, loading nothing; executemany of a prepared
 #               INSERT as one INSERT ... SELECT, and a row at a time into a
 #               table with a trigger
@@ -505,6 +507,99 @@ def ingest_in_a_transaction():
         with conn.cursor() as cur:
             expect_error(lambda: cur.adbc_ingest('ing_tx', table, mode='append'), 'must name it')
         conn.rollback()
+
+
+@test
+def ingest_with_table_options():
+    """a table an ingest makes gets the access method and the storage
+    parameters its options name (VF1); a table appended to keeps its own;
+    another option, or a WITH list that is not one, refused"""
+    table = pa.table({'a': pa.array(range(500), pa.int64()), 's': pa.array(['v%d' % i for i in range(500)])})
+    psql('DROP TABLE IF EXISTS ing_opts')
+    client, opts = flight_client()
+
+    def ingest(name, options, if_exists=1):      # TABLE_NOT_EXIST_OPTION_CREATE, TABLE_EXISTS_OPTION_FAIL
+        tdo = varint(1 << 3) + varint(1) + varint(2 << 3) + varint(if_exists)
+        body = fbytes(1, tdo) + fstr(2, name)
+        for k, v in options:
+            body += fbytes(1000, fstr(1, k) + fstr(2, v))
+        writer, reader = client.do_put(fl.FlightDescriptor.for_command(any_cmd('CommandStatementIngest', body)),
+                                       table.schema, opts)
+        writer.write_table(table)
+        writer.done_writing()
+        reader.read()
+        writer.close()
+    ingest('ing_opts', [('access_method', 'heap'), ('with', "fillfactor = 70, toast.autovacuum_enabled = false")])
+    assert psql("SELECT amname || ' ' || array_to_string(c.reloptions, ',') FROM pg_class c JOIN pg_am a ON a.oid = c.relam "
+                "WHERE relname = 'ing_opts'") == 'heap fillfactor=70', \
+        psql("SELECT c.reloptions FROM pg_class c WHERE relname = 'ing_opts'")
+    assert psql("SELECT array_to_string(t.reloptions, ',') FROM pg_class c JOIN pg_class t ON t.oid = c.reltoastrelid "
+                "WHERE c.relname = 'ing_opts'") == 'autovacuum_enabled=false'
+    assert psql('SELECT count(*), sum(a) FROM ing_opts') == '500|124750'
+    # appended to: the table's own, whatever the options say
+    ingest('ing_opts', [('with', 'fillfactor = 90')], if_exists=2)
+    assert psql("SELECT array_to_string(reloptions, ',') FROM pg_class WHERE relname = 'ing_opts'") == 'fillfactor=70'
+    assert psql('SELECT count(*) FROM ing_opts') == '1000'
+    expect_error(lambda: ingest('ing_opts2', [('nosuch', 'x')]), 'is not one of this server')
+    expect_error(lambda: ingest('ing_opts2', [('with', "fillfactor = 70) TABLESPACE pg_default --")]),
+                 'not a list of storage parameters')
+    expect_error(lambda: ingest('ing_opts2', [('with', "fillfactor = 70); DROP TABLE ing_opts; --")]),
+                 'not a list of storage parameters')
+    expect_error(lambda: ingest('ing_opts2', [('access_method', 'nosuch')]), 'does not exist')
+    client.close()
+    assert psql("SELECT count(*) FROM pg_class WHERE relname IN ('ing_opts', 'ing_opts2')") == '1'
+
+
+@test
+def ingest_into_mergetree():
+    """where ch_table_engines is preloaded (flight.sh): an ingest makes a
+    mergetree table of each store from its options (VF1), and loads the
+    rows adbc_driver_postgresql's COPY loads into another, row for row"""
+    if os.environ.get('FLIGHT_CHTE') != '1':
+        print('    skipped: ch_table_engines is not installed')
+        return
+    import datetime
+    n = 5000
+    data = pa.table({
+        'i8': pa.array(range(n), pa.int64()),
+        'i4': pa.array([None if i % 7 == 0 else i for i in range(n)], pa.int32()),
+        'tx': pa.array([None if i % 11 == 0 else 'row %d é' % i for i in range(n)], pa.string()),
+        'd': pa.array([datetime.date(2020, 1, 1) + datetime.timedelta(days=i % 900) for i in range(n)],
+                      pa.date32()),
+        'n': pa.array([decimal.Decimal(i) / 100 for i in range(n)], pa.decimal128(15, 2)),
+        'f': pa.array([i / 3 for i in range(n)], pa.float64()),
+        'b': pa.array([i % 2 == 0 for i in range(n)], pa.bool_()),
+        'ts': pa.array([datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc) +
+                        datetime.timedelta(seconds=i) for i in range(n)], pa.timestamp('us', tz='UTC')),
+        'bin': pa.array([bytes([i % 256]) * (i % 5) for i in range(n)], pa.binary()),
+    })
+    client, opts = flight_client()
+    for store in ('pages', 'files'):
+        name = 'ing_mt_' + store
+        psql('DROP TABLE IF EXISTS %s, %s_copy' % (name, name))
+        tdo = varint(1 << 3) + varint(1) + varint(2 << 3) + varint(1)     # create; fail if it exists
+        body = fbytes(1, tdo) + fstr(2, name)
+        for k, v in (('access_method', 'mergetree'), ('with', "order_by = 'i8', storage = '%s'" % store)):
+            body += fbytes(1000, fstr(1, k) + fstr(2, v))
+        writer, reader = client.do_put(fl.FlightDescriptor.for_command(any_cmd('CommandStatementIngest', body)),
+                                       data.schema, opts)
+        writer.write_table(data)
+        writer.done_writing()
+        reader.read()
+        writer.close()
+        got = psql("SELECT a.amname || ' ' || (c.reloptions @> ARRAY['order_by=i8', 'storage=%s']) FROM pg_class c "
+                   "JOIN pg_am a ON a.oid = c.relam WHERE c.relname = '%s'" % (store, name))
+        assert got == 'mergetree true', got
+        psql("CREATE TABLE %s_copy (LIKE %s) USING mergetree WITH (order_by = 'i8', storage = '%s')"
+             % (name, name, store))
+        with pgdb.connect(PG_URI, autocommit=True) as conn, conn.cursor() as cur:
+            cur.adbc_ingest(name + '_copy', data, mode='append')
+        assert psql('SELECT count(*) FROM %s' % name) == str(n)
+        diff = psql('SELECT count(*) FROM ((SELECT * FROM %s EXCEPT ALL SELECT * FROM %s_copy) '
+                    'UNION ALL (SELECT * FROM %s_copy EXCEPT ALL SELECT * FROM %s)) x' % (name, name, name, name))
+        assert diff == '0', diff
+        assert int(psql("SELECT count(*) FROM ch.parts('%s')" % name)) > 0
+    client.close()
 
 
 def ingest_descriptor(table):

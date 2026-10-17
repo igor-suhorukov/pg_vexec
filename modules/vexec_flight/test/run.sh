@@ -47,6 +47,13 @@
 #                     aoco, heap) and paths ("csv copy flight"; also
 #                     ingest); its loads of each are FLIGHT_RUNS
 #   FLIGHT_TESTS      test_flight.py's tests to run, by name: all
+#   CHTE_SRC, CHTE_ENGINE_LIB
+#                     ch_table_engines' tree (pg_ch_table_engines beside
+#                     pg_accel's checkout) and its engine library's directory
+#                     (~/.cache/pg_accel/chte/engine/lib): where both are,
+#                     the extension is built and preloaded in each leg, and
+#                     the ingest's tests and the bench's formats mergetree
+#                     and mergetree_files load its tables
 #   FLIGHT_CACHE      the runs: ~/.cache/pg_accel/flight
 #   FLIGHT_NOASSERT   1: the servers without their assertions, as a timed run
 #                     wants them (pg_accel's vanilla-noassert and portnoassert
@@ -71,6 +78,8 @@ if [ "${FLIGHT_NOASSERT:-0}" = 1 ]; then
 	STAGE=portbuild-noassert
 fi
 VEXEC_PORT_STAGE="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/$STAGE/stage}"
+CHTE_SRC="${CHTE_SRC:-$(cd "$VEXEC_SRC/.." && pwd)/pg_ch_table_engines}"
+CHTE_ENGINE_LIB="${CHTE_ENGINE_LIB:-$HOME/.cache/pg_accel/chte/engine/lib}"
 if [ -z "${CB_COMMIT:-}" ]; then
 	CB_COMMIT="$(docker images pg_accel/cb-ext --format '{{.CreatedAt}} {{.Tag}}' 2> /dev/null | sort -r | awk 'NR == 1 {print $NF}')"
 fi
@@ -106,6 +115,9 @@ in_leg() {					# in_leg <leg> <run dir> <command...>
 	if [ "$leg" = port ]; then
 		[ -d "$VEXEC_PORT_STAGE/usr/local/pgsql" ] || die "no stage of the port's modules at $VEXEC_PORT_STAGE (test/vexec/run.sh portbuild)"
 		stage=(-v "$VEXEC_PORT_STAGE:/cbstage:ro" -e "FLIGHT_SEGMENTS=${FLIGHT_SEGMENTS:-2}")
+	fi
+	if [ -d "$CHTE_SRC/include/vexec" ] && [ -f "$CHTE_ENGINE_LIB/libchte_engine.so" ]; then
+		stage+=(-v "$CHTE_SRC:/chte:ro" -v "$CHTE_ENGINE_LIB:/engine:ro" -e CHTE_ENGINE=/engine/libchte_engine.so)
 	fi
 	docker run --rm "${DOCKER_RUN_OPTS[@]}" --network none --cpus "$FLIGHT_CPUS" -m "$FLIGHT_MEM" --memory-swap "$FLIGHT_MEM" \
 		--shm-size 2g --tmpfs /tmp:exec --user postgres \

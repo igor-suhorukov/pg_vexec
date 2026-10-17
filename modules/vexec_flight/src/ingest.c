@@ -19,7 +19,10 @@
  *
  *	CommandStatementIngest	the table is found, created, replaced or appended
  *							to, as table_definition_options say, in the
- *							statement's transaction; the stream's columns go
+ *							statement's transaction; a table made is made
+ *							with the access method and the storage
+ *							parameters the command's options name
+ *							("access_method", "with"); the stream's columns go
  *							into the table's columns of the same names.  A
  *							column whose Arrow type names a type the table's
  *							column cannot be assigned from -- utf8 for a date,
@@ -44,8 +47,10 @@
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "commands/defrem.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_coerce.h"
+#include "parser/parser.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -56,6 +61,8 @@
 #include "session.h"
 
 #include "FlightSql.pb-c.h"
+
+static char *ingest_table_clauses(Arrow__Flight__Protocol__Sql__CommandStatementIngest *cmd);
 
 /* A FlightData's fields (Flight.proto:532-557), where they lie. */
 typedef struct FlightDataView
@@ -291,6 +298,7 @@ flight_ingest(FlightCall *call, const ProtobufCBinaryData *command,
 	void	   *stream;
 	const char *nspname = NULL;
 	char	   *qname;
+	char	   *clauses;
 	Oid			relid;
 	int			ncols;
 	int			i;
@@ -335,6 +343,7 @@ flight_ingest(FlightCall *call, const ProtobufCBinaryData *command,
 	}
 	qname = nspname != NULL ? quote_qualified_identifier(nspname, cmd->table) :
 		pstrdup(quote_identifier(cmd->table));
+	clauses = ingest_table_clauses(cmd);
 
 	/* the stream, its columns the types their Arrow types name */
 	memset(&r, 0, sizeof(r));
@@ -368,10 +377,10 @@ flight_ingest(FlightCall *call, const ProtobufCBinaryData *command,
 			appendStringInfo(&defs, "%s%s %s", i > 0 ? ", " : "",
 							 quote_identifier(cols[i].name),
 							 format_type_with_typemod(cols[i].type, cols[i].typmod));
-		(void) ingest_run(psprintf("CREATE %sTABLE %s (%s)",
+		(void) ingest_run(psprintf("CREATE %sTABLE %s (%s)%s",
 								   cmd->temporary ? "TEMPORARY " : "",
 								   cmd->temporary ? quote_identifier(cmd->table) : qname,
-								   defs.data));
+								   defs.data, clauses));
 		relid = RangeVarGetRelid(makeRangeVar(nspname ? pstrdup(nspname) : NULL, cmd->table, -1),
 								 NoLock, false);
 	}
@@ -401,6 +410,70 @@ flight_ingest(FlightCall *call, const ProtobufCBinaryData *command,
 	ingest_finish(call, eg, stream, &r);
 	flight_finish_xact();
 	put_update_result(call, n);
+}
+
+/*
+ * What an ingest's options say of a table it makes (VF1): "access_method",
+ * the table access method, as USING names it; "with", the storage
+ * parameters, "name = value, ...", as CREATE TABLE's WITH takes them.  The
+ * parameters are parsed as PostgreSQL parses a WITH list and written back
+ * one by one, each value a literal, so that nothing but them reaches the
+ * statement.  Another option is refused.  A table appended to keeps its own.
+ */
+static char *
+ingest_table_clauses(Arrow__Flight__Protocol__Sql__CommandStatementIngest *cmd)
+{
+	StringInfoData out;
+	const char *am = NULL;
+	const char *with = NULL;
+
+	for (size_t i = 0; i < cmd->n_options; i++)
+	{
+		const char *key = cmd->options[i]->key;
+
+		if (key && strcmp(key, "access_method") == 0)
+			am = cmd->options[i]->value;
+		else if (key && strcmp(key, "with") == 0)
+			with = cmd->options[i]->value;
+		else
+			flight_error(GRPC_INVALID_ARGUMENT, ERRCODE_INVALID_PARAMETER_VALUE,
+						 "CommandStatementIngest's option \"%s\" is not one of this server's: access_method, with",
+						 key ? key : "");
+	}
+	initStringInfo(&out);
+	if (am != NULL && am[0] != '\0')
+		appendStringInfo(&out, " USING %s", quote_identifier(am));
+	if (with != NULL && with[0] != '\0')
+	{
+		List	   *stmts = raw_parser(psprintf("CREATE TABLE t () WITH (%s)", with), RAW_PARSE_DEFAULT);
+		CreateStmt *create;
+		ListCell   *lc;
+		bool		first = true;
+
+		if (list_length(stmts) != 1 || !IsA(((RawStmt *) linitial(stmts))->stmt, CreateStmt))
+			flight_error(GRPC_INVALID_ARGUMENT, ERRCODE_SYNTAX_ERROR,
+						 "CommandStatementIngest's option \"with\" is not a list of storage parameters");
+		create = (CreateStmt *) ((RawStmt *) linitial(stmts))->stmt;
+		if (create->tableElts != NIL || create->inhRelations != NIL || create->partspec != NULL ||
+			create->partbound != NULL || create->ofTypename != NULL || create->tablespacename != NULL ||
+			create->accessMethod != NULL || create->oncommit != ONCOMMIT_NOOP)
+			flight_error(GRPC_INVALID_ARGUMENT, ERRCODE_SYNTAX_ERROR,
+						 "CommandStatementIngest's option \"with\" is not a list of storage parameters");
+		appendStringInfoString(&out, " WITH (");
+		foreach(lc, create->options)
+		{
+			DefElem    *def = lfirst(lc);
+
+			appendStringInfo(&out, "%s%s%s%s", first ? "" : ", ",
+							 def->defnamespace ? quote_identifier(def->defnamespace) : "",
+							 def->defnamespace ? "." : "", quote_identifier(def->defname));
+			if (def->arg != NULL)
+				appendStringInfo(&out, " = %s", quote_literal_cstr(defGetString(def)));
+			first = false;
+		}
+		appendStringInfoChar(&out, ')');
+	}
+	return out.data;
 }
 
 /* ---------------------------------------------------------------------

@@ -30,7 +30,8 @@ DROP TYPE vexec_pair;
 DROP TYPE vexec_mood;
 DROP DOMAIN vexec_price;
 
--- the sources storage modules registered: none in this build
-SELECT * FROM vexec.sources();
+-- the sources registered for this database's access methods: none before an
+-- extension makes one (vexec_source tests vexec_test's)
+SELECT * FROM vexec.sources() WHERE access_method IS NOT NULL;
 -- and the sinks: none either (§3.16)
-SELECT * FROM vexec.sinks();
+SELECT * FROM vexec.sinks() WHERE access_method IS NOT NULL;

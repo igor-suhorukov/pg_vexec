@@ -9,9 +9,10 @@
 -- The batch sources storage modules registered (vexec_source.h), each with
 -- the table access method of this database it serves, and the optional
 -- members it has: estimates for the cost model, aggregates answered from
--- its statistics.
+-- its statistics, bounds -- a running sort's keys -- it passes units over by.
 CREATE FUNCTION sources(OUT source text, OUT access_method text,
-                        OUT minor int4, OUT estimates bool, OUT aggregates bool)
+                        OUT minor int4, OUT estimates bool, OUT aggregates bool,
+                        OUT bounds bool)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'vexec_sources'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
