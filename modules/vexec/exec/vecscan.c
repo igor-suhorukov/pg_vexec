@@ -10,7 +10,12 @@
  *	a registered one	the batch reader the table's access method
  *						registered (vexec_source.h): PAX's, gp_ao's.  It
  *						hands each column in its storage's layout, and the
- *						rows it has deleted out of the batch's selection;
+ *						rows it has deleted out of the batch's selection.
+ *						Its text stays in that layout -- offsets, views or
+ *						Datums -- which kernels and parents read, and is
+ *						made the format's only where PostgreSQL's
+ *						evaluator reads it, at the rows past the eager
+ *						quals (VC14, vexec.enable_source_layouts);
  *	heap's pages		heap's page reader (source/heap.c, V4): each page
  *						prepared by heap, its visible tuples deformed
  *						straight into the batch -- with vexec.heap_page_reader
@@ -137,6 +142,9 @@ typedef struct VexecScanState
 	/* H2: the units, and their rows, a source answered from statistics */
 	int64		stats_units;
 	int64		stats_rows;
+
+	/* VC14: the most columns a batch kept in the layout the source gave them */
+	int			kept_cols;
 
 	/*
 	 * X3: the leading quals heap's page reader checks on a tuple before
@@ -794,7 +802,19 @@ fetch_source(VexecScanState *s)
 		v->validity = NULL;
 		v->values = (void *) sb.tids;
 	}
-	vexec_batch_apply_config(in, &s->node.layout);
+
+	/*
+	 * VC14: text stays as the source handed it -- kernels and parents read
+	 * its layout -- and is made the format's only for PostgreSQL's
+	 * evaluator, after the eager quals (node.c, convert_kept())
+	 */
+	if (vexec_enable_source_layouts)
+	{
+		s->node.in_kept = vexec_batch_apply_config_keep_bytes(in, &s->node.layout);
+		s->kept_cols = Max(s->kept_cols, s->node.in_kept);
+	}
+	else
+		vexec_batch_apply_config(in, &s->node.layout);
 	return true;
 }
 
@@ -1042,6 +1062,9 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		ExplainPropertyInteger("Units From Statistics", NULL, s->stats_units, es);
 		ExplainPropertyInteger("Rows From Statistics", NULL, s->stats_rows, es);
 	}
+	/* VC14: only where a batch kept one, in every format, as node.c's counts */
+	if (es->analyze && es->verbose && s->kept_cols > 0)
+		ExplainPropertyInteger("Text Columns Kept as Handed", NULL, s->kept_cols, es);
 }
 
 /*

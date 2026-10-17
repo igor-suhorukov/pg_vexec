@@ -324,6 +324,14 @@ vexec_node_compile(VexecNode *node, List *quals, List *tlist)
 	if (vexec_enable_shared_exprs)
 		share_subtrees(node);
 
+	/*
+	 * VC14: PostgreSQL's evaluator reads the input's rows -- every column of
+	 * each, vexec_node_load_input() -- for a lazy qual or target, its memo
+	 * included, and for a fallback step
+	 */
+	node->needs_input_datums = node->first_lazy < node->nquals || node->any_lazy_target ||
+		node->nfallbacks > 0;
+
 	/* the output batch, its columns the targets' */
 	{
 		VexecType **types = palloc(sizeof(VexecType *) * Max(node->ntargets, 1));
@@ -519,6 +527,39 @@ row_past_bound(VexecNode *node, int row)
 	return past;
 }
 
+/* The layouts that hold a value's bytes, which a scan may keep (VC14). */
+#define BYTES_LAYOUT(l) ((l) == VEXEC_DATUM || (l) == VEXEC_VIEW || (l) == VEXEC_OFFSETS)
+
+/*
+ * VC14: the input's columns a scan kept in its source's layout, in the
+ * format's at the rows `active` and `redo` alone (convert.c,
+ * vexec_vec_convert_rows()), in the input batch's memory: the rows past the
+ * eager quals, and those PostgreSQL's evaluator redoes, are the only ones
+ * it reads.  A column whose values the format's layout cannot hold stays
+ * as it is, read a value at a time (vexec_vec_datum()).
+ */
+static void
+convert_kept(VexecNode *node, const uint64 *active, const uint64 *redo)
+{
+	VexecBatch *in = node->in;
+	int			n = in->nrows;
+	uint64	   *rows = vexec_bits_copy(node->work, active, n);
+	int			i;
+
+	vexec_bits_or_into(rows, redo, n);
+	for (i = 0; i < in->ncols; i++)
+	{
+		VexecVec   *v = &in->cols[i];
+		VexecShape	target;
+
+		vexec_type_shape(v->type, &node->layout, &target);
+		if (BYTES_LAYOUT(target.layout) && BYTES_LAYOUT(v->shape.layout) &&
+			!vexec_shape_equal(&v->shape, &target))
+			(void) vexec_vec_convert_rows(in, v, &target, rows);
+	}
+	node->stats.text_converted += vexec_bits_count(rows, n);
+}
+
 /* The rows past the quals so far: those they passed, and those to redo. */
 static int
 rows_kept(VexecNode *node, uint64 *active, uint64 *redo, int n)
@@ -584,6 +625,14 @@ eval_batch(VexecNode *node)
 	if (node->jfilter != NULL && !node->jfilter->before_quals)
 		bounded += apply_join_filter(node, active, ev.redo, n);
 
+	/*
+	 * VC14: text the scan kept as its source handed it, made the format's
+	 * where PostgreSQL's evaluator is to read it: at the rows past the eager
+	 * prefix and those it redoes, the only ones it reads from here on
+	 */
+	if (node->in_kept > 0 && node->needs_input_datums)
+		convert_kept(node, active, ev.redo);
+
 	/* the eager quals after the first lazy one, over the same rows */
 	ev.exact = false;
 	for (i = node->first_lazy; i < node->nquals; i++)
@@ -628,6 +677,7 @@ next_batch(VexecNode *node)
 		node->child_redo = NULL;
 		node->loaded_row = -1;
 		node->ran = true;
+		node->in_kept = 0;
 		if (!node->fetch(node))
 			return false;
 		if (node->in->nrows == 0)
@@ -1202,6 +1252,8 @@ vexec_node_explain_properties(VexecNode *node, List *ancestors, ExplainState *es
 		if (st->declared_rows > 0)
 			ExplainPropertyInteger("Rows Through Declared Calls", NULL,
 								   st->declared_rows, es);
+		if (st->text_converted > 0)
+			ExplainPropertyInteger("Text Rows Converted", NULL, st->text_converted, es);
 		if (!node->ran)
 			ExplainPropertyInteger("Segments Reporting", NULL, node->segments_seen, es);
 	}

@@ -313,6 +313,9 @@ typedef struct VexecNodeStats
 	int64		drained_motions;	/* Motions read to their end, unread */
 	int64		drained_rows;
 	int64		squelched;		/* subtrees gp_core squelched (V7) */
+	int64		text_converted; /* VC14: rows of text kept as a source handed
+								 * it, made the format's for PostgreSQL's
+								 * evaluator */
 } VexecNodeStats;
 
 struct VexecNode
@@ -342,6 +345,16 @@ struct VexecNode
 	AttrNumber *input_attnos;	/* for each input column, the attno it is */
 	TupleTableSlot *input_slot; /* the scan slot, or an outer slot */
 	int			loaded_row;		/* the input row in input_slot, or -1 */
+
+	/*
+	 * VC14: the input batch's columns a scan left in the layout its source
+	 * handed them, not the format's (vexec_batch_apply_config_keep_bytes());
+	 * and whether PostgreSQL's evaluator reads the input's rows -- a lazy
+	 * qual or target, a fallback step -- so that those are made the
+	 * format's for it, after the eager quals (node.c)
+	 */
+	int			in_kept;
+	bool		needs_input_datums;
 
 	/* the programs */
 	int			nquals;

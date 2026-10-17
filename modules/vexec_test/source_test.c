@@ -22,8 +22,12 @@
  *
  *	next()			a unit's rows cut into batches of the spec's max_rows: a
  *					fixed-length type FIXED at its width, bool BYTE_BOOL, any
- *					other type DATUM; the TIDs heap gave; each batch's
- *					arrays its own, written over by the next unless retained
+ *					other type DATUM -- or, a varlena one, OFFSETS, int32
+ *					offsets into its values' bytes, as ch_table_engines'
+ *					MergeTree hands its strings, under
+ *					vexec_test.source_text_offsets (VC14); the TIDs heap
+ *					gave; each batch's arrays its own, written over by the
+ *					next unless retained
  *	aggregate()		count(*), count(x), and min(x), max(x) and sum(x) of the
  *					integers, from the next unit's statistics, which is then
  *					passed over as read
@@ -55,12 +59,15 @@
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
+#include "varatt.h"
 
 #include "vexec_sink.h"
 #include "vexec_source.h"
@@ -88,6 +95,9 @@ static const char *const member_names[NMEMBERS] = {
 };
 
 static int64 calls[NMEMBERS];
+
+/* vexec_test.source_text_offsets: varlena columns handed as OFFSETS */
+static bool text_offsets = false;
 
 /*
  * A TOAST table of the access method's is heap's own: heap's callback gives
@@ -211,7 +221,9 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 		Form_pg_attribute att = TupleDescAttr(st->desc, spec->attnums[i] - 1);
 
 		st->attnums[i] = spec->attnums[i];
-		st->layouts[i] = att->atttypid == BOOLOID ? VEXEC_BYTE_BOOL : att->attlen > 0 ? VEXEC_FIXED : VEXEC_DATUM;
+		st->layouts[i] = att->atttypid == BOOLOID ? VEXEC_BYTE_BOOL :
+			att->attlen > 0 ? VEXEC_FIXED :
+			att->attlen == -1 && text_offsets ? VEXEC_OFFSETS : VEXEC_DATUM;
 	}
 	st->ncols = spec->ncolumns;
 	if (spec->nkeys > 0)
@@ -436,6 +448,36 @@ src_next(void *arg, VexecSourceBatch *batch)
 			for (int r = 0; r < n; r++)
 				d[r] = u->values[(st->pos + r) * st->ncols + i];
 			c->values = d;
+		}
+		else if (c->layout == VEXEC_OFFSETS)
+		{
+			/* each value's bytes end to end, detoasted, without its header */
+			int32	   *off = palloc(sizeof(int32) * (n + 1));
+			const void **buffers = palloc(sizeof(void *));
+			int64	   *sizes = palloc(sizeof(int64));
+			StringInfoData bytes;
+
+			initStringInfo(&bytes);
+			off[0] = 0;
+			for (int r = 0; r < n; r++)
+			{
+				if (!u->nulls[(st->pos + r) * st->ncols + i])
+				{
+					varlena    *p = (varlena *) DatumGetPointer(u->values[(st->pos + r) * st->ncols + i]);
+					varlena    *plain = pg_detoast_datum_packed(p);
+
+					appendBinaryStringInfo(&bytes, VARDATA_ANY(plain), VARSIZE_ANY_EXHDR(plain));
+					if (plain != p)
+						pfree(plain);
+				}
+				off[r + 1] = bytes.len;
+			}
+			buffers[0] = bytes.data;
+			sizes[0] = bytes.len;
+			c->values = off;
+			c->buffers = buffers;
+			c->buffer_sizes = sizes;
+			c->nbuffers = 1;
 		}
 		else
 		{
@@ -772,6 +814,10 @@ void		_PG_init(void);
 void
 _PG_init(void)
 {
+	DefineCustomBoolVariable("vexec_test.source_text_offsets",
+							 "Hands the test source's varlena columns as int32 offsets into their bytes.",
+							 NULL, &text_offsets, false,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	if (!process_shared_preload_libraries_in_progress)
 		return;
 	source.am = routine();

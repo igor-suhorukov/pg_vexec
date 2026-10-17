@@ -29,6 +29,7 @@
 
 #include "access/detoast.h"
 #include "datatype/timestamp.h"
+#include "port/pg_bitutils.h"
 #include "utils/date.h"
 #include "utils/timestamp.h"
 #include "varatt.h"
@@ -657,6 +658,47 @@ vexec_vec_convert(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 }
 
 /*
+ * A column into the shape the format in effect and the per-structure
+ * settings give its type, or PostgreSQL's where its values cannot take
+ * that shape.  True when it has its configured shape.
+ */
+static bool
+apply_column(VexecBatch *batch, VexecVec *v, const VexecLayoutConfig *cfg)
+{
+	VexecShape	target;
+
+	vexec_type_shape(v->type, cfg, &target);
+	if (vexec_vec_convert(batch, v, &target))
+		return true;
+
+	/*
+	 * A numeric that has no scaled form takes the format's layout for other
+	 * numerics; a temporal value Arrow's cannot hold keeps PostgreSQL's;
+	 * offsets beyond int32 stay views.
+	 */
+	if (target.layout == VEXEC_SCALED)
+	{
+		VexecLayoutConfig c = *cfg;
+
+		c.numeric = VEXEC_NUMERIC_VARLENA;
+		vexec_type_shape(v->type, &c, &target);
+		if (!vexec_vec_convert(batch, v, &target))
+		{
+			VexecShape	view = {VEXEC_VIEW, false, 0, 0, 0};
+
+			(void) vexec_vec_convert(batch, v, &view);
+		}
+	}
+	else if (target.layout == VEXEC_OFFSETS)
+	{
+		VexecShape	view = {VEXEC_VIEW, false, 0, 0, 0};
+
+		(void) vexec_vec_convert(batch, v, &view);
+	}
+	return false;
+}
+
+/*
  * Give every column of a batch the shape the format in effect and the
  * per-structure settings give its type, or PostgreSQL's where its values
  * cannot take that shape.  True when every column has its configured
@@ -669,39 +711,99 @@ vexec_batch_apply_config(VexecBatch *batch, const VexecLayoutConfig *cfg)
 	int			i;
 
 	for (i = 0; i < batch->ncols; i++)
+		if (!apply_column(batch, &batch->cols[i], cfg))
+			all = false;
+	return all;
+}
+
+/* The layouts that hold a value's bytes: Datums, views and offsets (§3.4). */
+static inline bool
+bytes_layout(int layout)
+{
+	return layout == VEXEC_DATUM || layout == VEXEC_VIEW || layout == VEXEC_OFFSETS;
+}
+
+/*
+ * VC14: vexec_batch_apply_config(), but a column whose type the format
+ * holds in one of the bytes layouts -- text, and every type held by its
+ * bytes -- and that is in one of them already, as its source handed it, is
+ * left so.  Kernels read each of those layouts (§3.4.3), and parents read
+ * a child's columns through theirs; VecScan converts what PostgreSQL's
+ * evaluator reads, after its quals and at the rows past them alone
+ * (exec/node.c).  Returns how many columns it left in another layout than
+ * the format's.
+ */
+int
+vexec_batch_apply_config_keep_bytes(VexecBatch *batch, const VexecLayoutConfig *cfg)
+{
+	int			kept = 0;
+	int			i;
+
+	for (i = 0; i < batch->ncols; i++)
 	{
 		VexecVec   *v = &batch->cols[i];
 		VexecShape	target;
 
 		vexec_type_shape(v->type, cfg, &target);
-		if (vexec_vec_convert(batch, v, &target))
+		if (bytes_layout(target.layout) && bytes_layout(v->shape.layout))
+		{
+			if (!vexec_shape_equal(&v->shape, &target))
+				kept++;
 			continue;
-		all = false;
-
-		/*
-		 * A numeric that has no scaled form takes the format's layout for
-		 * other numerics; a temporal value Arrow's cannot hold keeps
-		 * PostgreSQL's; offsets beyond int32 stay views.
-		 */
-		if (target.layout == VEXEC_SCALED)
-		{
-			VexecLayoutConfig c = *cfg;
-
-			c.numeric = VEXEC_NUMERIC_VARLENA;
-			vexec_type_shape(v->type, &c, &target);
-			if (!vexec_vec_convert(batch, v, &target))
-			{
-				VexecShape	view = {VEXEC_VIEW, false, 0, 0, 0};
-
-				(void) vexec_vec_convert(batch, v, &view);
-			}
 		}
-		else if (target.layout == VEXEC_OFFSETS)
-		{
-			VexecShape	view = {VEXEC_VIEW, false, 0, 0, 0};
+		(void) apply_column(batch, v, cfg);
+	}
+	return kept;
+}
 
-			(void) vexec_vec_convert(batch, v, &view);
+/*
+ * VC14: a column in another shape at the rows of `rows` alone, every other
+ * row NULL: for PostgreSQL's evaluator, which reads no other (exec/node.c).
+ * Views or offsets become Datums at those rows, the Datums kept beside
+ * them taken where the source gave them; any other change of shape is
+ * vexec_vec_convert()'s, of every row.  A NULL `rows` is every row.  False,
+ * the column as it was, where its values cannot take the shape.
+ */
+bool
+vexec_vec_convert_rows(VexecBatch *batch, VexecVec *v, const VexecShape *to,
+					   const uint64 *rows)
+{
+	int			n = v->nvalues;
+	Datum	   *out;
+	uint64	   *validity;
+	int			w;
+
+	if (vexec_shape_equal(&v->shape, to))
+		return true;
+	if (rows == NULL || v->encoding != VEXEC_FLAT || to->layout != VEXEC_DATUM ||
+		(v->shape.layout != VEXEC_VIEW && v->shape.layout != VEXEC_OFFSETS))
+		return vexec_vec_convert(batch, v, to);
+
+	vexec_batch_column_changed(batch, v);
+	out = vexec_batch_alloc0(batch, sizeof(Datum) * Max(n, 1));
+	validity = vexec_bitmap_alloc(batch, n, false);
+	for (w = 0; w < VEXEC_WORDS(n); w++)
+	{
+		uint64		word = rows[w];
+
+		while (word != 0)
+		{
+			int			i = w * 64 + pg_rightmost_one_pos64(word);
+			bool		isnull;
+
+			word &= word - 1;
+			if (i >= n || !valid(v, i))
+				continue;
+			out[i] = vexec_vec_datum(batch, v, i, &isnull);
+			vexec_bit_set(validity, i);
 		}
 	}
-	return all;
+	v->values = out;
+	v->validity = validity;
+	v->datums = NULL;
+	v->buffers = NULL;
+	v->buffer_sizes = NULL;
+	v->nbuffers = 0;
+	v->shape = *to;
+	return true;
 }

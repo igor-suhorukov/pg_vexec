@@ -12,7 +12,9 @@
 -- vexec's aggregates over a scan with no qual are answered from them, a
 -- running bound passes the units it rules out over, and estimate() prices
 -- the scan.  A column of type xml it does not support: a scan reading one
--- stays on the slot path.  The sink takes every type but xml.
+-- stays on the slot path.  The sink takes every type but xml.  Under
+-- vexec_test.source_text_offsets the source hands text as offsets, which
+-- the scan keeps (VC14).
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vexec;
@@ -100,6 +102,31 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
 RESET vexec.mode;
 SELECT source_check('SELECT a, c FROM src ORDER BY a LIMIT 3');
 SELECT source_check('SELECT a, c FROM src ORDER BY a DESC LIMIT 3');
+
+-- text as the source hands it (VC14): int32 offsets into its bytes here, as
+-- MergeTree's source hands its strings, read so by the scan's kernels and
+-- by its parents -- an aggregation, a sort, a row node -- and made the
+-- format's only where PostgreSQL's evaluator reads it, a lazy target or
+-- qual's, at the rows past the vector quals; with
+-- vexec.enable_source_layouts off, as each batch arrives
+SET vexec_test.source_text_offsets = on;
+SET vexec.mode = force;
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT a, regexp_replace(c, 'v(.)', 'w\1') FROM src WHERE c LIKE 'v1%' AND a % 7 = 0;
+RESET vexec.mode;
+SELECT source_check('SELECT a, c FROM src WHERE c LIKE ''v1%'' AND e');
+SELECT source_check('SELECT count(*) FROM src WHERE c LIKE ''%99%''');
+SELECT source_check('SELECT c, count(*) FROM src WHERE a % 3 = 0 GROUP BY c ORDER BY c LIMIT 5');
+SELECT source_check('SELECT a, length(c), c > ''v5'' FROM src WHERE c <> ''v7'' AND a < 300');
+SELECT source_check('SELECT a, regexp_replace(c, ''v(.)'', ''w\1'') FROM src WHERE a % 97 = 0');
+SELECT source_check('SELECT a, c FROM src WHERE regexp_replace(c, ''v'', '''') = ''123'' OR a = 7');
+SELECT source_check('SELECT min(c), max(c), count(c), count(DISTINCT c) FROM src WHERE a < 5000');
+SELECT source_check('SELECT a, c FROM src ORDER BY c DESC NULLS LAST, a LIMIT 3');
+SET vexec.enable_source_layouts = off;
+SELECT source_check('SELECT a, c FROM src WHERE c LIKE ''v1%'' AND e');
+SELECT source_check('SELECT a, regexp_replace(c, ''v(.)'', ''w\1'') FROM src WHERE a % 97 = 0');
+RESET vexec.enable_source_layouts;
+RESET vexec_test.source_text_offsets;
 
 -- rescans: a subquery's scan, for each outer row
 CREATE TABLE src_outer (k int4);

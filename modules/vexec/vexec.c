@@ -53,6 +53,7 @@ int			vexec_scan_rows_per_worker = 163840;
 bool		vexec_enable_scan = true;
 bool		vexec_heap_page_reader = true;
 bool		vexec_enable_prefilter = true;
+bool		vexec_enable_source_layouts = true;
 bool		vexec_enable_bitmapscan = true;
 bool		vexec_enable_agg = true;
 bool		vexec_enable_repartition = true;
@@ -287,6 +288,14 @@ define_settings(void)
 							 "that cannot raise -- comparisons with constants, IN lists, LIKE literals, "
 							 "NULL tests -- and drops it at the first that fails.",
 							 &vexec_enable_prefilter, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_source_layouts",
+							 "Keeps a source's text in the layout it hands it, through a vector scan's quals.",
+							 "A vector scan reads the text of a registered source's batches -- offsets, "
+							 "views or Datums -- as the source gave it, through its kernels and its "
+							 "parents, and makes it the format's only where PostgreSQL's evaluator reads "
+							 "it, at the rows past the scan's vector quals.",
+							 &vexec_enable_source_layouts, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_bitmapscan",
 							 "Enables vector bitmap heap scans.",

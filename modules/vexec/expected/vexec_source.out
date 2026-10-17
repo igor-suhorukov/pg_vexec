@@ -12,7 +12,9 @@
 -- vexec's aggregates over a scan with no qual are answered from them, a
 -- running bound passes the units it rules out over, and estimate() prices
 -- the scan.  A column of type xml it does not support: a scan reading one
--- stays on the slot path.  The sink takes every type but xml.
+-- stays on the slot path.  The sink takes every type but xml.  Under
+-- vexec_test.source_text_offsets the source hands text as offsets, which
+-- the scan keeps (VC14).
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vexec;
 CREATE EXTENSION IF NOT EXISTS vexec_test;
@@ -189,6 +191,97 @@ SELECT source_check('SELECT a, c FROM src ORDER BY a DESC LIMIT 3');
  (10000,) | (9998,v9998) | (9999,v9999)
 (1 row)
 
+-- text as the source hands it (VC14): int32 offsets into its bytes here, as
+-- MergeTree's source hands its strings, read so by the scan's kernels and
+-- by its parents -- an aggregation, a sort, a row node -- and made the
+-- format's only where PostgreSQL's evaluator reads it, a lazy target or
+-- qual's, at the rows past the vector quals; with
+-- vexec.enable_source_layouts off, as each batch arrives
+SET vexec_test.source_text_offsets = on;
+SET vexec.mode = force;
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT a, regexp_replace(c, 'v(.)', 'w\1') FROM src WHERE c LIKE 'v1%' AND a % 7 = 0;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Vec Seq Scan on public.src (actual rows=126.00 loops=1)
+   Output: a, regexp_replace(c, 'v(.)'::text, 'w\1'::text)
+   Filter: ((src.c ~~ 'v1%'::text) AND ((src.a % 7) = 0))
+   Rows Removed by Filter: 9874
+   Batch Format: postgres
+   Vector Quals: 2 of 2
+   Kernel Steps: 3
+   Fallback Steps: 0
+   Row-by-Row Targets: 1
+   Batches: 10
+   Text Rows Converted: 126
+   Source: vexec_test
+   Text Columns Kept as Handed: 1
+(13 rows)
+
+RESET vexec.mode;
+SELECT source_check('SELECT a, c FROM src WHERE c LIKE ''v1%'' AND e');
+                  source_check                  
+------------------------------------------------
+ 444 rows, md5 b16207ca70bb21f7606c6f776bcf9642
+(1 row)
+
+SELECT source_check('SELECT count(*) FROM src WHERE c LIKE ''%99%''');
+ source_check 
+--------------
+ (242)
+(1 row)
+
+SELECT source_check('SELECT c, count(*) FROM src WHERE a % 3 = 0 GROUP BY c ORDER BY c LIMIT 5');
+                       source_check                        
+-----------------------------------------------------------
+ (v1002,1) | (v1008,1) | (v1011,1) | (v1014,1) | (v1017,1)
+(1 row)
+
+SELECT source_check('SELECT a, length(c), c > ''v5'' FROM src WHERE c <> ''v7'' AND a < 300');
+                  source_check                  
+------------------------------------------------
+ 239 rows, md5 c412fe2d64b69795183c82b73388d9a0
+(1 row)
+
+SELECT source_check('SELECT a, regexp_replace(c, ''v(.)'', ''w\1'') FROM src WHERE a % 97 = 0');
+                  source_check                  
+------------------------------------------------
+ 103 rows, md5 270b2dd1df542fe1e5ddb7a47c3d36b2
+(1 row)
+
+SELECT source_check('SELECT a, c FROM src WHERE regexp_replace(c, ''v'', '''') = ''123'' OR a = 7');
+    source_check     
+---------------------
+ (123,v123) | (7,v7)
+(1 row)
+
+SELECT source_check('SELECT min(c), max(c), count(c), count(DISTINCT c) FROM src WHERE a < 5000');
+    source_check     
+---------------------
+ (v1,v999,4000,4000)
+(1 row)
+
+SELECT source_check('SELECT a, c FROM src ORDER BY c DESC NULLS LAST, a LIMIT 3');
+                source_check                
+--------------------------------------------
+ (9997,v9997) | (9998,v9998) | (9999,v9999)
+(1 row)
+
+SET vexec.enable_source_layouts = off;
+SELECT source_check('SELECT a, c FROM src WHERE c LIKE ''v1%'' AND e');
+                  source_check                  
+------------------------------------------------
+ 444 rows, md5 b16207ca70bb21f7606c6f776bcf9642
+(1 row)
+
+SELECT source_check('SELECT a, regexp_replace(c, ''v(.)'', ''w\1'') FROM src WHERE a % 97 = 0');
+                  source_check                  
+------------------------------------------------
+ 103 rows, md5 270b2dd1df542fe1e5ddb7a47c3d36b2
+(1 row)
+
+RESET vexec.enable_source_layouts;
+RESET vexec_test.source_text_offsets;
 -- rescans: a subquery's scan, for each outer row
 CREATE TABLE src_outer (k int4);
 INSERT INTO src_outer VALUES (3), (5000), (9999);

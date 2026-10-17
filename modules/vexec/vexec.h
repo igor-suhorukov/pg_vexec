@@ -96,6 +96,7 @@ extern PGDLLIMPORT int vexec_scan_rows_per_worker;
 extern PGDLLIMPORT bool vexec_enable_scan;
 extern PGDLLIMPORT bool vexec_heap_page_reader;
 extern PGDLLIMPORT bool vexec_enable_prefilter;
+extern PGDLLIMPORT bool vexec_enable_source_layouts;
 extern PGDLLIMPORT bool vexec_enable_bitmapscan;
 extern PGDLLIMPORT bool vexec_enable_agg;
 extern PGDLLIMPORT bool vexec_enable_repartition;
