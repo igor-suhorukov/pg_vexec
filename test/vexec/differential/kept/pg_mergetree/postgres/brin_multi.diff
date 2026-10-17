@@ -1,6 +1,6 @@
 --- reference
 +++ session
-@@ -323,303 +323,153 @@
+@@ -325,303 +325,153 @@
  $x$;
  WARNING:  did not get bitmap indexscan plan for (int2col,>,int2,0,100)
 -WARNING:  did not get seqscan plan for (int2col,>,int2,0,100)

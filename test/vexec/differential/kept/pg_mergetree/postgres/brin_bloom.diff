@@ -1,6 +1,6 @@
 --- reference
 +++ session
-@@ -291,61 +291,32 @@
+@@ -292,61 +292,32 @@
  $x$;
  WARNING:  did not get bitmap indexscan plan for (byteacol,=,bytea,BNAAAABNAAAABNAAAABNAAAABNAAAABNAAAABNAAAABNAAAA,1)
 -WARNING:  did not get seqscan plan for (byteacol,=,bytea,BNAAAABNAAAABNAAAABNAAAABNAAAABNAAAABNAAAABNAAAA,1)

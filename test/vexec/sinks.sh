@@ -31,9 +31,9 @@
 # ch_table_engines' mergetree, in its pages store and its files store
 # (ch_table_engines.md §3, VC10), where the extension's tree is mounted at
 # /chte and its engine library at /engine: built and preloaded, its sink
-# named MergeTree.  It has no index before its CH2, so its tables are made
-# without the unique index, and the checks of one -- a unique violation,
-# the entries made from the sink's TIDs -- are left out for it; nor is
+# named MergeTree.  It has indexes from its CH2 on but no unique one before
+# its CH5, so its tables get a plain index where the others get a unique
+# one, and the check of a unique violation is left out for it; nor is
 # ORCA's route over its access methods decided (its decision 7): the check
 # of ORCA's VecInsert is left out for it, its loads under ORCA compared as
 # every storage's.
@@ -194,12 +194,13 @@ INSERT INTO $t SELECT id, i2, i4, i8, f4, f8, n, nfree::numeric, t, v, bp, d, ts
 			notok "$s, $l: VecInsert's load differs from COPY's"
 		fi
 	done
-	# ch_table_engines' tables: no index before its CH2, ORCA's route undecided
-	indexed=1
-	case "$s" in mergetree*) indexed=0 ;; esac
+	# ch_table_engines' tables: no unique index before its CH5, ORCA's route undecided
+	unique=1
+	orca=1
+	case "$s" in mergetree*) unique=0; orca=0 ;; esac
 	# under ORCA, its translation's VecInsert, with its sink
 	plan=$(PGOPTIONS="$(load_opts orca-postgres)" q "$D" postgres "EXPLAIN (COSTS OFF) INSERT INTO ref_mt_$s SELECT $cols FROM $from")
-	if [ $indexed = 0 ]; then
+	if [ $orca = 0 ]; then
 		:
 	elif echo "$plan" | grep -q "Optimizer: GPORCA" && echo "$plan" | grep -q "Vec Insert on ref_mt_$s" &&
 		echo "$plan" | grep -q "Write: $want"; then
@@ -212,11 +213,11 @@ INSERT INTO $t SELECT id, i2, i4, i8, f4, f8, n, nfree::numeric, t, v, bp, d, ts
 	# statement into tables of its own, as an aborted insert leaves index
 	# entries of its rows, which PAX cannot have btree delete
 	# (index_delete_tuples: "not supported on pax relations")
-	errtable() {				# errtable <name>: a fresh table, a unique index
+	errtable() {				# errtable <name>: a fresh table, an index on id, unique where the storage has them
 		q "$D" postgres "SET client_min_messages = warning;
 			DROP TABLE IF EXISTS $1;
 			CREATE TABLE $1 (id int4 NOT NULL, a int4 CHECK (a < 900), k dpos_$s, t text) $(storage_clause "$s");
-			$( [ $indexed = 1 ] && echo "CREATE UNIQUE INDEX ON $1 (id);")" > /dev/null
+			CREATE $( [ $unique = 1 ] && echo UNIQUE) INDEX ON $1 (id);" > /dev/null
 	}
 	errors() {					# errors <options> <sql>: SQLSTATE, message, detail
 		PGOPTIONS="$1 -c client_min_messages=warning" "$BINDIR/psql" -X -q -At -h "$D/sock" -U postgres -d postgres \
@@ -231,8 +232,8 @@ INSERT INTO $t SELECT id, i2, i4, i8, f4, f8, n, nfree::numeric, t, v, bp, d, ts
 		"INSERT INTO %e SELECT g % 2500, 1, 1, 'x' FROM generate_series(1, 3000) g" \
 		"INSERT INTO %e SELECT g, 1, 1, repeat('y', 100) || (g / (g - 1600)) FROM generate_series(1, 3000) g"; do
 		n=$((n + 1))
-		# a unique violation needs the index
-		[ $indexed = 0 ] && [ $n = 4 ] && continue
+		# a unique violation needs a unique index
+		[ $unique = 0 ] && [ $n = 4 ] && continue
 		errtable "e_mt_$s"
 		errtable "e_vec_$s"
 		ref_err=$(errors "$(load_opts off)" "${sql//%e/e_mt_$s}" | sed "s/e_mt_$s/%e/g")
@@ -261,15 +262,14 @@ rows left: $count"
 		*) notok "$s: the load was not cancelled" "$got" ;;
 	esac
 
-	# the unique index's entries, made from the sink's TIDs, find each row
-	[ $indexed = 0 ] && continue
+	# the index's entries, made from the sink's TIDs, find each row
 	errtable "e_vec_$s"
 	PGOPTIONS="-c gp.optimizer=off -c vexec.mode=force" q "$D" postgres "INSERT INTO e_vec_$s SELECT g, 1, 1, 'r' || g FROM generate_series(1, 5000) g" > /dev/null
 	got=$(q "$D" postgres "SET enable_seqscan = off; SET enable_bitmapscan = off; SELECT count(*) FROM generate_series(1, 5000) g WHERE (SELECT t FROM e_vec_$s WHERE id = g) = 'r' || g")
 	if [ "$got" = 5000 ]; then
-		ok "$s: the unique index finds each of 5,000 rows by its entry"
+		ok "$s: the index finds each of 5,000 rows by its entry"
 	else
-		notok "$s: the unique index finds $got of 5,000 rows"
+		notok "$s: the index finds $got of 5,000 rows"
 	fi
 done
 

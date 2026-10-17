@@ -36,9 +36,9 @@
 #             that the tables the tests make are its own; the off session's
 #             answers are PostgreSQL's over them, which differ from heap's
 #             expected output where the access method refuses what its later
-#             phases bring (DELETE, UPDATE, indexes), and every other session
-#             must answer as it does.  Run where the extension is installed
-#             (chte.sh).
+#             phases bring (unique indexes and ON CONFLICT, merges), and every
+#             other session must answer as it does.  Run where the extension
+#             is installed (chte.sh).
 #
 # Each session runs in a temporary instance pg_regress makes, with vexec
 # preloaded and the session's settings in PGOPTIONS, so that every

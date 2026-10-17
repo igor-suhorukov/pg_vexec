@@ -10,6 +10,12 @@
 # back four ways -- the plain sequential scan, ChScan, and vexec's source in
 # force mode in both formats -- and every read of every load must be the
 # heap table's rows; VecInsert's batches must have gone through the sink.
+# Then each table's rows are deleted and updated as a heap copy's are (the
+# extension's CH2), vexec in force mode beneath the statements, and every
+# read must be the copy's rows.  Each read is also asked the aggregates a
+# source may answer from a unit's statistics -- count(*) alone, which asks
+# a source for no more than a unit's rows, then count, min and max -- and
+# they must be heap's too.
 #
 #   VEXEC_ROWS   the table's rows: 30000
 set -u
@@ -43,7 +49,41 @@ case "$out" in *ERROR*) echo "the data: $out"; exit 1 ;; esac
 
 fail=0
 sum="SELECT md5(string_agg(x::text, '|' ORDER BY x.id)) FROM (SELECT * FROM %s) x"
+aggs() {						# aggs <settings> <table>: count(*) alone, then the others
+	echo "$(q "$D" postgres "$1 SELECT count(*) FROM $2")|$(q "$D" postgres "$1 SELECT count(i4), min(i4), max(i4), min(d), max(ts) FROM $2")"
+}
 ref=$(q "$D" postgres "$(printf "$sum" src)")
+ref_aggs=$(aggs "" src)
+# the deletions and updates, and a heap copy's rows after them
+dml="DELETE FROM %t WHERE id % 7 = 0; UPDATE %t SET t = coalesce(t, '') || '!', i4 = i4 + 1, n = NULL WHERE id % 11 = 0;"
+out=$(q "$D" postgres "CREATE TABLE src_dml AS SELECT * FROM src; ${dml//%t/src_dml}")
+case "$out" in *ERROR*) echo "the heap copy's deletions and updates: $out"; exit 1 ;; esac
+ref_dml=$(q "$D" postgres "$(printf "$sum" src_dml)")
+ref_dml_aggs=$(aggs "" src_dml)
+
+reads() {						# reads <table> <heap's rows> <heap's aggregates> <what>: every read of it
+	local read set got
+	for read in plain chscan vexec-postgres vexec-arrow; do
+		case "$read" in
+			plain) set="SET vexec.mode = off; SET ch.enable_chscan = off;" ;;
+			chscan) set="SET vexec.mode = off;" ;;
+			vexec-postgres) set="SET vexec.mode = force; SET vexec.batch_format = postgres;" ;;
+			vexec-arrow) set="SET vexec.mode = force; SET vexec.batch_format = arrow;" ;;
+		esac
+		got=$(q "$D" postgres "$set $(printf "$sum" "$1")")
+		if [ "$got" = "$2" ]; then
+			echo "  $1 read by $read$4: the same as heap's"
+		else
+			echo "  $1 read by $read$4: DIFFERENT: $got, heap's $2"
+			fail=1
+		fi
+		got=$(aggs "$set" "$1")
+		if [ "$got" != "$3" ]; then
+			echo "  $1 read by $read$4: aggregates DIFFERENT: $got, heap's $3"
+			fail=1
+		fi
+	done
+}
 for store in pages files; do
 	for load in copy insert vecinsert; do
 		t="m_${load}_$store"
@@ -62,21 +102,10 @@ for store in pages files; do
 				[ "${sink:-0}" -gt 0 ] || fail=1 ;;
 		esac
 		case "$out" in *ERROR*) echo "  $t: $out"; fail=1; continue ;; esac
-		for read in plain chscan vexec-postgres vexec-arrow; do
-			case "$read" in
-				plain) set="SET vexec.mode = off; SET ch.enable_chscan = off;" ;;
-				chscan) set="SET vexec.mode = off;" ;;
-				vexec-postgres) set="SET vexec.mode = force; SET vexec.batch_format = postgres;" ;;
-				vexec-arrow) set="SET vexec.mode = force; SET vexec.batch_format = arrow;" ;;
-			esac
-			got=$(q "$D" postgres "$set $(printf "$sum" "$t")")
-			if [ "$got" = "$ref" ]; then
-				echo "  $t read by $read: the same as heap's"
-			else
-				echo "  $t read by $read: DIFFERENT: $got, heap's $ref"
-				fail=1
-			fi
-		done
+		reads "$t" "$ref" "$ref_aggs" ""
+		out=$(q "$D" postgres "SET vexec.mode = force; ${dml//%t/$t}")
+		case "$out" in *ERROR*) echo "  $t, its deletions and updates: $out"; fail=1; continue ;; esac
+		reads "$t" "$ref_dml" "$ref_dml_aggs" " after deletions and updates"
 	done
 done
 exit $fail

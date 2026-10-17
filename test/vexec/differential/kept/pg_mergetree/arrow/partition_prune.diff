@@ -92,7 +92,7 @@
 + Vec Aggregate (actual rows=N loops=N)
  (15 rows)
  
-@@ -1163,29 +1163,28 @@
+@@ -1145,29 +1145,28 @@
                                 explain_parallel_append                               
  -------------------------------------------------------------------------------------
 -                     ->  Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
@@ -140,7 +140,7 @@
 +(23 rows)
  
  -- Ensure the same partitions are pruned when we make the nested loop
-@@ -1194,29 +1193,28 @@
+@@ -1176,29 +1175,28 @@
                                 explain_parallel_append                               
  -------------------------------------------------------------------------------------
 -                     ->  Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
@@ -188,7 +188,7 @@
 +(23 rows)
  
  insert into lprt_a values(3),(3);
-@@ -1224,58 +1222,56 @@
+@@ -1206,58 +1204,56 @@
                                 explain_parallel_append                               
  -------------------------------------------------------------------------------------
 -                     ->  Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
@@ -283,7 +283,7 @@
 +(23 rows)
  
  delete from lprt_a where a = 1;
-@@ -1285,29 +1281,28 @@
+@@ -1267,29 +1263,28 @@
                                 explain_parallel_append                               
  -------------------------------------------------------------------------------------
 -                     ->  Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
@@ -331,7 +331,7 @@
 +(23 rows)
  
  reset enable_hashjoin;
-@@ -2044,10 +2039,10 @@
+@@ -2012,10 +2007,10 @@
  -- the plan as it's pulled in setref.c due to having just a single subnode).
  select explain_parallel_append('select * from listp where a = (select 1);');
 -                      explain_parallel_append                       
@@ -346,7 +346,7 @@
 +         ->  Vec Seq Scan on listp_12_2 listp_2 (never executed)
       ->  Result (actual rows=N loops=N)
     ->  Parallel Append (actual rows=N loops=N)
-@@ -2065,6 +2060,6 @@
+@@ -2033,6 +2028,6 @@
    union all
  select * from listp where a = (select 2);');
 -                         explain_parallel_append                          
@@ -355,7 +355,7 @@
 +------------------------------------------------------------------------------
                       Filter: (a = (InitPlan expr_1).col1)
                       Filter: (a = (InitPlan expr_1).col1)
-@@ -2073,8 +2068,8 @@
+@@ -2041,8 +2036,8 @@
                   ->  Result (actual rows=N loops=N)
                   ->  Result (actual rows=N loops=N)
 -               ->  Seq Scan on listp_12_1 listp_1 (never executed)
@@ -368,7 +368,7 @@
 +               ->  Vec Seq Scan on listp_12_2 listp_5 (never executed)
                 InitPlan expr_1
                 InitPlan expr_2
-@@ -2218,98 +2213,66 @@
+@@ -2184,98 +2179,66 @@
  \gexec
  explain (costs off) select tableoid::regclass,* from hp_prefix_test where a is null and b is null and c is null and d is null
 - Custom Scan (ChScan) on hp_prefix_test_p0 hp_prefix_test

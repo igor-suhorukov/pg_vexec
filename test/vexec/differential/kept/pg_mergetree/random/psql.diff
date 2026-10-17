@@ -1,0 +1,19 @@
+--- reference
++++ session
+@@ -5014,16 +5014,4 @@
+ set debug_parallel_query = off;
+ select 1/(15-unique2) from tenk1 order by unique2 limit 19;
+- ?column? 
+-----------
+-        0
+-        0
+-        0
+-        0
+-        0
+-        0
+-        0
+-        0
+-        0
+-        0
+ ERROR:  division by zero
+ \echo 'error:' :ERROR

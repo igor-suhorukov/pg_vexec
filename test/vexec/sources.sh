@@ -51,10 +51,11 @@
 # ch_table_engines' mergetree, in its pages store and its files store
 # (ch_table_engines.md §3, VC10), where the extension's tree is mounted at
 # /chte and its engine library at /engine: built and preloaded, its source
-# named MergeTree.  It has no DELETE before its CH2, so its tables are
-# loaded without the rows the others delete; nor is ORCA's route over its
-# access methods decided (its decision 7): the plans' checks under ORCA are
-# left out for it, and its answers under ORCA compared as every storage's.
+# named MergeTree.  Its tables take the others' DELETEs from its CH2 on,
+# and its source hands the deleted rows as invisible ones.  ORCA's route
+# over its access methods is not decided (its decision 7): the plans' checks
+# under ORCA are left out for it, and its answers under ORCA compared as
+# every storage's.
 #
 #   VEXEC_ROWS        the table's rows: 30000
 #   VEXEC_STORAGES    "heap ao_row ao_column pax pax_porc_vec", and
@@ -144,17 +145,13 @@ q "$D" postgres "$(cat "$D/data.sql")" > /dev/null
 for s in $STORAGES; do
 	from=src
 	[ "$s" = pax_porc_vec ] && from=src_pv
-	# the rows the others delete, never loaded into a mergetree table
-	keep="true"
-	case "$s" in mergetree*) keep="id % 97 <> 0" ;; esac
 	out=$(q "$D" postgres "SET client_min_messages = warning;
 		CREATE TABLE t_$s (LIKE $from) $(storage_clause "$s");
-		INSERT INTO t_$s SELECT * FROM $from WHERE $keep;
+		INSERT INTO t_$s SELECT * FROM $from;
 		ALTER TABLE t_$s DROP COLUMN gone;
 		ALTER TABLE t_$s ADD COLUMN later int DEFAULT 42;
-		INSERT INTO t_$s (id, i4, t) SELECT $ROWS + g, g, 'late ' || g FROM generate_series(1, 100) g
-			WHERE $( [ "$keep" = true ] && echo true || echo "($ROWS + g) % 97 <> 0");
-		$( [ "$keep" = true ] && echo "DELETE FROM t_$s WHERE id % 97 = 0;")
+		INSERT INTO t_$s (id, i4, t) SELECT $ROWS + g, g, 'late ' || g FROM generate_series(1, 100) g;
+		DELETE FROM t_$s WHERE id % 97 = 0;
 		ANALYZE t_$s;")
 	case "$out" in *ERROR*) echo "the table in $s: $out"; fail=1 ;; esac
 done
@@ -236,9 +233,7 @@ PARALLEL_QUERIES=(
 	"SELECT count(*), sum(i4) FROM %t WHERE 100 / (id % 97) >= 0"
 )
 # and each storage module's own, a query a line, from sources/*.queries:
-# they make tables of their own with DELETEs, which ch_table_engines' tables
-# take from its CH2 on -- until then they skip them
-NSHARED=${#QUERIES[@]}
+# they make tables of their own, in the storage's access method, with DELETEs
 for f in "$here"/sources/*.queries; do
 	[ -f "$f" ] || continue
 	while IFS= read -r line; do
@@ -363,9 +358,7 @@ for s in $STORAGES; do
 			fail=1
 		fi
 	done
-	nqueries=${#QUERIES[@]}
-	case "$s" in mergetree*) nqueries=$NSHARED ;; esac
-	for qt in "${QUERIES[@]:0:$nqueries}"; do
+	for qt in "${QUERIES[@]}"; do
 		sql="${qt//%t/$t}"
 		ref=""
 		for sess in "${SESSIONS[@]}"; do
@@ -394,18 +387,34 @@ done
 # ch_table_engines' aggregates from its parts' statistics (its source's
 # aggregate(): rows from the catalog, NULLs, least and greatest values from
 # ClickHouse's "basic" statistics): VecAgg answers count(*), count() and the
-# integers' and dates' min and max of each part unread
+# integers' and dates' min and max of each part unread -- but of no part its
+# deletions may touch, whose rows are fewer than its statistics count.  The
+# table's deletions folded into its parts (ch.fold), its parts answer again;
+# and the answers are heap's either way
 for s in $STORAGES; do
 	case "$s" in mergetree*) ;; *) continue ;; esac
-	plan=$(q "$D" postgres "SET vexec.mode = force; EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*), count(i2), min(i4), max(i8), min(d), max(ts) FROM t_$s")
-	units=$(echo "$plan" | sed -n 's/^ *Units From Statistics: //p' | head -1)
-	if [ -n "$units" ] && [ "$units" -gt 0 ]; then
-		echo "  ok $s: VecAgg's count, min and max answered from $units parts' statistics"
-	else
-		echo "  FAILED $s: no part's statistics answered VecAgg's aggregates:"
-		echo "$plan" | sed 's/^/      /'
-		fail=1
-	fi
+	for state in deletions folded; do
+		[ $state = folded ] && q "$D" postgres "SELECT ch.fold('t_$s')" > /dev/null
+		for agg in "count(*)" "count(*), count(i2), min(i4), max(i8), min(d), max(ts)"; do
+			want=$(q "$D" postgres "SET vexec.mode = off; SELECT $agg FROM t_heap")
+			plan=$(q "$D" postgres "SET vexec.mode = force; EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT $agg FROM t_$s")
+			got=$(q "$D" postgres "SET vexec.mode = force; SELECT $agg FROM t_$s")
+			units=$(echo "$plan" | sed -n 's/^ *Units From Statistics: //p' | head -1)
+			if [ "$got" != "$want" ]; then
+				echo "  FAILED $s, $state: VecAgg's $agg is $got, heap's $want"
+				fail=1
+			elif [ $state = deletions ] && [ "${units:-0}" -gt 0 ]; then
+				echo "  FAILED $s, $state: $units parts its deletions touch answered $agg from their statistics"
+				fail=1
+			elif [ $state = folded ] && [ "${units:-0}" -eq 0 ]; then
+				echo "  FAILED $s, $state: no part's statistics answered $agg:"
+				echo "$plan" | sed 's/^/      /'
+				fail=1
+			else
+				echo "  ok $s, $state: VecAgg's $agg heap's, from ${units:-0} parts' statistics"
+			fi
+		done
+	done
 done
 
 # V4: each storage's tables scanned in parallel: off with workers, then
