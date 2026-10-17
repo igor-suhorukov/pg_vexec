@@ -131,6 +131,17 @@ typedef struct VexecSortState
 	int			kh_count;
 	int64		rows_put;		/* rows put since the sort began */
 	MemoryContext kh_cxt;		/* the by-reference keys' copies */
+
+	/*
+	 * The participants' bound (below): a first key of an integer, a date or
+	 * a timestamp, in its type's own order, shared through the parallel
+	 * VecScan's DSM
+	 */
+	int			share_len;		/* the key's bytes, 2, 4 or 8; 0: none */
+	bool		share_desc;		/* its order descending */
+	pg_atomic_uint64 *shared;	/* the scan's, once its DSM is made */
+	bool		out_done;		/* a kept row past it: the rest are too */
+	int64		rows_unfetched; /* kept rows not fetched for it */
 } VexecSortState;
 
 static bool sort_fetch(VexecNode *node);
@@ -346,6 +357,37 @@ bound_begin(VexecSortState *s)
 	s->bound = b;
 	s->key_typlen = att->attlen;
 	s->key_typbyval = att->attbyval;
+
+	/* the participants' bound: by the type's own < or > */
+	switch (att->atttypid)
+	{
+		case INT2OID:
+			s->share_len = 2;
+			break;
+		case INT4OID:
+		case DATEOID:
+			s->share_len = 4;
+			break;
+		case INT8OID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			s->share_len = 8;
+			break;
+		default:
+			s->share_len = 0;
+			break;
+	}
+	if (s->share_len > 0)
+	{
+		TypeCacheEntry *tc = lookup_type_cache(att->atttypid, TYPECACHE_LT_OPR | TYPECACHE_GT_OPR);
+
+		if (b->sortop == tc->lt_opr)
+			s->share_desc = false;
+		else if (b->sortop == tc->gt_opr)
+			s->share_desc = true;
+		else
+			s->share_len = 0;
+	}
 	s->kh_count = 0;
 	s->rows_put = 0;
 	/* the heap's arrays once a row is put: EXPLAIN alone puts none */
@@ -408,8 +450,82 @@ kh_sift_up(VexecSortState *s, int i)
 }
 
 /*
+ * The participants' bound.  Under a Gather Merge each participant sorts
+ * its own rows, bounded at the LIMIT's N, over a parallel VecScan; a
+ * participant whose heap holds N first keys keeps N rows within its top,
+ * so no row whose first key is strictly past that top is among the N the
+ * Gather Merge returns, in whatever participant it is -- and the least of
+ * the participants' tops bounds them all.  Each one makes its top the
+ * shared one where it is less (share_publish()), lends its scan the shared
+ * one where that is less than its own, and gives out none of its kept rows
+ * past it: the rows whose first key equals it stay, as the bound of one
+ * sort keeps them.  Over late columns that saves their fetches, each a
+ * granule read in a column store: of ClickBench's Q23 on 16 workers, 170
+ * fetches for the LIMIT's 10.  A key is encoded so that less is better:
+ * its bits as unsigned, the sign flipped, and complemented for a
+ * descending order.
+ */
+static inline uint64
+share_encode(VexecSortState *s, Datum d)
+{
+	int64		v = s->share_len == 2 ? (int64) DatumGetInt16(d) :
+		s->share_len == 4 ? (int64) DatumGetInt32(d) : DatumGetInt64(d);
+	uint64		u = (uint64) v ^ (UINT64CONST(1) << 63);
+
+	return s->share_desc ? ~u : u;
+}
+
+static inline Datum
+share_decode(VexecSortState *s, uint64 u)
+{
+	int64		v = (int64) ((s->share_desc ? ~u : u) ^ (UINT64CONST(1) << 63));
+
+	return s->share_len == 2 ? Int16GetDatum((int16) v) :
+		s->share_len == 4 ? Int32GetDatum((int32) v) : Int64GetDatum(v);
+}
+
+/* The shared bound, PG_UINT64_MAX for none: the scan's DSM, once made */
+static uint64
+share_read(VexecSortState *s)
+{
+	if (s->share_len == 0)
+		return PG_UINT64_MAX;
+	if (s->shared == NULL && (s->shared = vexec_scan_shared_bound(s->child)) == NULL)
+		return PG_UINT64_MAX;
+	return pg_atomic_read_u64(s->shared);
+}
+
+/* This participant's top, made the shared bound where it is less. */
+static void
+share_publish(VexecSortState *s, Datum top)
+{
+	uint64		u = share_encode(s, top);
+	uint64		cur = share_read(s);
+
+	if (s->shared == NULL)
+		return;
+	while (u < cur && !pg_atomic_compare_exchange_u64(s->shared, &cur, u))
+		;
+}
+
+/* Whether a kept row, sorted, is past the shared bound: its first key NULL never is. */
+static bool
+share_past(VexecSortState *s, TupleTableSlot *slot)
+{
+	bool		isnull;
+	Datum		d;
+	uint64		u = share_read(s);
+
+	if (u == PG_UINT64_MAX)
+		return false;
+	d = slot_getattr(slot, s->bound_keycol, &isnull);
+	return !isnull && share_encode(s, d) > u;
+}
+
+/*
  * A row put into the sort: its first key into the heap, and, past 2N rows,
- * the heap's top lent to the scan as the bound.
+ * the heap's top lent to the scan as the bound -- or the participants'
+ * bound, where it is less.
  */
 static void
 bound_note(VexecSortState *s, TupleTableSlot *slot)
@@ -454,12 +570,25 @@ bound_note(VexecSortState *s, TupleTableSlot *slot)
 	s->rows_put++;
 	if (s->rows_put % VEXEC_BATCH_ROWS == 0)
 		MemoryContextReset(b->tmpcxt);
+	if (s->share_len > 0 && s->kh_count == n && !s->kh_nulls[0] &&
+		(moved || s->rows_put == n))
+		share_publish(s, s->kh_values[0]);
 	if (s->rows_put > 2 * (int64) n)
 	{
-		if (!b->active || moved)
+		Datum		top = s->kh_values[0];
+		bool		top_null = s->kh_nulls[0];
+
+		if (s->share_len > 0 && !top_null)
+		{
+			uint64		u = share_read(s);
+
+			if (u < share_encode(s, top))
+				top = share_decode(s, u);
+		}
+		if (!b->active || b->isnull != top_null || (!top_null && b->value != top) || moved)
 			b->version++;
-		b->value = s->kh_values[0];
-		b->isnull = s->kh_nulls[0];
+		b->value = top;
+		b->isnull = top_null;
 		b->active = true;
 	}
 }
@@ -542,6 +671,8 @@ do_sort(VexecSortState *s)
 		tuplesort_set_bound(s->sort, s->plan.bound);
 	s->rows_sorted = 0;
 	s->rows_out = 0;
+	s->out_done = false;
+	s->rows_unfetched = 0;
 	bound_reset(s);
 
 	if (s->child_batches)
@@ -616,12 +747,24 @@ sort_fetch(VexecNode *node)
 
 	vexec_batch_reset(in);
 	vexec_batch_begin_rows(in);
-	while (in->nrows < VEXEC_BATCH_ROWS &&
+	while (in->nrows < VEXEC_BATCH_ROWS && !s->out_done &&
 		   (s->plan.bound <= 0 || s->rows_out < s->plan.bound) &&
 		   tuplesort_gettupleslot(s->sort, true, false, s->get_slot, NULL))
 	{
 		if (s->late_rel != NULL)
+		{
+			/*
+			 * Past the participants' bound, this row and those after it,
+			 * sorted, are none of the LIMIT's: none is fetched
+			 */
+			if (s->share_len > 0 && share_past(s, s->get_slot))
+			{
+				s->out_done = true;
+				s->rows_unfetched = Min(s->rows_sorted, s->plan.bound) - s->rows_out;
+				break;
+			}
 			add_late_row(s, in);
+		}
 		else
 			vexec_batch_add_slot(in, s->get_slot, NULL);
 		s->rows_out++;
@@ -661,6 +804,8 @@ sort_rescan(CustomScanState *css)
 	{
 		tuplesort_rescan(s->sort);
 		s->rows_out = 0;
+		s->out_done = false;
+		s->rows_unfetched = 0;
 	}
 }
 
@@ -777,5 +922,7 @@ sort_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 			ExplainPropertyInteger("Rows Sorted", NULL, s->rows_sorted, es);
 		if (es->verbose && s->late_rel != NULL)
 			ExplainPropertyInteger("Rows Fetched by TID", NULL, s->rows_out, es);
+		if (es->verbose && s->rows_unfetched > 0)
+			ExplainPropertyInteger("Rows Left Past the Workers' Bound", NULL, s->rows_unfetched, es);
 	}
 }

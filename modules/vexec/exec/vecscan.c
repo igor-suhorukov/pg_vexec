@@ -126,6 +126,8 @@ typedef struct VexecScanState
 	TupleTableSlot *amslot;		/* the slot path's */
 	ParallelTableScanDesc pscan;	/* a parallel-aware scan's, in the DSM */
 	Size		pscan_len;
+	pg_atomic_uint64 *shared_bound; /* the participants' sort bound, in the
+									 * DSM before pscan; NULL: none */
 	int			nattrs;			/* input columns that are attributes */
 	AttrNumber *attrs;			/* their attnos */
 	bool		need_tid;		/* the last input column is ctid */
@@ -1043,9 +1045,15 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 }
 
 /*
- * A parallel-aware VecScan's chunk of the DSM: the access method's parallel
- * scan descriptor, as a SeqScan's (ExecSeqScanEstimate() and on).
+ * A parallel-aware VecScan's chunk of the DSM: the participants' shared
+ * sort bound, then the access method's parallel scan descriptor, as a
+ * SeqScan's (ExecSeqScanEstimate() and on).  The bound is a bounded
+ * VecSort's above the scan in each participant (vecsort.c): the best of the
+ * first keys each one's sort has kept its N rows within, encoded so that
+ * less is better, PG_UINT64_MAX for none.
  */
+#define SCAN_SHARED_SIZE	MAXALIGN(sizeof(pg_atomic_uint64))
+
 static Size
 scan_estimate_dsm(CustomScanState *css, ParallelContext *pcxt)
 {
@@ -1053,7 +1061,7 @@ scan_estimate_dsm(CustomScanState *css, ParallelContext *pcxt)
 
 	(void) pcxt;
 	s->pscan_len = table_parallelscan_estimate(s->rel, css->ss.ps.state->es_snapshot);
-	return s->pscan_len;
+	return SCAN_SHARED_SIZE + s->pscan_len;
 }
 
 static void
@@ -1062,7 +1070,9 @@ scan_initialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordinat
 	VexecScanState *s = (VexecScanState *) css;
 
 	(void) pcxt;
-	s->pscan = (ParallelTableScanDesc) coordinate;
+	s->shared_bound = (pg_atomic_uint64 *) coordinate;
+	pg_atomic_init_u64(s->shared_bound, PG_UINT64_MAX);
+	s->pscan = (ParallelTableScanDesc) ((char *) coordinate + SCAN_SHARED_SIZE);
 	table_parallelscan_initialize(s->rel, s->pscan, css->ss.ps.state->es_snapshot);
 }
 
@@ -1073,6 +1083,8 @@ scan_reinitialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordin
 
 	(void) pcxt;
 	(void) coordinate;
+	if (s->shared_bound != NULL)
+		pg_atomic_write_u64(s->shared_bound, PG_UINT64_MAX);
 	if (s->pscan != NULL)
 		table_parallelscan_reinitialize(s->rel, s->pscan);
 }
@@ -1083,5 +1095,18 @@ scan_initialize_worker(CustomScanState *css, shm_toc *toc, void *coordinate)
 	VexecScanState *s = (VexecScanState *) css;
 
 	(void) toc;
-	s->pscan = (ParallelTableScanDesc) coordinate;
+	s->shared_bound = (pg_atomic_uint64 *) coordinate;
+	s->pscan = (ParallelTableScanDesc) ((char *) coordinate + SCAN_SHARED_SIZE);
+}
+
+/*
+ * The participants' shared sort bound of a parallel-aware VecScan, once its
+ * DSM is made -- the Gather makes it as it first runs -- else NULL.
+ */
+pg_atomic_uint64 *
+vexec_scan_shared_bound(PlanState *ps)
+{
+	if (!IsA(ps, CustomScanState) || ((CustomScanState *) ps)->methods != &scan_exec_methods)
+		return NULL;
+	return ((VexecScanState *) ps)->shared_bound;
 }

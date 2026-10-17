@@ -85,6 +85,13 @@ vexec_scan_path(PlannerInfo *root, RelOptInfo *rel, Path *rowpath, const VexecCo
 	return &cp->path;
 }
 
+/* Whether a path is a VecScan's, partial or not. */
+bool
+vexec_is_scan_path(Path *path)
+{
+	return IsA(path, CustomPath) && ((CustomPath *) path)->methods == &vecscan_path_methods;
+}
+
 /* VecScan's plan: a SeqScan's quals and target list on a CustomScan. */
 static Plan *
 plan_vecscan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,

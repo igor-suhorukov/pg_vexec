@@ -38,12 +38,18 @@
 #include "access/sysattr.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
+#include "common/hashfn.h"
 #include "executor/executor.h"
 #include "executor/instrument.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
+#include "utils/datum.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/regproc.h"
+#include "varatt.h"
 
 #include "cb_explain.h"
 #include "vexec_kernels.h"
@@ -52,9 +58,54 @@
 #include "pg_otel_probe_api.h"
 #include "batch/batch.h"
 #include "exec/exec.h"
+#include "exec/keyhash.h"
 #include "expr/expr.h"
 #include "expr/kernel.h"
 #include "motion/motion.h"
+
+/*
+ * A lazy target's results, kept by the value of the one input column it
+ * reads (vexec.enable_row_memo).  The target is computed at a value's first
+ * row, in row order as ever, and a later row of the same value takes that
+ * result: it is the same, since the target holds no volatile function, no
+ * SubPlan and no parameter, and so is a function of that column alone for
+ * the statement; and the first row raised whatever a later one would have.
+ * Values match by their bytes, never by a collation's equality.  The
+ * entries -- their inputs and results copied into the memo's memory -- are
+ * dropped together once MEMO_ENTRIES are kept: repeats come near one
+ * another in a table's order (in ClickBench's hits, by its sort key, 54% of
+ * Referer's values are within 16,384 rows of their last, 40% within its
+ * batch of 1,024).  A memo that found fewer than one value in ten again
+ * over its first MEMO_PROBATION rows stops.
+ */
+#define MEMO_SLOTS		32768
+#define MEMO_ENTRIES	16384
+#define MEMO_PROBATION	8192
+
+typedef struct VexecRowMemoSlot
+{
+	uint32		hash;
+	bool		used;
+	bool		in_null;
+	bool		out_null;
+	Datum		in;
+	Datum		out;
+} VexecRowMemoSlot;
+
+typedef struct VexecRowMemo
+{
+	int			col;			/* the input column */
+	int16		in_len;
+	bool		in_byval;
+	int16		out_len;
+	bool		out_byval;
+	bool		off;			/* stopped: too few repeats */
+	int			nentries;
+	int64		lookups;
+	int64		hits;
+	MemoryContext cxt;			/* the entries' inputs and results */
+	VexecRowMemoSlot *slots;	/* MEMO_SLOTS of them */
+} VexecRowMemo;
 
 void
 vexec_node_begin(VexecNode *node, EState *estate)
@@ -137,6 +188,65 @@ share_subtrees(VexecNode *node)
 	list_free(seen);
 }
 
+static bool
+has_param_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+		return true;
+	return expression_tree_walker(node, has_param_walker, context);
+}
+
+/*
+ * The input column a lazy target is a function of alone, for its memo, and
+ * that column's type: one column of the input, no volatile function,
+ * SubPlan or parameter; -1 for none.  A cstring has no length to compare
+ * by.
+ */
+static int
+memo_column(VexecNode *node, Expr *expr, Oid *type)
+{
+	List	   *vars;
+	Var		   *var = NULL;
+	ListCell   *lc;
+
+	if (contain_volatile_functions((Node *) expr) || contain_subplans((Node *) expr) ||
+		has_param_walker((Node *) expr, NULL))
+		return -1;
+	vars = pull_var_clause((Node *) expr, PVC_RECURSE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS |
+						   PVC_RECURSE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Var		   *v = lfirst(lc);
+
+		if (v->varno != node->input_varno || v->varlevelsup != 0 || v->varattno <= 0 ||
+			(var != NULL && v->varattno != var->varattno))
+			return -1;
+		var = v;
+	}
+	if (var == NULL || get_typlen(var->vartype) == -2)
+		return -1;
+	*type = var->vartype;
+	for (int i = 0; i < node->ninput; i++)
+		if (node->input_attnos[i] == var->varattno)
+			return i;
+	return -1;
+}
+
+static VexecRowMemo *
+memo_create(VexecNode *node, int col, Oid in_type, Oid out_type)
+{
+	VexecRowMemo *m = MemoryContextAllocZero(node->mcxt, sizeof(VexecRowMemo));
+
+	m->col = col;
+	get_typlenbyval(in_type, &m->in_len, &m->in_byval);
+	get_typlenbyval(out_type, &m->out_len, &m->out_byval);
+	m->cxt = AllocSetContextCreate(node->mcxt, "vexec row memo", ALLOCSET_DEFAULT_SIZES);
+	m->slots = MemoryContextAllocZero(node->mcxt, sizeof(VexecRowMemoSlot) * MEMO_SLOTS);
+	return m;
+}
+
 /*
  * Compile the node's quals and target list against its input: a Var of
  * input_varno reads the input column whose attno it is.
@@ -190,6 +300,23 @@ vexec_node_compile(VexecNode *node, List *quals, List *tlist)
 		if (node->targets[i].eager == NULL)
 			node->any_lazy_target = true;
 		i++;
+	}
+
+	/* a lazy target of one input column: its results kept by that column's value */
+	node->row_memo = palloc0(sizeof(VexecRowMemo *) * Max(node->ntargets, 1));
+	if (vexec_enable_row_memo && node->any_lazy_target)
+	{
+		i = 0;
+		foreach(lc, tlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+			Oid			type;
+			int			col;
+
+			if (node->targets[i].eager == NULL && (col = memo_column(node, tle->expr, &type)) >= 0)
+				node->row_memo[i] = memo_create(node, col, type, exprType((Node *) tle->expr));
+			i++;
+		}
 	}
 	node->nkernels = cc.nkernels;
 	node->nfallbacks = cc.nfallbacks;
@@ -627,6 +754,111 @@ lazy_qual_rejecting(VexecNode *node, int row)
 }
 
 /*
+ * A memo's input value, as the row holds it.  A varlena is compared by its
+ * bytes as stored -- its header, a compressed value's compressed bytes, a
+ * TOAST pointer -- never detoasted: what a function returns may depend on
+ * how a value is stored, as pg_column_compression(), pg_column_size() and
+ * pg_column_toast_chunk_id() do, so only a value stored alike is the same.
+ */
+static Datum
+memo_input(VexecNode *node, VexecRowMemo *m, int row, bool *isnull)
+{
+	return vexec_vec_datum(node->work, &node->in->cols[m->col], row, isnull);
+}
+
+static uint32
+memo_hash(VexecRowMemo *m, Datum d, bool isnull)
+{
+	if (isnull)
+		return 0x9e3779b9;
+	if (m->in_len == -1)
+		return vexec_hash_bytes(DatumGetPointer(d), VARSIZE_ANY(DatumGetPointer(d)));
+	if (m->in_byval)
+		return murmurhash32((uint32) DatumGetUInt64(d) ^ (uint32) (DatumGetUInt64(d) >> 32));
+	return vexec_hash_bytes(DatumGetPointer(d), m->in_len);
+}
+
+static bool
+memo_equal(VexecRowMemo *m, const VexecRowMemoSlot *s, Datum d, bool isnull)
+{
+	if (s->in_null || isnull)
+		return s->in_null && isnull;
+	if (m->in_len == -1)
+	{
+		const char *a = DatumGetPointer(s->in);
+		const char *b = DatumGetPointer(d);
+
+		return VARSIZE_ANY(a) == VARSIZE_ANY(b) && memcmp(a, b, VARSIZE_ANY(a)) == 0;
+	}
+	if (m->in_byval)
+		return s->in == d;
+	return memcmp(DatumGetPointer(s->in), DatumGetPointer(d), m->in_len) == 0;
+}
+
+/*
+ * Lazy target i for one row through its memo: a value met before takes its
+ * result; another is computed, at this row, by PostgreSQL's evaluator, and
+ * kept.
+ */
+static Datum
+memo_eval(VexecNode *node, int i, int row, bool *isnull)
+{
+	VexecRowMemo *m = node->row_memo[i];
+	ExprContext *econtext = node->css.ss.ps.ps_ExprContext;
+	bool		in_null;
+	Datum		in = memo_input(node, m, row, &in_null);
+	uint32		hash = memo_hash(m, in, in_null);
+	uint32		k;
+	VexecRowMemoSlot *s;
+	Datum		out;
+	MemoryContext old;
+
+	m->lookups++;
+	for (k = hash & (MEMO_SLOTS - 1);; k = (k + 1) & (MEMO_SLOTS - 1))
+	{
+		s = &m->slots[k];
+		if (!s->used)
+			break;
+		if (s->hash == hash && memo_equal(m, s, in, in_null))
+		{
+			m->hits++;
+			node->stats.memo_rows++;
+			*isnull = s->out_null;
+			return s->out;
+		}
+	}
+
+	vexec_node_load_input(node, row);
+	set_input_slot(node, econtext, node->input_slot);
+	out = ExecEvalExprSwitchContext(node->targets[i].state, econtext, isnull);
+
+	if (m->lookups == MEMO_PROBATION && m->hits * 10 < m->lookups)
+	{
+		/* too few repeats to pay for the lookups: the memo stops */
+		m->off = true;
+		MemoryContextReset(m->cxt);
+		return out;
+	}
+	if (m->nentries >= MEMO_ENTRIES)
+	{
+		MemoryContextReset(m->cxt);
+		memset(m->slots, 0, sizeof(VexecRowMemoSlot) * MEMO_SLOTS);
+		m->nentries = 0;
+		s = &m->slots[hash & (MEMO_SLOTS - 1)];
+	}
+	old = MemoryContextSwitchTo(m->cxt);
+	s->used = true;
+	s->hash = hash;
+	s->in_null = in_null;
+	s->in = in_null ? (Datum) 0 : datumCopy(in, m->in_byval, m->in_len);
+	s->out_null = *isnull;
+	s->out = *isnull ? (Datum) 0 : datumCopy(out, m->out_byval, m->out_len);
+	MemoryContextSwitchTo(old);
+	m->nentries++;
+	return out;
+}
+
+/*
  * The target list for one row: the eager entries read, the lazy evaluated
  * in the row's memory, as ExecProject evaluates a target.  Never in the
  * query's: a function's fn_mcxt is the query's memory, and a function that
@@ -647,6 +879,8 @@ project_row(VexecNode *node, int row)
 		if (node->outputs[i] != NULL)
 			slot->tts_values[i] = vexec_vec_datum(node->work, node->outputs[i], row,
 												  &slot->tts_isnull[i]);
+		else if (node->row_memo != NULL && node->row_memo[i] != NULL && !node->row_memo[i]->off)
+			slot->tts_values[i] = memo_eval(node, i, row, &slot->tts_isnull[i]);
 		else
 		{
 			vexec_node_load_input(node, row);
@@ -961,6 +1195,8 @@ vexec_node_explain_properties(VexecNode *node, List *ancestors, ExplainState *es
 		ExplainPropertyInteger("Batches", NULL, st->batches, es);
 		if (st->lazy_rows > 0)
 			ExplainPropertyInteger("Rows Evaluated Row by Row", NULL, st->lazy_rows, es);
+		if (st->memo_rows > 0)
+			ExplainPropertyInteger("Row-by-Row Results Reused", NULL, st->memo_rows, es);
 		if (st->redo_rows > 0)
 			ExplainPropertyInteger("Rows Sent to PostgreSQL", NULL, st->redo_rows, es);
 		if (st->declared_rows > 0)
@@ -1034,6 +1270,8 @@ vexec_node_report(PlanState *ps, PgOtelProbeAttrs *attrs, int when)
 	attrs->add_int(attrs, "vexec.fallback_rows", st->fallback_rows);
 	if (st->lazy_rows > 0)
 		attrs->add_int(attrs, "vexec.lazy_rows", st->lazy_rows);
+	if (st->memo_rows > 0)
+		attrs->add_int(attrs, "vexec.memo_rows", st->memo_rows);
 	if (st->redo_rows > 0)
 		attrs->add_int(attrs, "vexec.redo_rows", st->redo_rows);
 	if (st->declared_rows > 0)

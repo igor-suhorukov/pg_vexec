@@ -306,6 +306,7 @@ typedef struct VexecNodeStats
 	int64		kernel_steps;	/* kernel calls, a batch each */
 	int64		fallback_rows;	/* rows the fallback evaluated */
 	int64		lazy_rows;		/* rows PostgreSQL's evaluator ran lazily */
+	int64		memo_rows;		/* row-by-row targets' results reused */
 	int64		redo_rows;		/* rows a kernel sent to it */
 	int64		declared_rows;	/* rows declared calls answered */
 	int64		batches_out;	/* handed to a vector parent */
@@ -349,6 +350,9 @@ struct VexecNode
 	int			ntargets;
 	VexecTop   *targets;		/* the target list's, in its order */
 	bool		any_lazy_target;
+	struct VexecRowMemo **row_memo;	/* per target: a lazy one's results by
+									 * its one input column's value, or NULL
+									 * (node.c) */
 	bool	   *target_inexact; /* per target, or NULL: evaluated for rows
 								 * PostgreSQL may not evaluate it for, as
 								 * an aggregate's argument under a FILTER */
@@ -533,9 +537,10 @@ extern Node *vexec_create_sort_state(CustomScan *cscan);
 extern List *vexec_sort_plan_encode(const VexecSortPlan *plan);
 extern void vexec_sort_plan_decode(CustomScan *cscan, VexecSortPlan *plan);
 extern void vexec_sort_set_bound(CustomScan *cscan, int64 bound);
-extern bool vexec_sort_make_late(CustomScan *cscan);
+extern bool vexec_sort_make_late(CustomScan *cscan, bool parallel_ok);
 extern bool vexec_sort_plan_running_bound(CustomScan *cscan);
 extern bool vexec_scan_set_bound(PlanState *ps, VexecSortBound *bound);
+extern pg_atomic_uint64 *vexec_scan_shared_bound(PlanState *ps);
 extern bool vexec_scan_set_join_filter(PlanState *ps, VexecJoinFilter *filter);
 
 /* vecrepart.c */

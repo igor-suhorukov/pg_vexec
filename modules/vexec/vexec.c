@@ -47,6 +47,7 @@ double		vexec_cpu_operator_factor = 0.35;
 double		vexec_convert_cost = 0.001;
 double		vexec_batch_setup_cost = 1.0;
 int			vexec_min_rows = 10000;
+int			vexec_scan_rows_per_worker = 163840;
 
 /* per node kind */
 bool		vexec_enable_scan = true;
@@ -59,6 +60,7 @@ int			vexec_partial_agg_limit = 16384;
 bool		vexec_remember_agg_sizes = true;
 bool		vexec_enable_group_topk = true;
 bool		vexec_enable_shared_exprs = true;
+bool		vexec_enable_row_memo = true;
 bool		vexec_aggregate_statistics = true;
 bool		vexec_enable_hashjoin = true;
 bool		vexec_enable_join_filter = true;
@@ -259,6 +261,15 @@ define_settings(void)
 							10000, 0, INT_MAX,
 							PGC_USERSET, GUC_EXPLAIN,
 							NULL, NULL, NULL);
+	DefineCustomIntVariable("vexec.scan_rows_per_worker",
+							"Gives a vector scan of a batch source at least a parallel worker this many rows.",
+							"A source's pages are its compressed bytes, which PostgreSQL's rule sizes a "
+							"scan's workers by.  Up to max_parallel_workers_per_gather; a parallel_workers "
+							"reloption stays the relation's; 0: PostgreSQL's rule alone.",
+							&vexec_scan_rows_per_worker,
+							163840, 0, INT_MAX,
+							PGC_USERSET, GUC_EXPLAIN,
+							NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("vexec.enable_scan",
 							 "Enables vector scans.",
@@ -305,6 +316,13 @@ define_settings(void)
 							 "Equal subtrees of kernels, over columns and constants, are one, and its "
 							 "column is kept for the batch for each target that asks for the same rows.",
 							 &vexec_enable_shared_exprs, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_row_memo",
+							 "Reuses a row-by-row target's result for an input value it has met.",
+							 "A target PostgreSQL's evaluator computes a row at a time, a function of one "
+							 "input column with no volatile function, keeps its results by that column's "
+							 "value, up to 16384 of them, and computes each value once, at its first row.",
+							 &vexec_enable_row_memo, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_group_topk",
 							 "Lets a vector aggregation under a LIMIT without ORDER BY keep only the groups it returns.",
