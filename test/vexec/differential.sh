@@ -119,7 +119,8 @@ for corpus in ${VEXEC_CORPORA:-pg vexec}; do
 			# the instance's, accepted unchecked as the server starts: in
 			# PGOPTIONS it would be checked in pg_regress's first database,
 			# which the extension's access methods are not in
-			corpus_conf="default_table_access_method = mergetree"
+			corpus_conf="default_table_access_method = mergetree
+ch.max_merge_workers = 0"
 			# a prepared transaction a test leaves holds its relation-level
 			# predicate locks: a session waits a minute for them, not forever
 			session_extra="-c lock_timeout=60s"

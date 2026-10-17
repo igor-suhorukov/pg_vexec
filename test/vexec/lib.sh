@@ -22,6 +22,9 @@ server_init() {
 		echo "listen_addresses = ''"
 		echo "fsync = off"
 		echo "max_prepared_transactions = 2"
+		# ch_table_engines' merge workers off where it is preloaded (a placeholder
+		# elsewhere): a leg's answers and plans do not depend on when one merges
+		echo "ch.max_merge_workers = 0"
 		local s
 		for s in "$@"; do echo "$s"; done
 	} >> "$dir/data/postgresql.conf"
