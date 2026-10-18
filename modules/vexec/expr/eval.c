@@ -35,6 +35,16 @@
  * Registers -- the columns a program makes -- are allocated in the work
  * batch, reset with the input batch.
  *
+ * A subtree that reads one input column and constants alone, where that
+ * column is a dictionary's codes, is evaluated over the dictionary's values
+ * and its rows take their values' results (VC5; Velox's peeling,
+ * pg_vector_executor.md §3.18, X8).  Its results are kept for the
+ * dictionary's identity, so that every batch with that dictionary maps its
+ * codes and computes nothing; a dictionary without one is evaluated only
+ * where its values are fewer than the rows they answer.  A value whose
+ * kernel failed sends the rows holding it to redo; a value no row asked for
+ * raises nothing, as a kernel's failure at a row nobody asked for.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -360,6 +370,308 @@ kernel_arg(VexecEval *ev, VexecVec *v)
 }
 
 /* ---- the steps ---- */
+
+static VexecVec *eval_step(VexecEval *ev, VexecExpr *e, const uint64 *active);
+
+/*
+ * VC5: a subtree's results over a dictionary's values, kept for the
+ * dictionary's identity while batches come with it.
+ */
+typedef struct VexecDictMemo
+{
+	uint64		id;				/* the dictionary's; 0: none kept */
+	bool		refused;		/* its result is no column of values: never again */
+	VexecBatch *mem;			/* where the kept results live */
+	VexecVec   *result;			/* a value for each dictionary value */
+	uint64	   *redo;			/* the values whose rows PostgreSQL redoes */
+	bool		any_redo;
+	uint8	   *bools;			/* a boolean result's: bit 0 its truth, bit 1
+								 * its validity, a byte a value; or NULL */
+	uint64		result_id;		/* the results' identity, as a dictionary */
+	bool		have_null;		/* the result for a NULL computed: */
+	VexecVec   *null_result;
+	bool		null_redo;
+} VexecDictMemo;
+
+/*
+ * A subtree over `values`, nvals of them, in place of its input column's
+ * rows, its registers in `work`; *redo the values its kernels could not
+ * compute.
+ */
+static VexecVec *
+eval_over_values(VexecEval *ev, VexecExpr *e, VexecBatch *work, const VexecVec *values,
+				 int nvals, uint64 **redo)
+{
+	VexecEval	dev = *ev;
+	VexecBatch	din = *ev->in;
+	VexecVec   *r;
+
+	din.nrows = nvals;
+	din.selection = NULL;
+	din.cols = vexec_batch_alloc(work, sizeof(VexecVec) * Max(din.ncols, 1));
+	memcpy(din.cols, ev->in->cols, sizeof(VexecVec) * din.ncols);
+	din.cols[e->dict_col] = *values;
+	din.cols[e->dict_col].nvalues = nvals;
+	dev.in = &din;
+	dev.work = work;
+	dev.nrows = nvals;
+	dev.redo = vexec_bitmap_alloc(work, nvals, false);
+	dev.exact = false;
+	dev.over_dict = true;
+	r = eval_step(&dev, e, NULL);
+	*redo = dev.redo;
+	return r;
+}
+
+/* Value i of a boolean result, and whether it is valid */
+static inline bool
+result_bool(const VexecVec *r, int i, bool *valid)
+{
+	if (r->encoding == VEXEC_CONST)
+		i = 0;
+	*valid = r->validity == NULL || vexec_bit(r->validity, i);
+	if (r->shape.layout == VEXEC_BIT_BOOL)
+		return vexec_bit((const uint64 *) r->values, i);
+	return ((const uint8 *) r->values)[i] != 0;
+}
+
+/* A boolean result over nvals values as a byte a value: bit 0 true, bit 1 valid */
+static uint8 *
+result_bools(VexecBatch *work, const VexecVec *r, int nvals)
+{
+	uint8	   *b = vexec_batch_alloc(work, Max(nvals, 1));
+	int			i;
+
+	for (i = 0; i < nvals; i++)
+	{
+		bool		valid;
+		bool		t = result_bool(r, i, &valid);
+
+		b[i] = (t ? 1 : 0) | (valid ? 2 : 0);
+	}
+	return b;
+}
+
+/*
+ * A subtree over a dictionary column's values, its rows mapped to their
+ * values' results; NULL where it is better evaluated over the rows.
+ */
+static VexecVec *
+eval_dict(VexecEval *ev, VexecExpr *e, const uint64 *active)
+{
+	VexecVec   *in = &ev->in->cols[e->dict_col];
+	VexecVec   *dict = in->dictionary;
+	VexecDictMemo *m = e->dict_memo;
+	int			n = ev->nrows;
+	uint64	   *live;
+	VexecVec   *result;
+	uint64	   *redo;
+	bool		any_redo;
+	uint8	   *bools;
+	VexecVec   *null_result = NULL;
+	bool		null_redo = false;
+	bool		null_rows = false;
+	int			r;
+
+	if (m != NULL && m->refused)
+		return NULL;
+	live = live_rows(ev, active);
+	if (in->validity != NULL)
+	{
+		int			w;
+
+		for (w = 0; w < VEXEC_WORDS(n) && !null_rows; w++)
+			null_rows = (live[w] & ~in->validity[w]) != 0;
+	}
+
+	if (in->dict_id != 0 && m != NULL && m->id == in->dict_id)
+	{
+		result = m->result;
+		redo = m->redo;
+		any_redo = m->any_redo;
+		bools = m->bools;
+	}
+	else
+	{
+		VexecBatch *work;
+
+		/* without an identity, only where its values are fewer than the rows */
+		if (in->dict_id == 0 && dict->nvalues > vexec_bits_count(live, n))
+			return NULL;
+		if (m == NULL)
+		{
+			VexecType  *none = NULL;
+
+			m = MemoryContextAllocZero(ev->node->mcxt, sizeof(VexecDictMemo));
+			m->mem = vexec_batch_create(ev->node->mcxt, 0, &none);
+			e->dict_memo = m;
+		}
+		m->id = 0;
+		m->have_null = false;
+		if (in->dict_id != 0)
+		{
+			vexec_batch_reset(m->mem);
+			work = m->mem;
+		}
+		else
+			work = ev->work;
+		result = eval_over_values(ev, e, work, dict, dict->nvalues, &redo);
+		if (result->encoding == VEXEC_DICT)
+		{
+			m->refused = true;
+			return NULL;
+		}
+		ev->node->stats.dict_values += dict->nvalues;
+		any_redo = vexec_bits_any(redo, dict->nvalues);
+		bools = result->shape.layout == VEXEC_BIT_BOOL || result->shape.layout == VEXEC_BYTE_BOOL ?
+			result_bools(work, result, dict->nvalues) : NULL;
+		if (in->dict_id != 0)
+		{
+			m->id = in->dict_id;
+			m->result = result;
+			m->redo = redo;
+			m->any_redo = any_redo;
+			m->bools = bools;
+			m->result_id = vexec_dict_new_id();
+		}
+	}
+
+	/* a NULL row's result: the subtree over a NULL alone */
+	if (null_rows)
+	{
+		if (m->id != 0 && m->have_null)
+		{
+			null_result = m->null_result;
+			null_redo = m->null_redo;
+		}
+		else
+		{
+			VexecBatch *work = m->id != 0 ? m->mem : ev->work;
+			VexecVec	nv;
+			VexecShape	shape;
+			uint64	   *nredo;
+
+			nv.type = dict->type;
+			vexec_type_build_shape(dict->type, &shape);
+			vexec_vec_init(work, &nv, &shape, 1);
+			nv.validity = vexec_bitmap_alloc(work, 1, false);
+			null_result = eval_over_values(ev, e, work, &nv, 1, &nredo);
+			if (null_result->encoding == VEXEC_DICT)
+			{
+				m->refused = true;
+				return NULL;
+			}
+			null_redo = vexec_bit(nredo, 0);
+			if (m->id != 0)
+			{
+				m->have_null = true;
+				m->null_result = null_result;
+				m->null_redo = null_redo;
+			}
+		}
+	}
+
+	/* the rows asked for whose value's evaluation PostgreSQL redoes */
+	if (any_redo || null_redo)
+		for (r = vexec_bits_next(live, n, 0); r >= 0; r = vexec_bits_next(live, n, r + 1))
+			if (vexec_vec_isnull(in, r) ? null_redo : vexec_bit(redo, in->codes[r]))
+				vexec_bit_set(ev->redo, r);
+	ev->node->stats.dict_rows += vexec_bits_count(live, n);
+
+	if (bools != NULL)
+	{
+		/*
+		 * The rows' bits from their values' bytes, a word of rows at a time;
+		 * a NULL row's from the result over a NULL, where it was computed
+		 */
+		uint64	   *truth = vexec_bitmap_alloc(ev->work, n, false);
+		uint64	   *valid = vexec_bitmap_alloc(ev->work, n, false);
+		uint64		null_truth = 0;
+		uint64		null_valid = 0;
+		bool		all_valid = true;
+		const int32 *codes = in->codes;
+		int			w;
+
+		if (null_result != NULL)
+		{
+			bool		ok;
+
+			null_truth = result_bool(null_result, 0, &ok) ? ~UINT64CONST(0) : 0;
+			null_valid = ok ? ~UINT64CONST(0) : 0;
+		}
+		for (w = 0; w < VEXEC_WORDS(n); w++)
+		{
+			int			base = w * 64;
+			int			end = Min(n - base, 64);
+			uint64		tw = 0;
+			uint64		vw = 0;
+			uint64		mask = end == 64 ? ~UINT64CONST(0) : (UINT64CONST(1) << end) - 1;
+			int			b;
+
+			for (b = 0; b < end; b++)
+			{
+				uint8		x = bools[codes[base + b]];
+
+				tw |= (uint64) (x & 1) << b;
+				vw |= (uint64) ((x >> 1) & 1) << b;
+			}
+			if (in->validity != NULL)
+			{
+				uint64		rv = in->validity[w];
+
+				tw = (tw & rv) | (null_truth & ~rv);
+				vw = (vw & rv) | (null_valid & ~rv);
+			}
+			truth[w] = tw & mask;
+			valid[w] = vw & mask;
+			if ((vw & mask) != mask)
+				all_valid = false;
+		}
+		return bool_register(ev, truth, all_valid ? NULL : valid);
+	}
+
+	/*
+	 * Any other result: the rows' codes into the results, as a dictionary
+	 * column -- a NULL row's result must be NULL, as a strict call's is -- or
+	 * flattened where a result is NULL, so that a dictionary never holds one
+	 */
+	if (result->encoding != VEXEC_FLAT ||
+		(null_result != NULL && !vexec_vec_isnull(null_result, 0)))
+		return NULL;
+	{
+		VexecVec   *v = vexec_batch_alloc0(ev->work, sizeof(VexecVec));
+		bool		entry_nulls = result->validity != NULL &&
+			vexec_vec_null_count(NULL, result) > 0;
+
+		v->type = e->type;
+		v->shape = result->shape;
+		v->encoding = VEXEC_DICT;
+		v->nvalues = n;
+		v->codes = in->codes;
+		v->dictionary = result;
+		v->dict_id = m->id != 0 && !entry_nulls ? m->result_id : 0;
+		if (in->validity != NULL || entry_nulls)
+		{
+			v->validity = vexec_bitmap_alloc(ev->work, n, false);
+			for (r = 0; r < n; r++)
+				if (!vexec_vec_isnull(in, r) &&
+					(!entry_nulls || vexec_bit(result->validity, in->codes[r])))
+					vexec_bit_set(v->validity, r);
+		}
+		if (entry_nulls)
+			vexec_vec_flatten(ev->work, v);
+		else if (result->validity != NULL)
+		{
+			/* a dictionary's values have no validity of their own */
+			VexecVec   *d = vexec_batch_alloc(ev->work, sizeof(VexecVec));
+
+			*d = *result;
+			d->validity = NULL;
+			v->dictionary = d;
+		}
+		return v;
+	}
+}
 
 /*
  * A parameter, once a batch.  An InitPlan not yet run is run here only
@@ -1037,7 +1349,7 @@ eval_shared(VexecEval *ev, VexecExpr *e, const uint64 *active)
 VexecVec *
 vexec_eval(VexecEval *ev, VexecExpr *e, const uint64 *active)
 {
-	if (e->shared)
+	if (e->shared && !ev->over_dict)
 		return eval_shared(ev, e, active);
 	return eval_step(ev, e, active);
 }
@@ -1046,6 +1358,17 @@ static VexecVec *
 eval_step(VexecEval *ev, VexecExpr *e, const uint64 *active)
 {
 	check_stack_depth();
+
+	/* VC5: over a dictionary's values, where the subtree reads its column alone */
+	if (e->dict_pure && e->dict_col >= 0 && e->kind != VE_VAR && e->kind != VE_CONST &&
+		e->kind != VE_RELABEL && ev->in != NULL &&
+		ev->in->cols[e->dict_col].encoding == VEXEC_DICT)
+	{
+		VexecVec   *v = eval_dict(ev, e, active);
+
+		if (v != NULL)
+			return v;
+	}
 
 	switch (e->kind)
 	{

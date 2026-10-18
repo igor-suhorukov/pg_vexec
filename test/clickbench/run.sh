@@ -21,7 +21,10 @@
 #                             vanilla-heap_pk, port-<aoco|porc|porc_vec>-s<segments>,
 #                             or V6's vanillaorca-heap, vanillaorca-heap_pk:
 #                             vanilla PostgreSQL 19 with gp_orca built alone
-#                             (CB_ORCA_STAGE), ORCA and the planner
+#                             (CB_ORCA_STAGE), ORCA and the planner; or
+#                             ch_table_engines' vanilla-mergetree and
+#                             vanilla-mergetree_files (ch_table_engines.md §4),
+#                             not among the baseline's, built from CHTE_SRC
 #   run.sh baseline           the baseline, before development: every load in
 #                             check mode on 1M rows and in time mode on 10M rows,
 #                             ClickBench's protocol three times over, saved into
@@ -73,6 +76,12 @@
 #   CB_RUN             the run of the cache "run" goes on with, rather than
 #                      making a new one: a load it has reported is not run
 #                      again
+#   CHTE_SRC           the mergetree loads' ch_table_engines: its tree,
+#                      pg_ch_table_engines beside this checkout, built by
+#                      PGXS in its dev images (its test/run.sh images; in
+#                      time mode CHTE_VANILLA_FLAVOR=vanilla-noassert's) into
+#                      the cache; CHTE_ENGINE_LIB its engine library's
+#                      directory, mounted into the loads' containers
 #   CB_ORCA_STAGE      the vanillaorca loads' gp_orca, built alone for one
 #                      node by test/vexec/run.sh orcabuild: its build cache's
 #                      stage, ~/.cache/pg_accel/vexec/orcabuild/stage, and in
@@ -104,6 +113,8 @@ export CLICKBENCH_WORK="$CLICKBENCH_CACHE/work"
 export CLICKBENCH_RUNS="$CLICKBENCH_CACHE/runs"
 export CLICKBENCH_HOST="${CLICKBENCH_HOST:-$(hostname -s)}"
 export CB_TESTS_MEM="${CB_TESTS_MEM:-40g}"
+export CHTE_SRC="${CHTE_SRC:-$(cd "$ROOT/.." && pwd)/pg_ch_table_engines}"
+export CHTE_ENGINE_LIB="${CHTE_ENGINE_LIB:-$HOME/.cache/pg_accel/chte/engine/lib}"
 mkdir -p "$CLICKBENCH_CACHE" "$CLICKBENCH_WORK" "$CLICKBENCH_RUNS"
 
 # The servers' builds: the port's branch, and the core series it is built on.
@@ -260,6 +271,31 @@ vexec_build() {
 	done
 }
 
+# chte_build <mode>: ch_table_engines for the mergetree loads, built by PGXS
+# in its dev image of the server the mode runs -- with assertions for check
+# mode, without for time mode -- into the cache, where vexec-entry.sh
+# installs it from.
+chte_build() {
+	local mode="$1" flavor=vanilla asserts=yes dest="$CLICKBENCH_CACHE/chte/vanilla"
+	[ "$mode" = time ] && { flavor=vanilla-noassert; asserts=no; }
+	[ -d "$CHTE_SRC/src" ] || die "no ch_table_engines tree at $CHTE_SRC"
+	[ -f "$CHTE_ENGINE_LIB/libchte_engine.so" ] || die "no engine library at $CHTE_ENGINE_LIB: its test/run.sh engine"
+	rm -rf "$dest"
+	mkdir -p "$dest"
+	docker run --rm --network none -u postgres --tmpfs /tmp:exec -v "$CHTE_SRC:/src:ro" -v "$dest:/work" \
+		"pg_chte/dev:$flavor" bash -c '
+			CHTE_SRC=/src /src/test/build.sh > /work/build.log 2>&1 || { cat /work/build.log; exit 1; }
+			mkdir -p /work/lib /work/extension
+			cp "$(pg_config --pkglibdir)/ch_table_engines.so" /work/lib/
+			cp "$(pg_config --sharedir)"/extension/ch_table_engines* /work/extension/
+			sed -n "s/^building against //p" /work/build.log > /work/BUILT
+			if grep -q "^#define USE_ASSERT_CHECKING" "$(pg_config --includedir-server)/pg_config.h"; then
+				echo yes; else echo no; fi > /work/ASSERTS' || die "ch_table_engines' build"
+	[ "$(cat "$dest/ASSERTS" 2> /dev/null)" = "$asserts" ] ||
+		die "ch_table_engines was built against a server whose assertions are $(cat "$dest/ASSERTS" 2> /dev/null), not $asserts"
+	echo "  ch_table_engines $(git -C "$CHTE_SRC" rev-parse --short HEAD 2> /dev/null): $(cat "$dest/BUILT"), assertions $asserts"
+}
+
 # run_loads <mode> <run id> <load>...: each in its container, then reported.
 run_loads() {
 	local mode="$1" id="$2" load route storage seg service image orca_stage rc failed=0
@@ -272,7 +308,7 @@ run_loads() {
 	[ -n "$others" ] && echo "  (other containers are running: $others-- timings measure the host)"
 	for load in "$@"; do
 		case "$load" in
-			vanilla-heap|vanilla-heap_pk)
+			vanilla-heap|vanilla-heap_pk|vanilla-mergetree|vanilla-mergetree_files)
 				route=vanilla; storage="${load#vanilla-}"; seg=0; service=vanilla; image="$VANILLA_IMAGE" ;;
 			port-aoco-s*|port-porc-s*|port-porc_vec-s*)
 				route=port; seg="${load##*-s}"; storage="${load#port-}"; storage="${storage%-s*}"; service=orca
@@ -298,7 +334,7 @@ run_loads() {
 		[ -n "${CB_STATS_RUN:-}" ] && stats="/runs/$CB_STATS_RUN/$load/stats.json"
 		echo "== $mode, $load: $(date '+%F %T')"
 		local start=()
-		{ [ -n "${CB_VEXEC:-}" ] || [ "$route" = vanilla-orca ]; } &&
+		{ [ -n "${CB_VEXEC:-}" ] || [ "$route" = vanilla-orca ] || [[ "$storage" == mergetree* ]]; } &&
 			start=(--user root --entrypoint /clickbench/vexec-entry.sh)
 		ORCA_IMAGE="$image" CB_ORCA_STAGE="$orca_stage" compose --profile run run --rm -T "${start[@]}" \
 			-e CB_MODE="$mode" -e CB_ROUTE="$route" -e CB_STORAGE="$storage" -e CB_SEGMENTS="$seg" \
@@ -364,6 +400,7 @@ case "$cmd" in
 		if [ -n "${CB_VEXEC:-}" ]; then
 			vexec_build "$mode" "$@" || exit 1
 		fi
+		case " $* " in *" vanilla-mergetree"*) chte_build "$mode" || exit 1 ;; esac
 		run_loads "$mode" "${CB_RUN:-$(date +%Y%m%dT%H%M%S)-$mode${CB_VEXEC:+-vexec}}" "$@" ;;
 	baseline) baseline ;;
 	report)

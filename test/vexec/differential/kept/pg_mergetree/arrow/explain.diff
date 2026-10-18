@@ -1,0 +1,961 @@
+--- reference
++++ session
+@@ -59,47 +59,44 @@
+ 
+ select explain_filter('explain select * from int8_tbl i8');
+-                           explain_filter                            
+----------------------------------------------------------------------
+-   Columns: q1, q2
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
+-(2 rows)
++                       explain_filter                        
++-------------------------------------------------------------
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++(1 row)
+ 
+ select explain_filter('explain (analyze, buffers off) select * from int8_tbl i8');
+-                                               explain_filter                                                
+--------------------------------------------------------------------------------------------------------------
+-   Columns: q1, q2
+-   Granules: N read of N
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+- Execution Time: N.N ms
+- Planning Time: N.N ms
+-(5 rows)
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
++ Execution Time: N.N ms
++ Planning Time: N.N ms
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++(3 rows)
+ 
+ select explain_filter('explain (analyze, buffers off, verbose) select * from int8_tbl i8');
+-                                                   explain_filter                                                   
+---------------------------------------------------------------------------------------------------------------------
+-   Columns: q1, q2
+-   Granules: N read of N
++                                               explain_filter                                               
++------------------------------------------------------------------------------------------------------------
++   Batch Format: arrow
++   Batches: N
++   Fallback Steps: N
++   Kernel Steps: N
+    Output: q1, q2
+- Custom Scan (ChScan) on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+- Execution Time: N.N ms
+- Planning Time: N.N ms
+-(6 rows)
++   Source: MergeTree
++ Execution Time: N.N ms
++ Planning Time: N.N ms
++ Vec Seq Scan on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++(9 rows)
+ 
+ select explain_filter('explain (analyze, buffers, format text) select * from int8_tbl i8');
+-                                               explain_filter                                                
+--------------------------------------------------------------------------------------------------------------
+-   Columns: q1, q2
+-   Granules: N read of N
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+- Execution Time: N.N ms
+- Planning Time: N.N ms
+-(5 rows)
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
++ Execution Time: N.N ms
++ Planning Time: N.N ms
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++(3 rows)
+ 
+ select explain_filter('explain (buffers, format text) select * from int8_tbl i8');
+-                           explain_filter                            
+----------------------------------------------------------------------
+-   Columns: q1, q2
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
+-(2 rows)
++                       explain_filter                        
++-------------------------------------------------------------
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++(1 row)
+ 
+ \a
+@@ -110,5 +107,5 @@
+     <Plan>
+       <Node-Type>Custom Scan</Node-Type>
+-      <Custom-Plan-Provider>ChScan</Custom-Plan-Provider>
++      <Custom-Plan-Provider>VecScan</Custom-Plan-Provider>
+       <Parallel-Aware>false</Parallel-Aware>
+       <Async-Capable>false</Async-Capable>
+@@ -124,8 +121,4 @@
+       <Actual-Loops>N</Actual-Loops>
+       <Disabled>false</Disabled>
+-      <Columns>q1, q2</Columns>
+-      <Granules-Read>N</Granules-Read>
+-      <Granules>N</Granules>
+-      <Parts-Pruned>N</Parts-Pruned>
+       <Shared-Hit-Blocks>N</Shared-Hit-Blocks>
+       <Shared-Read-Blocks>N</Shared-Read-Blocks>
+@@ -162,5 +155,5 @@
+ - Plan: 
+     Node Type: "Custom Scan"
+-    Custom Plan Provider: "ChScan"
++    Custom Plan Provider: "VecScan"
+     Parallel Aware: false
+     Async Capable: false
+@@ -176,8 +169,4 @@
+     Actual Loops: N
+     Disabled: false
+-    Columns: "q1, q2"
+-    Granules Read: N
+-    Granules: N
+-    Parts Pruned: N
+     Shared Hit Blocks: N
+     Shared Read Blocks: N
+@@ -225,5 +214,5 @@
+     "Plan": {
+       "Node Type": "Custom Scan",
+-      "Custom Plan Provider": "ChScan",
++      "Custom Plan Provider": "VecScan",
+       "Parallel Aware": false,
+       "Async Capable": false,
+@@ -235,5 +224,4 @@
+       "Plan Width": N,
+       "Disabled": false,
+-      "Columns": "q1, q2",
+       "Shared Hit Blocks": N,
+       "Shared Read Blocks": N,
+@@ -267,7 +255,10 @@
+                                             explain_filter                                             
+ -------------------------------------------------------------------------------------------------------
+-                     Columns: unique1, unique2, ten, hundred, tenthous
++                     Batch Format: arrow
++                     Fallback Steps: N
++                     Kernel Steps: N
+                      Output: ten, hundred, unique1, unique2, tenthous
+-               ->  Custom Scan (ChScan) on public.tenk1  (cost=N.N..N.N rows=N width=N)
++                     Source: MergeTree
++               ->  Vec Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
+                Output: ten, hundred, unique1, unique2, tenthous
+                Sort Key: tenk1.ten, tenk1.hundred
+@@ -279,12 +270,15 @@
+    Window: w AS (PARTITION BY tenk1.ten)
+  WindowAgg  (cost=N.N..N.N rows=N width=N)
+-(12 rows)
++(15 rows)
+ 
+ select explain_filter('explain verbose select sum(unique1) over w1, sum(unique2) over (w1 order by hundred), sum(tenthous) over (w1 order by hundred rows 10 preceding) from tenk1 window w1 as (partition by ten)');
+                                              explain_filter                                              
+ ---------------------------------------------------------------------------------------------------------
+-                           Columns: unique1, unique2, ten, hundred, tenthous
++                           Batch Format: arrow
++                           Fallback Steps: N
++                           Kernel Steps: N
+                            Output: ten, hundred, unique1, unique2, tenthous
+-                     ->  Custom Scan (ChScan) on public.tenk1  (cost=N.N..N.N rows=N width=N)
++                           Source: MergeTree
++                     ->  Vec Seq Scan on public.tenk1  (cost=N.N..N.N rows=N width=N)
+                      Output: ten, hundred, unique1, unique2, tenthous
+                      Sort Key: tenk1.ten, tenk1.hundred
+@@ -299,5 +293,5 @@
+    Window: w1 AS (PARTITION BY tenk1.ten)
+  WindowAgg  (cost=N.N..N.N rows=N width=N)
+-(15 rows)
++(18 rows)
+ 
+ -- Check output including I/O timings.  These fields are conditional
+@@ -305,7 +299,7 @@
+ set track_io_timing = on;
+ select explain_filter('explain (analyze, buffers, format json) select * from int8_tbl i8');
+-             explain_filter              
+------------------------------------------
+- [                                      +
+   {                                    +
+     "Plan": {                          +
+       "Node Type": "Custom Scan",      +
+       "Custom Plan Provider": "ChScan",+
+       "Parallel Aware": false,         +
+       "Async Capable": false,          +
+       "Relation Name": "int8_tbl",     +
+       "Alias": "i8",                   +
+       "Startup Cost": N.N,             +
+       "Total Cost": N.N,               +
+       "Plan Rows": N,                  +
+       "Plan Width": N,                 +
+       "Actual Startup Time": N.N,      +
+       "Actual Total Time": N.N,        +
+       "Actual Rows": N.N,              +
+       "Actual Loops": N,               +
+       "Disabled": false,               +
+       "Columns": "q1, q2",             +
+       "Granules Read": N,              +
+       "Granules": N,                   +
+       "Parts Pruned": N,               +
+       "Shared Hit Blocks": N,          +
+       "Shared Read Blocks": N,         +
+       "Shared Dirtied Blocks": N,      +
+       "Shared Written Blocks": N,      +
+       "Local Hit Blocks": N,           +
+       "Local Read Blocks": N,          +
+       "Local Dirtied Blocks": N,       +
+       "Local Written Blocks": N,       +
+       "Temp Read Blocks": N,           +
+       "Temp Written Blocks": N,        +
+       "Shared I/O Read Time": N.N,     +
+       "Shared I/O Write Time": N.N,    +
+       "Local I/O Read Time": N.N,      +
+       "Local I/O Write Time": N.N,     +
+       "Temp I/O Read Time": N.N,       +
+       "Temp I/O Write Time": N.N       +
+     },                                 +
+     "Planning": {                      +
+       "Shared Hit Blocks": N,          +
+       "Shared Read Blocks": N,         +
+       "Shared Dirtied Blocks": N,      +
+       "Shared Written Blocks": N,      +
+       "Local Hit Blocks": N,           +
+       "Local Read Blocks": N,          +
+       "Local Dirtied Blocks": N,       +
+       "Local Written Blocks": N,       +
+       "Temp Read Blocks": N,           +
+       "Temp Written Blocks": N,        +
+       "Shared I/O Read Time": N.N,     +
+       "Shared I/O Write Time": N.N,    +
+       "Local I/O Read Time": N.N,      +
+       "Local I/O Write Time": N.N,     +
+       "Temp I/O Read Time": N.N,       +
+       "Temp I/O Write Time": N.N       +
+     },                                 +
+     "Planning Time": N.N,              +
+     "Triggers": [                      +
+     ],                                 +
+     "Execution Time": N.N              +
+   }                                    +
+ ]
++              explain_filter              
++------------------------------------------
++ [                                       +
+   {                                     +
+     "Plan": {                           +
+       "Node Type": "Custom Scan",       +
+       "Custom Plan Provider": "VecScan",+
+       "Parallel Aware": false,          +
+       "Async Capable": false,           +
+       "Relation Name": "int8_tbl",      +
+       "Alias": "i8",                    +
+       "Startup Cost": N.N,              +
+       "Total Cost": N.N,                +
+       "Plan Rows": N,                   +
+       "Plan Width": N,                  +
+       "Actual Startup Time": N.N,       +
+       "Actual Total Time": N.N,         +
+       "Actual Rows": N.N,               +
+       "Actual Loops": N,                +
+       "Disabled": false,                +
+       "Shared Hit Blocks": N,           +
+       "Shared Read Blocks": N,          +
+       "Shared Dirtied Blocks": N,       +
+       "Shared Written Blocks": N,       +
+       "Local Hit Blocks": N,            +
+       "Local Read Blocks": N,           +
+       "Local Dirtied Blocks": N,        +
+       "Local Written Blocks": N,        +
+       "Temp Read Blocks": N,            +
+       "Temp Written Blocks": N,         +
+       "Shared I/O Read Time": N.N,      +
+       "Shared I/O Write Time": N.N,     +
+       "Local I/O Read Time": N.N,       +
+       "Local I/O Write Time": N.N,      +
+       "Temp I/O Read Time": N.N,        +
+       "Temp I/O Write Time": N.N        +
+     },                                  +
+     "Planning": {                       +
+       "Shared Hit Blocks": N,           +
+       "Shared Read Blocks": N,          +
+       "Shared Dirtied Blocks": N,       +
+       "Shared Written Blocks": N,       +
+       "Local Hit Blocks": N,            +
+       "Local Read Blocks": N,           +
+       "Local Dirtied Blocks": N,        +
+       "Local Written Blocks": N,        +
+       "Temp Read Blocks": N,            +
+       "Temp Written Blocks": N,         +
+       "Shared I/O Read Time": N.N,      +
+       "Shared I/O Write Time": N.N,     +
+       "Local I/O Read Time": N.N,       +
+       "Local I/O Write Time": N.N,      +
+       "Temp I/O Read Time": N.N,        +
+       "Temp I/O Write Time": N.N        +
+     },                                  +
+     "Planning Time": N.N,               +
+     "Triggers": [                       +
+     ],                                  +
+     "Execution Time": N.N               +
+   }                                     +
+ ]
+ (1 row)
+ 
+@@ -338,5 +332,5 @@
+    ->  Bitmap Index Scan on tenk1_thous_tenthous  (cost=N.N..N.N rows=N width=N)
+    Recheck Cond: (thousand = $N)
+- Bitmap Heap Scan on tenk1  (cost=N.N..N.N rows=N width=N)
++ Vec Bitmap Heap Scan on tenk1  (cost=N.N..N.N rows=N width=N)
+ (4 rows)
+ 
+@@ -347,42 +341,38 @@
+ -- MEMORY option
+ select explain_filter('explain (memory) select * from int8_tbl i8');
+-                           explain_filter                            
+----------------------------------------------------------------------
+-   Columns: q1, q2
++                       explain_filter                        
++-------------------------------------------------------------
+    Memory: used=NkB  allocated=NkB
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
+-(3 rows)
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++(2 rows)
+ 
+ select explain_filter('explain (memory, analyze, buffers off) select * from int8_tbl i8');
+-                                               explain_filter                                                
+--------------------------------------------------------------------------------------------------------------
+-   Columns: q1, q2
+-   Granules: N read of N
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
+    Memory: used=NkB  allocated=NkB
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
+- Execution Time: N.N ms
+- Planning Time: N.N ms
+-(6 rows)
++ Execution Time: N.N ms
++ Planning Time: N.N ms
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++(4 rows)
+ 
+ select explain_filter('explain (memory, summary, format yaml) select * from int8_tbl i8');
+-           explain_filter           
+-------------------------------------
+- - Plan:                           +
+     Node Type: "Custom Scan"      +
+     Custom Plan Provider: "ChScan"+
+     Parallel Aware: false         +
+     Async Capable: false          +
+     Relation Name: "int8_tbl"     +
+     Alias: "i8"                   +
+     Startup Cost: N.N             +
+     Total Cost: N.N               +
+     Plan Rows: N                  +
+     Plan Width: N                 +
+     Disabled: false               +
+     Columns: "q1, q2"             +
+   Planning:                       +
+     Memory Used: N                +
+     Memory Allocated: N           +
+   Planning Time: N.N
++           explain_filter            
++-------------------------------------
++ - Plan:                            +
+     Node Type: "Custom Scan"       +
+     Custom Plan Provider: "VecScan"+
+     Parallel Aware: false          +
+     Async Capable: false           +
+     Relation Name: "int8_tbl"      +
+     Alias: "i8"                    +
+     Startup Cost: N.N              +
+     Total Cost: N.N                +
+     Plan Rows: N                   +
+     Plan Width: N                  +
+     Disabled: false                +
+   Planning:                        +
+     Memory Used: N                 +
+     Memory Allocated: N            +
+   Planning Time: N.N
+ (1 row)
+ 
+ select explain_filter('explain (memory, analyze, format json) select * from int8_tbl i8');
+-             explain_filter              
+------------------------------------------
+- [                                      +
+   {                                    +
+     "Plan": {                          +
+       "Node Type": "Custom Scan",      +
+       "Custom Plan Provider": "ChScan",+
+       "Parallel Aware": false,         +
+       "Async Capable": false,          +
+       "Relation Name": "int8_tbl",     +
+       "Alias": "i8",                   +
+       "Startup Cost": N.N,             +
+       "Total Cost": N.N,               +
+       "Plan Rows": N,                  +
+       "Plan Width": N,                 +
+       "Actual Startup Time": N.N,      +
+       "Actual Total Time": N.N,        +
+       "Actual Rows": N.N,              +
+       "Actual Loops": N,               +
+       "Disabled": false,               +
+       "Columns": "q1, q2",             +
+       "Granules Read": N,              +
+       "Granules": N,                   +
+       "Parts Pruned": N,               +
+       "Shared Hit Blocks": N,          +
+       "Shared Read Blocks": N,         +
+       "Shared Dirtied Blocks": N,      +
+       "Shared Written Blocks": N,      +
+       "Local Hit Blocks": N,           +
+       "Local Read Blocks": N,          +
+       "Local Dirtied Blocks": N,       +
+       "Local Written Blocks": N,       +
+       "Temp Read Blocks": N,           +
+       "Temp Written Blocks": N         +
+     },                                 +
+     "Planning": {                      +
+       "Shared Hit Blocks": N,          +
+       "Shared Read Blocks": N,         +
+       "Shared Dirtied Blocks": N,      +
+       "Shared Written Blocks": N,      +
+       "Local Hit Blocks": N,           +
+       "Local Read Blocks": N,          +
+       "Local Dirtied Blocks": N,       +
+       "Local Written Blocks": N,       +
+       "Temp Read Blocks": N,           +
+       "Temp Written Blocks": N,        +
+       "Memory Used": N,                +
+       "Memory Allocated": N            +
+     },                                 +
+     "Planning Time": N.N,              +
+     "Triggers": [                      +
+     ],                                 +
+     "Execution Time": N.N              +
+   }                                    +
+ ]
++              explain_filter              
++------------------------------------------
++ [                                       +
+   {                                     +
+     "Plan": {                           +
+       "Node Type": "Custom Scan",       +
+       "Custom Plan Provider": "VecScan",+
+       "Parallel Aware": false,          +
+       "Async Capable": false,           +
+       "Relation Name": "int8_tbl",      +
+       "Alias": "i8",                    +
+       "Startup Cost": N.N,              +
+       "Total Cost": N.N,                +
+       "Plan Rows": N,                   +
+       "Plan Width": N,                  +
+       "Actual Startup Time": N.N,       +
+       "Actual Total Time": N.N,         +
+       "Actual Rows": N.N,               +
+       "Actual Loops": N,                +
+       "Disabled": false,                +
+       "Shared Hit Blocks": N,           +
+       "Shared Read Blocks": N,          +
+       "Shared Dirtied Blocks": N,       +
+       "Shared Written Blocks": N,       +
+       "Local Hit Blocks": N,            +
+       "Local Read Blocks": N,           +
+       "Local Dirtied Blocks": N,        +
+       "Local Written Blocks": N,        +
+       "Temp Read Blocks": N,            +
+       "Temp Written Blocks": N          +
+     },                                  +
+     "Planning": {                       +
+       "Shared Hit Blocks": N,           +
+       "Shared Read Blocks": N,          +
+       "Shared Dirtied Blocks": N,       +
+       "Shared Written Blocks": N,       +
+       "Local Hit Blocks": N,            +
+       "Local Read Blocks": N,           +
+       "Local Dirtied Blocks": N,        +
+       "Local Written Blocks": N,        +
+       "Temp Read Blocks": N,            +
+       "Temp Written Blocks": N,         +
+       "Memory Used": N,                 +
+       "Memory Allocated": N             +
+     },                                  +
+     "Planning Time": N.N,               +
+     "Triggers": [                       +
+     ],                                  +
+     "Execution Time": N.N               +
+   }                                     +
+ ]
+ (1 row)
+ 
+ prepare int8_query as select * from int8_tbl i8;
+ select explain_filter('explain (memory) execute int8_query');
+-                           explain_filter                            
+----------------------------------------------------------------------
+-   Columns: q1, q2
++                       explain_filter                        
++-------------------------------------------------------------
+    Memory: used=NkB  allocated=NkB
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
+-(3 rows)
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++(2 rows)
+ 
+ -- Test EXPLAIN (GENERIC_PLAN) with partition pruning
+@@ -404,10 +394,10 @@
+ -- should scan gen_part_1_1 and gen_part_1_2, but not gen_part_2
+ select explain_filter('explain (generic_plan) select key1, key2 from gen_part where key1 = 1 and key2 = $1');
+-                              explain_filter                               
+----------------------------------------------------------------------------
++                                explain_filter                                 
++-------------------------------------------------------------------------------
+          Filter: ((key1 = N) AND (key2 = $N))
+          Filter: ((key1 = N) AND (key2 = $N))
+-   ->  Seq Scan on gen_part_1_1 gen_part_1  (cost=N.N..N.N rows=N width=N)
+-   ->  Seq Scan on gen_part_1_2 gen_part_2  (cost=N.N..N.N rows=N width=N)
++   ->  Vec Seq Scan on gen_part_1_1 gen_part_1  (cost=N.N..N.N rows=N width=N)
++   ->  Vec Seq Scan on gen_part_1_2 gen_part_2  (cost=N.N..N.N rows=N width=N)
+  Append  (cost=N.N..N.N rows=N width=N)
+ (5 rows)
+@@ -438,7 +428,7 @@
+   #- '{0,Plan,Plans,0,Sort Space Type}'
+ );
+-                                                                                  jsonb_pretty                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+- [                                                                                                                                                                              +
+     {                                                                                                                                                                          +
+         "Plan": {                                                                                                                                                              +
+             "Plans": [                                                                                                                                                         +
+                 {                                                                                                                                                              +
+                     "Plans": [                                                                                                                                                 +
+                         {                                                                                                                                                      +
+                             "Alias": "tenk1",                                                                                                                                  +
+                             "Output": [                                                                                                                                        +
+                                 "unique1",                                                                                                                                     +
+                                 "unique2",                                                                                                                                     +
+                                 "two",                                                                                                                                         +
+                                 "four",                                                                                                                                        +
+                                 "ten",                                                                                                                                         +
+                                 "twenty",                                                                                                                                      +
+                                 "hundred",                                                                                                                                     +
+                                 "thousand",                                                                                                                                    +
+                                 "twothousand",                                                                                                                                 +
+                                 "fivethous",                                                                                                                                   +
+                                 "tenthous",                                                                                                                                    +
+                                 "odd",                                                                                                                                         +
+                                 "even",                                                                                                                                        +
+                                 "stringu1",                                                                                                                                    +
+                                 "stringu2",                                                                                                                                    +
+                                 "string4"                                                                                                                                      +
+                             ],                                                                                                                                                 +
+                             "Schema": "public",                                                                                                                                +
+                             "Columns": "unique1, unique2, two, four, ten, twenty, hundred, thousand, twothousand, fivethous, tenthous, odd, even, stringu1, stringu2, string4",+
+                             "Disabled": false,                                                                                                                                 +
+                             "Granules": 0,                                                                                                                                     +
+                             "Node Type": "Custom Scan",                                                                                                                        +
+                             "Plan Rows": 0,                                                                                                                                    +
+                             "Plan Width": 0,                                                                                                                                   +
+                             "Total Cost": 0.0,                                                                                                                                 +
+                             "Actual Rows": 0.0,                                                                                                                                +
+                             "Actual Loops": 0,                                                                                                                                 +
+                             "Parts Pruned": 0,                                                                                                                                 +
+                             "Startup Cost": 0.0,                                                                                                                               +
+                             "Async Capable": false,                                                                                                                            +
+                             "Granules Read": 0,                                                                                                                                +
+                             "Relation Name": "tenk1",                                                                                                                          +
+                             "Parallel Aware": true,                                                                                                                            +
+                             "Local Hit Blocks": 0,                                                                                                                             +
+                             "Temp Read Blocks": 0,                                                                                                                             +
+                             "Actual Total Time": 0.0,                                                                                                                          +
+                             "Local Read Blocks": 0,                                                                                                                            +
+                             "Shared Hit Blocks": 0,                                                                                                                            +
+                             "Shared Read Blocks": 0,                                                                                                                           +
+                             "Actual Startup Time": 0.0,                                                                                                                        +
+                             "Parent Relationship": "Outer",                                                                                                                    +
+                             "Temp Written Blocks": 0,                                                                                                                          +
+                             "Custom Plan Provider": "ChScan",                                                                                                                  +
+                             "Local Dirtied Blocks": 0,                                                                                                                         +
+                             "Local Written Blocks": 0,                                                                                                                         +
+                             "Shared Dirtied Blocks": 0,                                                                                                                        +
+                             "Shared Written Blocks": 0                                                                                                                         +
+                         }                                                                                                                                                      +
+                     ],                                                                                                                                                         +
+                     "Output": [                                                                                                                                                +
+                         "unique1",                                                                                                                                             +
+                         "unique2",                                                                                                                                             +
+                         "two",                                                                                                                                                 +
+                         "four",                                                                                                                                                +
+                         "ten",                                                                                                                                                 +
+                         "twenty",                                                                                                                                              +
+                         "hundred",                                                                                                                                             +
+                         "thousand",                                                                                                                                            +
+                         "twothousand",                                                                                                                                         +
+                         "fivethous",                                                                                                                                           +
+                         "tenthous",                                                                                                                                            +
+                         "odd",                                                                                                                                                 +
+                         "even",                                                                                                                                                +
+                         "stringu1",                                                                                                                                            +
+                         "stringu2",                                                                                                                                            +
+                         "string4"                                                                                                                                              +
+                     ],                                                                                                                                                         +
+                     "Disabled": false,                                                                                                                                         +
+                     "Sort Key": [                                                                                                                                              +
+                         "tenk1.tenthous"                                                                                                                                       +
+                     ],                                                                                                                                                         +
+                     "Node Type": "Sort",                                                                                                                                       +
+                     "Plan Rows": 0,                                                                                                                                            +
+                     "Plan Width": 0,                                                                                                                                           +
+                     "Total Cost": 0.0,                                                                                                                                         +
+                     "Actual Rows": 0.0,                                                                                                                                        +
+                     "Actual Loops": 0,                                                                                                                                         +
+                     "Startup Cost": 0.0,                                                                                                                                       +
+                     "Async Capable": false,                                                                                                                                    +
+                     "Parallel Aware": false,                                                                                                                                   +
+                     "Sort Space Used": 0,                                                                                                                                      +
+                     "Local Hit Blocks": 0,                                                                                                                                     +
+                     "Temp Read Blocks": 0,                                                                                                                                     +
+                     "Actual Total Time": 0.0,                                                                                                                                  +
+                     "Local Read Blocks": 0,                                                                                                                                    +
+                     "Shared Hit Blocks": 0,                                                                                                                                    +
+                     "Shared Read Blocks": 0,                                                                                                                                   +
+                     "Actual Startup Time": 0.0,                                                                                                                                +
+                     "Parent Relationship": "Outer",                                                                                                                            +
+                     "Temp Written Blocks": 0,                                                                                                                                  +
+                     "Local Dirtied Blocks": 0,                                                                                                                                 +
+                     "Local Written Blocks": 0,                                                                                                                                 +
+                     "Shared Dirtied Blocks": 0,                                                                                                                                +
+                     "Shared Written Blocks": 0                                                                                                                                 +
+                 }                                                                                                                                                              +
+             ],                                                                                                                                                                 +
+             "Output": [                                                                                                                                                        +
+                 "unique1",                                                                                                                                                     +
+                 "unique2",                                                                                                                                                     +
+                 "two",                                                                                                                                                         +
+                 "four",                                                                                                                                                        +
+                 "ten",                                                                                                                                                         +
+                 "twenty",                                                                                                                                                      +
+                 "hundred",                                                                                                                                                     +
+                 "thousand",                                                                                                                                                    +
+                 "twothousand",                                                                                                                                                 +
+                 "fivethous",                                                                                                                                                   +
+                 "tenthous",                                                                                                                                                    +
+                 "odd",                                                                                                                                                         +
+                 "even",                                                                                                                                                        +
+                 "stringu1",                                                                                                                                                    +
+                 "stringu2",                                                                                                                                                    +
+                 "string4"                                                                                                                                                      +
+             ],                                                                                                                                                                 +
+             "Disabled": false,                                                                                                                                                 +
+             "Node Type": "Gather Merge",                                                                                                                                       +
+             "Plan Rows": 0,                                                                                                                                                    +
+             "Plan Width": 0,                                                                                                                                                   +
+             "Total Cost": 0.0,                                                                                                                                                 +
+             "Actual Rows": 0.0,                                                                                                                                                +
+             "Actual Loops": 0,                                                                                                                                                 +
+             "Startup Cost": 0.0,                                                                                                                                               +
+             "Async Capable": false,                                                                                                                                            +
+             "Parallel Aware": false,                                                                                                                                           +
+             "Workers Planned": 0,                                                                                                                                              +
+             "Local Hit Blocks": 0,                                                                                                                                             +
+             "Temp Read Blocks": 0,                                                                                                                                             +
+             "Workers Launched": 0,                                                                                                                                             +
+             "Actual Total Time": 0.0,                                                                                                                                          +
+             "Local Read Blocks": 0,                                                                                                                                            +
+             "Shared Hit Blocks": 0,                                                                                                                                            +
+             "Shared Read Blocks": 0,                                                                                                                                           +
+             "Actual Startup Time": 0.0,                                                                                                                                        +
+             "Temp Written Blocks": 0,                                                                                                                                          +
+             "Local Dirtied Blocks": 0,                                                                                                                                         +
+             "Local Written Blocks": 0,                                                                                                                                         +
+             "Shared Dirtied Blocks": 0,                                                                                                                                        +
+             "Shared Written Blocks": 0                                                                                                                                         +
+         },                                                                                                                                                                     +
+         "Planning": {                                                                                                                                                          +
+             "Local Hit Blocks": 0,                                                                                                                                             +
+             "Temp Read Blocks": 0,                                                                                                                                             +
+             "Local Read Blocks": 0,                                                                                                                                            +
+             "Shared Hit Blocks": 0,                                                                                                                                            +
+             "Shared Read Blocks": 0,                                                                                                                                           +
+             "Temp Written Blocks": 0,                                                                                                                                          +
+             "Local Dirtied Blocks": 0,                                                                                                                                         +
+             "Local Written Blocks": 0,                                                                                                                                         +
+             "Shared Dirtied Blocks": 0,                                                                                                                                        +
+             "Shared Written Blocks": 0                                                                                                                                         +
+         },                                                                                                                                                                     +
+         "Triggers": [                                                                                                                                                          +
+         ],                                                                                                                                                                     +
+         "Planning Time": 0.0,                                                                                                                                                  +
+         "Execution Time": 0.0                                                                                                                                                  +
+     }                                                                                                                                                                          +
+ ]
++                          jsonb_pretty                          
++----------------------------------------------------------------
++ [                                                             +
+     {                                                         +
+         "Plan": {                                             +
+             "Plans": [                                        +
+                 {                                             +
+                     "Input": "batches",                       +
+                     "Plans": [                                +
+                         {                                     +
+                             "Alias": "tenk1",                 +
+                             "Output": [                       +
+                                 "unique1",                    +
+                                 "unique2",                    +
+                                 "two",                        +
+                                 "four",                       +
+                                 "ten",                        +
+                                 "twenty",                     +
+                                 "hundred",                    +
+                                 "thousand",                   +
+                                 "twothousand",                +
+                                 "fivethous",                  +
+                                 "tenthous",                   +
+                                 "odd",                        +
+                                 "even",                       +
+                                 "stringu1",                   +
+                                 "stringu2",                   +
+                                 "string4"                     +
+                             ],                                +
+                             "Schema": "public",               +
+                             "Source": "MergeTree",            +
+                             "Batches": 0,                     +
+                             "Disabled": false,                +
+                             "Node Type": "Custom Scan",       +
+                             "Plan Rows": 0,                   +
+                             "Plan Width": 0,                  +
+                             "Total Cost": 0.0,                +
+                             "Actual Rows": 0.0,               +
+                             "Actual Loops": 0,                +
+                             "Batch Format": "arrow",          +
+                             "Kernel Steps": 0,                +
+                             "Startup Cost": 0.0,              +
+                             "Async Capable": false,           +
+                             "Relation Name": "tenk1",         +
+                             "Fallback Steps": 0,              +
+                             "Parallel Aware": true,           +
+                             "Local Hit Blocks": 0,            +
+                             "Temp Read Blocks": 0,            +
+                             "Actual Total Time": 0.0,         +
+                             "Local Read Blocks": 0,           +
+                             "Shared Hit Blocks": 0,           +
+                             "Shared Read Blocks": 0,          +
+                             "Actual Startup Time": 0.0,       +
+                             "Parent Relationship": "Outer",   +
+                             "Temp Written Blocks": 0,         +
+                             "Custom Plan Provider": "VecScan",+
+                             "Local Dirtied Blocks": 0,        +
+                             "Local Written Blocks": 0,        +
+                             "Shared Dirtied Blocks": 0,       +
+                             "Shared Written Blocks": 0        +
+                         }                                     +
+                     ],                                        +
+                     "Output": [                               +
+                         "unique1",                            +
+                         "unique2",                            +
+                         "two",                                +
+                         "four",                               +
+                         "ten",                                +
+                         "twenty",                             +
+                         "hundred",                            +
+                         "thousand",                           +
+                         "twothousand",                        +
+                         "fivethous",                          +
+                         "tenthous",                           +
+                         "odd",                                +
+                         "even",                               +
+                         "stringu1",                           +
+                         "stringu2",                           +
+                         "string4"                             +
+                     ],                                        +
+                     "Batches": 0,                             +
+                     "Disabled": false,                        +
+                     "Sort Key": [                             +
+                         "tenk1.tenthous"                      +
+                     ],                                        +
+                     "Node Type": "Custom Scan",               +
+                     "Plan Rows": 0,                           +
+                     "Plan Width": 0,                          +
+                     "Total Cost": 0.0,                        +
+                     "Actual Rows": 0.0,                       +
+                     "Rows Sorted": 0,                         +
+                     "Actual Loops": 0,                        +
+                     "Batch Format": "arrow",                  +
+                     "Kernel Steps": 0,                        +
+                     "Startup Cost": 0.0,                      +
+                     "Async Capable": false,                   +
+                     "Fallback Steps": 0,                      +
+                     "Parallel Aware": false,                  +
+                     "Sort Space Used": 0,                     +
+                     "Local Hit Blocks": 0,                    +
+                     "Temp Read Blocks": 0,                    +
+                     "Actual Total Time": 0.0,                 +
+                     "Local Read Blocks": 0,                   +
+                     "Shared Hit Blocks": 0,                   +
+                     "Shared Read Blocks": 0,                  +
+                     "Actual Startup Time": 0.0,               +
+                     "Parent Relationship": "Outer",           +
+                     "Temp Written Blocks": 0,                 +
+                     "Custom Plan Provider": "VecSort",        +
+                     "Local Dirtied Blocks": 0,                +
+                     "Local Written Blocks": 0,                +
+                     "Shared Dirtied Blocks": 0,               +
+                     "Shared Written Blocks": 0                +
+                 }                                             +
+             ],                                                +
+             "Output": [                                       +
+                 "unique1",                                    +
+                 "unique2",                                    +
+                 "two",                                        +
+                 "four",                                       +
+                 "ten",                                        +
+                 "twenty",                                     +
+                 "hundred",                                    +
+                 "thousand",                                   +
+                 "twothousand",                                +
+                 "fivethous",                                  +
+                 "tenthous",                                   +
+                 "odd",                                        +
+                 "even",                                       +
+                 "stringu1",                                   +
+                 "stringu2",                                   +
+                 "string4"                                     +
+             ],                                                +
+             "Disabled": false,                                +
+             "Node Type": "Gather Merge",                      +
+             "Plan Rows": 0,                                   +
+             "Plan Width": 0,                                  +
+             "Total Cost": 0.0,                                +
+             "Actual Rows": 0.0,                               +
+             "Actual Loops": 0,                                +
+             "Startup Cost": 0.0,                              +
+             "Async Capable": false,                           +
+             "Parallel Aware": false,                          +
+             "Workers Planned": 0,                             +
+             "Local Hit Blocks": 0,                            +
+             "Temp Read Blocks": 0,                            +
+             "Workers Launched": 0,                            +
+             "Actual Total Time": 0.0,                         +
+             "Local Read Blocks": 0,                           +
+             "Shared Hit Blocks": 0,                           +
+             "Shared Read Blocks": 0,                          +
+             "Actual Startup Time": 0.0,                       +
+             "Temp Written Blocks": 0,                         +
+             "Local Dirtied Blocks": 0,                        +
+             "Local Written Blocks": 0,                        +
+             "Shared Dirtied Blocks": 0,                       +
+             "Shared Written Blocks": 0                        +
+         },                                                    +
+         "Planning": {                                         +
+             "Local Hit Blocks": 0,                            +
+             "Temp Read Blocks": 0,                            +
+             "Local Read Blocks": 0,                           +
+             "Shared Hit Blocks": 0,                           +
+             "Shared Read Blocks": 0,                          +
+             "Temp Written Blocks": 0,                         +
+             "Local Dirtied Blocks": 0,                        +
+             "Local Written Blocks": 0,                        +
+             "Shared Dirtied Blocks": 0,                       +
+             "Shared Written Blocks": 0                        +
+         },                                                    +
+         "Triggers": [                                         +
+         ],                                                    +
+         "Planning Time": 0.0,                                 +
+         "Execution Time": 0.0                                 +
+     }                                                         +
+ ]
+ (1 row)
+ 
+@@ -451,19 +441,28 @@
+                        explain_filter                       
+ ------------------------------------------------------------
++   Batch Format: arrow
++   Fallback Steps: N
+    Filter: (pg_temp.mysin(t1.f1) < 'N.N'::double precision)
++   Kernel Steps: N
+    Output: f1
+- Seq Scan on pg_temp.t1  (cost=N.N..N.N rows=N width=N)
+-(3 rows)
++   Row-by-Row Qual: mysin(), which may raise
++   Source: MergeTree
++   Vector Quals: N of N
++ Vec Seq Scan on pg_temp.t1  (cost=N.N..N.N rows=N width=N)
++(9 rows)
+ 
+ -- Test compute_query_id
+ set compute_query_id = on;
+ select explain_filter('explain (verbose) select * from int8_tbl i8');
+-                               explain_filter                               
+-----------------------------------------------------------------------------
+-   Columns: q1, q2
++                           explain_filter                           
++--------------------------------------------------------------------
++   Batch Format: arrow
++   Fallback Steps: N
++   Kernel Steps: N
+    Output: q1, q2
+- Custom Scan (ChScan) on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++   Source: MergeTree
+  Query Identifier: N
+-(4 rows)
++ Vec Seq Scan on public.int8_tbl i8  (cost=N.N..N.N rows=N width=N)
++(7 rows)
+ 
+ -- Test compute_query_id with utility statements containing plannable query
+@@ -487,47 +486,39 @@
+ -- Test SERIALIZE option
+ select explain_filter('explain (analyze,buffers off,serialize) select * from int8_tbl i8');
+-                                               explain_filter                                                
+--------------------------------------------------------------------------------------------------------------
+-   Columns: q1, q2
+-   Granules: N read of N
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
+  Execution Time: N.N ms
+  Planning Time: N.N ms
+  Serialization: time=N.N ms  output=NkB  format=text
+-(6 rows)
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++(4 rows)
+ 
+ select explain_filter('explain (analyze,serialize text,buffers,timing off) select * from int8_tbl i8');
+-                                        explain_filter                                         
+------------------------------------------------------------------------------------------------
+-   Columns: q1, q2
+-   Granules: N read of N
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual rows=N.N loops=N)
++                                    explain_filter                                     
++---------------------------------------------------------------------------------------
+  Execution Time: N.N ms
+  Planning Time: N.N ms
+  Serialization: output=NkB  format=text
+-(6 rows)
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual rows=N.N loops=N)
++(4 rows)
+ 
+ select explain_filter('explain (analyze,serialize binary,buffers,timing) select * from int8_tbl i8');
+-                                               explain_filter                                                
+--------------------------------------------------------------------------------------------------------------
+-   Columns: q1, q2
+-   Granules: N read of N
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
+  Execution Time: N.N ms
+  Planning Time: N.N ms
+  Serialization: time=N.N ms  output=NkB  format=binary
+-(6 rows)
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++(4 rows)
+ 
+ -- this tests an edge case where we have no data to return
+ select explain_filter('explain (analyze,buffers off,serialize) create temp table explain_temp as select * from int8_tbl i8');
+-                                               explain_filter                                                
+--------------------------------------------------------------------------------------------------------------
+-   Columns: q1, q2
+-   Granules: N read of N
+- Custom Scan (ChScan) on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++                                           explain_filter                                            
++-----------------------------------------------------------------------------------------------------
+  Execution Time: N.N ms
+  Planning Time: N.N ms
+  Serialization: time=N.N ms  output=NkB  format=text
+-(6 rows)
++ Vec Seq Scan on int8_tbl i8  (cost=N.N..N.N rows=N width=N) (actual time=N.N..N.N rows=N.N loops=N)
++(4 rows)
+ 
+ -- Test tuplestore storage usage in Window aggregate (memory case)

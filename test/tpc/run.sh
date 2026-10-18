@@ -27,7 +27,12 @@
 #
 #   TPC_STORAGE   the tables' storage: heap (the port's suite's only one),
 #                 ao_column, pax (PAX porc) or pax_porc_vec, with gp_ao and
-#                 PAX preloaded and their extensions made where one is used
+#                 PAX preloaded and their extensions made where one is used;
+#                 or ch_table_engines' mergetree in its pages store, or
+#                 mergetree_files in its files store (ch_table_engines.md §3,
+#                 VC10), the extension preloaded and made, where it is
+#                 installed -- run.sh builds it from its mounted tree -- on
+#                 a vanilla server too
 #   TPC_VEXEC     vexec in every node's shared_preload_libraries, after the
 #                 port's modules: 1 (where it is installed), 0
 #   TPC_VEXEC_MODE  each query's vexec.mode: off; TPC_VEXEC_FORMAT its
@@ -138,7 +143,14 @@ case "$STORAGE" in
 	ao_column) STORAGE_CLAUSE="USING ao_column WITH (compresstype=zstd)"; STORAGE_PRELOAD=",gp_ao"; STORAGE_EXTENSIONS="CREATE EXTENSION gp_ao;" ;;
 	pax) STORAGE_CLAUSE="USING pax WITH (storage_format=porc)"; STORAGE_PRELOAD=",gp_ao,pax"; STORAGE_EXTENSIONS="CREATE EXTENSION pax;" ;;
 	pax_porc_vec) STORAGE_CLAUSE="USING pax WITH (storage_format=porc_vec)"; STORAGE_PRELOAD=",gp_ao,pax"; STORAGE_EXTENSIONS="CREATE EXTENSION pax;" ;;
-	*) echo "  TPC_STORAGE is heap, ao_column, pax or pax_porc_vec, not $STORAGE"; exit 1 ;;
+	mergetree) STORAGE_CLAUSE="USING mergetree"; STORAGE_PRELOAD=",ch_table_engines"; STORAGE_EXTENSIONS="CREATE EXTENSION ch_table_engines;" ;;
+	mergetree_files) STORAGE_CLAUSE="USING mergetree WITH (storage = 'files')"; STORAGE_PRELOAD=",ch_table_engines"; STORAGE_EXTENSIONS="CREATE EXTENSION ch_table_engines;" ;;
+	*) echo "  TPC_STORAGE is heap, ao_column, pax, pax_porc_vec, mergetree or mergetree_files, not $STORAGE"; exit 1 ;;
+esac
+case "$STORAGE" in
+	mergetree*)
+		[ -f "$("$BINDIR/pg_config" --pkglibdir)/ch_table_engines.so" ] ||
+			{ echo "  TPC_STORAGE $STORAGE: ch_table_engines is not installed"; exit 1; } ;;
 esac
 # A vanilla server (V6): gp_orca built alone, and nothing else of the port's.
 VANILLA=0
@@ -148,7 +160,10 @@ if [ ! -f "$("$BINDIR/pg_config" --pkglibdir)/gp_core.so" ]; then
 	CORE_PRELOAD="gp_orca"
 	[ -f "$("$BINDIR/pg_config" --pkglibdir)/gp_orca.so" ] \
 		|| { echo "  a server with neither gp_core nor gp_orca: nothing of ORCA's to run"; exit 1; }
-	[ "$STORAGE" = heap ] || { echo "  a vanilla server has heap tables only, not $STORAGE"; exit 1; }
+	case "$STORAGE" in
+		heap|mergetree*) ;;
+		*) echo "  a vanilla server has heap and ch_table_engines' tables only, not $STORAGE"; exit 1 ;;
+	esac
 	[ "${TPC_SEGMENTS:-4}" = 0 ] || { echo "  a vanilla server is one node: TPC_SEGMENTS=0"; exit 1; }
 fi
 # TPC_INTERCONNECT: the transport every node's Motions take, shm loaded
@@ -300,7 +315,7 @@ for kind in $KINDS; do
 	db="tpc$kind"
 	q postgres "CREATE DATABASE $db" > /dev/null
 	if [ -n "$STORAGE_EXTENSIONS" ]; then
-		out=$(q "$db" "SET client_min_messages = warning; CREATE EXTENSION gp_sql; $STORAGE_EXTENSIONS")
+		out=$(q "$db" "SET client_min_messages = warning; $( [ "$VANILLA" = 0 ] && echo "CREATE EXTENSION gp_sql;") $STORAGE_EXTENSIONS")
 		[ -n "$out" ] && { echo "the extensions of $STORAGE in $kind: $out"; exit 1; }
 	fi
 	# each table in the storage asked for, its clause before the distribution

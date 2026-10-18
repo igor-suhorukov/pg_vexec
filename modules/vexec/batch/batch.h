@@ -174,6 +174,10 @@ typedef struct VexecVec
 								 * NULL */
 	int32	   *codes;			/* DICT */
 	struct VexecVec *dictionary;	/* DICT: FLAT values, never NULL */
+	uint64		dict_id;		/* DICT: the dictionary's identity, from
+								 * vexec_dict_new_id(), or 0 for none: two
+								 * columns with one hold the same values at
+								 * the same codes (VC5) */
 } VexecVec;
 
 typedef struct VexecBatch
@@ -282,6 +286,7 @@ extern VEXEC_API void vexec_vec_init(VexecBatch *batch, VexecVec *v,
 										  const VexecShape *shape, int nvalues);
 extern VEXEC_API int vexec_vec_null_count(const VexecBatch *batch, const VexecVec *v);
 extern VEXEC_API void vexec_vec_flatten(VexecBatch *batch, VexecVec *v);
+extern VEXEC_API uint64 vexec_dict_new_id(void);
 extern VEXEC_API bool vexec_vec_encode_dict(VexecBatch *batch, VexecVec *v);
 extern VEXEC_API bool vexec_vec_encode_const(VexecBatch *batch, VexecVec *v);
 extern VEXEC_API int vexec_batch_selected(const VexecBatch *batch);
@@ -296,6 +301,10 @@ extern VEXEC_API bool vexec_vec_convert(VexecBatch *batch, VexecVec *v,
 											 const VexecShape *to);
 extern VEXEC_API bool vexec_batch_apply_config(VexecBatch *batch,
 													const VexecLayoutConfig *cfg);
+extern VEXEC_API int vexec_batch_apply_config_keep_bytes(VexecBatch *batch,
+															  const VexecLayoutConfig *cfg);
+extern VEXEC_API bool vexec_vec_convert_rows(VexecBatch *batch, VexecVec *v,
+												  const VexecShape *to, const uint64 *rows);
 
 /* A numeric's parts (numeric.c's NumericVar), or which special value it is. */
 typedef enum VexecNumericSpecial

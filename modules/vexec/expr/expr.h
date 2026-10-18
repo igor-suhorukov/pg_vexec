@@ -128,6 +128,16 @@ typedef struct VexecExpr
 	uint64		memo_generation;
 	const uint64 *memo_active;
 	VexecVec   *memo;
+
+	/*
+	 * VC5: the one input column the subtree reads, -1 none, -2 several; and
+	 * whether it reads nothing else -- no parameter, no fallback step -- so
+	 * that over a dictionary column it is a function of the column's value,
+	 * computed once for each of the dictionary's values (eval.c)
+	 */
+	int			dict_col;
+	bool		dict_pure;
+	struct VexecDictMemo *dict_memo;
 } VexecExpr;
 
 /* A top-level qual or target entry: eager, or lazy. */
@@ -170,6 +180,8 @@ typedef struct VexecEval
 	bool		exact;			/* the rows evaluated are those PostgreSQL
 								 * would reach: an InitPlan may run */
 	ExprContext *econtext;		/* for fallback steps and parameters */
+	bool		over_dict;		/* VC5: a subtree over a dictionary's values,
+								 * not the batch's rows: no X10 memo */
 } VexecEval;
 
 /* compile.c */

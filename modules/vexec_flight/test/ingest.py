@@ -20,7 +20,8 @@
 #                the client, in batches of FLIGHT_INGEST_BATCH rows, and a CSV
 #                file of the same rows
 #   the tables   in each of FLIGHT_INGEST_FORMATS -- PAX's porc_vec and porc,
-#                ao_column ("aoco"), heap -- made afresh before each load;
+#                ao_column ("aoco"), heap, ch_table_engines' mergetree and
+#                mergetree_files -- made afresh before each load;
 #                DISTRIBUTED BY (l_orderkey) on a cluster
 #   the measure  each load's wall time in the client, from the call to its
 #                commit; after a small warm load of each path, FLIGHT_RUNS
@@ -117,6 +118,12 @@ def storage_clause(fmt):
         return ''
     if fmt == 'aoco':
         return ' USING ao_column'
+    # ch_table_engines' MergeTree, in its pages store and its files store,
+    # ordered by lineitem's key, where flight.sh preloaded it
+    if fmt == 'mergetree':
+        return " USING mergetree WITH (order_by = 'l_orderkey, l_linenumber')"
+    if fmt == 'mergetree_files':
+        return " USING mergetree WITH (order_by = 'l_orderkey, l_linenumber', storage = 'files')"
     return ' USING pax WITH (storage_format=%s)' % fmt
 
 
@@ -220,7 +227,8 @@ def main():
         psql('DROP TABLE IF EXISTS %s' % name)
         base = statistics.median(times[PATHS[0]])
         print('%s, %d rows, %d loads each after a warm one of %d rows:'
-              % ('heap' if fmt == 'heap' else 'ao_column' if fmt == 'aoco' else 'PAX ' + fmt,
+              % ('heap' if fmt == 'heap' else 'ao_column' if fmt == 'aoco' else
+                 'ch_table_engines ' + fmt if fmt.startswith('mergetree') else 'PAX ' + fmt,
                  table.num_rows, RUNS, WARM))
         results['formats'][fmt] = {}
         for p in PATHS:

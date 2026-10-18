@@ -85,14 +85,15 @@ FROM unnest(ARRAY['vexec_price', 'vexec_mood', 'vexec_pair', 'vexec_pair[]']) t;
 DROP TYPE vexec_pair;
 DROP TYPE vexec_mood;
 DROP DOMAIN vexec_price;
--- the sources storage modules registered: none in this build
-SELECT * FROM vexec.sources();
- source | access_method | minor | estimates | aggregates 
---------+---------------+-------+-----------+------------
+-- the sources registered for this database's access methods: none before an
+-- extension makes one (vexec_source tests vexec_test's)
+SELECT * FROM vexec.sources() WHERE access_method IS NOT NULL;
+ source | access_method | minor | estimates | aggregates | bounds | dictionaries 
+--------+---------------+-------+-----------+------------+--------+--------------
 (0 rows)
 
 -- and the sinks: none either (§3.16)
-SELECT * FROM vexec.sinks();
+SELECT * FROM vexec.sinks() WHERE access_method IS NOT NULL;
  sink | access_method | minor 
 ------+---------------+-------
 (0 rows)

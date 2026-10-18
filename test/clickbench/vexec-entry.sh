@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # A load's container start when it runs with vexec (CB_VEXEC, phase VH of
-# pg_vector_executor.md §5, from V1 on), or on V6's vanilla-orca route: as
+# pg_vector_executor.md §5, from V1 on), on V6's vanilla-orca route, or in
+# ch_table_engines' storages (CB_STORAGE mergetree*, below): as
 # root, the server's installation is given vexec, which run.sh built by PGXS
 # in vexec's own images -- whose servers are this image's builds -- into the
 # cache; on the port's route the port's modules of the phase's worktree,
@@ -51,6 +52,22 @@ if [ -n "${CB_VEXEC:-}" ]; then
 	cp "$src"/extension/vexec* "$("$prefix/bin/pg_config" --sharedir)/extension/"
 	echo "  vexec, built against $(cat "$src/BUILT" 2> /dev/null || echo '?')"
 fi
+
+# ch_table_engines' loads (CB_STORAGE mergetree*): the extension run.sh built
+# by PGXS in its dev images, whose servers are this image's builds, into the
+# cache, and its engine library, mounted at /engine
+case "${CB_STORAGE:-}" in
+	mergetree*)
+		src="/cache/chte/vanilla"
+		[ -f "$src/lib/ch_table_engines.so" ] || die "no $src/lib/ch_table_engines.so: run.sh builds it for a mergetree load"
+		[ "$(cat "$src/ASSERTS" 2> /dev/null)" = "$asserts" ] ||
+			die "ch_table_engines in $src was built against a server whose assertions are $(cat "$src/ASSERTS" 2> /dev/null || echo unknown), and $prefix's are $asserts"
+		[ -f /engine/libchte_engine.so ] || die "no engine library at /engine: run.sh mounts CHTE_ENGINE_LIB"
+		cp "$src/lib/ch_table_engines.so" "$("$prefix/bin/pg_config" --pkglibdir)/"
+		ln -sf /engine/libchte_engine.so "$("$prefix/bin/pg_config" --pkglibdir)/libchte_engine.so"
+		cp "$src"/extension/ch_table_engines* "$("$prefix/bin/pg_config" --sharedir)/extension/"
+		echo "  ch_table_engines, built against $(cat "$src/BUILT" 2> /dev/null || echo '?')" ;;
+esac
 
 export HOME=/home/postgres
 exec setpriv --reuid=postgres --regid=postgres --init-groups /clickbench/bench.sh

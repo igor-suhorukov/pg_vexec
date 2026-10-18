@@ -7,10 +7,12 @@
 # and the diffs kept in RESULTS_DIR when it is set.  vexec_testpack, the
 # kernel pack of the tests (modules/vexec_testpack), is preloaded before
 # vexec, which the packs' registry allows (vexec_kernels.h): vexec_packs
-# binds its declarations.
+# binds its declarations.  vexec_test is preloaded after vexec, which it
+# reaches by symbol: the batch source and sink of its access method are
+# registered only then (vexec_source).
 #
 #   VEXEC_PRELOAD   the server's shared_preload_libraries:
-#                   vexec_testpack,vexec
+#                   vexec_testpack,vexec,vexec_test
 #   VEXEC_SETTINGS  more settings for it, one a line
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,7 +20,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
 
 D="$(mktemp -d "${TMPDIR:-/tmp}/vexec-suite-XXXXXX")"
-settings=("shared_preload_libraries = '${VEXEC_PRELOAD:-vexec_testpack,vexec}'")
+settings=("shared_preload_libraries = '${VEXEC_PRELOAD:-vexec_testpack,vexec,vexec_test}'")
 while IFS= read -r line; do [ -n "$line" ] && settings+=("$line"); done <<< "${VEXEC_SETTINGS:-}"
 server_init "$D" "${settings[@]}" || exit 1
 server_start "$D" || { echo "the server did not start"; tail -20 "$D/log"; exit 1; }

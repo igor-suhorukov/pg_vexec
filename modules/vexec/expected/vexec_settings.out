@@ -13,7 +13,7 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
 -----------------------------+---------------------------+------+------------+---------+---------+--------------+-----------------------------+---------
  vexec.aggregate_statistics  | on                        |      | user       | bool    |         |              |                             | f
  vexec.batch_bool_layout     | format                    |      | user       | enum    |         |              | {format,byte,bit}           | t
- vexec.batch_dictionary      | off                       |      | user       | bool    |         |              |                             | f
+ vexec.batch_dictionary      | on                        |      | user       | bool    |         |              |                             | t
  vexec.batch_format          | postgres                  |      | user       | enum    |         |              | {postgres,arrow}            | t
  vexec.batch_numeric_layout  | format                    |      | user       | enum    |         |              | {format,scaled,varlena}     | t
  vexec.batch_setup_cost      | 1                         |      | user       | real    | 0       | 1.79769e+308 |                             | t
@@ -35,10 +35,12 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.enable_motion_frames  | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_prefilter      | on                        |      | user       | bool    |         |              |                             | f
  vexec.enable_repartition    | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_row_memo       | on                        |      | user       | bool    |         |              |                             | f
  vexec.enable_running_bound  | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_scan           | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_shared_exprs   | on                        |      | user       | bool    |         |              |                             | f
  vexec.enable_sort           | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_source_layouts | on                        |      | user       | bool    |         |              |                             | f
  vexec.enable_window         | on                        |      | user       | bool    |         |              |                             | t
  vexec.gpu                   | off                       |      | user       | enum    |         |              | {off,auto,force}            | t
  vexec.gpu_arena_mb          | 256                       | MB   | postmaster | integer | 1       | 1073741823   |                             | f
@@ -56,7 +58,8 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.orca_settings         |                           |      | user       | string  |         |              |                             | t
  vexec.partial_agg_limit     | 16384                     |      | user       | integer | 0       | 2147483647   |                             | f
  vexec.remember_agg_sizes    | on                        |      | user       | bool    |         |              |                             | f
-(45 rows)
+ vexec.scan_rows_per_worker  | 163840                    |      | user       | integer | 0       | 2147483647   |                             | t
+(48 rows)
 
 -- the modes
 SET vexec.mode = explain;

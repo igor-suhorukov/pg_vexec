@@ -1,0 +1,34 @@
+--- reference
++++ session
+@@ -193,10 +193,9 @@
+ SELECT * FROM tenk1 WHERE unique1 <> ALL (ARRAY[1, 2, 99, NULL]);$$,
+ false, true, false, true);
+-                                                                explain_mask_costs                                                                
+---------------------------------------------------------------------------------------------------------------------------------------------------
+-   Columns: unique1, unique2, two, four, ten, twenty, hundred, thousand, twothousand, fivethous, tenthous, odd, even, stringu1, stringu2, string4
++                   explain_mask_costs                    
++---------------------------------------------------------
+    Filter: (unique1 <> ALL ('{1,2,99,NULL}'::integer[]))
+- Custom Scan (ChScan) on tenk1  (cost=N..N rows=1 width=N)
+-(3 rows)
++ Vec Seq Scan on tenk1  (cost=N..N rows=1 width=N)
++(2 rows)
+ 
+ -- Try a non-const array containing a NULL
+@@ -204,12 +203,11 @@
+ SELECT * FROM tenk1 WHERE unique1 <> ALL (ARRAY[1, 2, 98, (SELECT 99), NULL]);$$,
+ false, true, false, true);
+-                                                                explain_mask_costs                                                                
+---------------------------------------------------------------------------------------------------------------------------------------------------
++                                 explain_mask_costs                                  
++-------------------------------------------------------------------------------------
+      ->  Result  (cost=N..N rows=1 width=N)
+-   Columns: unique1, unique2, two, four, ten, twenty, hundred, thousand, twothousand, fivethous, tenthous, odd, even, stringu1, stringu2, string4
+    Filter: (unique1 <> ALL (ARRAY[1, 2, 98, (InitPlan expr_1).col1, NULL::integer]))
+    InitPlan expr_1
+- Custom Scan (ChScan) on tenk1  (cost=N..N rows=1 width=N)
+-(5 rows)
++ Vec Seq Scan on tenk1  (cost=N..N rows=1 width=N)
++(4 rows)
+ 
+ -- Verify that scalarineqsel() works on "char" columns

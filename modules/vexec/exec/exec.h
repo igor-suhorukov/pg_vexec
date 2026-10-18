@@ -306,12 +306,19 @@ typedef struct VexecNodeStats
 	int64		kernel_steps;	/* kernel calls, a batch each */
 	int64		fallback_rows;	/* rows the fallback evaluated */
 	int64		lazy_rows;		/* rows PostgreSQL's evaluator ran lazily */
+	int64		memo_rows;		/* row-by-row targets' results reused */
 	int64		redo_rows;		/* rows a kernel sent to it */
 	int64		declared_rows;	/* rows declared calls answered */
 	int64		batches_out;	/* handed to a vector parent */
 	int64		drained_motions;	/* Motions read to their end, unread */
 	int64		drained_rows;
 	int64		squelched;		/* subtrees gp_core squelched (V7) */
+	int64		text_converted; /* VC14: rows of text kept as a source handed
+								 * it, made the format's for PostgreSQL's
+								 * evaluator */
+	int64		dict_values;	/* VC5: dictionary values subtrees were
+								 * evaluated over */
+	int64		dict_rows;		/* VC5: rows those results answered */
 } VexecNodeStats;
 
 struct VexecNode
@@ -342,6 +349,16 @@ struct VexecNode
 	TupleTableSlot *input_slot; /* the scan slot, or an outer slot */
 	int			loaded_row;		/* the input row in input_slot, or -1 */
 
+	/*
+	 * VC14: the input batch's columns a scan left in the layout its source
+	 * handed them, not the format's (vexec_batch_apply_config_keep_bytes());
+	 * and whether PostgreSQL's evaluator reads the input's rows -- a lazy
+	 * qual or target, a fallback step -- so that those are made the
+	 * format's for it, after the eager quals (node.c)
+	 */
+	int			in_kept;
+	bool		needs_input_datums;
+
 	/* the programs */
 	int			nquals;
 	VexecTop   *quals;			/* in the plan's order */
@@ -349,6 +366,9 @@ struct VexecNode
 	int			ntargets;
 	VexecTop   *targets;		/* the target list's, in its order */
 	bool		any_lazy_target;
+	struct VexecRowMemo **row_memo;	/* per target: a lazy one's results by
+									 * its one input column's value, or NULL
+									 * (node.c) */
 	bool	   *target_inexact; /* per target, or NULL: evaluated for rows
 								 * PostgreSQL may not evaluate it for, as
 								 * an aggregate's argument under a FILTER */
@@ -533,9 +553,10 @@ extern Node *vexec_create_sort_state(CustomScan *cscan);
 extern List *vexec_sort_plan_encode(const VexecSortPlan *plan);
 extern void vexec_sort_plan_decode(CustomScan *cscan, VexecSortPlan *plan);
 extern void vexec_sort_set_bound(CustomScan *cscan, int64 bound);
-extern bool vexec_sort_make_late(CustomScan *cscan);
+extern bool vexec_sort_make_late(CustomScan *cscan, bool parallel_ok);
 extern bool vexec_sort_plan_running_bound(CustomScan *cscan);
 extern bool vexec_scan_set_bound(PlanState *ps, VexecSortBound *bound);
+extern pg_atomic_uint64 *vexec_scan_shared_bound(PlanState *ps);
 extern bool vexec_scan_set_join_filter(PlanState *ps, VexecJoinFilter *filter);
 
 /* vecrepart.c */

@@ -13,7 +13,10 @@
 #     its batch-sink contract, include/vexec_sink.h, the same way (VI);
 #   - pg_otel_probe's API, pg_otel_probe_api.h, whose copy in the port's
 #     pg19/include vexec's (in pgxs/include, above) and vexec_flight's
-#     (modules/vexec_flight/src) equal.
+#     (modules/vexec_flight/src) equal;
+#   - the two contracts' copies in ch_table_engines' include/vexec, which
+#     its source and sink compile against (ch_table_engines.md §3, VC10),
+#     where its tree is: CHTE_SRC, pg_ch_table_engines beside this checkout.
 #
 # A change to one fails here until its copy is refreshed in the same commit.
 # On the host.  The port's sources to compare with are VEXEC_PORT_SRC, a
@@ -29,12 +32,28 @@ if [ -d "$PORT_SRC/pg19/include" ]; then
 fi
 COPIES="$ROOT/modules/vexec/pgxs/include"
 
+CHTE_SRC="${CHTE_SRC:-$(cd "$ROOT/.." && pwd)/pg_ch_table_engines}"
+fail=0
+
+# ch_table_engines' copies of the contracts
+if [ -d "$CHTE_SRC/include/vexec" ]; then
+	echo "headers: ch_table_engines' copies at $CHTE_SRC ($(git -C "$CHTE_SRC" rev-parse --short HEAD 2>/dev/null))"
+	for contract in vexec_source.h vexec_sink.h; do
+		if cmp -s "$ROOT/include/$contract" "$CHTE_SRC/include/vexec/$contract"; then
+			echo "  ok $contract, ch_table_engines' copy"
+		else
+			echo "  DIFFERS $contract: refresh ch_table_engines' include/vexec copy from include/$contract"
+			fail=1
+		fi
+	done
+fi
+
 if [ ! -d "$CB_SRC/pg19/include" ]; then
-	echo "  skipped: no port checkout at $CB_SRC (test/vexec/run.sh cloudberry)"
-	exit 77
+	echo "  the port's: skipped, no port checkout at $CB_SRC (test/vexec/run.sh cloudberry)"
+	[ $fail = 0 ] && [ ! -d "$CHTE_SRC/include/vexec" ] && exit 77
+	exit $fail
 fi
 echo "headers: the copies against $CB_SRC at $(git -C "$CB_SRC" rev-parse --short HEAD 2>/dev/null)"
-fail=0
 for copy in "$COPIES"/*.h; do
 	name="$(basename "$copy")"
 	if cmp -s "$copy" "$CB_SRC/pg19/include/$name"; then

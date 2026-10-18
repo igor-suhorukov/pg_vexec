@@ -10,7 +10,12 @@
  *	a registered one	the batch reader the table's access method
  *						registered (vexec_source.h): PAX's, gp_ao's.  It
  *						hands each column in its storage's layout, and the
- *						rows it has deleted out of the batch's selection;
+ *						rows it has deleted out of the batch's selection.
+ *						Its text stays in that layout -- offsets, views or
+ *						Datums -- which kernels and parents read, and is
+ *						made the format's only where PostgreSQL's
+ *						evaluator reads it, at the rows past the eager
+ *						quals (VC14, vexec.enable_source_layouts);
  *	heap's pages		heap's page reader (source/heap.c, V4): each page
  *						prepared by heap, its visible tuples deformed
  *						straight into the batch -- with vexec.heap_page_reader
@@ -126,6 +131,8 @@ typedef struct VexecScanState
 	TupleTableSlot *amslot;		/* the slot path's */
 	ParallelTableScanDesc pscan;	/* a parallel-aware scan's, in the DSM */
 	Size		pscan_len;
+	pg_atomic_uint64 *shared_bound; /* the participants' sort bound, in the
+									 * DSM before pscan; NULL: none */
 	int			nattrs;			/* input columns that are attributes */
 	AttrNumber *attrs;			/* their attnos */
 	bool		need_tid;		/* the last input column is ctid */
@@ -135,6 +142,18 @@ typedef struct VexecScanState
 	/* H2: the units, and their rows, a source answered from statistics */
 	int64		stats_units;
 	int64		stats_rows;
+
+	/* VC14: the most columns a batch kept in the layout the source gave them */
+	int			kept_cols;
+
+	/*
+	 * VC5: per column, the identity the source gave its last dictionary
+	 * (dictionary_id()) and vexec's for it, and the batches whose columns
+	 * came as dictionaries
+	 */
+	uint64	   *dict_src_ids;
+	uint64	   *dict_ids;
+	int64		dict_batches;
 
 	/*
 	 * X3: the leading quals heap's page reader checks on a tuple before
@@ -571,6 +590,16 @@ begin_scan(VexecScanState *s)
 		spec->quals = pruning_quals((CustomScan *) s->node.css.ss.ps.plan);
 		spec->max_rows = VEXEC_BATCH_ROWS;
 		spec->flags = s->need_tid ? VEXEC_SRC_TIDS : 0;
+		/* VC5: a source that keeps a column as a dictionary hands it so */
+		if (vexec_batch_dictionary)
+		{
+			spec->flags |= VEXEC_SRC_DICT;
+			if (s->dict_ids == NULL)
+			{
+				s->dict_src_ids = palloc0(sizeof(uint64) * Max(s->nattrs, 1));
+				s->dict_ids = palloc0(sizeof(uint64) * Max(s->nattrs, 1));
+			}
+		}
 		s->srcstate = s->src->begin(s->scan, spec);
 		return;
 	}
@@ -715,6 +744,49 @@ fetch_slots(VexecScanState *s)
 	return in->nrows > 0;
 }
 
+/*
+ * A source's dictionary column as the contract has it (VC5): its codes
+ * within the dictionary, and no NULL among its values -- a NULL row is one
+ * whose validity bit is clear.
+ */
+static void
+check_dictionary(VexecScanState *s, const VexecVec *v, int col)
+{
+	const VexecVec *d = v->dictionary;
+	int			i;
+
+	if (d->validity != NULL && vexec_vec_null_count(NULL, d) > 0)
+		elog(ERROR, "vexec: the batch source \"%s\" gave a dictionary holding a NULL in column %d",
+			 s->src->name, col + 1);
+	for (i = 0; i < v->nvalues; i++)
+		if ((uint32) v->codes[i] >= (uint32) d->nvalues)
+			elog(ERROR, "vexec: the batch source \"%s\" gave code %d past its dictionary's %d values in column %d",
+				 s->src->name, v->codes[i], d->nvalues, col + 1);
+}
+
+/*
+ * vexec's identity for a source column's dictionary: one for each identity
+ * the source gives (dictionary_id()), new each time it changes; 0 where the
+ * source gives none
+ */
+static uint64
+dictionary_identity(VexecScanState *s, int col)
+{
+	uint64		sid;
+
+	if (!VEXEC_SOURCE_HAS(s->src, dictionary_id))
+		return 0;
+	sid = s->src->dictionary_id(s->srcstate, col);
+	if (sid == 0)
+		return 0;
+	if (sid != s->dict_src_ids[col])
+	{
+		s->dict_src_ids[col] = sid;
+		s->dict_ids[col] = vexec_dict_new_id();
+	}
+	return s->dict_ids[col];
+}
+
 /* A registered source's next batch, its columns as the source holds them. */
 static bool
 fetch_source(VexecScanState *s)
@@ -757,6 +829,10 @@ fetch_source(VexecScanState *s)
 			VexecVec   *d = vexec_batch_alloc0(in, sizeof(VexecVec));
 			const VexecColumn *dc = c->dictionary;
 
+			if (s->dict_ids == NULL || dc == NULL || c->codes == NULL ||
+				c->ndictionary <= 0 || dc->encoding != VEXEC_FLAT)
+				elog(ERROR, "vexec: the batch source \"%s\" gave a dictionary column it was not asked for, or one without its dictionary",
+					 s->src->name);
 			v->codes = (int32 *) c->codes;
 			d->type = v->type;
 			d->shape.layout = dc->layout;
@@ -774,11 +850,25 @@ fetch_source(VexecScanState *s)
 			d->nbuffers = dc->nbuffers;
 			d->datums = (Datum *) dc->datums;
 			v->dictionary = d;
+			/* the column is read by its dictionary's shape, whatever it said */
+			v->shape = d->shape;
+			check_dictionary(s, v, i);
+			v->dict_id = dictionary_identity(s, i);
 		}
+	}
+	if (s->dict_ids != NULL)
+	{
+		int			k;
+
+		for (k = 0; k < s->nattrs; k++)
+			if (in->cols[k].encoding == VEXEC_DICT)
+				break;
+		if (k < s->nattrs)
+			s->dict_batches++;
 	}
 	if (s->need_tid)
 	{
-		VexecVec   *v = &in->cols[i];
+		VexecVec   *v = &in->cols[s->nattrs];
 
 		if (sb.tids == NULL)
 			elog(ERROR, "vexec: the batch source \"%s\" gave no TIDs", s->src->name);
@@ -792,7 +882,19 @@ fetch_source(VexecScanState *s)
 		v->validity = NULL;
 		v->values = (void *) sb.tids;
 	}
-	vexec_batch_apply_config(in, &s->node.layout);
+
+	/*
+	 * VC14: text stays as the source handed it -- kernels and parents read
+	 * its layout -- and is made the format's only for PostgreSQL's
+	 * evaluator, after the eager quals (node.c, convert_kept())
+	 */
+	if (vexec_enable_source_layouts)
+	{
+		s->node.in_kept = vexec_batch_apply_config_keep_bytes(in, &s->node.layout);
+		s->kept_cols = Max(s->kept_cols, s->node.in_kept);
+	}
+	else
+		vexec_batch_apply_config(in, &s->node.layout);
 	return true;
 }
 
@@ -1040,12 +1142,24 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		ExplainPropertyInteger("Units From Statistics", NULL, s->stats_units, es);
 		ExplainPropertyInteger("Rows From Statistics", NULL, s->stats_rows, es);
 	}
+	/* VC14: only where a batch kept one, in every format, as node.c's counts */
+	if (es->analyze && es->verbose && s->kept_cols > 0)
+		ExplainPropertyInteger("Text Columns Kept as Handed", NULL, s->kept_cols, es);
+	/* VC5: likewise, only where the source handed a dictionary */
+	if (es->analyze && es->verbose && s->dict_batches > 0)
+		ExplainPropertyInteger("Batches With Dictionaries", NULL, s->dict_batches, es);
 }
 
 /*
- * A parallel-aware VecScan's chunk of the DSM: the access method's parallel
- * scan descriptor, as a SeqScan's (ExecSeqScanEstimate() and on).
+ * A parallel-aware VecScan's chunk of the DSM: the participants' shared
+ * sort bound, then the access method's parallel scan descriptor, as a
+ * SeqScan's (ExecSeqScanEstimate() and on).  The bound is a bounded
+ * VecSort's above the scan in each participant (vecsort.c): the best of the
+ * first keys each one's sort has kept its N rows within, encoded so that
+ * less is better, PG_UINT64_MAX for none.
  */
+#define SCAN_SHARED_SIZE	MAXALIGN(sizeof(pg_atomic_uint64))
+
 static Size
 scan_estimate_dsm(CustomScanState *css, ParallelContext *pcxt)
 {
@@ -1053,7 +1167,7 @@ scan_estimate_dsm(CustomScanState *css, ParallelContext *pcxt)
 
 	(void) pcxt;
 	s->pscan_len = table_parallelscan_estimate(s->rel, css->ss.ps.state->es_snapshot);
-	return s->pscan_len;
+	return SCAN_SHARED_SIZE + s->pscan_len;
 }
 
 static void
@@ -1062,7 +1176,9 @@ scan_initialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordinat
 	VexecScanState *s = (VexecScanState *) css;
 
 	(void) pcxt;
-	s->pscan = (ParallelTableScanDesc) coordinate;
+	s->shared_bound = (pg_atomic_uint64 *) coordinate;
+	pg_atomic_init_u64(s->shared_bound, PG_UINT64_MAX);
+	s->pscan = (ParallelTableScanDesc) ((char *) coordinate + SCAN_SHARED_SIZE);
 	table_parallelscan_initialize(s->rel, s->pscan, css->ss.ps.state->es_snapshot);
 }
 
@@ -1073,6 +1189,8 @@ scan_reinitialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordin
 
 	(void) pcxt;
 	(void) coordinate;
+	if (s->shared_bound != NULL)
+		pg_atomic_write_u64(s->shared_bound, PG_UINT64_MAX);
 	if (s->pscan != NULL)
 		table_parallelscan_reinitialize(s->rel, s->pscan);
 }
@@ -1083,5 +1201,18 @@ scan_initialize_worker(CustomScanState *css, shm_toc *toc, void *coordinate)
 	VexecScanState *s = (VexecScanState *) css;
 
 	(void) toc;
-	s->pscan = (ParallelTableScanDesc) coordinate;
+	s->shared_bound = (pg_atomic_uint64 *) coordinate;
+	s->pscan = (ParallelTableScanDesc) ((char *) coordinate + SCAN_SHARED_SIZE);
+}
+
+/*
+ * The participants' shared sort bound of a parallel-aware VecScan, once its
+ * DSM is made -- the Gather makes it as it first runs -- else NULL.
+ */
+pg_atomic_uint64 *
+vexec_scan_shared_bound(PlanState *ps)
+{
+	if (!IsA(ps, CustomScanState) || ((CustomScanState *) ps)->methods != &scan_exec_methods)
+		return NULL;
+	return ((VexecScanState *) ps)->shared_bound;
 }

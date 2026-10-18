@@ -13,7 +13,8 @@
 #                     adbc_driver_postgresql (bench.py)
 #   flight.sh ingest  lineitem into PAX tables, through DoPut's parameters,
 #                     adbc_driver_postgresql's binary COPY and a CSV file's
-#                     COPY (ingest.py)
+#                     COPY (ingest.py); and into ch_table_engines' tables,
+#                     where run.sh mounts the extension, built and preloaded
 #   flight.sh serve   the test's server and corpus, its environment in
 #                     RESULTS_DIR/env, until the container is stopped
 #
@@ -35,6 +36,14 @@ make -s -C /tmp/flight-build PG_CONFIG="$PG_CONFIG" COPT=-Werror -j4 2>&1 | grep
 [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "vexec_flight did not build"; exit 1; }
 make -s -C /tmp/flight-build PG_CONFIG="$PG_CONFIG" install > /dev/null || exit 1
 echo "  vexec_flight built and installed"
+# ch_table_engines, where run.sh mounts its tree and engine library
+FLIGHT_CHTE=0
+if [ -d /chte/include/vexec ] && [ -f /engine/libchte_engine.so ]; then
+	CHTE_SRC=/chte /chte/test/build.sh > /tmp/chte-build.log 2>&1 || { cat /tmp/chte-build.log; exit 1; }
+	echo "  ch_table_engines $(git -C /chte rev-parse --short HEAD 2> /dev/null || echo '?') built and installed"
+	FLIGHT_CHTE=1
+fi
+export FLIGHT_CHTE
 
 . /src/test/vexec/lib.sh
 
@@ -76,6 +85,7 @@ else
 	PRELOAD="vexec"
 	[ "${FLIGHT_LEG:-vanilla}" = port ] && PRELOAD="gp_core,gp_orca,gp_sql,gp_ao,pax,vexec"
 fi
+[ "$FLIGHT_CHTE" = 1 ] && PRELOAD="$PRELOAD,ch_table_engines"
 for n in $NODES; do
 	mkdir -p "$(sockdir "$n")"
 	"$BINDIR/initdb" -D "$(datadir "$n")" -N -U postgres --locale=C --encoding=UTF8 > "$D/initdb$n.log" 2>&1 \
@@ -145,6 +155,10 @@ out=$(sql postgres "CREATE DATABASE flight")
 if [ "$SEGMENTS" -gt 0 ] || [ "${FLIGHT_LEG:-vanilla}" = port ]; then
 	out=$(sql flight "SET client_min_messages = warning; CREATE EXTENSION gp_sql; CREATE EXTENSION gp_ao; CREATE EXTENSION pax")
 	[ -n "$out" ] && { echo "the port's extensions: $out"; exit 1; }
+fi
+if [ "$FLIGHT_CHTE" = 1 ]; then
+	out=$(sql flight "SET client_min_messages = warning; CREATE EXTENSION ch_table_engines")
+	[ -n "$out" ] && { echo "ch_table_engines: $out"; exit 1; }
 fi
 
 export FLIGHT_PORT FLIGHT_CA="$D/ca.crt" FLIGHT_DATA="$(datadir 0)" FLIGHT_LOG="$D/node0.log"

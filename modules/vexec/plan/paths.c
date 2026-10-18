@@ -44,6 +44,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
@@ -63,6 +65,7 @@
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #include "vexec.h"
 #include "plan/plan.h"
@@ -256,6 +259,81 @@ needed_attrs(RelOptInfo *rel)
 }
 
 /*
+ * VC1: a registered source's estimate of what the scan reads -- the needed
+ * attributes' bytes in what the quals leave once the source prunes by them
+ * -- which the cost model takes in place of the relation's pages (cost.c).
+ * The spec is the one begin_scan() would give (exec/vecscan.c): the
+ * attributes in order, the TIDs where ctid is read, the restrictions that
+ * may prune -- over the relation's own columns alone, with no parameter,
+ * subplan or volatile function -- and a batch's rows.  -1 where the source
+ * gives no estimate.
+ */
+static bool
+estimate_prunable_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param) || IsA(node, SubPlan) || IsA(node, AlternativeSubPlan))
+		return true;
+	return expression_tree_walker(node, estimate_prunable_walker, context);
+}
+
+static double
+source_estimate(RelOptInfo *rel, Relation relation, const VexecSourceRoutine *src, Bitmapset *attrs)
+{
+	VexecSourceSpec spec;
+	TupleDesc	desc = RelationGetDescr(relation);
+	AttrNumber *attnums = palloc(sizeof(AttrNumber) * Max(desc->natts, 1));
+	bool		whole_row = false;
+	bool		need_tid = false;
+	List	   *quals = NIL;
+	double		rows = -1;
+	double		bytes = -1;
+	int			n = 0;
+	int			i = -1;
+	ListCell   *lc;
+
+	while ((i = bms_next_member(attrs, i)) >= 0)
+	{
+		AttrNumber	attno = i + FirstLowInvalidHeapAttributeNumber;
+
+		if (attno == 0)
+			whole_row = true;
+		else if (attno == SelfItemPointerAttributeNumber)
+			need_tid = true;
+		else if (attno > 0)
+			attnums[n++] = attno;
+	}
+	if (whole_row)
+	{
+		n = 0;
+		for (i = 0; i < desc->natts; i++)
+			if (!TupleDescAttr(desc, i)->attisdropped)
+				attnums[n++] = i + 1;
+	}
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst(lc);
+
+		if (bms_is_subset(rinfo->clause_relids, rel->relids) &&
+			!estimate_prunable_walker((Node *) rinfo->clause, NULL) &&
+			!contain_volatile_functions((Node *) rinfo->clause))
+			quals = lappend(quals, rinfo->clause);
+	}
+
+	memset(&spec, 0, sizeof(spec));
+	spec.size = sizeof(VexecSourceSpec);
+	spec.ncolumns = n;
+	spec.attnums = attnums;
+	spec.layouts = NULL;
+	spec.quals = quals;
+	spec.max_rows = VEXEC_BATCH_ROWS;
+	spec.flags = need_tid ? VEXEC_SRC_TIDS : 0;
+	src->estimate(relation, ActiveSnapshotSet() ? GetActiveSnapshot() : NULL, &spec, &rows, &bytes);
+	return bytes;
+}
+
+/*
  * A system column the scan cannot give: VecScan gives ctid, from each row's
  * TID, and tableoid; xmin and its kind are heap's tuple header.
  */
@@ -273,6 +351,68 @@ reads_other_system_column(Bitmapset *attrs)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * H6's late columns, priced (plan/sort.c): the cost of a VecScan path that
+ * reads only the sort keys' columns, its quals' and each row's TID, as a
+ * bounded VecSort over it makes it read (vexec_sort_make_late()) -- the
+ * same scan, of as many workers, with the source's estimate of those
+ * columns' bytes.  False where the path is no VecScan of a base relation,
+ * or no column of its target would be read late: every entry that is no
+ * key must be a Var of the relation, and one at least a column of its own.
+ */
+bool
+vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost)
+{
+	RelOptInfo *rel = path->parent;
+	Bitmapset  *attrs = NULL;
+	Relation	relation;
+	const VexecSourceRoutine *src;
+	const char *how;
+	double		source_bytes = -1;
+	VexecSteps	quals;
+	VexecSteps	target;
+	Path	   *rowpath;
+	bool		any_late = false;
+	ListCell   *lc;
+
+	if (!vexec_is_scan_path(path) || path->param_info != NULL ||
+		rel->reloptkind != RELOPT_BASEREL || rel->rtekind != RTE_RELATION)
+		return false;
+	foreach(lc, path->pathtarget->exprs)
+	{
+		Var		   *v = lfirst(lc);
+
+		if (list_member(keys, v))
+			continue;
+		if (!IsA(v, Var) || v->varno != rel->relid || v->varlevelsup != 0 || v->varattno == 0)
+			return false;
+		if (v->varattno > 0)
+			any_late = true;
+	}
+	if (!any_late)
+		return false;
+
+	pull_varattnos((Node *) keys, rel->relid, &attrs);
+	foreach(lc, rel->baserestrictinfo)
+		pull_varattnos((Node *) ((RestrictInfo *) lfirst(lc))->clause, rel->relid, &attrs);
+	attrs = bms_add_member(attrs, SelfItemPointerAttributeNumber - FirstLowInvalidHeapAttributeNumber);
+
+	relation = table_open(planner_rt_fetch(rel->relid, root)->relid, NoLock);
+	src = vexec_source_for(relation, &how);
+	if (src != NULL && VEXEC_SOURCE_HAS(src, estimate))
+		source_bytes = source_estimate(rel, relation, src, attrs);
+	table_close(relation, NoLock);
+
+	memset(&quals, 0, sizeof(quals));
+	memset(&target, 0, sizeof(target));
+	vexec_oracle_exprs(root, rel->baserestrictinfo, &quals);
+	vexec_oracle_exprs(root, keys, &target);
+	rowpath = create_seqscan_path(root, rel, NULL, path->parallel_workers);
+	vexec_cost_scan(root, rel, rowpath, &quals, &target, bms_num_members(attrs),
+					list_length(keys) + 1, source_bytes, cost);
+	return true;
 }
 
 /*
@@ -352,6 +492,8 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 	}
 	if (src == NULL && vexec_heap_page_reader && vexec_heap_reader_possible(relation))
 		how = "heap's pages";
+	if (src != NULL && VEXEC_SOURCE_HAS(src, estimate))
+		source_bytes = source_estimate(rel, relation, src, attrs);
 	table_close(relation, NoLock);
 
 	/*
@@ -458,14 +600,30 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 		 * (V4): a parallel-aware VecScan, of the workers
 		 * create_plain_partial_paths() gives the parallel sequential scan
 		 * (PG19:src/backend/optimizer/path/allpaths.c), for a Gather, a
-		 * Gather Merge or a partial VecAgg above it.  In force mode it is the
-		 * relation's only partial path, so that a plan the planner makes
-		 * parallel -- as tests that force one ask -- stays parallel.
+		 * Gather Merge or a partial VecAgg above it -- or, for a source's
+		 * relation, at least one a vexec.scan_rows_per_worker rows (below).
+		 * In force mode it is the relation's only partial path, so that a
+		 * plan the planner makes parallel -- as tests that force one ask --
+		 * stays parallel.
 		 */
 		if (rel->consider_parallel && required_outer == NULL)
 		{
 			int			workers = compute_parallel_worker(rel, rel->pages, -1,
 														  max_parallel_workers_per_gather);
+
+			/*
+			 * A source's pages are its compressed bytes (a column store's):
+			 * PostgreSQL's log3 of them gives 10M rows of ClickBench's hits
+			 * 6 workers in ch_table_engines' MergeTree, where heap's 7.2 GB
+			 * get 7, and its aggregations and functions run on that many.
+			 * ClickHouse reads a table on as many threads as it has, each
+			 * at least merge_tree_min_rows_for_concurrent_read rows
+			 * (163,840).  A parallel_workers reloption stays the relation's.
+			 */
+			if (src != NULL && vexec_scan_rows_per_worker > 0 && rel->rel_parallel_workers < 0)
+				workers = Max(workers,
+							  (int) Min(floor(rel->tuples / vexec_scan_rows_per_worker),
+										(double) max_parallel_workers_per_gather));
 
 			if (workers > 0)
 			{

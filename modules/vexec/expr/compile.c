@@ -278,6 +278,7 @@ new_expr(VexecCompileContext *cc, VexecExprKind kind, Expr *expr, int nargs)
 		e->args = palloc0(sizeof(VexecExpr *) * nargs);
 	e->col = -1;
 	e->paramid = -1;
+	e->dict_col = -1;
 	MemoryContextSwitchTo(old);
 	return e;
 }
@@ -555,6 +556,36 @@ compile_vector(VexecCompileContext *cc, Expr *expr)
 }
 
 /*
+ * VC5: the one input column a compiled subtree reads, and whether it reads
+ * nothing but it and constants (VexecExpr.dict_col): its arguments are
+ * compiled before it.
+ */
+static VexecExpr *
+dict_input(VexecExpr *e)
+{
+	int			i;
+
+	if (e == NULL)
+		return NULL;
+	e->dict_col = e->kind == VE_VAR ? e->col : -1;
+	e->dict_pure = e->kind != VE_PARAM && e->kind != VE_FALLBACK;
+	for (i = 0; i < e->nargs; i++)
+	{
+		const VexecExpr *a = e->args[i];
+
+		if (!a->dict_pure)
+			e->dict_pure = false;
+		if (a->dict_col == -1)
+			continue;
+		if (e->dict_col == -1)
+			e->dict_col = a->dict_col;
+		else if (e->dict_col != a->dict_col)
+			e->dict_col = -2;
+	}
+	return e;
+}
+
+/*
  * Compile an expression: its vector form where it has one, else a fallback
  * step for the whole subtree where that is pure.  NULL when neither: the
  * qual or target it is part of is lazy (cc->why says why).
@@ -569,12 +600,12 @@ vexec_compile_expr(VexecCompileContext *cc, Expr *expr)
 
 	e = compile_vector(cc, expr);
 	if (e != NULL)
-		return e;
+		return dict_input(e);
 	/* what a failed vector form counted is not in the program */
 	cc->nkernels = nkernels;
 	cc->nfallbacks = nfallbacks;
 	cc->declared = list_truncate(cc->declared, ndeclared);
-	return compile_fallback(cc, expr);
+	return dict_input(compile_fallback(cc, expr));
 }
 
 /*

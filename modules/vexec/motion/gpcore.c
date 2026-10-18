@@ -131,6 +131,9 @@ explain_deposit(PlanState *ps, int content, const char *data, int len)
 	node->segment_stats.drained_motions += b.stats.drained_motions;
 	node->segment_stats.drained_rows += b.stats.drained_rows;
 	node->segment_stats.squelched += b.stats.squelched;
+	node->segment_stats.text_converted += b.stats.text_converted;
+	node->segment_stats.dict_values += b.stats.dict_values;
+	node->segment_stats.dict_rows += b.stats.dict_rows;
 	if (node->kind == VEXEC_NODE_MOTION_SEND || node->kind == VEXEC_NODE_MOTION_RECV)
 	{
 		VexecMotionStats *m = vexec_motion_stats(node);

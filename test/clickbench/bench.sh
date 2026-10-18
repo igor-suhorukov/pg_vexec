@@ -17,7 +17,11 @@
 #                node preloaded, the vanilla route's settings, in the image's
 #                own server (vexec-entry.sh installs gp_orca over it)
 #   CB_STORAGE   vanilla and vanilla-orca: heap, heap_pk (with the primary
-#                key's btree); port: aoco, porc, porc_vec
+#                key's btree); vanilla also mergetree and mergetree_files,
+#                ch_table_engines' MergeTree in its pages store and its files
+#                store, ordered by the primary key (ch_table_engines.md §4),
+#                the extension preloaded, installed at the container's start
+#                (vexec-entry.sh); port: aoco, porc, porc_vec
 #   CB_PLANNERS  vanilla: planner; port and vanilla-orca: "orca planner" --
 #                ORCA, and the planner's route on the same tables
 #   CB_SUBSET    1m, 10m, full: the rows loaded (clickbench.py subsets)
@@ -77,10 +81,10 @@ WORKERS="${CB_WORKERS:-0}"
 OUT="${CB_OUT:-}"
 case "$MODE" in check|time) ;; *) die "CB_MODE is check or time" ;; esac
 case "$ROUTE:$STORAGE" in
-	vanilla:heap|vanilla:heap_pk) PLANNERS="${CB_PLANNERS:-planner}" ;;
+	vanilla:heap|vanilla:heap_pk|vanilla:mergetree|vanilla:mergetree_files) PLANNERS="${CB_PLANNERS:-planner}" ;;
 	port:aoco|port:porc|port:porc_vec) PLANNERS="${CB_PLANNERS:-orca planner}" ;;
 	vanilla-orca:heap|vanilla-orca:heap_pk) PLANNERS="${CB_PLANNERS:-orca planner}" ;;
-	*) die "CB_ROUTE and CB_STORAGE: vanilla or vanilla-orca with heap or heap_pk, port with aoco, porc or porc_vec" ;;
+	*) die "CB_ROUTE and CB_STORAGE: vanilla or vanilla-orca with heap or heap_pk, vanilla with mergetree or mergetree_files, port with aoco, porc or porc_vec" ;;
 esac
 VEXEC="${CB_VEXEC:-}"
 if [ -n "$VEXEC" ]; then
@@ -213,7 +217,12 @@ for n in $NODES; do
 		echo "port = $(port "$n")"
 		# the temporary files of EXPLAIN ANALYZE's queries, from the log
 		echo "log_temp_files = 0"
-		[ -n "$VEXEC" ] && [ "$ROUTE" = vanilla ] && echo "shared_preload_libraries = 'vexec'"
+		if [ "$ROUTE" = vanilla ]; then
+			case "$STORAGE" in
+				mergetree*) echo "shared_preload_libraries = '${VEXEC:+vexec,}ch_table_engines'" ;;
+				*) [ -n "$VEXEC" ] && echo "shared_preload_libraries = 'vexec'" ;;
+			esac
+		fi
 		[ "$ROUTE" = vanilla-orca ] && echo "shared_preload_libraries = 'gp_orca${VEXEC:+,vexec}'"
 		if [ "$ROUTE" != port ]; then
 			# ClickBench's PostgreSQL settings (postgresql/install), the
@@ -255,6 +264,11 @@ if [ "$ROUTE" = port ]; then
 fi
 out=$(q postgres "CREATE DATABASE clickbench")
 [ -n "$out" ] && { echo "CREATE DATABASE: $out"; exit 1; }
+case "$STORAGE" in
+	mergetree*)
+		out=$(q clickbench "SET client_min_messages = warning; CREATE EXTENSION ch_table_engines")
+		[ -n "$out" ] && { echo "ch_table_engines: $out"; exit 1; } ;;
+esac
 if [ "$ROUTE" = port ]; then
 	out=$(q clickbench "SET client_min_messages = warning; CREATE EXTENSION gp_sql; CREATE EXTENSION gp_ao; CREATE EXTENSION pax")
 	[ -n "$out" ] && { echo "the port's extensions: $out"; exit 1; }
@@ -274,6 +288,10 @@ PK="CounterID, EventDate, UserID, EventTime, WatchID"
 MINMAX="advengineid,counterid,eventdate,dontcounthits,isrefresh,islink,isdownload,traficsourceid"
 case "$STORAGE" in
 	heap|heap_pk) CLAUSE="" ;;
+	# ordered by the suite's primary key, the one sort key ClickBench's rules
+	# allow; no OPTIMIZE before the queries (ClickBench/README.md:133)
+	mergetree) CLAUSE="USING mergetree WITH (order_by = '$(echo "$PK" | tr 'A-Z' 'a-z')')" ;;
+	mergetree_files) CLAUSE="USING mergetree WITH (order_by = '$(echo "$PK" | tr 'A-Z' 'a-z')', storage = 'files')" ;;
 	aoco) CLAUSE="USING ao_column WITH (compresstype=zstd) DISTRIBUTED BY (UserID)" ;;
 	porc|porc_vec)
 		CLAUSE="USING pax WITH (${CB_PAX_WITH:-storage_format=$STORAGE, compresstype=zstd, cluster_type='lexical', cluster_columns='counterid,eventdate', minmax_columns='$MINMAX', bloomfilter_columns='userid,urlhash,refererhash'}) DISTRIBUTED BY (UserID)" ;;

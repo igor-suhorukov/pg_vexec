@@ -159,3 +159,17 @@ CREATE FUNCTION cdbhash(query text, nsegs int4, format text DEFAULT 'postgres',
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'vexec_test_cdbhash'
 LANGUAGE C VOLATILE;
+
+-- vexec_test_am, a table access method of the tests: heap's, with a batch
+-- source and sink of every member of their contracts (source_test.c),
+-- registered where vexec_test is preloaded after vexec.
+CREATE FUNCTION am_handler(internal) RETURNS table_am_handler
+AS 'MODULE_PATHNAME', 'vexec_test_am_handler'
+LANGUAGE C STRICT;
+CREATE ACCESS METHOD vexec_test_am TYPE TABLE HANDLER am_handler;
+
+-- Each member of the source's and the sink's calls in this backend.
+CREATE FUNCTION source_calls(OUT member text, OUT calls int8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_test_source_calls'
+LANGUAGE C STRICT VOLATILE;

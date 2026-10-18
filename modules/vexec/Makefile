@@ -87,7 +87,7 @@ DATA = vexec--1.0.sql
 HEADERS = ../../include/vexec_source.h ../../include/vexec_kernels.h ../../include/vexec_egress.h \
 	../../include/vexec_sink.h
 
-REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_ingest vexec_insert vexec_frames vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs
+REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_ingest vexec_insert vexec_frames vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs vexec_source
 
 PG_CPPFLAGS = -I$(srcdir) -I$(srcdir)/pgxs/include -I$(srcdir)/../../include
 
