@@ -76,17 +76,20 @@ vexec_parallel_divisor(Path *path)
  * those of cost_seqscan (PG19:src/backend/optimizer/path/costsize.c): a
  * page term, cpu_tuple_cost and the quals a tuple, the target an output
  * row.  source_bytes, when a registered source gave it, replaces the page
- * term with the needed columns' bytes.  For a partial path (V4) the CPU
- * terms are divided among the participants as cost_seqscan divides them,
- * and the page term is not, and its rows are each participant's.
+ * term with the needed columns' bytes, and source_rows the relation's
+ * tuples in the CPU terms with the rows its pruning leaves (VC13): a
+ * MergeTree scan of a key's range reads its granules, not the table.  For
+ * a partial path (V4) the CPU terms are divided among the participants as
+ * cost_seqscan divides them, and the page term is not, and its rows are
+ * each participant's.
  */
 void
 vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 				const VexecSteps *quals, const VexecSteps *target,
-				int ncols_in, int ncols_out, double source_bytes,
+				int ncols_in, int ncols_out, double source_rows, double source_bytes,
 				VexecCost *cost)
 {
-	double		tuples = rel->tuples;
+	double		tuples = source_rows >= 0 ? source_rows : rel->tuples;
 	double		rows = rowpath->rows;
 	double		divisor = rowpath->parallel_workers > 0 ? vexec_parallel_divisor(rowpath) : 1.0;
 	Cost		qual_total = rel->baserestrictcost.per_tuple;
@@ -102,7 +105,7 @@ vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 	cost->row_total = rowpath->total_cost;
 	cost->rows = rows;
 
-	row_cpu = (cpu_tuple_cost + qual_total) * tuples / divisor + target_total * rows;
+	row_cpu = (cpu_tuple_cost + qual_total) * rel->tuples / divisor + target_total * rows;
 	disk = Max(rowpath->total_cost - rowpath->startup_cost - row_cpu, 0);
 	if (source_bytes >= 0)
 	{

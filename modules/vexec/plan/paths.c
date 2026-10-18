@@ -278,8 +278,15 @@ estimate_prunable_walker(Node *node, void *context)
 	return expression_tree_walker(node, estimate_prunable_walker, context);
 }
 
-static double
-source_estimate(RelOptInfo *rel, Relation relation, const VexecSourceRoutine *src, Bitmapset *attrs)
+/*
+ * A source's estimate of a scan of the needed attributes (VC1): the rows
+ * its pruning leaves and their columns' bytes, and from minor version 3
+ * (estimate_ex(), VC13) the units a serial scan reads and whether
+ * aggregate() answers them; -1 for what the source does not give.
+ */
+static void
+source_estimate(RelOptInfo *rel, Relation relation, const VexecSourceRoutine *src, Bitmapset *attrs,
+				VexecSourceEstimate *est)
 {
 	VexecSourceSpec spec;
 	TupleDesc	desc = RelationGetDescr(relation);
@@ -287,8 +294,6 @@ source_estimate(RelOptInfo *rel, Relation relation, const VexecSourceRoutine *sr
 	bool		whole_row = false;
 	bool		need_tid = false;
 	List	   *quals = NIL;
-	double		rows = -1;
-	double		bytes = -1;
 	int			n = 0;
 	int			i = -1;
 	ListCell   *lc;
@@ -329,8 +334,15 @@ source_estimate(RelOptInfo *rel, Relation relation, const VexecSourceRoutine *sr
 	spec.quals = quals;
 	spec.max_rows = VEXEC_BATCH_ROWS;
 	spec.flags = need_tid ? VEXEC_SRC_TIDS : 0;
-	src->estimate(relation, ActiveSnapshotSet() ? GetActiveSnapshot() : NULL, &spec, &rows, &bytes);
-	return bytes;
+	memset(est, 0, sizeof(*est));
+	est->size = sizeof(*est);
+	est->rows = -1;
+	est->bytes = -1;
+	if (VEXEC_SOURCE_HAS(src, estimate_ex))
+		src->estimate_ex(relation, ActiveSnapshotSet() ? GetActiveSnapshot() : NULL, &spec, est);
+	else
+		src->estimate(relation, ActiveSnapshotSet() ? GetActiveSnapshot() : NULL, &spec,
+					  &est->rows, &est->bytes);
 }
 
 /*
@@ -370,7 +382,7 @@ vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost)
 	Relation	relation;
 	const VexecSourceRoutine *src;
 	const char *how;
-	double		source_bytes = -1;
+	VexecSourceEstimate est = {.rows = -1, .bytes = -1};
 	VexecSteps	quals;
 	VexecSteps	target;
 	Path	   *rowpath;
@@ -402,7 +414,7 @@ vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost)
 	relation = table_open(planner_rt_fetch(rel->relid, root)->relid, NoLock);
 	src = vexec_source_for(relation, &how);
 	if (src != NULL && VEXEC_SOURCE_HAS(src, estimate))
-		source_bytes = source_estimate(rel, relation, src, attrs);
+		source_estimate(rel, relation, src, attrs, &est);
 	table_close(relation, NoLock);
 
 	memset(&quals, 0, sizeof(quals));
@@ -411,7 +423,7 @@ vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost)
 	vexec_oracle_exprs(root, keys, &target);
 	rowpath = create_seqscan_path(root, rel, NULL, path->parallel_workers);
 	vexec_cost_scan(root, rel, rowpath, &quals, &target, bms_num_members(attrs),
-					list_length(keys) + 1, source_bytes, cost);
+					list_length(keys) + 1, est.rows, est.bytes, cost);
 	return true;
 }
 
@@ -435,7 +447,7 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 	VexecSteps	target;
 	Path	   *rowpath;
 	VexecCost	cost;
-	double		source_bytes = -1;
+	VexecSourceEstimate est = {.rows = -1, .bytes = -1};
 	Bitmapset  *attrs;
 	Relids		required_outer;
 	bool		add = ps->mode == VEXEC_MODE_AUTO || ps->mode == VEXEC_MODE_FORCE;
@@ -493,7 +505,7 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 	if (src == NULL && vexec_heap_page_reader && vexec_heap_reader_possible(relation))
 		how = "heap's pages";
 	if (src != NULL && VEXEC_SOURCE_HAS(src, estimate))
-		source_bytes = source_estimate(rel, relation, src, attrs);
+		source_estimate(rel, relation, src, attrs, &est);
 	table_close(relation, NoLock);
 
 	/*
@@ -553,7 +565,7 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 	rowpath = create_seqscan_path(root, rel, required_outer, 0);
 	vexec_cost_scan(root, rel, rowpath, &quals, &target,
 					bms_num_members(attrs), list_length(rel->reltarget->exprs),
-					source_bytes, &cost);
+					est.rows, est.bytes, &cost);
 	vexec_alt_costed(ps, alt, &cost,
 					 psprintf("source: %s; quals: %s, %s%s; target: %s, %s%s",
 							  how,
@@ -567,6 +579,10 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 	{
 		Path	   *path = vexec_scan_path(root, rel, rowpath, &cost);
 		bool		index_kept = false;
+
+		/* VC13: a scan of no qual whose source's statistics answer its units */
+		if ((est.flags & VEXEC_EST_AGG_EXACT) && rel->baserestrictinfo == NIL && required_outer == NULL)
+			vexec_scan_path_set_answers(path, est.units);
 
 		/*
 		 * Force mode: wherever the oracle accepts it, the vector scan is the
@@ -618,11 +634,20 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 			 * get 7, and its aggregations and functions run on that many.
 			 * ClickHouse reads a table on as many threads as it has, each
 			 * at least merge_tree_min_rows_for_concurrent_read rows
-			 * (163,840).  A parallel_workers reloption stays the relation's.
+			 * (163,840).  Where the source's estimate gives what its pruning
+			 * leaves, both rules take it, its bytes' pages and its rows, in
+			 * place of the relation's (VC13): a key's range of 81,920 rows of
+			 * 10M ran 1.2 to 2.6 times as fast in one process as in 17, each
+			 * paying its start of the engine (ch_table_engines.md §3,
+			 * "Statistics, workers and null maps").  A parallel_workers
+			 * reloption stays the relation's.
 			 */
+			if (src != NULL && est.bytes >= 0)
+				workers = compute_parallel_worker(rel, ceil(est.bytes / BLCKSZ), -1,
+												  max_parallel_workers_per_gather);
 			if (src != NULL && vexec_scan_rows_per_worker > 0 && rel->rel_parallel_workers < 0)
 				workers = Max(workers,
-							  (int) Min(floor(rel->tuples / vexec_scan_rows_per_worker),
+							  (int) Min(floor((est.rows >= 0 ? est.rows : rel->tuples) / vexec_scan_rows_per_worker),
 										(double) max_parallel_workers_per_gather));
 
 			if (workers > 0)
@@ -632,7 +657,7 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 
 				vexec_cost_scan(root, rel, prowpath, &quals, &target,
 								bms_num_members(attrs), list_length(rel->reltarget->exprs),
-								source_bytes, &pcost);
+								est.rows, est.bytes, &pcost);
 				if (ps->mode == VEXEC_MODE_FORCE)
 					rel->partial_pathlist = NIL;
 				add_partial_path(rel, vexec_scan_path(root, rel, prowpath, &pcost));

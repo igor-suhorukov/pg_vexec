@@ -92,6 +92,30 @@ vexec_is_scan_path(Path *path)
 	return IsA(path, CustomPath) && ((CustomPath *) path)->methods == &vecscan_path_methods;
 }
 
+/*
+ * VC13: a serial VecScan whose source answers a plain aggregation's count(*),
+ * counts, least and greatest values from its statistics, unit by unit
+ * (VEXEC_EST_AGG_EXACT): its units, kept on the path -- whose private list
+ * no plan takes -- for VecAgg's price (agg.c).
+ */
+void
+vexec_scan_path_set_answers(Path *path, double units)
+{
+	Assert(vexec_is_scan_path(path) && !path->parallel_aware);
+	((CustomPath *) path)->custom_private = list_make1(makeFloat(psprintf("%.0f", units)));
+}
+
+bool
+vexec_scan_path_answers(Path *path, double *units)
+{
+	CustomPath *cp = (CustomPath *) path;
+
+	if (!vexec_is_scan_path(path) || path->parallel_aware || cp->custom_private == NIL)
+		return false;
+	*units = floatVal(linitial(cp->custom_private));
+	return true;
+}
+
 /* VecScan's plan: a SeqScan's quals and target list on a CustomScan. */
 static Plan *
 plan_vecscan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,

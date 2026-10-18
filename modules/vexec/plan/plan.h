@@ -124,7 +124,7 @@ extern bool vexec_kernel_bound(Oid funcid, Oid inputtype, Oid collation);
 extern double vexec_parallel_divisor(Path *path);
 extern void vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 							const VexecSteps *quals, const VexecSteps *target,
-							int ncols_in, int ncols_out, double source_bytes,
+							int ncols_in, int ncols_out, double source_rows, double source_bytes,
 							VexecCost *cost);
 extern void vexec_cost_hashjoin(PlannerInfo *root, Path *rowpath,
 								Path *outer, Path *inner, int nclauses,
@@ -220,6 +220,8 @@ extern Plan *vexec_build_window(VexecPlanState *ps, WindowAgg *window, List *rta
 
 /* build.c */
 extern bool vexec_is_scan_path(Path *path);
+extern void vexec_scan_path_set_answers(Path *path, double units);
+extern bool vexec_scan_path_answers(Path *path, double *units);
 extern Path *vexec_scan_path(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 							 const VexecCost *cost);
 extern Path *vexec_bitmapscan_path(PlannerInfo *root, RelOptInfo *rel, BitmapHeapPath *bp,

@@ -50,6 +50,7 @@
 #include <math.h>
 
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_namespace.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -980,6 +981,50 @@ consider_distinct_pair(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *out
 }
 
 /*
+ * VC13: whether a plain aggregation's every aggregate is one the source of
+ * its input's serial VecScan answers from its statistics, unit by unit
+ * (H2, VEXEC_EST_AGG_EXACT): count(*), or count, min or max of a column of
+ * the scanned relation, with no FILTER, DISTINCT or ORDER BY -- what
+ * VecAgg's stats_setup() asks of the source (exec/vecagg.c).  *units is the
+ * scan's.
+ */
+static bool
+stats_answer(RelOptInfo *input_rel, Path *input, List *aggrefs, double *units)
+{
+	ListCell   *lc;
+
+	if (!vexec_aggregate_statistics || aggrefs == NIL || !vexec_scan_path_answers(input, units))
+		return false;
+	foreach(lc, aggrefs)
+	{
+		Aggref	   *a = lfirst(lc);
+		char	   *name;
+
+		if (a->aggfilter != NULL || a->aggdistinct != NIL || a->aggorder != NIL ||
+			get_func_namespace(a->aggfnoid) != PG_CATALOG_NAMESPACE)
+			return false;
+		name = get_func_name(a->aggfnoid);
+		if (a->aggstar)
+		{
+			if (strcmp(name, "count") != 0)
+				return false;
+			continue;
+		}
+		if (list_length(a->args) != 1 ||
+			(strcmp(name, "count") != 0 && strcmp(name, "min") != 0 && strcmp(name, "max") != 0))
+			return false;
+		{
+			Expr	   *arg = linitial_node(TargetEntry, a->args)->expr;
+
+			if (!IsA(arg, Var) || ((Var *) arg)->varno != input_rel->relid ||
+				((Var *) arg)->varattno < 1 || ((Var *) arg)->varlevelsup != 0)
+				return false;
+		}
+	}
+	return true;
+}
+
+/*
  * VecAgg's alternatives for an aggregation (§3.3.3): recorded for EXPLAIN,
  * and in auto and force mode added.
  */
@@ -1010,6 +1055,8 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 	double		numgroups;
 	int			nvec;
 	int			nkeys_kernel;
+	bool		answered = false;
+	double		units = 0;
 	List	   *names = NIL;
 	List	   *newpaths = NIL;
 	ListCell   *lc;
@@ -1076,6 +1123,26 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 		}
 	}
 
+	/*
+	 * VC13: where the input relation has a serial VecScan whose source's
+	 * statistics answer every aggregate unit by unit, the aggregation reads
+	 * it, whichever scan is cheapest by rows (below)
+	 */
+	if (strategy == AGG_PLAIN)
+	{
+		foreach(lc, input_rel->pathlist)
+		{
+			Path	   *p = lfirst(lc);
+
+			if (vexec_scan_path_answers(p, &units) && stats_answer(input_rel, p, as.aggrefs, &units))
+			{
+				input = p;
+				answered = true;
+				break;
+			}
+		}
+	}
+
 	/* PostgreSQL's own Agg over the same input, which the cost derives from */
 	MemSet(&agg_costs, 0, sizeof(AggClauseCosts));
 	get_agg_clause_costs(root, AGGSPLIT_SIMPLE, &agg_costs);
@@ -1087,6 +1154,19 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 	vexec_cost_agg(root, &rowpath->path, input, vexec_is_vector_path(input),
 				   list_length(groupclause), nkeys_kernel, nvec,
 				   strategy == AGG_PLAIN ? 1 : numgroups, &cost);
+
+	/*
+	 * VC13: an aggregation the source's statistics answer reads its units'
+	 * statistics, not its rows: priced at a tuple a unit, and given no
+	 * partial pair, whose participants' units -- runs of a part's granules,
+	 * in MergeTree -- no statistics answer (Q0 and Q6 of ClickBench, 13 and
+	 * 17 ms with 16 workers, 0.04 and 0.1 in one process).
+	 */
+	if (answered)
+	{
+		cost.startup = input->startup_cost + units * cpu_tuple_cost;
+		cost.total = cost.startup + cpu_tuple_cost;
+	}
 	{
 		StringInfoData buf;
 
@@ -1118,7 +1198,7 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 	 * where core made the partially grouped relation and every aggregate
 	 * can be split.
 	 */
-	if ((extra->flags & GROUPING_CAN_PARTIAL_AGG) && input_rel->partial_pathlist != NIL &&
+	if (!answered && (extra->flags & GROUPING_CAN_PARTIAL_AGG) && input_rel->partial_pathlist != NIL &&
 		output_rel->consider_parallel)
 	{
 		RelOptInfo *prel = partial_grouped_rel(root, output_rel);

@@ -100,6 +100,30 @@ SELECT source_check('SELECT count(*), count(c), min(a), max(b), sum(g) FROM src'
 -- not all of them: the units read
 SELECT source_check('SELECT count(*), sum(f) FROM src');
 
+-- estimate_ex() (VC13): an aggregation whose every aggregate the units'
+-- statistics answer is planned in one process, priced at its units, where
+-- in parallel each participant's units are its own share; a min of text,
+-- which they do not keep, a sum, which VEXEC_EST_AGG_EXACT does not promise,
+-- and a qual keep the Gather.  The rows the estimate leaves after a qual --
+-- a fifth here -- size the scan's workers
+SET vexec.mode = auto;
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET vexec.scan_rows_per_worker = 1000;
+EXPLAIN (COSTS OFF) SELECT count(*), count(a), min(a), max(b) FROM src;
+EXPLAIN (COSTS OFF) SELECT count(*), min(c) FROM src;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(g) FROM src;
+EXPLAIN (COSTS OFF) SELECT count(*), max(a) FROM src WHERE b > 7;
+SELECT source_check('SELECT count(*), count(a), min(a), max(b) FROM src');
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET vexec.scan_rows_per_worker;
+RESET vexec.mode;
+
 -- a running bound passes over the units none of whose rows is within it
 SET vexec.mode = force;
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
@@ -211,7 +235,8 @@ INSERT INTO src_xml SELECT * FROM src;
 RESET vexec.mode;
 SELECT count(*) FROM src_xml;
 
--- which members vexec called: every one but retain and release, which it never asks for
+-- which members vexec called: every one but retain and release, which it never asks for,
+-- and estimate, which estimate_ex replaces (minor 3)
 SELECT member, calls > 0 AS called FROM vexec_test.source_calls();
 
 DROP TABLE src, src_outer, src_copy, src_xml;

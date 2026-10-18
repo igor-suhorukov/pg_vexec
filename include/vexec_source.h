@@ -47,7 +47,7 @@
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
 #define VEXEC_SOURCE_MINOR		3	/* 1: aggregate; 2: set_keys; 3:
-									 * dictionary_id */
+									 * dictionary_id, estimate_ex */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -202,6 +202,28 @@ typedef struct VexecSourceAggAnswer
 } VexecSourceAggAnswer;
 
 /*
+ * What a scan of a spec's columns would read (from minor version 3,
+ * estimate_ex()): estimate()'s two numbers, and what the planner needs
+ * beyond them.
+ */
+typedef struct VexecSourceEstimate
+{
+	Size		size;			/* sizeof as the caller was built */
+	double		rows;			/* rows handed, after pruning: estimate()'s */
+	double		bytes;			/* the columns' bytes read: estimate()'s */
+	double		units;			/* the units a serial scan reads, each of which
+								 * aggregate() may answer */
+	uint32		flags;			/* VEXEC_EST_* */
+} VexecSourceEstimate;
+
+/*
+ * aggregate() would answer count(*), and count, min and max of every one of
+ * the spec's columns, for every unit of a serial scan with no qual: its
+ * statistics are exact there, and no row of the units is deleted
+ */
+#define VEXEC_EST_AGG_EXACT		0x0001
+
+/*
  * A source.  vexec begins the scan itself through the generic wrappers
  * (table_beginscan, table_beginscan_parallel), so the access method keeps
  * the snapshot's registration, predicate locks, parallel units, rescan and
@@ -274,6 +296,15 @@ typedef struct VexecSourceRoutine
 	 * call.
 	 */
 	uint64		(*dictionary_id) (void *state, int column);
+
+	/*
+	 * Optional, from minor version 3: estimate()'s rows and bytes, and the
+	 * units and VEXEC_EST_* flags beside them, asked in place of estimate()
+	 * where a source has it.  est->size is the caller's; the source fills
+	 * the members that size holds.
+	 */
+	void		(*estimate_ex) (Relation rel, Snapshot snapshot,
+								const VexecSourceSpec *spec, VexecSourceEstimate *est);
 } VexecSourceRoutine;
 
 /*

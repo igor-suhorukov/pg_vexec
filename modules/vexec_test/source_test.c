@@ -42,6 +42,9 @@
  *					them, by its least and greatest values, is passed over
  *	estimate()		the relation's tuples, and the needed attributes' widths
  *					over them, a fifth where the quals are not empty
+ *	estimate_ex()	estimate()'s, the units a serial scan reads, and
+ *					VEXEC_EST_AGG_EXACT where aggregate() answers each: no qual,
+ *					no TIDs, every column an integer
  *	supports()		every attribute but one of type xml, which keeps a scan
  *					reading it on the slot path
  *
@@ -57,6 +60,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#include <math.h>
 
 #include "access/heapam.h"
 #include "access/sysattr.h"
@@ -93,13 +98,13 @@ typedef enum Member
 {
 	M_SUPPORTS, M_BEGIN, M_NEXT, M_RETAIN, M_RELEASE, M_RESCAN, M_END, M_ESTIMATE, M_AGGREGATE,
 	M_AGGREGATE_ANSWERED, M_SET_KEYS, M_UNITS_PASSED, M_SINK_SUPPORTS, M_SINK_BEGIN, M_SINK_PUT,
-	M_SINK_END, M_DICTIONARY_ID, M_DICTIONARIES, NMEMBERS
+	M_SINK_END, M_DICTIONARY_ID, M_DICTIONARIES, M_ESTIMATE_EX, NMEMBERS
 } Member;
 
 static const char *const member_names[NMEMBERS] = {
 	"supports", "begin", "next", "retain", "release", "rescan", "end", "estimate", "aggregate",
 	"aggregate answered", "set_keys", "units passed by keys", "sink supports", "sink begin",
-	"sink put", "sink end", "dictionary_id", "dictionaries made"
+	"sink put", "sink end", "dictionary_id", "dictionaries made", "estimate_ex"
 };
 
 static int64 calls[NMEMBERS];
@@ -793,12 +798,11 @@ src_end(void *arg)
 }
 
 static void
-src_estimate(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, double *rows, double *bytes)
+estimate_scan(Relation rel, const VexecSourceSpec *spec, double *rows, double *bytes)
 {
 	double		tuples = Max(rel->rd_rel->reltuples, 0);
 	double		width = 0;
 
-	calls[M_ESTIMATE]++;
 	for (int i = 0; i < spec->ncolumns; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), spec->attnums[i] - 1);
@@ -809,6 +813,32 @@ src_estimate(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, doubl
 		width += sizeof(ItemPointerData);
 	*rows = spec->quals != NIL ? tuples / 5 : tuples;
 	*bytes = width * *rows;
+}
+
+static void
+src_estimate(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, double *rows, double *bytes)
+{
+	calls[M_ESTIMATE]++;
+	estimate_scan(rel, spec, rows, bytes);
+}
+
+static void
+src_estimate_ex(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, VexecSourceEstimate *est)
+{
+	bool		tids = spec->size >= offsetof(VexecSourceSpec, flags) + sizeof(spec->flags) &&
+		(spec->flags & VEXEC_SRC_TIDS) != 0;
+	bool		ints = true;
+
+	calls[M_ESTIMATE_EX]++;
+	estimate_scan(rel, spec, &est->rows, &est->bytes);
+	for (int i = 0; i < spec->ncolumns && ints; i++)
+	{
+		Oid			type = TupleDescAttr(RelationGetDescr(rel), spec->attnums[i] - 1)->atttypid;
+
+		ints = type == INT2OID || type == INT4OID || type == INT8OID;
+	}
+	est->units = ceil(Max(rel->rd_rel->reltuples, 0) / UNIT_ROWS);
+	est->flags = spec->quals == NIL && !tids && ints ? VEXEC_EST_AGG_EXACT : 0;
 }
 
 static bool
@@ -1022,6 +1052,7 @@ static VexecSourceRoutine source = {
 	.aggregate = src_aggregate,
 	.set_keys = src_set_keys,
 	.dictionary_id = src_dictionary_id,
+	.estimate_ex = src_estimate_ex,
 };
 
 static VexecSinkRoutine sink = {
