@@ -386,12 +386,15 @@ for round in $(seq 1 "$ROUNDS"); do
 				else
 					pms=0; pst=-
 				fi
-				# the Gathers of ORCA's plan, the writers' fragments' (orca/parallel.c)
+				# the Gathers of ORCA's plan, the writers' fragments' or on one
+				# node the plan's (orca/parallel.c), with the run's vexec
+				# settings, as the query ran; the plan's text in <out>-orca.plan
 				gathers=-
 				if [ "$w" -gt 0 ] && [ "$planned" = yes ]; then
-					gathers=$(PGOPTIONS="-c gp.optimizer=on $(parallel "$w")" "$PSQL" -X -h "$(sockdir 0)" -p "$(port 0)" \
+					gathers=$(PGOPTIONS="-c gp.optimizer=on $(parallel "$w") $VEXEC_OPTIONS -c vexec.debug_require_vector=off" \
+						"$PSQL" -X -h "$(sockdir 0)" -p "$(port 0)" \
 						-d "tpc$kind" -At -c "EXPLAIN (COSTS OFF) $(sed 's/;[[:space:]]*$//' "$f")" 2> /dev/null |
-						grep -c -E '^[[:space:]]*(->  )?Gather$') || gathers=0
+						tee "$out-orca.plan" | grep -c -E '^[[:space:]]*(->  )?Gather$') || gathers=0
 				fi
 				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$round" "$kind" "$name" "$planned" \
 					"$(echo "$reason" | tr '\t' ' ')" "$oms" "$ost" "$pms" "$pst" "$w" "$gathers" >> "$ROOT/results.tsv"

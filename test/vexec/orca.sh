@@ -15,6 +15,11 @@
 #                 and with vexec, in either preload order, ORCA's plans carry
 #                 vector nodes, answering as ORCA's row plans and PostgreSQL's
 #                 planner answer
+#   parallel      ORCA's Gathers on one node (the port's orca/parallel.c):
+#                 gp.enable_parallel, gp_orca's, off; on, Gathers where
+#                 PostgreSQL's settings say they pay, aggregates in two
+#                 stages around them, vexec's nodes below them, workers
+#                 launched, the planner's rows, none for a cursor
 #   pg            PostgreSQL's own suite, its parallel_schedule, with ORCA on
 #                 and vexec preloaded off, against its unchanged expected
 #                 output, compared as the port's singlenode suite compares it
@@ -25,8 +30,18 @@
 #   differential  the same suite in more sessions, each compared with pg's by
 #                 differential.py, its kept differences in
 #                 differential/kept/pg-orca/<session>/: off once more, the
-#                 suite's own noise; vexec.mode = force in each format; and
-#                 force with the per-structure settings drawn at random
+#                 suite's own noise; vexec.mode = force in each format;
+#                 and force with the per-structure settings drawn at random;
+#                 on request (VEXEC_SESSIONS), with workers, ORCA's Gathers
+#                 wherever they are allowed (parallel costs 0), vexec off
+#                 (parallel) and in force mode (parallel-force) -- not by
+#                 default: so the suite's rows without an ORDER BY, and its
+#                 tables made by CREATE TABLE AS, come in another order,
+#                 its plans printed by functions differ, a parallel index
+#                 build meets vacuum's VACUUM FULL pg_class in a deadlock,
+#                 and parallel-force meets a crash of vexec's on the
+#                 planner's route (a catalog query, on gp_orca without the
+#                 one-node Gathers too, 2026-10-18)
 #
 # Each session runs on a server of its own, made afresh, as the port's suite
 # runs PostgreSQL's tests on one, with every connection's settings in
@@ -34,10 +49,10 @@
 # once the one statement of subselect's that ORCA is known not to finish
 # (the port's orca/README).
 #
-#   VEXEC_ORCA_SECTIONS  "module pg differential"; differential runs pg's
-#                        session as its reference
+#   VEXEC_ORCA_SECTIONS  "module parallel pg differential"; differential
+#                        runs pg's session as its reference
 #   VEXEC_SESSIONS       differential's other sessions: "off-again postgres
-#                        arrow random"
+#                        arrow random"; "parallel parallel-force" on request
 #   VEXEC_SEED           the random session's seed: drawn and printed
 #   VEXEC_ROWS           the module section's table: 20000 rows
 set -u
@@ -56,7 +71,7 @@ PGSUITE="${PG_REGRESS_SUITE:-/cb/pgregress}"
 PG_REGRESS="$PKGLIB/pgxs/src/test/regress/pg_regress"
 SN=/cbsrc/pg19/test/singlenode
 W="$(mktemp -d "${TMPDIR:-/tmp}/vexec-orca-XXXXXX")"
-SECTIONS="${VEXEC_ORCA_SECTIONS:-module pg differential}"
+SECTIONS="${VEXEC_ORCA_SECTIONS:-module parallel pg differential}"
 SEED="${VEXEC_SEED:-$(( (RANDOM << 15 | RANDOM) % 2147483646 + 1 ))}"
 ROWS="${VEXEC_ROWS:-20000}"
 
@@ -253,6 +268,156 @@ section_module() {
 }
 
 ###############################################################################
+# parallel: ORCA's Gathers on one node
+###############################################################################
+
+# The port's ORCA puts PostgreSQL's Gathers into its plans on one node as on
+# a segment (pg19/orca/parallel.c): gp.enable_parallel, which gp_orca's
+# single-node build defines, off by default; on, a Gather over the subtrees
+# a Gather's participants can split, an aggregate ORCA planned in one stage
+# done in two around it, as PostgreSQL's planner does it, vexec's nodes too;
+# below a Limit through a Sort, in a CTE's subplan, on the inner side of a
+# loop over one row; the rows PostgreSQL's planner gives; workers launched,
+# as pg_stat_database counts them, and none for a cursor.  Costs that make a
+# Gather pay on the section's small table, as the cluster leg sets them.
+PAR="SET gp.enable_parallel = on; SET max_parallel_workers_per_gather = 2; SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET min_parallel_table_scan_size = 0;"
+PAR_QUERIES=(
+	"${QUERIES[@]}"
+	"SELECT k, sum(v) FROM %t GROUP BY k HAVING sum(v) > 9000000"
+	"SELECT count(*) FROM %t WHERE v > (SELECT avg(v) FROM %t)"
+	"WITH x AS (SELECT k, sum(v) AS sv FROM %t GROUP BY k) SELECT count(*), max(a.sv) FROM x a JOIN x b USING (k)"
+	"SELECT k, count(*) FROM %t WHERE v > 1000 GROUP BY k ORDER BY 2 DESC, 1 LIMIT 5"
+	"SELECT (SELECT max(v) FROM %t) AS m, count(*) FROM %t WHERE k = 3"
+	"SELECT k, count(*), sum(n), avg(v), min(s), max(d) FROM %t WHERE NOT b GROUP BY k"
+)
+section_parallel() {
+	local D sql ref got nq=0 nsame=0 before after plan s
+
+	echo
+	echo "== parallel: ORCA's Gathers on one node"
+	D="$W/parallel"
+	server_init "$D" "shared_preload_libraries = 'gp_orca,vexec'" "max_worker_processes = 16" \
+		"max_parallel_workers = 8" || { notok "a server is made"; return; }
+	server_start "$D" || { notok "it starts" "$(tail -5 "$D/log")"; return; }
+	q "$D" postgres "
+		CREATE TABLE t_heap AS
+		SELECT g AS id, g % 97 AS k, (g * 7919) % 100000 AS v, ((g % 1000) / 7.0)::numeric(12,4) AS n,
+		       'name ' || (g % 503) AS s, DATE '2020-01-01' + g % 1000 AS d, g % 3 = 0 AS b
+		FROM generate_series(1, $ROWS) g;
+		ANALYZE t_heap" > /dev/null
+	is "gp.enable_parallel is gp_orca's own on one node, off" \
+		"$(q "$D" postgres "SELECT setting, vartype FROM pg_settings WHERE name = 'gp.enable_parallel'")" "off|bool"
+
+	sql="SELECT count(*), sum(v) FROM t_heap WHERE k < 50"
+	plan=$(q "$D" postgres "$PAR SET gp.enable_parallel = off; SET vexec.mode = off; EXPLAIN (COSTS OFF) $sql")
+	[[ "$plan" == *"Optimizer: GPORCA"* && "$plan" != *Gather* ]] \
+		&& ok "with gp.enable_parallel off, ORCA's plan has no Gather" || notok "no Gather with gp.enable_parallel off" "$plan"
+	# the workers the database's backends launched, once a session that
+	# launched them has ended and reported them: past <before>, or 5 s on
+	launched() {				# launched [before]
+		local now i
+		for i in $(seq 1 10); do
+			now=$(q "$D" postgres "SELECT parallel_workers_launched FROM pg_stat_database WHERE datname = current_database()")
+			[ -n "${1:-}" ] && [ "$now" -gt "$1" ] 2> /dev/null && break
+			sleep 0.5
+		done
+		echo "$now"
+	}
+	par_plan() {				# par_plan <what> <vexec mode> <sql> <EXPLAIN's pattern>
+		plan=$(q "$D" postgres "$PAR SET vexec.mode = $2; EXPLAIN (COSTS OFF) $3")
+		[[ "$plan" == $4 && "$plan" == *"Optimizer: GPORCA"* ]] && ok "$1" || notok "$1" "$plan"
+	}
+	par_plan "a Gather over the scan, and the aggregate in two stages around it" off "$sql" \
+		"*Finalize Aggregate*Gather*Workers Planned: 2*Partial Aggregate*Parallel Seq Scan on t_heap*"
+	par_plan "a grouping and its HAVING: each participant's groups below the Gather, the final groups and their filter above it" off \
+		"SELECT k, sum(v) FROM t_heap GROUP BY k HAVING sum(v) > 9000000" \
+		"*Finalize HashAggregate*Filter:*Gather*Partial HashAggregate*Parallel Seq Scan on t_heap*"
+	par_plan "a join split among the participants, the outer side's scan shared, the inner side's hashed by each" off \
+		"SELECT count(*) FROM t_heap a JOIN t_heap b ON a.id = b.v WHERE b.k < 10" \
+		"*Gather*Partial Aggregate*Hash Join*Parallel Seq Scan on t_heap*Hash*Seq Scan on t_heap*"
+	par_plan "below a Limit, through the Sort that reads all its input" off \
+		"SELECT id, v FROM t_heap WHERE v > 99000 ORDER BY v, id LIMIT 20" \
+		"*Limit*Sort*Gather*Parallel Seq Scan on t_heap*"
+	par_plan "in a CTE's subplan" off \
+		"WITH x AS (SELECT k, sum(v) AS sv FROM t_heap GROUP BY k) SELECT count(*), max(a.sv) FROM x a JOIN x b USING (k)" \
+		"*CTE cte0*Finalize HashAggregate*Gather*Partial HashAggregate*Parallel Seq Scan on t_heap*CTE Scan*"
+	par_plan "on the inner side of a loop over the one row of an aggregate" off \
+		"SELECT (SELECT max(v) FROM t_heap) AS m, count(*) FROM t_heap WHERE k = 3" \
+		"*Nested Loop*Finalize Aggregate*Gather*Partial Aggregate*Finalize Aggregate*Gather*Partial Aggregate*"
+	par_plan "with vexec, its aggregate's stages and its scan the participants share" force "$sql" \
+		"*Vec Finalize Aggregate*Gather*Workers Planned: 2*Vec Partial Aggregate*Parallel Vec Seq Scan on t_heap*"
+	par_plan "with vexec, a grouping's" force \
+		"SELECT k, count(*), sum(n), avg(v) FROM t_heap WHERE b GROUP BY k" \
+		"*Vec Finalize HashAggregate*Gather*Vec Partial HashAggregate*Parallel Vec Seq Scan on t_heap*"
+	# a bounded VecSort right over its scan fetches the columns past its keys
+	# by TID from the scan's relation (vexec's late columns): no Gather
+	# between them, which vexec.debug_check_plans would refuse
+	sql="SELECT id, v, s FROM t_heap WHERE v > 99000 ORDER BY v, id LIMIT 20"
+	plan=$(q "$D" postgres "$PAR SET vexec.mode = force; SET vexec.debug_check_plans = on; EXPLAIN (COSTS OFF) $sql")
+	got=$(q "$D" postgres "$PAR SET vexec.mode = force; SET vexec.debug_check_plans = on; $sql")
+	[[ "$plan" == *"Vec Sort"*"Vec Seq Scan on t_heap"* && "$plan" != *Gather* ]] &&
+		[ "$got" = "$(q "$D" postgres "SET gp.optimizer = off; SET vexec.mode = off; $sql")" ] \
+		&& ok "with vexec, no Gather between a bounded sort and the scan it fetches its late columns from" \
+		|| notok "a late-columns sort without a Gather below it" "$plan $got"
+
+	before=$(launched)
+	for qt in "${PAR_QUERIES[@]}"; do
+		sql="${qt//%t/t_heap}"
+		ref=$(q "$D" postgres "SET gp.optimizer = off; SET vexec.mode = off; $sql" | sort)
+		for s in off force-postgres force-arrow; do
+			got=$(q "$D" postgres "$PAR $(session_sets "$s") $sql" | sort)
+			nq=$((nq + 1))
+			if [ "$got" = "$ref" ]; then
+				nsame=$((nsame + 1))
+			else
+				notok "with workers, $s answers as PostgreSQL's planner: $sql" "$(diff <(echo "$ref") <(echo "$got") | head -8)"
+			fi
+		done
+	done
+	is "every query, in each session, with workers, answers as PostgreSQL's planner does" "$nsame of $nq" "$nq of $nq"
+	after=$(launched "$before")
+	[ -n "$before" ] && [ -n "$after" ] && [ "$after" -gt "$before" ] \
+		&& ok "the backend launched workers for them ($before, then $after)" || notok "workers launched" "$before, then $after"
+	plan=$(q "$D" postgres "$PAR SET vexec.mode = off; EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT count(*), sum(v) FROM t_heap WHERE k < 50")
+	has "EXPLAIN ANALYZE: Workers Launched: 2" "$plan" "Workers Launched: 2"
+	before=$(launched)
+	got=$(printf '%s\n' "$PAR" "BEGIN;" "DECLARE c CURSOR FOR SELECT count(*), sum(v) FROM t_heap WHERE k < 50;" \
+		"FETCH ALL FROM c;" "COMMIT;" |
+		"$BINDIR/psql" -X -q -At -h "$D/sock" -U postgres -d postgres 2>&1)
+	after=$(launched "$before")
+	[ "$got" = "$(q "$D" postgres "SELECT count(*), sum(v) FROM t_heap WHERE k < 50")" ] && [ "$after" = "$before" ] \
+		&& ok "a cursor's plan, which may be fetched in part, has no Gather, and launches no workers" \
+		|| notok "a cursor without workers" "[$got] $before, then $after"
+
+	# A plan made with workers, carried out without them: a prepared
+	# statement's cached plan, gp.enable_parallel turned off since, runs a
+	# copy without its Gathers and launches none, as a segment's writer does
+	# (the cluster suite's check); on again, the cached plan has them still.
+	sql="SELECT count(*), sum(v), avg(n) FROM t_heap WHERE k < 50"
+	want=$(q "$D" postgres "SET gp.optimizer = off; SET vexec.mode = off; $sql")
+	for s in off force-postgres; do
+		got=$(printf '%s\n' "$PAR" "$(session_sets "$s")" "PREPARE pps AS $sql;" \
+			"SELECT 'made';" "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) EXECUTE pps;" \
+			"SET gp.enable_parallel = off;" \
+			"SELECT 'off';" "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) EXECUTE pps;" \
+			"SELECT 'rows';" "EXECUTE pps;" \
+			"SET gp.enable_parallel = on;" \
+			"SELECT 'on';" "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) EXECUTE pps;" |
+			"$BINDIR/psql" -X -q -At -h "$D/sock" -U postgres -d postgres 2>&1)
+		part() { echo "$got" | awk -v m="$1" '/^(made|off|rows|on)$/ { p = ($0 == m); next } p'; }
+		if part made | grep -q "Workers Launched: 2" && ! part off | grep -q -E "Gather|Workers" &&
+			part off | grep -q "Partial Aggregate" && [ "$(part rows)" = "$want" ] &&
+			part on | grep -q "Workers Launched: 2"; then
+			ok "a cached plan with Gathers, gp.enable_parallel off since, runs without them ($s); on again, with them"
+		else
+			notok "a cached plan's Gathers ($s)" "want [$want]: $got"
+		fi
+	done
+	server_stop "$D"
+	log_clean "ORCA's Gathers on one node" "$D"
+}
+
+###############################################################################
 # pg and differential: PostgreSQL's suite under ORCA
 ###############################################################################
 
@@ -295,12 +460,16 @@ EOF
 	chmod +x "$W/bin/diff"
 }
 
+# ORCA's Gathers wherever its pass may put one (section parallel's PAR)
+PAR_OPTIONS="-c gp.enable_parallel=on -c max_parallel_workers_per_gather=2 -c parallel_setup_cost=0 -c parallel_tuple_cost=0 -c min_parallel_table_scan_size=0"
 session_options() {
 	case "$1" in
 		off|off-again) echo "-c gp.optimizer=on -c vexec.mode=off" ;;
 		postgres) echo "-c gp.optimizer=on -c vexec.mode=force -c vexec.batch_format=postgres" ;;
 		arrow) echo "-c gp.optimizer=on -c vexec.mode=force -c vexec.batch_format=arrow" ;;
 		random) echo "-c gp.optimizer=on -c vexec.mode=force -c vexec.batch_format=postgres -c vexec.debug_layout_seed=$SEED" ;;
+		parallel) echo "-c gp.optimizer=on -c vexec.mode=off $PAR_OPTIONS" ;;
+		parallel-force) echo "-c gp.optimizer=on -c vexec.mode=force -c vexec.batch_format=postgres $PAR_OPTIONS" ;;
 		*) echo "unknown session $1" >&2; return 1 ;;
 	esac
 }
@@ -409,6 +578,7 @@ esac
 for section in $SECTIONS; do
 	case "$section" in
 		module) section_module ;;
+		parallel) section_parallel ;;
 		pg) section_pg ;;
 		differential) section_differential ;;
 		*) echo "orca: unknown section $section"; exit 1 ;;
