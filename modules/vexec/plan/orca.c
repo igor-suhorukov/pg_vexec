@@ -47,6 +47,14 @@
  *			WindowAgg over a Sort: VecWindowHashAgg in the Sort's place
  *			(window.c).
  *
+ * And through its minor version 3, at one more (ch_table_engines.md, VC17):
+ *
+ *	scan_workers	a VecScan that drives a subtree gp_orca's parallel pass
+ *			splits among a Gather's participants: a source's scan the
+ *			workers the planner's route gives it (paths.c), at least one
+ *			a vexec.scan_rows_per_worker rows, where PostgreSQL's rule of
+ *			a column store's compressed pages gives few.
+ *
  * Force mode builds a vector node wherever the oracle accepts one.  Auto
  * mode, where ORCA's search priced vexec's nodes, builds one wherever it
  * priced one: where the oracle accepts it, of vexec.min_rows rows at least.
@@ -63,6 +71,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#include <math.h>
 
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -102,6 +112,8 @@ static int	orca_cost_aggregate(void *state, Oid aggfnoid, int nargs,
 static int	orca_cost_relation(void *state, Oid relid);
 static bool orca_cost_hash_key(void *state, Oid eqop, Oid collation);
 static Plan *orca_build_window(void *state, WindowAgg *window, List *rtable);
+static int	orca_scan_workers(Plan *scan, Relation rel, double pages, double tuples,
+							  int workers);
 
 static const GpOrcaVecRoutine orca_routine = {
 	.size = sizeof(GpOrcaVecRoutine),
@@ -118,6 +130,7 @@ static const GpOrcaVecRoutine orca_routine = {
 	.cost_relation = orca_cost_relation,
 	.cost_hash_key = orca_cost_hash_key,
 	.build_window = orca_build_window,
+	.scan_workers = orca_scan_workers,
 };
 
 void
@@ -1070,6 +1083,29 @@ orca_cost_relation(void *state, Oid relid)
 	}
 	table_close(rel, NoLock);
 	return kind;
+}
+
+/*
+ * The workers of a Gather over a subtree a VecScan of rel drives (from the
+ * API's minor version 3): as the planner's route gives a source's partial
+ * VecScan (paths.c) -- at least one a vexec.scan_rows_per_worker rows of
+ * the share it scans, tuples, up to max_parallel_workers_per_gather, where
+ * PostgreSQL's rule of its pages, workers, gives fewer: a source's pages
+ * are its compressed bytes.  PostgreSQL's rule stays (a negative answer)
+ * for a relation with no source, for one whose parallel_workers reloption
+ * says, and where vexec.scan_rows_per_worker is 0.  It reads rel and the
+ * settings alone, and raises nothing.
+ */
+static int
+orca_scan_workers(Plan *scan, Relation rel, double pages, double tuples, int workers)
+{
+	(void) scan;
+	(void) pages;
+	if (rel->rd_tableam == NULL || vexec_find_source(rel->rd_tableam) == NULL ||
+		vexec_scan_rows_per_worker <= 0 || RelationGetParallelWorkers(rel, -1) >= 0)
+		return -1;
+	return Max(workers, (int) Min(floor(tuples / vexec_scan_rows_per_worker),
+								  (double) max_parallel_workers_per_gather));
 }
 
 /* Whether vexec hashes a key compared by this operator: strict, with a hash function. */

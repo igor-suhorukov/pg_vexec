@@ -38,7 +38,10 @@
  *						passes over the finished plan (lockrows.c, merge.c,
  *						parallel.c), the dependency walk -- sees the final
  *						tree, and a node replaced keeps its plan node id,
- *						its costs and its parameters
+ *						its costs and its parameters.  On one node, also
+ *						the two stages parallel.c makes of an aggregate
+ *						ORCA planned in one, around the Gather between
+ *						them, each over children offered already
  *	end_statement		once ORCA's plan is made: the engine's check of it,
  *						and what it records in PlannedStmt.extension_state
  *
@@ -81,6 +84,14 @@
  *						engine's node in the Sort's place, under the
  *						WindowAgg, or NULL to keep the lowering
  *
+ * and, from minor version 3, at one more:
+ *
+ *	scan_workers		a sequential scan of the engine's that drives a
+ *						subtree parallel.c splits among a Gather's
+ *						participants: how many workers it gets, as the
+ *						engine's own rule gives its scan on PostgreSQL's
+ *						planner's route
+ *
  * A node built so is the engine's CustomScan, found by name where the
  * plan is read back, a segment's fragment among them.  Without a
  * registration gp_orca calls nothing, and its plans are as they were.
@@ -106,12 +117,14 @@
 #include "nodes/parsenodes.h"
 #include "nodes/plannodes.h"
 #include "utils/memutils.h"
+#include "utils/relcache.h"
 
 #define GP_ORCA_VEC_RENDEZVOUS	"Cloudberry/gp_orca_vec_v1"	/* the major
 															 * version is in
 															 * the name */
-#define GP_ORCA_VEC_MINOR		2	/* 1: describe_node; 2: set_options,
-									 * the cost oracle, build_window */
+#define GP_ORCA_VEC_MINOR		3	/* 1: describe_node; 2: set_options,
+									 * the cost oracle, build_window; 3:
+									 * scan_workers */
 #define GP_ORCA_VEC_MAGIC		0x47564331	/* "GVC1" */
 
 struct ExplainState;
@@ -316,6 +329,22 @@ typedef struct GpOrcaVecRoutine
 	 * order, which it takes to be none (the translator lowers no other).
 	 */
 	Plan	   *(*build_window) (void *state, WindowAgg *window, List *rtable);
+
+	/*
+	 * From minor version 3: the workers of a Gather over a subtree whose
+	 * driver is scan, a sequential scan of the engine's (describe_node) of
+	 * rel, which parallel.c has found it can split among them, and which
+	 * holds pages pages and tuples rows on a segment, as ANALYZE counted
+	 * the whole -- workers being what PostgreSQL's rule gives a SeqScan of
+	 * them there (compute_parallel_worker(), rel's parallel_workers
+	 * reloption first).  gp_orca takes at most
+	 * max_parallel_workers_per_gather, and a negative answer as workers;
+	 * 0 leaves the subtree whole.  Without it, workers.  Any time while the
+	 * plan is planned, in any memory context; it reads rel and the
+	 * engine's settings, and raises no error.
+	 */
+	int			(*scan_workers) (Plan *scan, Relation rel, double pages,
+								 double tuples, int workers);
 } GpOrcaVecRoutine;
 
 typedef struct GpOrcaVecRegistry

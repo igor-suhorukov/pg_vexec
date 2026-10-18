@@ -296,7 +296,7 @@ section_parallel() {
 	echo
 	echo "== parallel: ORCA's Gathers on one node"
 	D="$W/parallel"
-	server_init "$D" "shared_preload_libraries = 'gp_orca,vexec'" "max_worker_processes = 16" \
+	server_init "$D" "shared_preload_libraries = 'gp_orca,vexec,vexec_test'" "max_worker_processes = 16" \
 		"max_parallel_workers = 8" || { notok "a server is made"; return; }
 	server_start "$D" || { notok "it starts" "$(tail -5 "$D/log")"; return; }
 	q "$D" postgres "
@@ -413,6 +413,36 @@ section_parallel() {
 			notok "a cached plan's Gathers ($s)" "want [$want]: $got"
 		fi
 	done
+
+	# A batch source's vector scan driving the split subtree gets the
+	# workers vexec gives it (gp_orca_vec.h's scan_workers, VC17): at least
+	# one a vexec.scan_rows_per_worker rows, up to
+	# max_parallel_workers_per_gather, as on the planner's route, where
+	# PostgreSQL's rule of its pages gives fewer; a heap table's scan, and
+	# the setting 0, PostgreSQL's rule.  vexec_test_am is heap's routine with
+	# a source of the tests' (modules/vexec_test/source_test.c), which
+	# registers it where it is preloaded, as the server is made.
+	q "$D" postgres "SET client_min_messages = warning; CREATE EXTENSION IF NOT EXISTS vexec_test CASCADE;
+		CREATE TABLE t_src USING vexec_test_am AS SELECT * FROM t_heap; ANALYZE t_src" > /dev/null
+	sql="SELECT count(*), sum(v), avg(n) FROM %t WHERE k < 50"
+	planned() {				# planned <table> <vexec.scan_rows_per_worker>: Workers Planned
+		q "$D" postgres "$PAR SET max_parallel_workers_per_gather = 8; SET vexec.mode = force;
+			SET vexec.scan_rows_per_worker = $2; EXPLAIN (COSTS OFF) ${sql//%t/$1}" |
+			sed -n 's/.*Workers Planned: \([0-9]*\).*/\1/p' | head -1
+	}
+	per=$(( ROWS / 8 ))
+	src_rows=$(planned t_src "$per"); src_pages=$(planned t_src 0)
+	heap_rows=$(planned t_heap "$per"); heap_pages=$(planned t_heap 0)
+	if [ "$src_rows" = 8 ] && [ -n "$src_pages" ] && [ "$src_pages" -lt 8 ] && [ -n "$heap_rows" ] &&
+		[ "$heap_rows" = "$heap_pages" ]; then
+		ok "a source's vector scan gets a worker a vexec.scan_rows_per_worker rows, $src_rows where PostgreSQL's rule gives $src_pages; heap's scan PostgreSQL's rule, $heap_pages"
+	else
+		notok "a source's scan's workers" "source: $src_rows by rows, $src_pages by pages; heap: $heap_rows by rows, $heap_pages by pages"
+	fi
+	got=$(q "$D" postgres "$PAR SET max_parallel_workers_per_gather = 8; SET vexec.mode = force;
+		SET vexec.scan_rows_per_worker = $per; ${sql//%t/t_src}")
+	is "and answers with them as PostgreSQL's planner does" "$got" \
+		"$(q "$D" postgres "SET gp.optimizer = off; SET vexec.mode = off; ${sql//%t/t_heap}")"
 	server_stop "$D"
 	log_clean "ORCA's Gathers on one node" "$D"
 }
