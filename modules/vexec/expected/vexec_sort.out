@@ -569,6 +569,67 @@ SELECT sort_explain('SELECT id, t, n FROM so WHERE k < 5000 ORDER BY t, n, id LI
                      Rows Removed by Bound: N
 (6 rows)
 
+-- the input's cheapest path freed before VecSort is considered:
+-- create_ordered_paths() hands a path already in the order -- here the
+-- Gather Merge the scan's relation made -- to the ordered relation itself,
+-- whose own Gather Merge of fewer rows then beats it and add_path() frees
+-- it, while the scan's relation still names it its cheapest.  The parallel
+-- plan a third of a per cent under the serial one makes it so: the plain
+-- Gather loses to the serial scan, the Gather Merge does not.  VecSort's
+-- alternative sorts the partial path alone then, and reads nothing freed.
+CREATE TABLE sfree AS SELECT g AS id, 'n' || (g % 1000) AS s FROM generate_series(1, 200000) g;
+ANALYZE sfree;
+CREATE FUNCTION sfree_cost() RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE
+	plan json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM sfree WHERE id IN (5, 100, 2000)' INTO plan;
+	RETURN (plan->0->'Plan'->>'Total Cost')::float8;
+END $$;
+SET vexec.mode = off;
+SET max_parallel_workers_per_gather = 0;
+SELECT sfree_cost() AS sfree_serial \gset
+SET max_parallel_workers_per_gather = 2;
+SELECT sfree_cost() AS sfree_parallel \gset
+SELECT :sfree_serial - :sfree_parallel - 0.003 * :sfree_serial AS sfree_setup \gset
+SET parallel_setup_cost = :sfree_setup;
+SET vexec.mode = explain;
+SET vexec.min_rows = 0;
+EXPLAIN (VEXEC, COSTS OFF) SELECT * FROM sfree WHERE id IN (5, 100, 2000) ORDER BY s;
+                                                 QUERY PLAN                                                 
+------------------------------------------------------------------------------------------------------------
+ Gather Merge
+   Workers Planned: 2
+   ->  Sort
+         Sort Key: s
+         ->  Parallel Seq Scan on sfree
+               Filter: (id = ANY ('{5,100,2000}'::integer[]))
+ Vexec: mode explain, format postgres
+   VecScan on sfree: not chosen (explain mode)
+     source: heap's pages; quals: 1 kernel step, 0 fallback steps; target: 0 kernel steps, 0 fallback steps
+   VecSort on ORDER BY: not chosen (explain mode)
+     1 sort key; in each participant alone
+(11 rows)
+
+RESET vexec.min_rows;
+SET vexec.mode = auto;
+SELECT * FROM sfree WHERE id IN (5, 100, 2000) ORDER BY s;
+  id  |  s   
+------+------
+ 2000 | n0
+  100 | n100
+    5 | n5
+(3 rows)
+
+SELECT sort_check('SELECT * FROM sfree WHERE id IN (5, 100, 2000) ORDER BY s');
+  sort_check   
+---------------
+ same, VecSort
+(1 row)
+
+SET vexec.mode = force;
+DROP TABLE sfree;
+DROP FUNCTION sfree_cost();
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;

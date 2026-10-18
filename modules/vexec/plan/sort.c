@@ -273,22 +273,77 @@ late_saving(PlannerInfo *root, Path *input, int64 bound)
 }
 
 /*
+ * The input relation's cheapest path, where the ordered relation's paths
+ * still hold it -- as it is, or under the Sort, the incremental sort or the
+ * projection create_ordered_paths() put over it -- and NULL elsewhere.  A
+ * path already in the order is handed to the ordered relation itself
+ * there, and when a later path of that relation beats it, add_path() frees
+ * it, while the input relation's list and its cheapest_total_path still
+ * name it (PG19:src/backend/optimizer/plan/planner.c,
+ * create_ordered_paths(), "sorted_path = input_path"): the hook runs after
+ * all of that, so the path is never read through the input relation alone.
+ * Only pointers are compared here.  The input's partial paths are only ever
+ * put under a Gather Merge there, and stay.
+ */
+static Path *
+live_input(Path *input, RelOptInfo *output_rel)
+{
+	ListCell   *lc;
+
+	if (input == NULL)
+		return NULL;
+	foreach(lc, output_rel->pathlist)
+	{
+		Path	   *path = lfirst(lc);
+
+		while (path != NULL)
+		{
+			if (path == input)
+				return input;
+			switch (nodeTag(path))
+			{
+				case T_SortPath:
+					path = ((SortPath *) path)->subpath;
+					break;
+				case T_IncrementalSortPath:
+					path = ((IncrementalSortPath *) path)->spath.subpath;
+					break;
+				case T_ProjectionPath:
+					path = ((ProjectionPath *) path)->subpath;
+					break;
+				default:
+					path = NULL;
+					break;
+			}
+		}
+	}
+	return NULL;
+}
+
+/*
  * VecSort's alternative for the query's ORDER BY (§3.3.3, UPPERREL_ORDERED):
  * recorded for EXPLAIN, and in auto and force mode added.  In parallel, the
  * input's cheapest partial path is sorted in each participant too, under a
  * Gather Merge, as create_ordered_paths() sorts it: each participant's
  * sort bounded as the whole one is, the LIMIT's rows being among each
- * one's first.
+ * one's first.  The input's cheapest path is taken where the planner's
+ * paths still hold it (live_input()); where a sort of it lost to another
+ * path, or it was in the order already and lost, only the partial path is
+ * sorted.
  */
 void
 vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 					VexecPlanState *ps, const char *target_name)
 {
 	VexecAlt   *alt = NULL;
-	Path	   *input = input_rel->cheapest_total_path;
+	Path	   *input;
 	Path	   *pinput = NULL;
+	Path	   *base;
+	double		rows;
 	bool		add = ps->mode == VEXEC_MODE_AUTO || ps->mode == VEXEC_MODE_FORCE;
-	SortPath   *rowpath;
+	SortPath   *rowpath = NULL;
+	SortPath   *prow = NULL;
+	VexecCost	pcost;
 	List	   *newpaths;
 	VexecSteps	steps;
 	VexecCost	cost;
@@ -318,12 +373,19 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 		vexec_alt_refuse(ps, alt, "vexec.enable_sort is off");
 		return;
 	}
-	if (input == NULL || PATH_REQ_OUTER(input) != NULL)
+	/*
+	 * The input's cheapest path, where the planner's ordered paths still hold
+	 * it (live_input()).  Where they do not -- its Sort lost to the Gather
+	 * Merge of a parallel plan, or it was in the order already and lost --
+	 * only the input's partial path is sorted, under a Gather Merge.
+	 */
+	input = live_input(input_rel->cheapest_total_path, output_rel);
+	if (input != NULL && PATH_REQ_OUTER(input) != NULL)
 	{
 		vexec_alt_refuse(ps, alt, "a parameterized input");
 		return;
 	}
-	if (pathkeys_contained_in(root->sort_pathkeys, input->pathkeys))
+	if (input != NULL && pathkeys_contained_in(root->sort_pathkeys, input->pathkeys))
 	{
 		vexec_alt_refuse(ps, alt, "its input is in the order already");
 		return;
@@ -340,21 +402,28 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 	{
 		pinput = linitial(input_rel->partial_pathlist);
 		if (PATH_REQ_OUTER(pinput) != NULL ||
-			!equal(pinput->pathtarget->exprs, input->pathtarget->exprs) ||
+			(input != NULL && !equal(pinput->pathtarget->exprs, input->pathtarget->exprs)) ||
 			pathkeys_contained_in(root->sort_pathkeys, pinput->pathkeys))
 			pinput = NULL;
 	}
-	saving = late_saving(root, input, bound);
+	if (input == NULL && pinput == NULL)
+	{
+		vexec_alt_refuse(ps, alt, "no path of its input that the planner's ordered paths still hold, and no partial one");
+		return;
+	}
+	base = input != NULL ? input : pinput;
+	rows = input != NULL ? input->rows : pinput->rows * vexec_parallel_divisor(pinput);
+	saving = input != NULL ? late_saving(root, input, bound) : 0;
 	psaving = pinput != NULL ? late_saving(root, pinput, bound) : 0;
 
-	if (ps->mode != VEXEC_MODE_FORCE && input->rows < vexec_min_rows && saving <= 0 && psaving <= 0)
+	if (ps->mode != VEXEC_MODE_FORCE && rows < vexec_min_rows && saving <= 0 && psaving <= 0)
 	{
-		vexec_alt_refuse(ps, alt, psprintf("%.0f input rows, fewer than vexec.min_rows", input->rows));
+		vexec_alt_refuse(ps, alt, psprintf("%.0f input rows, fewer than vexec.min_rows", rows));
 		return;
 	}
 	memset(&steps, 0, sizeof(steps));
 	vexec_oracle_exprs(root, (List *) over_columns_mutator((Node *) target->exprs,
-														   input->pathtarget->exprs),
+														   base->pathtarget->exprs),
 					   &steps);
 	if (steps.refusal)
 	{
@@ -362,35 +431,40 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 		return;
 	}
 
-	rowpath = create_sort_path(root, output_rel, input, root->sort_pathkeys,
-							   bound > 0 ? (double) bound : -1.0);
-	vexec_cost_sort(root, &rowpath->path, input, vexec_is_vector_path(input), &cost);
-	if (bound > 0 && vexec_agg_path_ranks(input))
-		vexec_cost_topn(&cost, input, bound);	/* C3 */
-	cost.startup -= saving;
-	cost.total -= saving;
-	vexec_alt_costed(ps, alt, &cost,
-					 psprintf("%s%s", count_of(list_length(root->sort_pathkeys), "sort key", "sort keys"),
-							  bound > 0 ? psprintf(", bounded at " INT64_FORMAT, bound) : ""));
-	if (!add)
-		return;
-	newpaths = list_make1(vecsort_path(output_rel, target, rowpath, &cost, bound, false));
-
+	if (input != NULL)
+	{
+		rowpath = create_sort_path(root, output_rel, input, root->sort_pathkeys,
+								   bound > 0 ? (double) bound : -1.0);
+		vexec_cost_sort(root, &rowpath->path, input, vexec_is_vector_path(input), &cost);
+		if (bound > 0 && vexec_agg_path_ranks(input))
+			vexec_cost_topn(&cost, input, bound);	/* C3 */
+		cost.startup -= saving;
+		cost.total -= saving;
+	}
 	if (pinput != NULL)
 	{
-		SortPath   *prow = create_sort_path(root, output_rel, pinput, root->sort_pathkeys,
-											bound > 0 ? (double) bound : -1.0);
-		VexecCost	pcost;
-		Path	   *psort;
-		double		total;
-
+		prow = create_sort_path(root, output_rel, pinput, root->sort_pathkeys,
+								bound > 0 ? (double) bound : -1.0);
 		vexec_cost_sort(root, &prow->path, pinput, vexec_is_vector_path(pinput), &pcost);
 		if (bound > 0 && vexec_agg_path_ranks(pinput))
 			vexec_cost_topn(&pcost, pinput, bound);	/* C3 */
 		pcost.startup -= psaving;
 		pcost.total -= psaving;
-		psort = vecsort_path(output_rel, target, prow, &pcost, bound, psaving > 0);
-		total = compute_gather_rows(psort);
+	}
+	vexec_alt_costed(ps, alt, input != NULL ? &cost : &pcost,
+					 psprintf("%s%s%s", count_of(list_length(root->sort_pathkeys), "sort key", "sort keys"),
+							  bound > 0 ? psprintf(", bounded at " INT64_FORMAT, bound) : "",
+							  input != NULL ? "" : "; in each participant alone"));
+	if (!add)
+		return;
+	newpaths = NIL;
+	if (input != NULL)
+		newpaths = lappend(newpaths, vecsort_path(output_rel, target, rowpath, &cost, bound, false));
+	if (pinput != NULL)
+	{
+		Path	   *psort = vecsort_path(output_rel, target, prow, &pcost, bound, psaving > 0);
+		double		total = compute_gather_rows(psort);
+
 		newpaths = lappend(newpaths,
 						   create_gather_merge_path(root, output_rel, psort, target,
 													root->sort_pathkeys, NULL, &total));

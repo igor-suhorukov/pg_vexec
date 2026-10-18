@@ -38,10 +38,10 @@
 #                 default: so the suite's rows without an ORDER BY, and its
 #                 tables made by CREATE TABLE AS, come in another order,
 #                 its plans printed by functions differ, a parallel index
-#                 build meets vacuum's VACUUM FULL pg_class in a deadlock,
-#                 and parallel-force meets a crash of vexec's on the
-#                 planner's route (a catalog query, on gp_orca without the
-#                 one-node Gathers too, 2026-10-18)
+#                 build meets vacuum's VACUUM FULL pg_class in a deadlock
+#                 (parallel-force met a crash of vexec's on the planner's
+#                 route too, a freed path read: fixed in plan/sort.c's
+#                 live_input(), vexec_sort's check of it)
 #
 # Each session runs on a server of its own, made afresh, as the port's suite
 # runs PostgreSQL's tests on one, with every connection's settings in

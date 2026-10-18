@@ -203,6 +203,41 @@ SELECT sort_check('SELECT id, t, n FROM so ORDER BY n DESC, t, id OFFSET 100 LIM
 SELECT sort_check('SELECT id, d, f FROM so WHERE s < 10 ORDER BY d, f NULLS FIRST, id');
 SELECT sort_explain('SELECT id, t, n FROM so WHERE k < 5000 ORDER BY t, n, id LIMIT 20',
                     'Gather Merge|Vec Sort|Bound|Sort Method');
+
+-- the input's cheapest path freed before VecSort is considered:
+-- create_ordered_paths() hands a path already in the order -- here the
+-- Gather Merge the scan's relation made -- to the ordered relation itself,
+-- whose own Gather Merge of fewer rows then beats it and add_path() frees
+-- it, while the scan's relation still names it its cheapest.  The parallel
+-- plan a third of a per cent under the serial one makes it so: the plain
+-- Gather loses to the serial scan, the Gather Merge does not.  VecSort's
+-- alternative sorts the partial path alone then, and reads nothing freed.
+CREATE TABLE sfree AS SELECT g AS id, 'n' || (g % 1000) AS s FROM generate_series(1, 200000) g;
+ANALYZE sfree;
+CREATE FUNCTION sfree_cost() RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE
+	plan json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM sfree WHERE id IN (5, 100, 2000)' INTO plan;
+	RETURN (plan->0->'Plan'->>'Total Cost')::float8;
+END $$;
+SET vexec.mode = off;
+SET max_parallel_workers_per_gather = 0;
+SELECT sfree_cost() AS sfree_serial \gset
+SET max_parallel_workers_per_gather = 2;
+SELECT sfree_cost() AS sfree_parallel \gset
+SELECT :sfree_serial - :sfree_parallel - 0.003 * :sfree_serial AS sfree_setup \gset
+SET parallel_setup_cost = :sfree_setup;
+SET vexec.mode = explain;
+SET vexec.min_rows = 0;
+EXPLAIN (VEXEC, COSTS OFF) SELECT * FROM sfree WHERE id IN (5, 100, 2000) ORDER BY s;
+RESET vexec.min_rows;
+SET vexec.mode = auto;
+SELECT * FROM sfree WHERE id IN (5, 100, 2000) ORDER BY s;
+SELECT sort_check('SELECT * FROM sfree WHERE id IN (5, 100, 2000) ORDER BY s');
+SET vexec.mode = force;
+DROP TABLE sfree;
+DROP FUNCTION sfree_cost();
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
