@@ -239,6 +239,14 @@ struct VexecAggState
 								 * NULL */
 	uint32		last_hash;		/* the hash of the group last returned */
 	int		   *rows;			/* the batch's rows to take, in order */
+
+	/*
+	 * VC5: per key, the hashes of a dictionary key's values, for the
+	 * dictionary of that identity (D6): a value's hash computed once for
+	 * every batch that comes with it
+	 */
+	uint64	   *dict_hash_ids;
+	uint32	  **dict_hashes;
 	char	   *probe_group;	/* stands for the probe in the table */
 
 	/* the columns a group keeps from its first row */
@@ -679,8 +687,46 @@ probe_set(VexecAggKeyCol *k, VexecAggProbe *p, Datum d, bool isnull)
 }
 
 /*
+ * VC5: the hashes of a dictionary key column's values, as key_hash() gives
+ * them, kept for the dictionary's identity; NULL where it has none and more
+ * values than the rows they answer, whose hashes are then a row's each.
+ */
+static const uint32 *
+dict_key_hashes(VexecAggState *s, int key, const VexecVec *v, int nrows)
+{
+	const VexecVec *d = v->dictionary;
+	uint32	   *h;
+	int			i;
+
+	if (s->dict_hashes == NULL)
+	{
+		s->dict_hash_ids = MemoryContextAllocZero(s->node.mcxt, sizeof(uint64) * s->nkeys);
+		s->dict_hashes = MemoryContextAllocZero(s->node.mcxt, sizeof(uint32 *) * s->nkeys);
+	}
+	if (v->dict_id != 0 && s->dict_hash_ids[key] == v->dict_id)
+		return s->dict_hashes[key];
+	if (v->dict_id == 0 && d->nvalues > nrows)
+		return NULL;
+	if (s->dict_hashes[key])
+		pfree(s->dict_hashes[key]);
+	h = MemoryContextAlloc(s->node.mcxt, sizeof(uint32) * Max(d->nvalues, 1));
+	for (i = 0; i < d->nvalues; i++)
+	{
+		const char *bytes;
+		Size		len;
+
+		vexec_vec_value_bytes(d, i, &bytes, &len);
+		h[i] = vexec_hash_bytes(bytes, (int) len);
+	}
+	s->dict_hashes[key] = h;
+	s->dict_hash_ids[key] = v->dict_id;
+	return h;
+}
+
+/*
  * The keys and hashes of a batch's rows, a key column at a time: integers
- * read from their array, Arrow's bytes where they are, any other value as
+ * read from their array, Arrow's bytes where they are -- a dictionary's at
+ * the rows' codes, their hashes its values' (VC5) -- any other value as
  * its Datum.  The rows are those of `rows`, in the batch.
  */
 static void
@@ -704,6 +750,10 @@ batch_keys(VexecAggState *s, const int *rows, int nlist)
 			v->shape.stride == v->shape.width && v->shape.width == k->typlen;
 		bool		views = k->kind == KEY_BYTES && v->encoding == VEXEC_FLAT &&
 			(v->shape.layout == VEXEC_VIEW || v->shape.layout == VEXEC_OFFSETS);
+		bool		dict = k->kind == KEY_BYTES && v->encoding == VEXEC_DICT &&
+			(v->dictionary->shape.layout == VEXEC_VIEW ||
+			 v->dictionary->shape.layout == VEXEC_OFFSETS);
+		const uint32 *dhash = dict && hashes == NULL ? dict_key_hashes(s, i, v, nlist) : NULL;
 
 		for (j = 0; j < nlist; j++)
 		{
@@ -735,6 +785,24 @@ batch_keys(VexecAggState *s, const int *rows, int nlist)
 					vexec_vec_value_bytes(v, row, &bytes, &len);
 					p->bytes = bytes;
 					p->len = (int32) len;
+				}
+			}
+			else if (dict)
+			{
+				p->isnull = vexec_vec_isnull(v, row);
+				if (!p->isnull)
+				{
+					const char *bytes;
+					Size		len;
+
+					vexec_vec_value_bytes(v->dictionary, v->codes[row], &bytes, &len);
+					p->bytes = bytes;
+					p->len = (int32) len;
+					if (dhash != NULL)
+					{
+						s->rowhash[row] = h ^ dhash[v->codes[row]];
+						continue;
+					}
 				}
 			}
 			else

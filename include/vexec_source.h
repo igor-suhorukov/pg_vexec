@@ -46,7 +46,8 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		2	/* 1: aggregate; 2: set_keys */
+#define VEXEC_SOURCE_MINOR		3	/* 1: aggregate; 2: set_keys; 3:
+									 * dictionary_id */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -104,6 +105,12 @@ typedef enum VexecEncoding
  *			pair must still lie in the buffer, as Arrow's does.
  *	VIEW	the views, and buffers and buffer_sizes for the bytes past 12.
  *
+ * A DICT column (VEXEC_SRC_DICT asks for one) has a code a row, each in
+ * [0, ndictionary), and validity a bit a row; its dictionary is FLAT, in
+ * one of the layouts above, and holds no NULL: a NULL row is one whose
+ * validity bit is clear, its code any of the dictionary's.  vexec checks
+ * both.
+ *
  * vexec ignores the fields a layout does not read: a source may leave them
  * as it likes.
  */
@@ -131,7 +138,9 @@ typedef struct VexecColumn
 /* VexecSourceSpec.flags */
 #define VEXEC_SRC_COMPACT	0x0001	/* hand only visible rows */
 #define VEXEC_SRC_TIDS		0x0002	/* fill VexecSourceBatch.tids */
-#define VEXEC_SRC_DICT		0x0004	/* dictionary columns are welcome */
+#define VEXEC_SRC_DICT		0x0004	/* dictionary columns are welcome: a
+									 * column of a type's bytes, its
+									 * dictionary in the layout asked */
 
 /* What a scan asks of a source. */
 typedef struct VexecSourceSpec
@@ -250,6 +259,21 @@ typedef struct VexecSourceRoutine
 	 * Called between batches; the source copies what it keeps of them.
 	 */
 	void		(*set_keys) (void *state, int nkeys, const ScanKeyData *keys);
+
+	/*
+	 * Optional, from minor version 3: the identity of the dictionary of
+	 * column `column` (0..ncolumns-1 of the spec) of the batch next() last
+	 * handed, a VEXEC_DICT column.  Two batches of the scan whose
+	 * dictionaries have one nonzero identity have the same values in them,
+	 * at the same codes -- a dictionary the storage shares between its
+	 * batches, as ClickHouse's LowCardinality shares one between a part's
+	 * granules -- so that what vexec computed from a dictionary's values
+	 * holds for every batch that comes with it.  An identity is never given
+	 * to another dictionary while the process runs; 0 is none, and the
+	 * dictionary is taken as new.  Called after next(), before the next
+	 * call.
+	 */
+	uint64		(*dictionary_id) (void *state, int column);
 } VexecSourceRoutine;
 
 /*

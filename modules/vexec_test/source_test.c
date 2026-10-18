@@ -4,7 +4,7 @@
  * source_test.c
  *	  vexec_test_am, a table access method of the tests, and its batch
  *	  source and sink with every member of their contracts (vexec_source.h
- *	  at minor 2, vexec_sink.h), so that vexec's suite tests the contracts
+ *	  at minor 3, vexec_sink.h), so that vexec's suite tests the contracts
  *	  on vanilla PostgreSQL, where no storage module registers either
  *	  (ch_table_engines.md §3, VC9).
  *
@@ -27,7 +27,14 @@
  *					MergeTree hands its strings, under
  *					vexec_test.source_text_offsets (VC14); the TIDs heap
  *					gave; each batch's arrays its own, written over by the
- *					next unless retained
+ *					next unless retained.  Under
+ *					vexec_test.source_dictionaries, where vexec asks for
+ *					dictionaries, a varlena column is DICT: a dictionary of
+ *					the unit's distinct values (their detoasted bytes, in
+ *					their bytes' order), as DATUM or OFFSETS -- the last
+ *					unit's, where it has the same values (VC5)
+ *	dictionary_id()	a dictionary's, the same for every batch of every unit
+ *					that has it
  *	aggregate()		count(*), count(x), and min(x), max(x) and sum(x) of the
  *					integers, from the next unit's statistics, which is then
  *					passed over as read
@@ -56,6 +63,7 @@
 #include "access/tableam.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
+#include "common/hashfn.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -85,19 +93,25 @@ typedef enum Member
 {
 	M_SUPPORTS, M_BEGIN, M_NEXT, M_RETAIN, M_RELEASE, M_RESCAN, M_END, M_ESTIMATE, M_AGGREGATE,
 	M_AGGREGATE_ANSWERED, M_SET_KEYS, M_UNITS_PASSED, M_SINK_SUPPORTS, M_SINK_BEGIN, M_SINK_PUT,
-	M_SINK_END, NMEMBERS
+	M_SINK_END, M_DICTIONARY_ID, M_DICTIONARIES, NMEMBERS
 } Member;
 
 static const char *const member_names[NMEMBERS] = {
 	"supports", "begin", "next", "retain", "release", "rescan", "end", "estimate", "aggregate",
 	"aggregate answered", "set_keys", "units passed by keys", "sink supports", "sink begin",
-	"sink put", "sink end"
+	"sink put", "sink end", "dictionary_id", "dictionaries made"
 };
 
 static int64 calls[NMEMBERS];
 
 /* vexec_test.source_text_offsets: varlena columns handed as OFFSETS */
 static bool text_offsets = false;
+
+/* vexec_test.source_dictionaries: varlena columns handed as DICT where asked */
+static bool dictionaries = false;
+
+/* The last dictionary's identity, in this backend */
+static uint64 last_dictionary = 0;
 
 /*
  * A TOAST table of the access method's is heap's own: heap's callback gives
@@ -140,6 +154,19 @@ typedef struct ColStats
 	int128		sum;
 } ColStats;
 
+/*
+ * A dictionary of a varlena column: a unit's distinct values in their bytes'
+ * order, in the source's memory, for as many units as have those values
+ */
+typedef struct UnitDict
+{
+	VexecColumn values;			/* DATUM or OFFSETS, no NULL */
+	int			nvalues;
+	char	  **bytes;			/* each value's, and its length */
+	int		   *lens;
+	uint64		id;
+} UnitDict;
+
 /* A unit read ahead: its rows' values of the spec's columns, and their TIDs */
 typedef struct Unit
 {
@@ -149,6 +176,8 @@ typedef struct Unit
 	bool	   *nulls;
 	ItemPointerData *tids;
 	ColStats   *stats;
+	UnitDict  **dicts;			/* per column, where it is handed as DICT */
+	int32	  **codes;			/* and the rows' codes into it; a NULL row's 0 */
 	int			refs;			/* retained batches pointing into it */
 	bool		current;		/* the source's own, still being handed */
 } Unit;
@@ -173,6 +202,8 @@ typedef struct SrcState
 	int			ncols;
 	AttrNumber *attnums;
 	uint8	   *layouts;		/* what each is handed in: FIXED, BYTE_BOOL or DATUM */
+	bool	   *dict;			/* per column: handed as DICT */
+	UnitDict  **last_dict;		/* per column: the last unit's dictionary */
 	bool		tids;
 	bool		compact;
 	int			max_rows;
@@ -216,6 +247,8 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 	st->compact = (spec->flags & VEXEC_SRC_COMPACT) != 0;
 	st->attnums = palloc(sizeof(AttrNumber) * Max(spec->ncolumns, 1));
 	st->layouts = palloc(Max(spec->ncolumns, 1));
+	st->dict = palloc0(sizeof(bool) * Max(spec->ncolumns, 1));
+	st->last_dict = palloc0(sizeof(UnitDict *) * Max(spec->ncolumns, 1));
 	for (int i = 0; i < spec->ncolumns; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(st->desc, spec->attnums[i] - 1);
@@ -224,6 +257,7 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 		st->layouts[i] = att->atttypid == BOOLOID ? VEXEC_BYTE_BOOL :
 			att->attlen > 0 ? VEXEC_FIXED :
 			att->attlen == -1 && text_offsets ? VEXEC_OFFSETS : VEXEC_DATUM;
+		st->dict[i] = dictionaries && (spec->flags & VEXEC_SRC_DICT) != 0 && att->attlen == -1;
 	}
 	st->ncols = spec->ncolumns;
 	if (spec->nkeys > 0)
@@ -350,6 +384,165 @@ unit_add(SrcState *st, Unit *u, TupleTableSlot *slot)
 	MemoryContextSwitchTo(old);
 }
 
+/* Two values' bytes in their order: memcmp's, then the shorter first */
+static int
+bytes_cmp(const char *a, int alen, const char *b, int blen)
+{
+	int			c = memcmp(a, b, Min(alen, blen));
+
+	return c != 0 ? c : (alen > blen) - (alen < blen);
+}
+
+static int
+plain_cmp(const void *x, const void *y, void *arg)
+{
+	varlena   **plain = arg;
+	const varlena *a = plain[*(const int *) x];
+	const varlena *b = plain[*(const int *) y];
+
+	return bytes_cmp(VARDATA_ANY(a), VARSIZE_ANY_EXHDR(a), VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));
+}
+
+/*
+ * A unit's dictionary of column i and its rows' codes: its distinct values,
+ * matched by their detoasted bytes, in their bytes' order -- the last
+ * unit's dictionary where it holds the same values; NULL where every row is
+ * NULL.
+ */
+static UnitDict *
+unit_dict(SrcState *st, Unit *u, int i, int32 **codes_out)
+{
+	MemoryContext old = MemoryContextSwitchTo(u->cxt);
+	UnitDict   *d;
+	UnitDict   *last = st->last_dict[i];
+	int			nslots = 2048;
+	int		   *slots = palloc(sizeof(int) * nslots);
+	int		   *first = palloc(sizeof(int) * Max(u->nrows, 1));
+	int		   *rank = palloc(sizeof(int) * Max(u->nrows, 1));
+	varlena   **plain = palloc0(sizeof(varlena *) * Max(u->nrows, 1));
+	int32	   *codes = palloc0(sizeof(int32) * Max(u->nrows, 1));
+	int			nvals = 0;
+	bool		same;
+
+	Assert(u->nrows <= UNIT_ROWS && nslots >= 2 * UNIT_ROWS);
+	memset(slots, -1, sizeof(int) * nslots);
+	for (int r = 0; r < u->nrows; r++)
+	{
+		uint32		h;
+		int			k;
+
+		if (u->nulls[r * st->ncols + i])
+			continue;
+		plain[r] = pg_detoast_datum_packed((varlena *) DatumGetPointer(u->values[r * st->ncols + i]));
+		h = hash_bytes((const unsigned char *) VARDATA_ANY(plain[r]), VARSIZE_ANY_EXHDR(plain[r]));
+		for (k = h & (nslots - 1);; k = (k + 1) & (nslots - 1))
+		{
+			int			f = slots[k];
+
+			if (f < 0)
+			{
+				slots[k] = r;
+				first[nvals] = r;
+				codes[r] = nvals++;
+				break;
+			}
+			if (bytes_cmp(VARDATA_ANY(plain[f]), VARSIZE_ANY_EXHDR(plain[f]),
+						  VARDATA_ANY(plain[r]), VARSIZE_ANY_EXHDR(plain[r])) == 0)
+			{
+				codes[r] = codes[f];
+				break;
+			}
+		}
+	}
+	*codes_out = codes;
+	if (nvals == 0)
+	{
+		MemoryContextSwitchTo(old);
+		return NULL;
+	}
+
+	/* the values in their bytes' order, the codes their places in it */
+	{
+		int		   *order = palloc(sizeof(int) * nvals);
+
+		for (int v = 0; v < nvals; v++)
+			order[v] = first[v];
+		qsort_arg(order, nvals, sizeof(int), plain_cmp, plain);
+		for (int v = 0; v < nvals; v++)
+		{
+			rank[codes[order[v]]] = v;
+			first[v] = order[v];
+		}
+		for (int r = 0; r < u->nrows; r++)
+			codes[r] = u->nulls[r * st->ncols + i] ? 0 : rank[codes[r]];
+	}
+
+	same = last != NULL && last->nvalues == nvals;
+	for (int v = 0; v < nvals && same; v++)
+		same = bytes_cmp(last->bytes[v], last->lens[v], VARDATA_ANY(plain[first[v]]),
+						 VARSIZE_ANY_EXHDR(plain[first[v]])) == 0;
+	if (same)
+	{
+		MemoryContextSwitchTo(old);
+		return last;
+	}
+
+	/* a new dictionary, in the source's memory: later units may share it */
+	MemoryContextSwitchTo(st->cxt);
+	d = palloc0(sizeof(UnitDict));
+	d->nvalues = nvals;
+	d->bytes = palloc(sizeof(char *) * nvals);
+	d->lens = palloc(sizeof(int) * nvals);
+	for (int v = 0; v < nvals; v++)
+	{
+		d->lens[v] = VARSIZE_ANY_EXHDR(plain[first[v]]);
+		d->bytes[v] = palloc(Max(d->lens[v], 1));
+		memcpy(d->bytes[v], VARDATA_ANY(plain[first[v]]), d->lens[v]);
+	}
+	d->values.layout = st->layouts[i];
+	d->values.encoding = VEXEC_FLAT;
+	if (st->layouts[i] == VEXEC_OFFSETS)
+	{
+		int32	   *off = palloc(sizeof(int32) * (nvals + 1));
+		const void **buffers = palloc(sizeof(void *));
+		int64	   *sizes = palloc(sizeof(int64));
+		StringInfoData all;
+
+		initStringInfo(&all);
+		off[0] = 0;
+		for (int v = 0; v < nvals; v++)
+		{
+			appendBinaryStringInfo(&all, d->bytes[v], d->lens[v]);
+			off[v + 1] = all.len;
+		}
+		buffers[0] = all.data;
+		sizes[0] = all.len;
+		d->values.values = off;
+		d->values.buffers = buffers;
+		d->values.buffer_sizes = sizes;
+		d->values.nbuffers = 1;
+	}
+	else
+	{
+		Datum	   *vals = palloc(sizeof(Datum) * nvals);
+
+		for (int v = 0; v < nvals; v++)
+		{
+			varlena    *vl = palloc(VARHDRSZ + d->lens[v]);
+
+			SET_VARSIZE(vl, VARHDRSZ + d->lens[v]);
+			memcpy(VARDATA(vl), d->bytes[v], d->lens[v]);
+			vals[v] = PointerGetDatum(vl);
+		}
+		d->values.values = vals;
+	}
+	d->id = ++last_dictionary;
+	calls[M_DICTIONARIES]++;
+	st->last_dict[i] = d;
+	MemoryContextSwitchTo(old);
+	return d;
+}
+
 /* The next unit read ahead, with its statistics, past those the keys rule out; false at the scan's end */
 static bool
 load_unit(SrcState *st)
@@ -381,6 +574,11 @@ load_unit(SrcState *st)
 			continue;
 		}
 		u->current = true;
+		u->dicts = MemoryContextAllocZero(u->cxt, sizeof(UnitDict *) * Max(st->ncols, 1));
+		u->codes = MemoryContextAllocZero(u->cxt, sizeof(int32 *) * Max(st->ncols, 1));
+		for (int i = 0; i < st->ncols; i++)
+			if (st->dict[i])
+				u->dicts[i] = unit_dict(st, u, i, &u->codes[i]);
 		st->unit = u;
 		st->pos = 0;
 		return true;
@@ -441,7 +639,21 @@ src_next(void *arg, VexecSourceBatch *batch)
 				validity[r / 64] &= ~(UINT64CONST(1) << (r % 64));
 			}
 		c->validity = validity;
-		if (c->layout == VEXEC_DATUM)
+		if (u->dicts[i] != NULL)
+		{
+			/* the unit's dictionary, and the rows' codes into it */
+			*c = u->dicts[i]->values;
+			c->encoding = VEXEC_DICT;
+			c->validity = validity;
+			c->values = NULL;
+			c->buffers = NULL;
+			c->buffer_sizes = NULL;
+			c->nbuffers = 0;
+			c->codes = u->codes[i] + st->pos;
+			c->dictionary = &u->dicts[i]->values;
+			c->ndictionary = u->dicts[i]->nvalues;
+		}
+		else if (c->layout == VEXEC_DATUM)
 		{
 			Datum	   *d = palloc(sizeof(Datum) * Max(n, 1));
 
@@ -555,6 +767,19 @@ src_rescan(void *arg)
 	unit_done(st);
 	st->done = false;
 	st->nkeys = st->nspec_keys;
+}
+
+/* The identity of the dictionary of a column of the last batch: its unit's (minor 3) */
+static uint64
+src_dictionary_id(void *arg, int column)
+{
+	SrcState   *st = arg;
+
+	calls[M_DICTIONARY_ID]++;
+	if (st->out == NULL || st->out->unit == NULL || column < 0 || column >= st->ncols ||
+		st->out->unit->dicts == NULL || st->out->unit->dicts[column] == NULL)
+		return 0;
+	return st->out->unit->dicts[column]->id;
 }
 
 static void
@@ -796,6 +1021,7 @@ static VexecSourceRoutine source = {
 	.estimate = src_estimate,
 	.aggregate = src_aggregate,
 	.set_keys = src_set_keys,
+	.dictionary_id = src_dictionary_id,
 };
 
 static VexecSinkRoutine sink = {
@@ -817,6 +1043,10 @@ _PG_init(void)
 	DefineCustomBoolVariable("vexec_test.source_text_offsets",
 							 "Hands the test source's varlena columns as int32 offsets into their bytes.",
 							 NULL, &text_offsets, false,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec_test.source_dictionaries",
+							 "Hands the test source's varlena columns as a unit's dictionary, where vexec asks for dictionaries.",
+							 NULL, &dictionaries, false,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	if (!process_shared_preload_libraries_in_progress)
 		return;

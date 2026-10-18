@@ -13,7 +13,7 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
 -----------------------------+---------------------------+------+------------+---------+---------+--------------+-----------------------------+---------
  vexec.aggregate_statistics  | on                        |      | user       | bool    |         |              |                             | f
  vexec.batch_bool_layout     | format                    |      | user       | enum    |         |              | {format,byte,bit}           | t
- vexec.batch_dictionary      | off                       |      | user       | bool    |         |              |                             | f
+ vexec.batch_dictionary      | on                        |      | user       | bool    |         |              |                             | t
  vexec.batch_format          | postgres                  |      | user       | enum    |         |              | {postgres,arrow}            | t
  vexec.batch_numeric_layout  | format                    |      | user       | enum    |         |              | {format,scaled,varlena}     | t
  vexec.batch_setup_cost      | 1                         |      | user       | real    | 0       | 1.79769e+308 |                             | t

@@ -633,8 +633,11 @@ convert_flat(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 
 /*
  * Convert a column to another shape of its type.  A dictionary's values
- * are converted and its codes kept; a constant's one value.  False, and the
- * column unchanged, when its values cannot be held in that shape.
+ * are converted and its codes kept; a constant's one value.  A dictionary
+ * of more values than its rows -- a source's, shared by many batches (VC5)
+ * -- is converted as those rows, made flat first, so that no batch converts
+ * more values than it has rows.  False, and the column unchanged but for
+ * that, when its values cannot be held in that shape.
  */
 bool
 vexec_vec_convert(VexecBatch *batch, VexecVec *v, const VexecShape *to)
@@ -642,6 +645,8 @@ vexec_vec_convert(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 	if (vexec_shape_equal(&v->shape, to))
 		return true;
 	vexec_batch_column_changed(batch, v);
+	if (v->encoding == VEXEC_DICT && v->dictionary->nvalues > v->nvalues)
+		vexec_vec_flatten(batch, v);
 	if (v->encoding == VEXEC_DICT)
 	{
 		/* a dictionary of its own: copies of a column share theirs */
@@ -775,7 +780,7 @@ vexec_vec_convert_rows(VexecBatch *batch, VexecVec *v, const VexecShape *to,
 
 	if (vexec_shape_equal(&v->shape, to))
 		return true;
-	if (rows == NULL || v->encoding != VEXEC_FLAT || to->layout != VEXEC_DATUM ||
+	if (rows == NULL || v->encoding == VEXEC_CONST || to->layout != VEXEC_DATUM ||
 		(v->shape.layout != VEXEC_VIEW && v->shape.layout != VEXEC_OFFSETS))
 		return vexec_vec_convert(batch, v, to);
 
@@ -794,10 +799,15 @@ vexec_vec_convert_rows(VexecBatch *batch, VexecVec *v, const VexecShape *to,
 			word &= word - 1;
 			if (i >= n || !valid(v, i))
 				continue;
+			/* a dictionary's row, through its code (VC5) */
 			out[i] = vexec_vec_datum(batch, v, i, &isnull);
 			vexec_bit_set(validity, i);
 		}
 	}
+	v->encoding = VEXEC_FLAT;
+	v->codes = NULL;
+	v->dictionary = NULL;
+	v->dict_id = 0;
 	v->values = out;
 	v->validity = validity;
 	v->datums = NULL;

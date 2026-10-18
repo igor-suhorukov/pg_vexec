@@ -406,6 +406,19 @@ offsets_buffer_init(VexecBatch *batch, VexecVec *v, int64 size)
 }
 
 /*
+ * A dictionary's identity (VexecVec.dict_id): never given twice in the
+ * process.  VecScan gives one for each dictionary its source names, and a
+ * subtree evaluated over a dictionary's values one for its results (VC5).
+ */
+uint64
+vexec_dict_new_id(void)
+{
+	static uint64 last = 0;
+
+	return ++last;
+}
+
+/*
  * Turn a constant or dictionary-encoded column into a flat one, in the
  * shape of its values.
  */

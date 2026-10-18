@@ -81,7 +81,7 @@ int			vexec_batch_varlena_layout = VEXEC_VARLENA_FORMAT;
 int			vexec_batch_bool_layout = VEXEC_BOOL_FORMAT;
 int			vexec_batch_temporal_layout = VEXEC_TEMPORAL_FORMAT;
 int			vexec_batch_numeric_layout = VEXEC_NUMERIC_FORMAT;
-bool		vexec_batch_dictionary = false;
+bool		vexec_batch_dictionary = true;
 
 /* the GPU tier (§3.11): off at every level by default */
 int			vexec_gpu = VEXEC_GPU_OFF;
@@ -469,8 +469,12 @@ define_settings(void)
 							 NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.batch_dictionary",
 							 "Lets sources hand dictionary-encoded columns.",
-							 NULL, &vexec_batch_dictionary, false,
-							 PGC_USERSET, 0, NULL, NULL, NULL);
+							 "A vector scan asks its source for the columns it keeps as dictionaries "
+							 "-- ch_table_engines' LowCardinality columns -- as their codes and "
+							 "dictionaries, and evaluates an expression of one such column over the "
+							 "dictionary's values, once for every batch that comes with it.",
+							 &vexec_batch_dictionary, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 
 	DefineCustomEnumVariable("vexec.gpu",
 							 "Whether GPU-eligible subtrees run on a GPU.",

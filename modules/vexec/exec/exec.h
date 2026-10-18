@@ -316,6 +316,9 @@ typedef struct VexecNodeStats
 	int64		text_converted; /* VC14: rows of text kept as a source handed
 								 * it, made the format's for PostgreSQL's
 								 * evaluator */
+	int64		dict_values;	/* VC5: dictionary values subtrees were
+								 * evaluated over */
+	int64		dict_rows;		/* VC5: rows those results answered */
 } VexecNodeStats;
 
 struct VexecNode

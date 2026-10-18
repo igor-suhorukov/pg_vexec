@@ -88,8 +88,8 @@ DROP DOMAIN vexec_price;
 -- the sources registered for this database's access methods: none before an
 -- extension makes one (vexec_source tests vexec_test's)
 SELECT * FROM vexec.sources() WHERE access_method IS NOT NULL;
- source | access_method | minor | estimates | aggregates | bounds 
---------+---------------+-------+-----------+------------+--------
+ source | access_method | minor | estimates | aggregates | bounds | dictionaries 
+--------+---------------+-------+-----------+------------+--------+--------------
 (0 rows)
 
 -- and the sinks: none either (§3.16)

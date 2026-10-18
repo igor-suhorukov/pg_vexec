@@ -147,6 +147,15 @@ typedef struct VexecScanState
 	int			kept_cols;
 
 	/*
+	 * VC5: per column, the identity the source gave its last dictionary
+	 * (dictionary_id()) and vexec's for it, and the batches whose columns
+	 * came as dictionaries
+	 */
+	uint64	   *dict_src_ids;
+	uint64	   *dict_ids;
+	int64		dict_batches;
+
+	/*
 	 * X3: the leading quals heap's page reader checks on a tuple before
 	 * deforming it (source/prefilter.c): the checks, how many of the quals
 	 * they stand for, and the rows they dropped that EXPLAIN ANALYZE counted
@@ -581,6 +590,16 @@ begin_scan(VexecScanState *s)
 		spec->quals = pruning_quals((CustomScan *) s->node.css.ss.ps.plan);
 		spec->max_rows = VEXEC_BATCH_ROWS;
 		spec->flags = s->need_tid ? VEXEC_SRC_TIDS : 0;
+		/* VC5: a source that keeps a column as a dictionary hands it so */
+		if (vexec_batch_dictionary)
+		{
+			spec->flags |= VEXEC_SRC_DICT;
+			if (s->dict_ids == NULL)
+			{
+				s->dict_src_ids = palloc0(sizeof(uint64) * Max(s->nattrs, 1));
+				s->dict_ids = palloc0(sizeof(uint64) * Max(s->nattrs, 1));
+			}
+		}
 		s->srcstate = s->src->begin(s->scan, spec);
 		return;
 	}
@@ -725,6 +744,49 @@ fetch_slots(VexecScanState *s)
 	return in->nrows > 0;
 }
 
+/*
+ * A source's dictionary column as the contract has it (VC5): its codes
+ * within the dictionary, and no NULL among its values -- a NULL row is one
+ * whose validity bit is clear.
+ */
+static void
+check_dictionary(VexecScanState *s, const VexecVec *v, int col)
+{
+	const VexecVec *d = v->dictionary;
+	int			i;
+
+	if (d->validity != NULL && vexec_vec_null_count(NULL, d) > 0)
+		elog(ERROR, "vexec: the batch source \"%s\" gave a dictionary holding a NULL in column %d",
+			 s->src->name, col + 1);
+	for (i = 0; i < v->nvalues; i++)
+		if ((uint32) v->codes[i] >= (uint32) d->nvalues)
+			elog(ERROR, "vexec: the batch source \"%s\" gave code %d past its dictionary's %d values in column %d",
+				 s->src->name, v->codes[i], d->nvalues, col + 1);
+}
+
+/*
+ * vexec's identity for a source column's dictionary: one for each identity
+ * the source gives (dictionary_id()), new each time it changes; 0 where the
+ * source gives none
+ */
+static uint64
+dictionary_identity(VexecScanState *s, int col)
+{
+	uint64		sid;
+
+	if (!VEXEC_SOURCE_HAS(s->src, dictionary_id))
+		return 0;
+	sid = s->src->dictionary_id(s->srcstate, col);
+	if (sid == 0)
+		return 0;
+	if (sid != s->dict_src_ids[col])
+	{
+		s->dict_src_ids[col] = sid;
+		s->dict_ids[col] = vexec_dict_new_id();
+	}
+	return s->dict_ids[col];
+}
+
 /* A registered source's next batch, its columns as the source holds them. */
 static bool
 fetch_source(VexecScanState *s)
@@ -767,6 +829,10 @@ fetch_source(VexecScanState *s)
 			VexecVec   *d = vexec_batch_alloc0(in, sizeof(VexecVec));
 			const VexecColumn *dc = c->dictionary;
 
+			if (s->dict_ids == NULL || dc == NULL || c->codes == NULL ||
+				c->ndictionary <= 0 || dc->encoding != VEXEC_FLAT)
+				elog(ERROR, "vexec: the batch source \"%s\" gave a dictionary column it was not asked for, or one without its dictionary",
+					 s->src->name);
 			v->codes = (int32 *) c->codes;
 			d->type = v->type;
 			d->shape.layout = dc->layout;
@@ -784,11 +850,25 @@ fetch_source(VexecScanState *s)
 			d->nbuffers = dc->nbuffers;
 			d->datums = (Datum *) dc->datums;
 			v->dictionary = d;
+			/* the column is read by its dictionary's shape, whatever it said */
+			v->shape = d->shape;
+			check_dictionary(s, v, i);
+			v->dict_id = dictionary_identity(s, i);
 		}
+	}
+	if (s->dict_ids != NULL)
+	{
+		int			k;
+
+		for (k = 0; k < s->nattrs; k++)
+			if (in->cols[k].encoding == VEXEC_DICT)
+				break;
+		if (k < s->nattrs)
+			s->dict_batches++;
 	}
 	if (s->need_tid)
 	{
-		VexecVec   *v = &in->cols[i];
+		VexecVec   *v = &in->cols[s->nattrs];
 
 		if (sb.tids == NULL)
 			elog(ERROR, "vexec: the batch source \"%s\" gave no TIDs", s->src->name);
@@ -1065,6 +1145,9 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 	/* VC14: only where a batch kept one, in every format, as node.c's counts */
 	if (es->analyze && es->verbose && s->kept_cols > 0)
 		ExplainPropertyInteger("Text Columns Kept as Handed", NULL, s->kept_cols, es);
+	/* VC5: likewise, only where the source handed a dictionary */
+	if (es->analyze && es->verbose && s->dict_batches > 0)
+		ExplainPropertyInteger("Batches With Dictionaries", NULL, s->dict_batches, es);
 }
 
 /*

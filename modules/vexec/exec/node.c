@@ -1254,6 +1254,11 @@ vexec_node_explain_properties(VexecNode *node, List *ancestors, ExplainState *es
 								   st->declared_rows, es);
 		if (st->text_converted > 0)
 			ExplainPropertyInteger("Text Rows Converted", NULL, st->text_converted, es);
+		if (st->dict_rows > 0)
+		{
+			ExplainPropertyInteger("Dictionary Values Evaluated", NULL, st->dict_values, es);
+			ExplainPropertyInteger("Rows Answered by Dictionary", NULL, st->dict_rows, es);
+		}
 		if (!node->ran)
 			ExplainPropertyInteger("Segments Reporting", NULL, node->segments_seen, es);
 	}

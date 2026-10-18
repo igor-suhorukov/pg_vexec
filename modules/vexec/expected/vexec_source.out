@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: Apache-2.0
 --
--- The batch-source and batch-sink contracts (vexec_source.h at minor 2,
+-- The batch-source and batch-sink contracts (vexec_source.h at minor 3,
 -- vexec_sink.h) on vanilla PostgreSQL, through vexec_test's access method,
 -- heap's with a source and a sink of every member
 -- (modules/vexec_test/source_test.c): each query run with vexec.mode off,
@@ -14,16 +14,21 @@
 -- the scan.  A column of type xml it does not support: a scan reading one
 -- stays on the slot path.  The sink takes every type but xml.  Under
 -- vexec_test.source_text_offsets the source hands text as offsets, which
--- the scan keeps (VC14).
+-- the scan keeps (VC14).  Under vexec_test.source_dictionaries, with
+-- vexec.batch_dictionary on, it hands text as dictionaries -- a unit's
+-- distinct values, shared by the units that have the same ones and named by
+-- dictionary_id() -- and the subtrees over one such column are evaluated
+-- over the dictionary's values, once for every batch with it, and an
+-- aggregation hashes its keys' values once (VC5).
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vexec;
 CREATE EXTENSION IF NOT EXISTS vexec_test;
 RESET client_min_messages;
 -- the source and the sink, with their members
 SELECT * FROM vexec.sources() WHERE source = 'vexec_test';
-   source   | access_method | minor | estimates | aggregates | bounds 
-------------+---------------+-------+-----------+------------+--------
- vexec_test | vexec_test_am |     2 | t         | t          | t
+   source   | access_method | minor | estimates | aggregates | bounds | dictionaries 
+------------+---------------+-------+-----------+------------+--------+--------------
+ vexec_test | vexec_test_am |     3 | t         | t          | t      | t
 (1 row)
 
 SELECT * FROM vexec.sinks() WHERE sink = 'vexec_test';
@@ -282,6 +287,226 @@ SELECT source_check('SELECT a, regexp_replace(c, ''v(.)'', ''w\1'') FROM src WHE
 
 RESET vexec.enable_source_layouts;
 RESET vexec_test.source_text_offsets;
+-- dictionaries (VC5): m of 7 values and NULLs, one dictionary for every
+-- unit; t of a value a row, a dictionary a unit; both through quals, targets,
+-- aggregations, sorts, joins and PostgreSQL's evaluator, in both formats,
+-- with the text as Datums and as offsets
+CREATE TABLE srcd (k int4, m text, t text, n int4) USING vexec_test_am;
+INSERT INTO srcd
+SELECT i, CASE WHEN i % 13 = 0 THEN NULL ELSE 'm' || (i % 7) END,
+	   CASE WHEN i % 17 = 0 THEN NULL ELSE 't' || i END, i % 100
+FROM generate_series(1, 10000) i;
+ANALYZE srcd;
+SET vexec.batch_dictionary = on;
+SET vexec_test.source_dictionaries = on;
+SET vexec.mode = force;
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT k, upper(m) FROM srcd WHERE m <> 'm3' AND m LIKE 'm%' AND k % 1000 = 1;
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Vec Seq Scan on public.srcd (actual rows=8.00 loops=1)
+   Output: k, upper(m)
+   Filter: ((srcd.m <> 'm3'::text) AND (srcd.m ~~ 'm%'::text) AND ((srcd.k % 1000) = 1))
+   Rows Removed by Filter: 9992
+   Batch Format: postgres
+   Vector Quals: 3 of 3
+   Kernel Steps: 4
+   Fallback Steps: 0
+   Row-by-Row Targets: 1
+   Batches: 10
+   Row-by-Row Results Reused: 2
+   Dictionary Values Evaluated: 14
+   Rows Answered by Dictionary: 17912
+   Source: vexec_test
+   Batches With Dictionaries: 10
+(15 rows)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT m, count(*) FROM srcd GROUP BY m;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Vec HashAggregate (actual rows=8.00 loops=1)
+   Group Key: m
+   Groups: 8
+   Memory Usage: 40 kB
+   ->  Vec Seq Scan on srcd (actual rows=10000.00 loops=1)
+(5 rows)
+
+RESET vexec.mode;
+SELECT member, calls > 0 AS called FROM vexec_test.source_calls()
+WHERE member IN ('dictionary_id', 'dictionaries made') ORDER BY member;
+      member       | called 
+-------------------+--------
+ dictionaries made | t
+ dictionary_id     | t
+(2 rows)
+
+SELECT source_check('SELECT k, m, t FROM srcd WHERE k % 997 = 1');
+                                                                                     source_check                                                                                     
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ (1,m1,t1) | (1995,m0,t1995) | (2992,m3,) | (3989,m6,t3989) | (4986,m2,t4986) | (5983,m5,t5983) | (6980,m1,t6980) | (7977,m4,t7977) | (8974,m0,t8974) | (9971,,t9971) | (998,m4,t998)
+(1 row)
+
+-- the TIDs beside them: after the columns, not over a dictionary's
+SELECT source_check('SELECT ctid, k, m FROM srcd WHERE k % 1999 = 1');
+                                                          source_check                                                           
+---------------------------------------------------------------------------------------------------------------------------------
+ ("(0,1)",1,m1) | ("(11,105)",2000,m5) | ("(24,24)",3999,m2) | ("(36,103)",5998,m6) | ("(49,22)",7997,m3) | ("(61,101)",9996,m0)
+(1 row)
+
+SELECT source_check('SELECT m, t FROM srcd WHERE m <> ''m1'' ORDER BY k LIMIT 7');
+                            source_check                             
+---------------------------------------------------------------------
+ (m0,t7) | (m2,t2) | (m2,t9) | (m3,t3) | (m4,t4) | (m5,t5) | (m6,t6)
+(1 row)
+
+SELECT source_check('SELECT count(*) FROM srcd WHERE m <> ''m3''');
+ source_check 
+--------------
+ (7912)
+(1 row)
+
+SELECT source_check('SELECT count(*) FROM srcd WHERE m IS NULL OR m IN (''m1'', ''m5'')');
+ source_check 
+--------------
+ (3406)
+(1 row)
+
+SELECT source_check('SELECT count(*) FROM srcd WHERE m IS DISTINCT FROM ''m2''');
+ source_check 
+--------------
+ (8681)
+(1 row)
+
+SELECT source_check('SELECT count(*) FROM srcd WHERE NOT (m LIKE ''%4'') AND n > 50');
+ source_check 
+--------------
+ (3876)
+(1 row)
+
+SELECT source_check('SELECT k, upper(m), length(t), t || ''!'' FROM srcd WHERE k % 1001 = 0');
+                                                                               source_check                                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ (1001,,5,t1001!) | (2002,,5,t2002!) | (3003,,5,t3003!) | (4004,,5,t4004!) | (5005,,5,t5005!) | (6006,,5,t6006!) | (7007,,5,t7007!) | (8008,,5,t8008!) | (9009,,5,t9009!)
+(1 row)
+
+SELECT source_check('SELECT m, count(*), min(t), max(k) FROM srcd GROUP BY m');
+                                                                                  source_check                                                                                  
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ (,769,t1001,9997) | (m0,1319,t1008,9996) | (m1,1319,t1,9990) | (m2,1319,t100,9998) | (m3,1319,t10,9999) | (m4,1319,t10000,10000) | (m5,1318,t1006,9994) | (m6,1318,t1000,9995)
+(1 row)
+
+SELECT source_check('SELECT m, n % 3, count(*) FROM srcd GROUP BY m, n % 3');
+                 source_check                  
+-----------------------------------------------
+ 24 rows, md5 480d57b4e699f416c16645b6c4f48d88
+(1 row)
+
+SELECT source_check('SELECT upper(m), count(*) FROM srcd GROUP BY upper(m)');
+                                        source_check                                        
+--------------------------------------------------------------------------------------------
+ (,769) | (M0,1319) | (M1,1319) | (M2,1319) | (M3,1319) | (M4,1319) | (M5,1318) | (M6,1318)
+(1 row)
+
+SELECT source_check('SELECT count(DISTINCT m), count(DISTINCT t), count(m) FROM srcd');
+ source_check  
+---------------
+ (7,9412,9231)
+(1 row)
+
+SELECT source_check('SELECT t, count(*) FROM srcd WHERE t LIKE ''t99%'' GROUP BY t');
+                  source_check                  
+------------------------------------------------
+ 105 rows, md5 f4b19259d58d7ed27afb3040de0a0405
+(1 row)
+
+SELECT source_check('SELECT k, m FROM srcd ORDER BY m DESC NULLS FIRST, k LIMIT 5');
+             source_check              
+---------------------------------------
+ (13,) | (26,) | (39,) | (52,) | (65,)
+(1 row)
+
+SELECT source_check('SELECT a.k, b.m FROM srcd a JOIN srcd b ON a.m = b.m AND a.k = b.k + 7 WHERE a.k < 300');
+                  source_check                  
+------------------------------------------------
+ 247 rows, md5 a081a5c5aeb27dda3480ff68cc979022
+(1 row)
+
+SELECT source_check('SELECT k, regexp_replace(m, ''m(.)'', ''x\1'') FROM srcd WHERE k % 503 = 0');
+                 source_check                  
+-----------------------------------------------
+ 19 rows, md5 1f1f9e15947a89c0c55072a842f91403
+(1 row)
+
+SELECT source_check('SELECT count(*) FROM srcd WHERE substr(m, 2)::int4 > 3');
+ source_check 
+--------------
+ (3955)
+(1 row)
+
+SELECT source_check('SELECT k FROM srcd WHERE coalesce(m, ''none'') = ''none'' AND k < 200');
+                                                  source_check                                                  
+----------------------------------------------------------------------------------------------------------------
+ (104) | (117) | (13) | (130) | (143) | (156) | (169) | (182) | (195) | (26) | (39) | (52) | (65) | (78) | (91)
+(1 row)
+
+SET vexec_test.source_text_offsets = on;
+SELECT source_check('SELECT count(*) FROM srcd WHERE m <> ''m3''');
+ source_check 
+--------------
+ (7912)
+(1 row)
+
+SELECT source_check('SELECT m, count(*), min(t), max(k) FROM srcd GROUP BY m');
+                                                                                  source_check                                                                                  
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ (,769,t1001,9997) | (m0,1319,t1008,9996) | (m1,1319,t1,9990) | (m2,1319,t100,9998) | (m3,1319,t10,9999) | (m4,1319,t10000,10000) | (m5,1318,t1006,9994) | (m6,1318,t1000,9995)
+(1 row)
+
+SELECT source_check('SELECT k, upper(m), length(t), t || ''!'' FROM srcd WHERE k % 1001 = 0');
+                                                                               source_check                                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ (1001,,5,t1001!) | (2002,,5,t2002!) | (3003,,5,t3003!) | (4004,,5,t4004!) | (5005,,5,t5005!) | (6006,,5,t6006!) | (7007,,5,t7007!) | (8008,,5,t8008!) | (9009,,5,t9009!)
+(1 row)
+
+SELECT source_check('SELECT k, regexp_replace(m, ''m(.)'', ''x\1'') FROM srcd WHERE k % 503 = 0');
+                 source_check                  
+-----------------------------------------------
+ 19 rows, md5 1f1f9e15947a89c0c55072a842f91403
+(1 row)
+
+SELECT source_check('SELECT t, count(*) FROM srcd WHERE t LIKE ''t99%'' GROUP BY t');
+                  source_check                  
+------------------------------------------------
+ 105 rows, md5 f4b19259d58d7ed27afb3040de0a0405
+(1 row)
+
+SET vexec.enable_source_layouts = off;
+SELECT source_check('SELECT m, count(*), min(t) FROM srcd WHERE m > ''m2'' GROUP BY m');
+                             source_check                             
+----------------------------------------------------------------------
+ (m3,1319,t10) | (m4,1319,t10000) | (m5,1318,t1006) | (m6,1318,t1000)
+(1 row)
+
+RESET vexec.enable_source_layouts;
+RESET vexec_test.source_text_offsets;
+-- not asked for, none is handed: the same dictionaries made as before
+SET vexec.batch_dictionary = off;
+SELECT calls AS made FROM vexec_test.source_calls() WHERE member = 'dictionaries made' \gset
+SELECT source_check('SELECT m, count(*), min(t) FROM srcd GROUP BY m');
+                                                             source_check                                                              
+---------------------------------------------------------------------------------------------------------------------------------------
+ (,769,t1001) | (m0,1319,t1008) | (m1,1319,t1) | (m2,1319,t100) | (m3,1319,t10) | (m4,1319,t10000) | (m5,1318,t1006) | (m6,1318,t1000)
+(1 row)
+
+SELECT calls = :made AS none_made FROM vexec_test.source_calls() WHERE member = 'dictionaries made';
+ none_made 
+-----------
+ t
+(1 row)
+
+RESET vexec_test.source_dictionaries;
+RESET vexec.batch_dictionary;
 -- rescans: a subquery's scan, for each outer row
 CREATE TABLE src_outer (k int4);
 INSERT INTO src_outer VALUES (3), (5000), (9999);
@@ -352,7 +577,9 @@ SELECT member, calls > 0 AS called FROM vexec_test.source_calls();
  sink begin           | t
  sink put             | t
  sink end             | t
-(16 rows)
+ dictionary_id        | t
+ dictionaries made    | t
+(18 rows)
 
 DROP TABLE src, src_outer, src_copy, src_xml;
 DROP FUNCTION source_check(text), source_run(text, text, text);
