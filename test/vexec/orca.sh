@@ -284,10 +284,14 @@ section_module() {
 # where it is small beside the outer side, and in two stages around a
 # Gather of its own where it is not; with vexec, a VecHashJoin's table
 # shared (gp_orca_vec.h's shares_table), its rows all the participants';
+# a grouping of many groups in three stages below the Gather, H5's
+# VecRepartition dealing its partial groups among the participants
+# (gp_orca_vec.h's repartitions), on q18's semi join's inner side under a
+# shared table too, and none under vexec.enable_repartition off;
 # the rows PostgreSQL's planner gives; workers launched,
 # as pg_stat_database counts them, and none for a cursor.  Costs that make a
 # Gather pay on the section's small table, as the cluster leg sets them.
-PAR="SET gp.enable_parallel = on; SET max_parallel_workers_per_gather = 2; SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET min_parallel_table_scan_size = 0;"
+PAR="SET gp.enable_parallel = on; SET max_parallel_workers_per_gather = 2; SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET min_parallel_table_scan_size = 0; SET vexec.repartition_min_rows = 0;"
 PAR_QUERIES=(
 	"${QUERIES[@]}"
 	"SELECT k, sum(v) FROM %t GROUP BY k HAVING sum(v) > 9000000"
@@ -304,6 +308,8 @@ PAR_QUERIES=(
 	"SELECT count(*), max(b.s), min(b.n), max(b.d) FROM %t a JOIN %t b ON a.id::text = (b.id + 3)::text WHERE b.k < 90"
 	"SELECT count(*), count(b.x), sum(b.x) FROM %t a JOIN (SELECT id, NULLIF(k, 3) AS x FROM %t WHERE v < 90000) b ON a.id = b.id + 2"
 	"SELECT count(*), count(b.id), sum(b.v) FROM %t a LEFT JOIN %t b ON a.id = b.id * 3"
+	"SELECT id, sum(v), count(*) FROM %t GROUP BY id HAVING sum(v) > 99000"
+	"SELECT count(*), sum(b.n) FROM %t a JOIN (SELECT id, sum(n) AS n FROM %t GROUP BY id) b ON a.id = b.id + 5"
 )
 section_parallel() {
 	local D sql ref got nq=0 nsame=0 before after plan s
@@ -394,6 +400,32 @@ section_parallel() {
 		&& ok "with vexec and enable_parallel_hash off, the VecHashJoin's table each participant's own" \
 		|| notok "a VecHashJoin under enable_parallel_hash off" "$plan"
 	# the side ORCA hashes: b's rows, or a's, all of them
+	# a grouping of many groups at the top: in two stages around the Gather
+	# where its participants' partial groups cost little to pass, else in
+	# three below it -- here a tuple's passing a tenth of the leg's own
+	sql="SELECT id, sum(v), count(*) FROM t_heap GROUP BY id HAVING sum(v) > 99000"
+	plan=$(q "$D" postgres "$PAR SET parallel_tuple_cost = 0.01; SET vexec.mode = force; EXPLAIN (COSTS OFF) $sql")
+	[[ "$plan" == *"Gather"*"Vec Finalize HashAggregate"*"Filter:"*"Vec Repartition"*"Vec Partial HashAggregate"*"Parallel Vec Seq Scan on t_heap"* ]] \
+		&& ok "with vexec, a grouping of many groups in three stages below the Gather, its partial groups dealt among the participants" \
+		|| notok "a grouping in three stages" "$plan"
+	par_plan "and in two around it where its partial groups cost nothing to pass" force "$sql" \
+		"*Vec Finalize HashAggregate*Gather*Vec Partial HashAggregate*Parallel Vec Seq Scan on t_heap*"
+	par_plan "with vexec, q18's: the semi join's inner grouping in three stages, below a table the participants share" force \
+		"SELECT a.k, count(*) FROM t_heap a WHERE a.id IN (SELECT id FROM t_heap GROUP BY id HAVING sum(v) > 99000) GROUP BY a.k" \
+		"*Gather*Parallel Vec Hash*Join*Parallel Vec Seq Scan on t_heap*Vec Finalize HashAggregate*Vec Repartition*Vec Partial HashAggregate*Parallel Vec Seq Scan on t_heap*"
+	plan=$(q "$D" postgres "$PAR SET parallel_tuple_cost = 0.01; SET vexec.mode = force; SET vexec.enable_repartition = off; EXPLAIN (COSTS OFF) $sql")
+	[[ "$plan" != *"Vec Repartition"* ]] \
+		&& ok "with vexec.enable_repartition off, no grouping's groups dealt" \
+		|| notok "no VecRepartition under vexec.enable_repartition off" "$plan"
+	want=$(q "$D" postgres "SELECT count(*) FROM (SELECT id FROM t_heap GROUP BY id HAVING sum(v) > 99000) x")
+	plan=$(q "$D" postgres "$PAR SET parallel_tuple_cost = 0.01; SET vexec.mode = force; EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) $sql")
+	no_min=$(q "$D" postgres "$PAR SET parallel_tuple_cost = 0.01; SET vexec.mode = force; SET vexec.repartition_min_rows = $((ROWS + 1)); EXPLAIN (COSTS OFF) $sql")
+	[[ "$plan" == *"Gather (actual rows=$want.00 "*"Workers Launched: 2"*"Vec Repartition"* ]] \
+		&& ok "and the Gather receives the final groups alone, $want, from 2 workers and the leader" \
+		|| notok "a repartitioned grouping's Gather" "want $want: $plan"
+	[[ "$no_min" != *"Vec Repartition"* ]] \
+		&& ok "a grouping of fewer input rows than vexec.repartition_min_rows not repartitioned" \
+		|| notok "vexec.repartition_min_rows" "$no_min"
 	want=$(q "$D" postgres "SELECT count(*) FROM t_heap WHERE k < 90")
 	for s in force-postgres force-arrow; do
 		plan=$(q "$D" postgres "$PAR $(session_sets "$s") EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)

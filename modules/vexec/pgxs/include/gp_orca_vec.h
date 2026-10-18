@@ -101,6 +101,16 @@
  *						engine's node -- which the pass then asks for by
  *						making the node parallel-aware
  *
+ * and, from minor version 5, at two more:
+ *
+ *	repartitions		a grouping ORCA planned in one stage, in a subtree
+ *						parallel.c splits: whether the engine deals its
+ *						partial groups among the Gather's participants, so
+ *						that its final stage runs in each of them, below the
+ *						Gather, each finalizing the groups it is dealt
+ *	build_repartition	that node, between the partial stage the pass made
+ *						and the final stage it puts over it
+ *
  * A node built so is the engine's CustomScan, found by name where the
  * plan is read back, a segment's fragment among them.  Without a
  * registration gp_orca calls nothing, and its plans are as they were.
@@ -131,9 +141,10 @@
 #define GP_ORCA_VEC_RENDEZVOUS	"Cloudberry/gp_orca_vec_v1"	/* the major
 															 * version is in
 															 * the name */
-#define GP_ORCA_VEC_MINOR		4	/* 1: describe_node; 2: set_options,
+#define GP_ORCA_VEC_MINOR		5	/* 1: describe_node; 2: set_options,
 									 * the cost oracle, build_window; 3:
-									 * scan_workers; 4: shares_table */
+									 * scan_workers; 4: shares_table; 5:
+									 * repartitions, build_repartition */
 #define GP_ORCA_VEC_MAGIC		0x47564331	/* "GVC1" */
 
 struct ExplainState;
@@ -369,6 +380,44 @@ typedef struct GpOrcaVecRoutine
 	 * alone and raises no error.
 	 */
 	bool		(*shares_table) (Plan *join);
+
+	/*
+	 * From minor version 5: may the engine deal the partial groups of agg --
+	 * an aggregate ORCA planned in one stage (AGGSPLIT_SIMPLE), hashed, of a
+	 * subtree parallel.c splits among a Gather's participants -- among the
+	 * participants by their keys' hash (build_repartition), so that the
+	 * aggregate's final stage runs in each participant below the Gather and
+	 * finalizes the groups it is dealt, each group whole in one of them; its
+	 * estimates of groups and of input rows are agg's plan_rows and its
+	 * lefttree's.  True: the pass may split such a grouping, in three
+	 * stages, below a Gather and within a subtree it splits -- a join's
+	 * inner side among them -- where without it a grouping only ends one:
+	 * its partial stage below the Gather, its final stage above.  at_top:
+	 * the grouping would be the top of the Gather's subtree, where without
+	 * it the pass may put the Gather below it instead, its input's rows
+	 * passed to it in one process; else within a subtree, where computed
+	 * whole by each participant, or alone, it keeps the subtree from
+	 * splitting.  During the statement, between begin_statement and
+	 * end_statement; it raises no error.
+	 */
+	bool		(*repartitions) (void *state, Agg *agg, bool at_top);
+
+	/*
+	 * From minor version 5: the engine's node that deals partial's rows --
+	 * the partial groups of an aggregate repartitions accepted, of
+	 * AGGSPLIT_INITIAL_SERIAL, as the pass made them, or the engine's node
+	 * build_node made of them -- among the Gather's participants by the hash
+	 * of nkeys of its columns, keycols (resnos of partial's target list),
+	 * compared by eqops in collations: each participant gets every row of
+	 * the groups it is dealt, whatever participant made them, and the
+	 * final stage over it in each finalizes those.  Its columns are
+	 * partial's; it is parallel-aware, and where it runs with no Gather's
+	 * DSM -- one process -- it passes partial's rows on.  NULL only where
+	 * repartitions refused; the pass numbers the node.
+	 */
+	Plan	   *(*build_repartition) (void *state, Plan *partial, int nkeys,
+									  const AttrNumber *keycols, const Oid *eqops,
+									  const Oid *collations);
 } GpOrcaVecRoutine;
 
 typedef struct GpOrcaVecRegistry

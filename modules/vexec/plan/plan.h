@@ -173,6 +173,8 @@ extern void vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel,
 extern const char *vexec_orca_agg_refusal(Agg *agg);
 extern Plan *vexec_build_agg_from_agg(Agg *agg);
 extern Agg *vexec_agg_describe(CustomScan *cscan);
+extern Plan *vexec_build_repart(Plan *child, int nkeys, const AttrNumber *keycols,
+								const Oid *eqops, const Oid *collations);
 extern bool vexec_agg_path_ranks(Path *path);
 
 /* join.c */

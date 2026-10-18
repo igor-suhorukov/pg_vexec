@@ -47,6 +47,7 @@ double		vexec_cpu_operator_factor = 0.35;
 double		vexec_convert_cost = 0.001;
 double		vexec_batch_setup_cost = 1.0;
 int			vexec_min_rows = 10000;
+int			vexec_repartition_min_rows = 500000;
 int			vexec_scan_rows_per_worker = 163840;
 
 /* per node kind */
@@ -313,6 +314,15 @@ define_settings(void)
 							 "runs in parallel the same way, its pairs of keys and argument dealt out first.",
 							 &vexec_enable_repartition, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomIntVariable("vexec.repartition_min_rows",
+							"The input rows from which a grouping under ORCA's parallel plan is repartitioned.",
+							"On one node gp_orca's parallel pass splits a grouping of many groups in three "
+							"stages below a Gather, its partial groups dealt out among the participants, "
+							"where its input by ORCA's estimate has at least these rows -- twice these at the "
+							"Gather's top, where a Gather below the grouping is the other plan; fewer do not "
+							"win back the repartition's files.",
+							&vexec_repartition_min_rows, 500000, 0, INT_MAX,
+							PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 	DefineCustomIntVariable("vexec.partial_agg_limit",
 							"The groups a parallel aggregation's first stage keeps before it hands new keys on.",
 							"Past them, the first stage under a repartition updates only the groups it holds, "

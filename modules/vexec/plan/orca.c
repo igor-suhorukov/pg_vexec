@@ -61,6 +61,14 @@
  *			participants may share its table, built from an inner side
  *			they split too (exec/vechashjoin.c's shared table).
  *
+ * And through its minor version 5 (H5 under ORCA, TPC-H q18):
+ *
+ *	repartitions, build_repartition	a grouping of a subtree the pass
+ *			splits, in three stages below the Gather: H5's
+ *			VecRepartition between its partial and its final stage,
+ *			which the pass makes, each participant finalizing the
+ *			groups it is dealt (exec/vecrepart.c).
+ *
  * Force mode builds a vector node wherever the oracle accepts one.  Auto
  * mode, where ORCA's search priced vexec's nodes, builds one wherever it
  * priced one: where the oracle accepts it, of vexec.min_rows rows at least.
@@ -121,6 +129,10 @@ static Plan *orca_build_window(void *state, WindowAgg *window, List *rtable);
 static int	orca_scan_workers(Plan *scan, Relation rel, double pages, double tuples,
 							  int workers);
 static bool orca_shares_table(Plan *join);
+static bool orca_repartitions(void *state, Agg *agg, bool at_top);
+static Plan *orca_build_repartition(void *state, Plan *partial, int nkeys,
+									const AttrNumber *keycols, const Oid *eqops,
+									const Oid *collations);
 
 static const GpOrcaVecRoutine orca_routine = {
 	.size = sizeof(GpOrcaVecRoutine),
@@ -139,6 +151,8 @@ static const GpOrcaVecRoutine orca_routine = {
 	.build_window = orca_build_window,
 	.scan_workers = orca_scan_workers,
 	.shares_table = orca_shares_table,
+	.repartitions = orca_repartitions,
+	.build_repartition = orca_build_repartition,
 };
 
 void
@@ -1145,6 +1159,58 @@ orca_shares_table(Plan *join)
 	bytes = inner->plan_rows *
 		(inner->plan_width + 2 * sizeof(uint32) + 16 * list_length(jp.hashoperators));
 	return bytes <= (double) get_hash_memory_limit() * (max_parallel_workers_per_gather + 1);
+}
+
+/*
+ * The groups of a grouping's estimate from which vexec deals them among the
+ * participants under ORCA (orca_repartitions()): fewer cost little to pass
+ * through the Gather, each participant's, to the final stage above it.  Its
+ * input's rows, vexec.repartition_min_rows: a VecRepartition of 17
+ * participants writes and reads up to 64 stores in each, its files' setup
+ * some 20-40 ms whatever its rows (TPC-DS 34, 68, 73 and 79 on mergetree,
+ * 2026-10-18), which a grouping of fewer input rows does not win back; and
+ * twice those at a Gather's top, where a Gather below the grouping, its
+ * input's rows passed to it in one process, is the other plan: there the
+ * partial states, serialized, written and read, of a grouping of nearly as
+ * many groups as rows cost more than its rows' passing (TPC-DS 38, 65, 87
+ * and 97, 550-650 thousand rows, 20-45% slower on mergetree; 04, 11, 74
+ * and 23, 1.1-1.2 million, 1.2-2.3 times as fast).
+ */
+#define ORCA_REPART_MIN_GROUPS	10000
+
+/*
+ * Whether vexec deals a grouping's partial groups among a Gather's
+ * participants (from the API's minor version 5), so that its final stage
+ * runs in each: H5's VecRepartition, as on the planner's route, where its
+ * nodes are built (auto and force mode) and vexec.enable_repartition is on,
+ * for a hashed grouping by keys of ORCA_REPART_MIN_GROUPS groups and
+ * vexec.repartition_min_rows input rows at least by ORCA's estimates, twice
+ * those at a Gather's top.  It reads
+ * the statement's state and agg, and raises nothing.
+ */
+static bool
+orca_repartitions(void *state, Agg *agg, bool at_top)
+{
+	VexecPlanState *ps = state;
+
+	return ps != NULL && ps->gate_open && vexec_enable_repartition &&
+		(ps->mode == VEXEC_MODE_AUTO || ps->mode == VEXEC_MODE_FORCE) &&
+		agg->aggstrategy == AGG_HASHED && agg->numCols > 0 && agg->plan.lefttree != NULL &&
+		agg->plan.plan_rows >= ORCA_REPART_MIN_GROUPS &&
+		agg->plan.lefttree->plan_rows >= (at_top ? 2.0 : 1.0) * vexec_repartition_min_rows;
+}
+
+/* The VecRepartition over the partial stage the pass made (agg.c). */
+static Plan *
+orca_build_repartition(void *state, Plan *partial, int nkeys, const AttrNumber *keycols,
+					   const Oid *eqops, const Oid *collations)
+{
+	VexecPlanState *ps = state;
+
+	if (ps == NULL || !ps->gate_open || !vexec_enable_repartition || nkeys <= 0 ||
+		(ps->mode != VEXEC_MODE_AUTO && ps->mode != VEXEC_MODE_FORCE))
+		return NULL;
+	return vexec_build_repart(partial, nkeys, keycols, eqops, collations);
 }
 
 /* Whether vexec hashes a key compared by this operator: strict, with a hash function. */

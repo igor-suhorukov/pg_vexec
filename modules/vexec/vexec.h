@@ -100,6 +100,7 @@ extern PGDLLIMPORT bool vexec_enable_source_layouts;
 extern PGDLLIMPORT bool vexec_enable_bitmapscan;
 extern PGDLLIMPORT bool vexec_enable_agg;
 extern PGDLLIMPORT bool vexec_enable_repartition;
+extern PGDLLIMPORT int vexec_repartition_min_rows;
 extern PGDLLIMPORT int vexec_partial_agg_limit;
 extern PGDLLIMPORT bool vexec_remember_agg_sizes;
 extern PGDLLIMPORT bool vexec_enable_group_topk;

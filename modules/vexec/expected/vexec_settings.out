@@ -58,8 +58,9 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.orca_settings         |                           |      | user       | string  |         |              |                             | t
  vexec.partial_agg_limit     | 16384                     |      | user       | integer | 0       | 2147483647   |                             | f
  vexec.remember_agg_sizes    | on                        |      | user       | bool    |         |              |                             | f
+ vexec.repartition_min_rows  | 500000                    |      | user       | integer | 0       | 2147483647   |                             | t
  vexec.scan_rows_per_worker  | 163840                    |      | user       | integer | 0       | 2147483647   |                             | t
-(48 rows)
+(49 rows)
 
 -- the modes
 SET vexec.mode = explain;

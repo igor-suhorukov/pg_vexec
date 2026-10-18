@@ -458,6 +458,61 @@ plan_vecrepart(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	return &cscan->scan.plan;
 }
 
+/*
+ * VecRepartition over a partial stage gp_orca's parallel pass made on one
+ * node, between it and the final stage it puts over it in each participant
+ * (gp_orca_vec.h's build_repartition, plan/orca.c): its keys columns of the
+ * child's row, by their resnos, with the grouping's equality operators; its
+ * scan tuple the child's row, references to its columns as the planner's
+ * finished plan has them (join.c), and its target list that row, as it is.
+ */
+Plan *
+vexec_build_repart(Plan *child, int nkeys, const AttrNumber *keycols, const Oid *eqops,
+				   const Oid *collations)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	VexecRepartPlan plan;
+	ListCell   *lc;
+
+	memset(&plan, 0, sizeof(plan));
+	for (int i = 0; i < nkeys; i++)
+	{
+		plan.keycols = lappend_int(plan.keycols, keycols[i]);
+		plan.eqops = lappend_oid(plan.eqops, eqops[i]);
+		plan.collations = lappend_oid(plan.collations, collations[i]);
+	}
+	foreach(lc, child->targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		Var		   *outer = makeVarFromTargetEntry(OUTER_VAR, tle);
+		Var		   *scan = makeVarFromTargetEntry(INDEX_VAR, tle);
+
+		outer->varnosyn = 0;
+		outer->varattnosyn = 0;
+		scan->varattno = (AttrNumber) (list_length(cscan->custom_scan_tlist) + 1);
+		scan->varnosyn = 0;
+		scan->varattnosyn = 0;
+		cscan->custom_scan_tlist = lappend(cscan->custom_scan_tlist,
+										   makeTargetEntry((Expr *) outer, scan->varattno,
+														   NULL, false));
+		cscan->scan.plan.targetlist = lappend(cscan->scan.plan.targetlist,
+											  makeTargetEntry((Expr *) scan, tle->resno,
+															  tle->resname, tle->resjunk));
+	}
+	cscan->scan.plan.startup_cost = child->total_cost;
+	cscan->scan.plan.total_cost = child->total_cost;
+	cscan->scan.plan.plan_rows = child->plan_rows;
+	cscan->scan.plan.plan_width = child->plan_width;
+	cscan->scan.plan.parallel_aware = true;
+	cscan->scan.plan.parallel_safe = true;
+	cscan->scan.plan.lefttree = child;
+	cscan->scan.scanrelid = 0;
+	cscan->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+	cscan->custom_private = vexec_repart_plan_encode(&plan);
+	cscan->methods = vexec_repart_methods();
+	return &cscan->scan.plan;
+}
+
 /* The partially grouped relation core made for this grouped one, if any. */
 static RelOptInfo *
 partial_grouped_rel(PlannerInfo *root, RelOptInfo *grouped)
