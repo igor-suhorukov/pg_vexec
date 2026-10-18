@@ -62,6 +62,31 @@
  * in its batches' order; and the outer side is read whole before the first
  * row comes out, where PostgreSQL's first batch would interleave.
  *
+ * A parallel-aware VecHashJoin shares its table among a Gather's
+ * participants, as PostgreSQL's Parallel Hash does (nodeHash.c,
+ * ExecParallelHashTableAlloc() and its kin; ch_table_engines.md §8 item
+ * 15): gp_orca's pass on one node makes it so where vexec says it may
+ * (gp_orca_vec.h, shares_table), its inner side split among the
+ * participants as its outer side is.  Each participant puts its share of
+ * the inner rows into chunks of its own, as the table's (above), and copies
+ * each chunk as it fills into the query's DSA area, its values past their
+ * Datums into blocks of its own there; past a barrier one participant
+ * allocates the buckets, each links its chunks' rows into them, and past
+ * another, each probes the one table with its share of the outer rows,
+ * through views of the chunks: their columns read in place, but where
+ * they are Datums -- or keys that point -- which a view points at the
+ * values in its process's mapping of the area.  A participant that comes
+ * once the table is built probes it; one that comes while it is built
+ * helps.  The shared table holds an inner, a left, a semi or an anti join,
+ * an inner row's matches not counted; it is never spilled: vexec shares it
+ * where its estimate fits the memory the participants' tables hold
+ * together (plan/orca.c), and past that it grows on, as PostgreSQL's table
+ * grows past its limit where its batches cannot split.  As PostgreSQL's
+ * shared table, it reads the inner side before any outer row, and a
+ * participant's rows come out in no order the others' keep.  Without the
+ * DSM -- the Gather's plan run without workers -- the join builds its own
+ * table, its inner side read whole.
+ *
  * Where PostgreSQL leaves a side unread and the side receives a Motion,
  * gp_core's executor would squelch it (pg19/modules/gp_core/gp_motion.c:
  * 1869-1896, 2062-2079), or its senders wait.  A VecHashJoin is no node
@@ -78,6 +103,7 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
+#include "access/parallel.h"
 #include "access/tupmacs.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -89,16 +115,20 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "port/atomics.h"
 #include "port/pg_bitutils.h"
+#include "storage/barrier.h"
 #include "storage/buffile.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/dsa.h"
 #include "utils/fmgroids.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/ruleutils.h"
 #include "utils/tuplestore.h"
+#include "utils/wait_event.h"
 #include "varatt.h"
 
 #include "cb_explain.h"
@@ -206,16 +236,70 @@ typedef struct HjSide
 	Tuplestorestate *nullrows;	/* rows of a NULL key a join keeps */
 } HjSide;
 
-/* A chunk of the table: inner rows, their hashes, keys and matches. */
+/*
+ * A chunk of the table: inner rows, their hashes, keys and matches, a
+ * HJ_CHUNK_ROWS of each; a shared table's view of one of its chunks points
+ * into it, and counts no matches.
+ */
 typedef struct HjChunk
 {
 	VexecBatch *batch;			/* the inner side's columns, in store shapes */
 	int			nrows;
-	uint32		hashes[HJ_CHUNK_ROWS];
-	uint32		next[HJ_CHUNK_ROWS];	/* the bucket's next row: rid + 1 */
-	uint64		matched[VEXEC_WORDS(HJ_CHUNK_ROWS)];
+	uint32	   *hashes;
+	uint32	   *next;			/* the bucket's next row: rid + 1 */
+	uint64	   *matched;		/* VEXEC_WORDS(HJ_CHUNK_ROWS) */
 	HjKeyVal   *keys;			/* nkeys a row */
 } HjChunk;
+
+/* The barrier's phases of a shared table. */
+#define HJS_BUILD		0		/* each participant puts its inner rows in */
+#define HJS_ALLOCATE	1		/* one allocates the buckets */
+#define HJS_LINK		2		/* each links its chunks' rows into them */
+#define HJS_PROBE		3		/* each probes the table with its outer rows */
+
+/* the bytes of a block of a shared table's values, the least */
+#define HJS_BLOCK_SIZE	(1024 * 1024)
+
+/* A parallel-aware VecHashJoin's chunk of the DSM: its shared table. */
+typedef struct HjShared
+{
+	Barrier		barrier;
+	pg_atomic_uint32 nchunks;	/* chunks numbered */
+	pg_atomic_uint64 nrows;		/* rows in them */
+	pg_atomic_uint64 memory;	/* their bytes, and their values' blocks' */
+	dsa_pointer_atomic chunks;	/* the last chunk copied in, the first of a
+								 * list through each one's "next" */
+	dsa_pointer_atomic blocks;	/* the last block of values, likewise */
+	dsa_pointer heads;			/* a pg_atomic_uint32 a bucket: its first
+								 * row, rid + 1 */
+	uint32		mask;
+} HjShared;
+
+/*
+ * A shared table's chunk in the DSA area: a HjChunk's rows, which the
+ * participant that made it links (HJS_LINK); then, at offsets HjState
+ * keeps, each column's layout and whether it has NULLs, each column's
+ * validity and values, and the keys.  A column of Datums holds the
+ * dsa_pointers of its values, a key that points the dsa_pointer of its
+ * bytes.
+ */
+typedef struct HjSharedChunk
+{
+	dsa_pointer next;			/* copied in before it, or InvalidDsaPointer */
+	uint32		chunkno;
+	int			nrows;
+	uint32		hashes[HJ_CHUNK_ROWS];
+	uint32		next_row[HJ_CHUNK_ROWS];
+} HjSharedChunk;
+
+/* A block of a shared table's values, in the DSA area. */
+typedef struct HjSharedBlock
+{
+	dsa_pointer next;			/* allocated before it */
+	Size		size;			/* its bytes, the header's too */
+} HjSharedBlock;
+
+#define HJS_BLOCK_HEADER	MAXALIGN(sizeof(HjSharedBlock))
 
 /* A partition of the grace join: its inner rows' file and its outer rows'. */
 typedef struct HjPart
@@ -313,6 +397,28 @@ typedef struct HjState
 	VexecJoinFilter *jfilter;
 	bool		jf_lent;
 
+	/*
+	 * a shared table: the DSM's chunk, or NULL for a table of the
+	 * participant's own; the chunks it copied in, which it links; its block
+	 * of values, and the layout of a chunk in the area
+	 */
+	HjShared   *shared;
+	dsa_area   *area;
+	dsa_pointer *own;
+	int			nown;
+	int			maxown;
+	dsa_pointer block;
+	char	   *block_base;
+	Size		block_used;
+	Size		block_size;
+	Size		sc_size;
+	Size		sc_layout;		/* uint8 a column, then bool a column */
+	Size	   *sc_validity;	/* per column */
+	Size	   *sc_values;
+	Size		sc_keys;
+	bool		keys_in_place;	/* no key points: a view reads them there */
+	int64		shared_rows;	/* the table's, all participants' */
+
 	/* the grace join */
 	bool		spilled;
 	int			level;			/* of the files being written */
@@ -374,6 +480,10 @@ static TupleTableSlot *hj_exec(CustomScanState *css);
 static void hj_end(CustomScanState *css);
 static void hj_rescan(CustomScanState *css);
 static void hj_explain(CustomScanState *css, List *ancestors, ExplainState *es);
+static Size hj_estimate_dsm(CustomScanState *css, ParallelContext *pcxt);
+static void hj_initialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordinate);
+static void hj_reinitialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordinate);
+static void hj_initialize_worker(CustomScanState *css, shm_toc *toc, void *coordinate);
 
 static const CustomExecMethods hj_exec_methods = {
 	.CustomName = VEXEC_HASHJOIN_NAME,
@@ -381,8 +491,15 @@ static const CustomExecMethods hj_exec_methods = {
 	.ExecCustomScan = hj_exec,
 	.EndCustomScan = hj_end,
 	.ReScanCustomScan = hj_rescan,
+	.EstimateDSMCustomScan = hj_estimate_dsm,
+	.InitializeDSMCustomScan = hj_initialize_dsm,
+	.ReInitializeDSMCustomScan = hj_reinitialize_dsm,
+	.InitializeWorkerCustomScan = hj_initialize_worker,
 	.ExplainCustomScan = hj_explain,
 };
+
+/* the wait at a shared table's barrier, as pg_stat_activity names it */
+static uint32 hj_wait_event = 0;
 
 /* Its methods, for pg_otel_probe's reporter of vector nodes (node.c). */
 const CustomExecMethods *
@@ -1402,6 +1519,11 @@ chunk_new(HjState *s)
 		vexec_vec_init(ch->batch, v, &s->store_shape[i], HJ_CHUNK_ROWS);
 		v->nvalues = 0;
 	}
+	/* the rows' hashes, links and matches in one piece, as the table holds them */
+	ch->hashes = palloc0(sizeof(uint32) * 2 * HJ_CHUNK_ROWS +
+						 sizeof(uint64) * VEXEC_WORDS(HJ_CHUNK_ROWS));
+	ch->next = ch->hashes + HJ_CHUNK_ROWS;
+	ch->matched = (uint64 *) (ch->next + HJ_CHUNK_ROWS);
 	ch->keys = palloc0(sizeof(HjKeyVal) * Max(s->nkeys, 1) * HJ_CHUNK_ROWS);
 	if (s->nchunks >= s->maxchunks)
 	{
@@ -1633,6 +1755,377 @@ table_reset(HjState *s)
 	s->mask = 0;
 	for (int i = 0; i < s->side[1].ncols; i++)
 		s->store_uniform[i] = true;
+}
+
+/* ---------------------------------------------------------------------
+ * A shared table (the file's header)
+ * ---------------------------------------------------------------------
+ */
+
+/* A row's bytes of a chunk's column in a shape. */
+static Size
+store_row_bytes(const VexecShape *shape)
+{
+	switch (shape->layout)
+	{
+		case VEXEC_FIXED:
+		case VEXEC_SCALED:
+			return shape->stride;
+		case VEXEC_BYTE_BOOL:
+			return 1;
+		default:
+			return sizeof(Datum);
+	}
+}
+
+/*
+ * Where a shared chunk keeps what: each column's values room for its store
+ * shape's, or for dsa_pointers, should a chunk hold the column as Datums
+ * (chunk_col_to_datum()).
+ */
+static void
+shared_layout(HjState *s)
+{
+	HjSide	   *in = &s->side[1];
+	Size		off = MAXALIGN(sizeof(HjSharedChunk));
+
+	s->sc_layout = off;
+	off = MAXALIGN(off + 2 * Max(in->ncols, 1));
+	s->sc_validity = palloc(sizeof(Size) * Max(in->ncols, 1));
+	s->sc_values = palloc(sizeof(Size) * Max(in->ncols, 1));
+	for (int c = 0; c < in->ncols; c++)
+	{
+		s->sc_validity[c] = off;
+		off += sizeof(uint64) * VEXEC_WORDS(HJ_CHUNK_ROWS);
+		s->sc_values[c] = off;
+		off = MAXALIGN(off + Max(store_row_bytes(&s->store_shape[c]), sizeof(dsa_pointer)) *
+					   HJ_CHUNK_ROWS);
+	}
+	s->sc_keys = off;
+	s->sc_size = off + sizeof(HjKeyVal) * s->nkeys * HJ_CHUNK_ROWS;
+	s->keys_in_place = true;
+	for (int k = 0; k < s->nkeys; k++)
+		if (s->keys[k].kind == HJ_KEY_BYTES ||
+			(s->keys[k].kind == HJ_KEY_FMGR && !s->keys[k].typbyval[1]))
+			s->keys_in_place = false;
+}
+
+/* A value's bytes into this participant's block of the area: their dsa_pointer. */
+static dsa_pointer
+shared_copy(HjState *s, const void *p, Size len)
+{
+	Size		need = MAXALIGN(Max(len, 1));
+	dsa_pointer dp;
+
+	if (s->block_base == NULL || s->block_used + need > s->block_size)
+	{
+		Size		size = Max(HJS_BLOCK_SIZE, HJS_BLOCK_HEADER + need);
+		HjSharedBlock *b;
+
+		s->block = dsa_allocate_extended(s->area, size, DSA_ALLOC_HUGE);
+		b = dsa_get_address(s->area, s->block);
+		b->size = size;
+		b->next = dsa_pointer_atomic_read(&s->shared->blocks);
+		while (!dsa_pointer_atomic_compare_exchange(&s->shared->blocks, &b->next, s->block))
+			;
+		pg_atomic_fetch_add_u64(&s->shared->memory, size);
+		s->block_base = (char *) b;
+		s->block_size = size;
+		s->block_used = HJS_BLOCK_HEADER;
+	}
+	dp = s->block + s->block_used;
+	memcpy(s->block_base + s->block_used, p, len);
+	s->block_used += need;
+	return dp;
+}
+
+/*
+ * A chunk of this participant's copied into the area, numbered, and put at
+ * the head of the shared table's list of chunks: its rows' columns, hashes
+ * and keys, values past their Datums and keys that point copied into its
+ * blocks.
+ */
+static void
+chunk_publish(HjState *s, HjChunk *ch)
+{
+	HjShared   *sh = s->shared;
+	HjSide	   *in = &s->side[1];
+	dsa_pointer dp = dsa_allocate(s->area, s->sc_size);
+	char	   *base = dsa_get_address(s->area, dp);
+	HjSharedChunk *sc = (HjSharedChunk *) base;
+	uint8	   *layout = (uint8 *) (base + s->sc_layout);
+	bool	   *nulls = (bool *) (layout + in->ncols);
+	HjKeyVal   *keys = (HjKeyVal *) (base + s->sc_keys);
+	int			n = ch->nrows;
+
+	sc->chunkno = pg_atomic_fetch_add_u32(&sh->nchunks, 1);
+	sc->nrows = n;
+	memcpy(sc->hashes, ch->hashes, sizeof(uint32) * n);
+	for (int c = 0; c < in->ncols; c++)
+	{
+		VexecVec   *v = &ch->batch->cols[c];
+		char	   *values = base + s->sc_values[c];
+
+		layout[c] = v->shape.layout;
+		nulls[c] = v->validity != NULL;
+		if (v->validity != NULL)
+			memcpy(base + s->sc_validity[c], v->validity,
+				   sizeof(uint64) * VEXEC_WORDS(HJ_CHUNK_ROWS));
+		if (v->shape.layout != VEXEC_DATUM)
+		{
+			memcpy(values, v->values, store_row_bytes(&v->shape) * n);
+			continue;
+		}
+		for (int r = 0; r < n; r++)
+		{
+			Datum		d = ((Datum *) v->values)[r];
+
+			if (vexec_vec_isnull(v, r))
+				((dsa_pointer *) values)[r] = InvalidDsaPointer;
+			else if (v->type->typbyval)
+				((dsa_pointer *) values)[r] = (dsa_pointer) d;
+			else
+				((dsa_pointer *) values)[r] =
+					shared_copy(s, DatumGetPointer(d),
+								datumGetSize(d, false, v->type->typlen));
+		}
+	}
+	memcpy(keys, ch->keys, sizeof(HjKeyVal) * s->nkeys * n);
+	if (!s->keys_in_place)
+		for (int i = 0; i < n * s->nkeys; i++)
+		{
+			HjKey	   *key = &s->keys[i % s->nkeys];
+
+			if (key->kind == HJ_KEY_BYTES)
+				keys[i].u.i = (int64) shared_copy(s, ch->keys[i].u.p, ch->keys[i].len);
+			else if (key->kind == HJ_KEY_FMGR && !key->typbyval[1])
+				keys[i].u.i = (int64)
+					shared_copy(s, DatumGetPointer(ch->keys[i].u.d),
+								datumGetSize(ch->keys[i].u.d, false, key->typlen[1]));
+		}
+	pg_atomic_fetch_add_u64(&sh->nrows, n);
+	pg_atomic_fetch_add_u64(&sh->memory, s->sc_size);
+
+	if (s->nown >= s->maxown)
+	{
+		s->maxown = Max(s->maxown * 2, 64);
+		s->own = s->own ? repalloc(s->own, sizeof(dsa_pointer) * s->maxown) :
+			MemoryContextAlloc(s->node.mcxt, sizeof(dsa_pointer) * s->maxown);
+	}
+	s->own[s->nown++] = dp;
+	sc->next = dsa_pointer_atomic_read(&sh->chunks);
+	while (!dsa_pointer_atomic_compare_exchange(&sh->chunks, &sc->next, dp))
+		;
+}
+
+/*
+ * This participant's chunks copied into the shared table and freed: those
+ * that are full, or all of them.
+ */
+static void
+publish_chunks(HjState *s, bool all)
+{
+	int			keep = 0;
+
+	for (int c = 0; c < s->nchunks; c++)
+	{
+		HjChunk    *ch = s->chunks[c];
+
+		if (!all && ch->nrows < HJ_CHUNK_ROWS)
+		{
+			s->chunks[keep++] = ch;
+			continue;
+		}
+		if (ch->nrows > 0)
+			chunk_publish(s, ch);
+		vexec_batch_free(ch->batch);
+		pfree(ch->hashes);
+		pfree(ch->keys);
+		pfree(ch);
+	}
+	s->nchunks = keep;
+}
+
+/* The shared table's buckets, by its rows: the participant the barrier chose. */
+static void
+shared_buckets(HjState *s)
+{
+	HjShared   *sh = s->shared;
+	uint64		nb = table_buckets((int64) pg_atomic_read_u64(&sh->nrows));
+	pg_atomic_uint32 *heads;
+
+	sh->heads = dsa_allocate_extended(s->area, sizeof(pg_atomic_uint32) * nb, DSA_ALLOC_HUGE);
+	heads = dsa_get_address(s->area, sh->heads);
+	for (uint64 b = 0; b < nb; b++)
+		pg_atomic_init_u32(&heads[b], 0);
+	sh->mask = (uint32) (nb - 1);
+	pg_atomic_fetch_add_u64(&sh->memory, sizeof(pg_atomic_uint32) * nb);
+}
+
+/* This participant's chunks' rows into the shared buckets, each first in its own. */
+static void
+shared_link(HjState *s)
+{
+	HjShared   *sh = s->shared;
+	pg_atomic_uint32 *heads = dsa_get_address(s->area, sh->heads);
+
+	for (int i = 0; i < s->nown; i++)
+	{
+		HjSharedChunk *sc = dsa_get_address(s->area, s->own[i]);
+
+		for (int r = 0; r < sc->nrows; r++)
+		{
+			uint32		rid = (sc->chunkno << HJ_CHUNK_SHIFT) | (uint32) r;
+			pg_atomic_uint32 *head = &heads[sc->hashes[r] & sh->mask];
+			uint32		first = pg_atomic_read_u32(head);
+
+			do
+				sc->next_row[r] = first;
+			while (!pg_atomic_compare_exchange_u32(head, &first, rid + 1));
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * A view of a shared chunk, in this process: its columns, hashes and links
+ * read in place, but a column of Datums, whose values it points at here;
+ * its keys in place, or where one points, copied, pointing here.
+ */
+static HjChunk *
+chunk_view(HjState *s, HjSharedChunk *sc)
+{
+	HjSide	   *in = &s->side[1];
+	char	   *base = (char *) sc;
+	uint8	   *layout = (uint8 *) (base + s->sc_layout);
+	bool	   *nulls = (bool *) (layout + in->ncols);
+	HjKeyVal   *keys = (HjKeyVal *) (base + s->sc_keys);
+	HjChunk    *ch = palloc0(sizeof(HjChunk));
+	VexecBatch *b = palloc0(sizeof(VexecBatch));
+	int			n = sc->nrows;
+
+	b->nrows = n;
+	b->ncols = in->ncols;
+	b->types = in->types;
+	b->cols = palloc0(sizeof(VexecVec) * Max(in->ncols, 1));
+	b->mcxt = s->tablecxt;
+	b->arena.mcxt = s->tablecxt;
+	for (int c = 0; c < in->ncols; c++)
+	{
+		VexecVec   *v = &b->cols[c];
+
+		v->type = in->types[c];
+		v->encoding = VEXEC_FLAT;
+		v->nvalues = n;
+		v->validity = nulls[c] ? (uint64 *) (base + s->sc_validity[c]) : NULL;
+		if (layout[c] != s->store_shape[c].layout)
+			s->store_uniform[c] = false;
+		if (layout[c] != VEXEC_DATUM)
+		{
+			v->shape = s->store_shape[c];
+			v->values = base + s->sc_values[c];
+		}
+		else
+		{
+			const dsa_pointer *dps = (const dsa_pointer *) (base + s->sc_values[c]);
+			Datum	   *vals = palloc(sizeof(Datum) * Max(n, 1));
+			VexecShape	datum = {VEXEC_DATUM, false, 0, 0, 0};
+
+			v->shape = datum;
+			for (int r = 0; r < n; r++)
+				vals[r] = !DsaPointerIsValid(dps[r]) ? (Datum) 0 :
+					v->type->typbyval ? (Datum) dps[r] :
+					PointerGetDatum(dsa_get_address(s->area, dps[r]));
+			v->values = vals;
+		}
+	}
+	ch->batch = b;
+	ch->nrows = n;
+	ch->hashes = sc->hashes;
+	ch->next = sc->next_row;
+	if (s->keys_in_place)
+		ch->keys = keys;
+	else
+	{
+		ch->keys = palloc(sizeof(HjKeyVal) * Max(n * s->nkeys, 1));
+		memcpy(ch->keys, keys, sizeof(HjKeyVal) * n * s->nkeys);
+		for (int i = 0; i < n * s->nkeys; i++)
+		{
+			HjKey	   *key = &s->keys[i % s->nkeys];
+
+			if (key->kind == HJ_KEY_BYTES)
+				ch->keys[i].u.p = dsa_get_address(s->area, (dsa_pointer) keys[i].u.i);
+			else if (key->kind == HJ_KEY_FMGR && !key->typbyval[1])
+				ch->keys[i].u.d =
+					PointerGetDatum(dsa_get_address(s->area, (dsa_pointer) keys[i].u.i));
+		}
+	}
+	return ch;
+}
+
+/* The shared table, as this process probes it: a view of each chunk, its buckets. */
+static void
+shared_views(HjState *s)
+{
+	HjShared   *sh = s->shared;
+	MemoryContext old = MemoryContextSwitchTo(s->tablecxt);
+	uint32		n = pg_atomic_read_u32(&sh->nchunks);
+	HjSharedChunk *sc;
+
+	StaticAssertDecl(sizeof(pg_atomic_uint32) == sizeof(uint32),
+					 "a shared bucket is read as a uint32");
+	table_reset(s);
+	s->chunks = palloc0(sizeof(HjChunk *) * Max(n, 1));
+	s->nchunks = (int) n;
+	s->maxchunks = (int) n;
+	for (dsa_pointer dp = dsa_pointer_atomic_read(&sh->chunks); DsaPointerIsValid(dp);
+		 dp = sc->next)
+	{
+		sc = dsa_get_address(s->area, dp);
+		s->chunks[sc->chunkno] = chunk_view(s, sc);
+	}
+	MemoryContextSwitchTo(old);
+	s->nrows = (int64) pg_atomic_read_u64(&sh->nrows);
+	s->shared_rows = s->nrows;
+	s->heads = DsaPointerIsValid(sh->heads) ?
+		(uint32 *) dsa_get_address(s->area, sh->heads) : NULL;
+	s->mask = sh->mask;
+	s->peak_memory = Max(s->peak_memory, (Size) pg_atomic_read_u64(&sh->memory));
+}
+
+/* A shared table empty, its phases from the first. */
+static void
+shared_init(HjShared *sh)
+{
+	BarrierInit(&sh->barrier, 0);
+	pg_atomic_init_u32(&sh->nchunks, 0);
+	pg_atomic_init_u64(&sh->nrows, 0);
+	pg_atomic_init_u64(&sh->memory, 0);
+	dsa_pointer_atomic_init(&sh->chunks, InvalidDsaPointer);
+	dsa_pointer_atomic_init(&sh->blocks, InvalidDsaPointer);
+	sh->heads = InvalidDsaPointer;
+	sh->mask = 0;
+}
+
+/* A shared table's chunks, blocks and buckets freed, by the one process left. */
+static void
+shared_free(dsa_area *area, HjShared *sh)
+{
+	dsa_pointer next;
+
+	for (dsa_pointer dp = dsa_pointer_atomic_read(&sh->chunks); DsaPointerIsValid(dp); dp = next)
+	{
+		next = ((HjSharedChunk *) dsa_get_address(area, dp))->next;
+		dsa_free(area, dp);
+	}
+	for (dsa_pointer dp = dsa_pointer_atomic_read(&sh->blocks); DsaPointerIsValid(dp); dp = next)
+	{
+		next = ((HjSharedBlock *) dsa_get_address(area, dp))->next;
+		dsa_free(area, dp);
+	}
+	if (DsaPointerIsValid(sh->heads))
+		dsa_free(area, sh->heads);
+	shared_init(sh);
 }
 
 /* ---------------------------------------------------------------------
@@ -2070,7 +2563,9 @@ inner_keep(HjState *s, HjBatch *hb, const int *rows, int n)
  * The inner side, read whole (MultiExecPrivateHash): each row in order --
  * resolved first where the vector child still resolves it, its keys by
  * PostgreSQL's evaluator where they are dirty -- into the table; one of a
- * NULL key kept for a right join's end, else dropped.
+ * NULL key kept for a right join's end, else dropped.  For a shared table,
+ * the participant's share of it, into its chunks, each copied into the
+ * area as it fills (MultiExecParallelHash).
  */
 static void
 build(HjState *s)
@@ -2134,10 +2629,21 @@ build(HjState *s)
 				keep_null_row(s, in, batch_row_slot(in, hb, r));
 		}
 		inner_keep(s, hb, run, nrun);
-		maybe_spill(s);
+		if (s->shared != NULL)
+			publish_chunks(s, false);
+		else
+			maybe_spill(s);
 		CHECK_FOR_INTERRUPTS();
 	}
 	pfree(run);
+	if (s->shared != NULL)
+	{
+		/* this participant's share, copied in; shared_build() links it */
+		publish_chunks(s, true);
+		s->inner_rows += s->nrows;
+		table_reset(s);
+		return;
+	}
 	s->built = true;
 	if (!s->spilled)
 	{
@@ -2409,26 +2915,78 @@ join_filter_lend(HjState *s)
 	}
 }
 
+/*
+ * A shared table, built with the participants that come (HJS_*): this
+ * participant's share of the inner side copied in, where it comes while
+ * the rows are put in; the buckets allocated by the one the barrier
+ * chooses, each participant's chunks' rows linked by it; then a view of
+ * every chunk (ExecParallelHashJoin's PHJ_BUILD_* phases).
+ */
+static void
+shared_build(HjState *s)
+{
+	HjShared   *sh = s->shared;
+	EState	   *estate = s->node.css.ss.ps.state;
+	int			phase;
+
+	if (hj_wait_event == 0)
+		hj_wait_event = WaitEventExtensionNew("VexecHashJoinBuild");
+	if (estate->es_query_dsa != NULL)
+		s->area = estate->es_query_dsa;
+	s->nown = 0;
+	s->block_base = NULL;
+	phase = BarrierAttach(&sh->barrier);
+	if (phase == HJS_BUILD)
+	{
+		build(s);
+		if (BarrierArriveAndWait(&sh->barrier, hj_wait_event))
+			shared_buckets(s);
+		phase = HJS_ALLOCATE;
+	}
+	if (phase == HJS_ALLOCATE)
+	{
+		BarrierArriveAndWait(&sh->barrier, hj_wait_event);
+		phase = HJS_LINK;
+	}
+	if (phase == HJS_LINK)
+	{
+		shared_link(s);
+		BarrierArriveAndWait(&sh->barrier, hj_wait_event);
+	}
+	BarrierDetach(&sh->barrier);
+	shared_views(s);
+	s->built = true;
+}
+
+/*
+ * The table built, and whether the outer side is to be read.  A shared
+ * table's participant reads no outer row first: none knows alone that the
+ * outer side has none (nodeHashjoin.c's HJ_BUILD_HASHTABLE).
+ */
 static bool
 build_phase(HjState *s)
 {
 	Plan	   *outer = s->side[0].ps->plan;
 	Plan	   *inner = s->side[1].ps->plan;
 
-	if (!s->fill_inner &&
-		(s->fill_outer ||
-		 (outer->startup_cost < inner->total_cost && !s->outer_not_empty)))
+	if (s->shared != NULL)
+		shared_build(s);
+	else
 	{
-		if (!prefetch_outer(s))
+		if (!s->fill_inner &&
+			(s->fill_outer ||
+			 (outer->startup_cost < inner->total_cost && !s->outer_not_empty)))
 		{
-			s->outer_not_empty = false;
-			drain_side(s, &s->side[1]);
-			return false;
+			if (!prefetch_outer(s))
+			{
+				s->outer_not_empty = false;
+				drain_side(s, &s->side[1]);
+				return false;
+			}
+			s->outer_not_empty = true;
 		}
-		s->outer_not_empty = true;
+		build(s);
 	}
-
-	build(s);
 	join_filter_lend(s);
 
 	/* an inner side with nothing to match: the outer side is not read */
@@ -3353,6 +3911,9 @@ hj_begin(CustomScanState *css, EState *estate, int eflags)
 	s->fill_outer = s->jointype == JOIN_LEFT || s->jointype == JOIN_ANTI;
 	s->fill_inner = s->jointype == JOIN_RIGHT;
 	s->single_match = s->plan.inner_unique || s->jointype == JOIN_SEMI;
+	/* a shared table counts no inner row's matches (plan/orca.c) */
+	if (cscan->scan.plan.parallel_aware && s->fill_inner)
+		elog(ERROR, "vexec: a parallel-aware VecHashJoin of a right join");
 
 	/* the children: neither runs backward or marks (nodeHashjoin.c) */
 	eflags &= ~(EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK);
@@ -3482,6 +4043,8 @@ hj_begin(CustomScanState *css, EState *estate, int eflags)
 		vexec_type_shape(s->side[1].types[i], &cfg, &s->store_shape[i]);
 		s->store_uniform[i] = true;
 	}
+	if (cscan->scan.plan.parallel_aware)
+		shared_layout(s);
 
 	/* a round's arrays */
 	s->c_outer = palloc(sizeof(int) * VEXEC_BATCH_ROWS);
@@ -3513,14 +4076,15 @@ hj_rescan(CustomScanState *css)
 	 * The table again where it is all in memory and neither the inner side's
 	 * parameters nor its keys' changed, its rows' matches forgotten
 	 * (ExecReScanHashJoin, whose Hash node's chgParam holds both); else made
-	 * again.
+	 * again -- and a shared one always, with the Gather's new participants,
+	 * which hj_reinitialize_dsm() emptied.
 	 */
-	if (s->built && !s->spilled && inner->chgParam == NULL &&
+	if (s->built && !s->spilled && s->shared == NULL && inner->chgParam == NULL &&
 		!bms_overlap(css->ss.ps.chgParam, s->inner_key_params))
 	{
 		if (s->fill_inner)
 			for (int c = 0; c < s->nchunks; c++)
-				memset(s->chunks[c]->matched, 0, sizeof(s->chunks[c]->matched));
+				memset(s->chunks[c]->matched, 0, sizeof(uint64) * VEXEC_WORDS(HJ_CHUNK_ROWS));
 		if (s->side[1].nullrows != NULL)
 			tuplestore_rescan(s->side[1].nullrows);
 		s->outer_not_empty = false;
@@ -3582,6 +4146,55 @@ hj_end(CustomScanState *css)
 	ExecEndNode(outerPlanState(css));
 	ExecEndNode(innerPlanState(css));
 	vexec_node_end(&s->node);
+}
+
+/* ---------------------------------------------------------------------
+ * The DSM of a parallel-aware VecHashJoin: its shared table
+ * ---------------------------------------------------------------------
+ */
+
+static Size
+hj_estimate_dsm(CustomScanState *css, ParallelContext *pcxt)
+{
+	(void) css;
+	(void) pcxt;
+	return MAXALIGN(sizeof(HjShared));
+}
+
+static void
+hj_initialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordinate)
+{
+	HjState    *s = (HjState *) css;
+
+	(void) pcxt;
+	shared_init((HjShared *) coordinate);
+	s->shared = (HjShared *) coordinate;
+	s->area = css->ss.ps.state->es_query_dsa;
+}
+
+/*
+ * A Gather run again: its workers gone, the leader, its view dropped
+ * (hj_rescan()), frees the table, which its new participants build again.
+ */
+static void
+hj_reinitialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordinate)
+{
+	HjState    *s = (HjState *) css;
+	dsa_area   *area = css->ss.ps.state->es_query_dsa != NULL ?
+		css->ss.ps.state->es_query_dsa : s->area;
+
+	(void) pcxt;
+	shared_free(area, (HjShared *) coordinate);
+}
+
+static void
+hj_initialize_worker(CustomScanState *css, shm_toc *toc, void *coordinate)
+{
+	HjState    *s = (HjState *) css;
+
+	(void) toc;
+	s->shared = (HjShared *) coordinate;
+	s->area = css->ss.ps.state->es_query_dsa;
 }
 
 /* ---------------------------------------------------------------------
@@ -3672,6 +4285,8 @@ hj_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		if (s->nl1 > 0)
 			ExplainPropertyInteger("Rows Removed by Join Filter", NULL, s->join_filtered, es);
 		ExplainPropertyInteger("Inner Rows", NULL, s->inner_rows, es);
+		if (s->shared_rows > 0)
+			ExplainPropertyInteger("Shared Table Rows", NULL, s->shared_rows, es);
 		ExplainPropertyInteger("Memory Usage", "kB", (int64) ((s->peak_memory + 1023) / 1024), es);
 		if (s->spilled_parts > 0)
 		{

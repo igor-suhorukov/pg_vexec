@@ -55,6 +55,12 @@
  *			a vexec.scan_rows_per_worker rows, where PostgreSQL's rule of
  *			a column store's compressed pages gives few.
  *
+ * And through its minor version 4 (ch_table_engines.md §8 item 15):
+ *
+ *	shares_table	a VecHashJoin of a subtree the pass splits: whether the
+ *			participants may share its table, built from an inner side
+ *			they split too (exec/vechashjoin.c's shared table).
+ *
  * Force mode builds a vector node wherever the oracle accepts one.  Auto
  * mode, where ORCA's search priced vexec's nodes, builds one wherever it
  * priced one: where the oracle accepts it, of vexec.min_rows rows at least.
@@ -114,6 +120,7 @@ static bool orca_cost_hash_key(void *state, Oid eqop, Oid collation);
 static Plan *orca_build_window(void *state, WindowAgg *window, List *rtable);
 static int	orca_scan_workers(Plan *scan, Relation rel, double pages, double tuples,
 							  int workers);
+static bool orca_shares_table(Plan *join);
 
 static const GpOrcaVecRoutine orca_routine = {
 	.size = sizeof(GpOrcaVecRoutine),
@@ -131,6 +138,7 @@ static const GpOrcaVecRoutine orca_routine = {
 	.cost_hash_key = orca_cost_hash_key,
 	.build_window = orca_build_window,
 	.scan_workers = orca_scan_workers,
+	.shares_table = orca_shares_table,
 };
 
 void
@@ -1106,6 +1114,37 @@ orca_scan_workers(Plan *scan, Relation rel, double pages, double tuples, int wor
 		return -1;
 	return Max(workers, (int) Min(floor(tuples / vexec_scan_rows_per_worker),
 								  (double) max_parallel_workers_per_gather));
+}
+
+/*
+ * Whether the participants of a Gather may share a VecHashJoin's table
+ * (from the API's minor version 4), the pass then making it parallel-aware:
+ * under enable_parallel_hash, as PostgreSQL's Parallel Hash, an inner, a
+ * left, a semi or an anti join -- whose inner rows' matches no participant
+ * counts -- whose table by ORCA's estimate of its inner side, a row's
+ * columns, hash, link and keys, fits the memory the participants' own
+ * tables would hold together, a shared table never spilling
+ * (exec/vechashjoin.c).  It reads the node alone, and raises nothing.
+ */
+static bool
+orca_shares_table(Plan *join)
+{
+	CustomScan *cscan = (CustomScan *) join;
+	Plan	   *inner = innerPlan(join);
+	VexecJoinPlan jp;
+	double		bytes;
+
+	if (!enable_parallel_hash || !IsA(join, CustomScan) ||
+		cscan->methods != vexec_hashjoin_methods() || inner == NULL ||
+		list_length(cscan->custom_private) != 4)
+		return false;
+	vexec_join_plan_decode(cscan, &jp);
+	if (jp.jointype != JOIN_INNER && jp.jointype != JOIN_LEFT &&
+		jp.jointype != JOIN_SEMI && jp.jointype != JOIN_ANTI)
+		return false;
+	bytes = inner->plan_rows *
+		(inner->plan_width + 2 * sizeof(uint32) + 16 * list_length(jp.hashoperators));
+	return bytes <= (double) get_hash_memory_limit() * (max_parallel_workers_per_gather + 1);
 }
 
 /* Whether vexec hashes a key compared by this operator: strict, with a hash function. */

@@ -92,6 +92,15 @@
  *						engine's own rule gives its scan on PostgreSQL's
  *						planner's route
  *
+ * and, from minor version 4, at one more:
+ *
+ *	shares_table		a hash join of the engine's in a subtree parallel.c
+ *						splits: whether its table may be one the Gather's
+ *						participants share, built from an inner side they
+ *						split as well -- PostgreSQL's Parallel Hash, in the
+ *						engine's node -- which the pass then asks for by
+ *						making the node parallel-aware
+ *
  * A node built so is the engine's CustomScan, found by name where the
  * plan is read back, a segment's fragment among them.  Without a
  * registration gp_orca calls nothing, and its plans are as they were.
@@ -122,9 +131,9 @@
 #define GP_ORCA_VEC_RENDEZVOUS	"Cloudberry/gp_orca_vec_v1"	/* the major
 															 * version is in
 															 * the name */
-#define GP_ORCA_VEC_MINOR		3	/* 1: describe_node; 2: set_options,
+#define GP_ORCA_VEC_MINOR		4	/* 1: describe_node; 2: set_options,
 									 * the cost oracle, build_window; 3:
-									 * scan_workers */
+									 * scan_workers; 4: shares_table */
 #define GP_ORCA_VEC_MAGIC		0x47564331	/* "GVC1" */
 
 struct ExplainState;
@@ -345,6 +354,21 @@ typedef struct GpOrcaVecRoutine
 	 */
 	int			(*scan_workers) (Plan *scan, Relation rel, double pages,
 								 double tuples, int workers);
+
+	/*
+	 * From minor version 4: may a hash join of the engine's (describe_node's
+	 * HASHJOIN), the join of a subtree parallel.c splits among a Gather's
+	 * participants, share its table among them: each participant hashes
+	 * its share of the inner side, its righttree, which the pass splits as
+	 * well, into the one table, and all of them probe it once it is built.
+	 * True: the pass may ask for that by making the node parallel-aware,
+	 * as it makes PostgreSQL's HashJoin and Hash for Parallel Hash; the
+	 * engine's node then shares its table where it runs under a Gather, and
+	 * builds its own elsewhere.  Without it, no table is shared.  Any time
+	 * while the plan is planned, in any memory context; it reads the node
+	 * alone and raises no error.
+	 */
+	bool		(*shares_table) (Plan *join);
 } GpOrcaVecRoutine;
 
 typedef struct GpOrcaVecRegistry

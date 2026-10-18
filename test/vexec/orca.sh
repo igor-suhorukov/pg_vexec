@@ -277,7 +277,14 @@ section_module() {
 # a Gather's participants can split, an aggregate ORCA planned in one stage
 # done in two around it, as PostgreSQL's planner does it, vexec's nodes too;
 # below a Limit through a Sort, in a CTE's subplan, on the inner side of a
-# loop over one row; the rows PostgreSQL's planner gives; workers launched,
+# loop over one row; a hash join's table shared among the participants,
+# PostgreSQL's Parallel Hash, of an inner, an anti and a full join, and none
+# under enable_parallel_hash off; an aggregate with HAVING on a semi join's
+# inner side (TPC-H q18's shape), which each participant computes whole
+# where it is small beside the outer side, and in two stages around a
+# Gather of its own where it is not; with vexec, a VecHashJoin's table
+# shared (gp_orca_vec.h's shares_table), its rows all the participants';
+# the rows PostgreSQL's planner gives; workers launched,
 # as pg_stat_database counts them, and none for a cursor.  Costs that make a
 # Gather pay on the section's small table, as the cluster leg sets them.
 PAR="SET gp.enable_parallel = on; SET max_parallel_workers_per_gather = 2; SET parallel_setup_cost = 0; SET parallel_tuple_cost = 0; SET min_parallel_table_scan_size = 0;"
@@ -289,6 +296,14 @@ PAR_QUERIES=(
 	"SELECT k, count(*) FROM %t WHERE v > 1000 GROUP BY k ORDER BY 2 DESC, 1 LIMIT 5"
 	"SELECT (SELECT max(v) FROM %t) AS m, count(*) FROM %t WHERE k = 3"
 	"SELECT k, count(*), sum(n), avg(v), min(s), max(d) FROM %t WHERE NOT b GROUP BY k"
+	"SELECT count(*), sum(a.v) FROM %t a JOIN %t b ON a.id = b.id + 1 WHERE b.k < 90"
+	"SELECT count(*) FROM %t a WHERE a.k < 50 AND NOT EXISTS (SELECT 1 FROM %t b WHERE b.id = a.id + 7 AND b.v < 50000)"
+	"SELECT count(*), count(a.id), count(b.id) FROM %t a FULL JOIN %t b ON a.id = b.id + $((ROWS - 100))"
+	"SELECT a.k, count(*) FROM %t a WHERE a.id IN (SELECT id FROM %t GROUP BY id HAVING sum(v) > 99000) GROUP BY a.k"
+	"SELECT a.k, count(*) FROM %t a WHERE a.id IN (SELECT id FROM t_small GROUP BY id HAVING sum(k) > 40) GROUP BY a.k"
+	"SELECT count(*), max(b.s), min(b.n), max(b.d) FROM %t a JOIN %t b ON a.id::text = (b.id + 3)::text WHERE b.k < 90"
+	"SELECT count(*), count(b.x), sum(b.x) FROM %t a JOIN (SELECT id, NULLIF(k, 3) AS x FROM %t WHERE v < 90000) b ON a.id = b.id + 2"
+	"SELECT count(*), count(b.id), sum(b.v) FROM %t a LEFT JOIN %t b ON a.id = b.id * 3"
 )
 section_parallel() {
 	local D sql ref got nq=0 nsame=0 before after plan s
@@ -304,7 +319,8 @@ section_parallel() {
 		SELECT g AS id, g % 97 AS k, (g * 7919) % 100000 AS v, ((g % 1000) / 7.0)::numeric(12,4) AS n,
 		       'name ' || (g % 503) AS s, DATE '2020-01-01' + g % 1000 AS d, g % 3 = 0 AS b
 		FROM generate_series(1, $ROWS) g;
-		ANALYZE t_heap" > /dev/null
+		CREATE TABLE t_small AS SELECT g AS id, g % 97 AS k FROM generate_series(1, $((ROWS / 20))) g;
+		ANALYZE t_heap; ANALYZE t_small" > /dev/null
 	is "gp.enable_parallel is gp_orca's own on one node, off" \
 		"$(q "$D" postgres "SELECT setting, vartype FROM pg_settings WHERE name = 'gp.enable_parallel'")" "off|bool"
 
@@ -346,6 +362,47 @@ section_parallel() {
 		"*Nested Loop*Finalize Aggregate*Gather*Partial Aggregate*Finalize Aggregate*Gather*Partial Aggregate*"
 	par_plan "with vexec, its aggregate's stages and its scan the participants share" force "$sql" \
 		"*Vec Finalize Aggregate*Gather*Workers Planned: 2*Vec Partial Aggregate*Parallel Vec Seq Scan on t_heap*"
+	par_plan "a hash join's table shared: PostgreSQL's Parallel Hash, the inner side split as well" off \
+		"SELECT count(*), sum(a.v) FROM t_heap a JOIN t_heap b ON a.id = b.id + 1 WHERE b.k < 90" \
+		"*Gather*Parallel Hash Join*Parallel Seq Scan on t_heap*Parallel Hash*Parallel Seq Scan on t_heap*"
+	par_plan "an anti join's table shared" off \
+		"SELECT count(*) FROM t_heap a WHERE a.k < 50 AND NOT EXISTS (SELECT 1 FROM t_heap b WHERE b.id = a.id + 7 AND b.v < 50000)" \
+		"*Gather*Parallel Hash Anti Join*Parallel Seq Scan on t_heap*Parallel Hash*Parallel Seq Scan on t_heap*"
+	par_plan "a full join's, which only a shared table splits" off \
+		"SELECT count(*), count(a.id), count(b.id) FROM t_heap a FULL JOIN t_heap b ON a.id = b.id + $((ROWS - 100))" \
+		"*Gather*Parallel Hash Full Join*Parallel Seq Scan on t_heap*Parallel Hash*Parallel Seq Scan on t_heap*"
+	plan=$(q "$D" postgres "$PAR SET enable_parallel_hash = off; SET vexec.mode = off; EXPLAIN (COSTS OFF) SELECT count(*), sum(a.v) FROM t_heap a JOIN t_heap b ON a.id = b.id + 1 WHERE b.k < 90")
+	[[ "$plan" == *Gather* && "$plan" != *"Parallel Hash"* ]] \
+		&& ok "with enable_parallel_hash off, the join's inner side hashed whole by each participant" \
+		|| notok "enable_parallel_hash off" "$plan"
+	par_plan "an aggregate with HAVING on a semi join's inner side, small beside its outer side: computed whole by each participant" off \
+		"SELECT a.k, count(*) FROM t_heap a WHERE a.id IN (SELECT id FROM t_small GROUP BY id HAVING sum(k) > 40) GROUP BY a.k" \
+		"*Gather*Hash*Join*Parallel Seq Scan on t_heap*Hash*Aggregate*Seq Scan on t_small*"
+	plan=$(q "$D" postgres "$PAR SET vexec.mode = off; EXPLAIN (COSTS OFF) SELECT a.k, count(*) FROM t_heap a WHERE a.id IN (SELECT id FROM t_heap GROUP BY id HAVING sum(v) > 99000) GROUP BY a.k")
+	[[ "$plan" == *"Finalize HashAggregate"*"Gather"*"Partial HashAggregate"*"Parallel Seq Scan on t_heap"* &&
+		"$plan" != *"Gather"*"Hash Semi Join"*"Parallel Seq Scan on t_heap"*"Hash"*"HashAggregate"*"  Seq Scan on t_heap"* ]] \
+		&& ok "and as large as its outer side: in two stages around a Gather of its own, not computed whole by each participant" \
+		|| notok "a large aggregate on a semi join's inner side" "$plan"
+	par_plan "with vexec, a VecHashJoin's table shared, the inner side's scan split as well" force \
+		"SELECT count(*), sum(a.v) FROM t_heap a JOIN t_heap b ON a.id = b.id + 1 WHERE b.k < 90" \
+		"*Gather*Parallel Vec Hash Join*Parallel Vec Seq Scan on t_heap*Parallel Vec Seq Scan on t_heap*"
+	par_plan "with vexec, an anti join's" force \
+		"SELECT count(*) FROM t_heap a WHERE a.k < 50 AND NOT EXISTS (SELECT 1 FROM t_heap b WHERE b.id = a.id + 7 AND b.v < 50000)" \
+		"*Gather*Parallel Vec Hash Anti Join*Parallel Vec Seq Scan on t_heap*Parallel Vec Seq Scan on t_heap*"
+	plan=$(q "$D" postgres "$PAR SET enable_parallel_hash = off; SET vexec.mode = force; EXPLAIN (COSTS OFF) SELECT count(*), sum(a.v) FROM t_heap a JOIN t_heap b ON a.id = b.id + 1 WHERE b.k < 90")
+	[[ "$plan" == *Gather*"Vec Hash Join"* && "$plan" != *"Parallel Vec Hash"* ]] \
+		&& ok "with vexec and enable_parallel_hash off, the VecHashJoin's table each participant's own" \
+		|| notok "a VecHashJoin under enable_parallel_hash off" "$plan"
+	# the side ORCA hashes: b's rows, or a's, all of them
+	want=$(q "$D" postgres "SELECT count(*) FROM t_heap WHERE k < 90")
+	for s in force-postgres force-arrow; do
+		plan=$(q "$D" postgres "$PAR $(session_sets "$s") EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+			SELECT count(*), max(b.s) FROM t_heap a JOIN t_heap b ON a.id::text = (b.id + 3)::text WHERE b.k < 90")
+		[[ ( "$plan" == *"Parallel Vec Hash Join"*"Shared Table Rows: $want"* ||
+			"$plan" == *"Parallel Vec Hash Join"*"Shared Table Rows: $ROWS"* ) && "$plan" == *"Workers Launched: 2"* ]] \
+			&& ok "with vexec ($s), the shared table holds every participant's inner rows, its keys text" \
+			|| notok "a shared table's rows ($s)" "want $want: $plan"
+	done
 	par_plan "with vexec, a grouping's" force \
 		"SELECT k, count(*), sum(n), avg(v) FROM t_heap WHERE b GROUP BY k" \
 		"*Vec Finalize HashAggregate*Gather*Vec Partial HashAggregate*Parallel Vec Seq Scan on t_heap*"
