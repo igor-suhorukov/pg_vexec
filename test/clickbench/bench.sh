@@ -295,9 +295,11 @@ MINMAX="advengineid,counterid,eventdate,dontcounthits,isrefresh,islink,isdownloa
 # their values (ch_table_engines.md §3, "VC5 as built"; SearchPhrase, of
 # 892,232 values in 10M rows, left out) -- granules of 1,024 rows, as
 # ClickHouse's own tuned entry has them (clickhouse/create-tuned.sql), and
-# no compression codec
+# lz4, the default codec, named: without a codec the 10M rows took 11.8 GB
+# where they take 4.8, and the hot runs' geometric mean was 110 ms where it
+# was 71 (2026-10-19)
 LC="flashminor2, useragentminor, mobilephonemodel, params, pagecharset, hitcolor, browserlanguage, browsercountry, socialnetwork, socialaction, socialsourcepage, paramorderid, paramcurrency, openstatservicename, openstatcampaignid, openstatsourceid, utmsource, utmmedium, utmcampaign, utmcontent, utmterm, fromtag"
-MT_WITH="${CB_MT_WITH-low_cardinality = '$LC', index_granularity = 1024, compression = 'none'}"
+MT_WITH="${CB_MT_WITH-low_cardinality = '$LC', index_granularity = 1024, compression = 'lz4'}"
 case "$STORAGE" in
 	heap|heap_pk) CLAUSE="" ;;
 	# ordered by the suite's primary key, the one sort key ClickBench's rules
