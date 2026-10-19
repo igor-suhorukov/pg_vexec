@@ -45,6 +45,14 @@
 #   CB_PAX_WITH  PAX's table options in place of the suite's
 #   CB_MT_WITH   mergetree's table options in place of the suite's, but for
 #                order_by and storage: '' for none, the table's defaults
+#   CB_MT_MERGES mergetree: wait -- the load waits for the merge workers'
+#                merges of the parts it wrote, their time its step "merges",
+#                as ClickHouse's own load runs its merges while it loads;
+#                none (the default) -- the queries begin on the load's parts,
+#                about 35 of 10M rows, which a timed run's restarts, one
+#                before each query's cold run, leave too little time to merge
+#   CB_SETTINGS  more server settings, one "name = value" a line, for every
+#                node's postgresql.auto.conf
 #   CB_VEXEC     vexec's sessions, each one more configuration of each
 #                planner, "<planner>+<session>": force-postgres, force-arrow
 #                (vexec.mode = force in that format), auto-postgres,
@@ -256,6 +264,7 @@ for n in $NODES; do
 			fi
 			[ "$n" -eq 0 ] && echo "gp.role = 'dispatch'"
 		fi
+		[ -n "${CB_SETTINGS:-}" ] && printf '%s\n' "$CB_SETTINGS"
 	} >> "$(datadir "$n")/postgresql.auto.conf"
 done
 start_all || exit 1
@@ -289,17 +298,11 @@ fi
 # 3388 returned NULL", numeric_poly_sum; their bloom filters stay.
 PK="CounterID, EventDate, UserID, EventTime, WatchID"
 MINMAX="advengineid,counterid,eventdate,dontcounthits,isrefresh,islink,isdownload,traficsourceid"
-# mergetree's options beside its key, tuned as ClickBench's "-tuned" entries
-# are (ClickBench/README.md:107-109): the text columns of few distinct values
-# LowCardinality -- ClickHouse's dictionaries, which vexec evaluates over
-# their values (ch_table_engines.md §3, "VC5 as built"; SearchPhrase, of
-# 892,232 values in 10M rows, left out) -- granules of 1,024 rows, as
-# ClickHouse's own tuned entry has them (clickhouse/create-tuned.sql), and
-# lz4, the default codec, named: without a codec the 10M rows took 11.8 GB
-# where they take 4.8, and the hot runs' geometric mean was 110 ms where it
-# was 71 (2026-10-19)
-LC="flashminor2, useragentminor, mobilephonemodel, params, pagecharset, hitcolor, browserlanguage, browsercountry, socialnetwork, socialaction, socialsourcepage, paramorderid, paramcurrency, openstatservicename, openstatcampaignid, openstatsourceid, utmsource, utmmedium, utmcampaign, utmcontent, utmterm, fromtag"
-MT_WITH="${CB_MT_WITH-low_cardinality = '$LC', index_granularity = 1024, compression = 'lz4'}"
+# mergetree's options beside its key: none, the table's defaults.  The tuned
+# ones -- low_cardinality on 22 text columns, index_granularity = 1024, a
+# codec named -- are CB_MT_WITH's to give (2026-10-19's runs of them had the
+# load's ~35 parts unmerged, as the CB_VEXEC_ONLY runs' restarts leave them)
+MT_WITH="${CB_MT_WITH-}"
 case "$STORAGE" in
 	heap|heap_pk) CLAUSE="" ;;
 	# ordered by the suite's primary key, the one sort key ClickBench's rules
@@ -338,12 +341,37 @@ else
 	case "$STORAGE" in porc|porc_vec) step cluster -c "CLUSTER hits" ;; esac
 	step analyze -c "ANALYZE hits"
 fi
+# The load's merges (CB_MT_MERGES=wait): done once the database's merge
+# worker runs -- the launcher starts it again a minute after it found no
+# extension there, as before CREATE EXTENSION -- and the table's parts have
+# stayed as they are, the worker holding no lock on it, for two of its passes
+# (ch.merge_naptime, 10 s) and a few seconds more; the step's time, and the
+# load's, the time to the last change seen
+confirmed=0
+if [ "${CB_MT_MERGES:-none}" = wait ] && [[ "$STORAGE" == mergetree* ]]; then
+	s=$(now_ms); last=""; since=$s
+	while :; do
+		parts=$(q clickbench "SELECT count(*) FROM ch.parts('hits')")
+		worker=$(q clickbench "SELECT count(*) FROM pg_stat_activity
+			WHERE backend_type = 'ch_table_engines merge worker' AND datname = current_database()")
+		busy=$(q clickbench "SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+			WHERE a.backend_type = 'ch_table_engines merge worker' AND l.relation = 'hits'::regclass")
+		[ -n "$parts" ] && [ -n "$worker" ] && [ -n "$busy" ] || { echo "loading, merges: $parts $worker $busy"; exit 1; }
+		if [ "$parts" != "$last" ] || [ "$worker" = 0 ] || [ "$busy" != 0 ]; then last="$parts"; since=$(now_ms); fi
+		[ $(( $(now_ms) - since )) -ge 25000 ] && break
+		[ $(( $(now_ms) - s )) -ge 1800000 ] && { echo "loading, merges: not done in 30 minutes, $parts parts, $worker workers"; exit 1; }
+		sleep 0.5
+	done
+	confirmed=$(( $(now_ms) - since ))
+	printf 'merges\t%d\n' $(( since - s )) >> "$OUT/load.tsv"
+	echo "  merges: $parts parts after $(( (since - s) / 1000 )) s"
+fi
 s=$(now_ms); sync; printf 'sync\t%d\n' $(( $(now_ms) - s )) >> "$OUT/load.tsv"
-printf 'total\t%d\n' $(( $(now_ms) - t0 )) >> "$OUT/load.tsv"
+printf 'total\t%d\n' $(( $(now_ms) - t0 - confirmed )) >> "$OUT/load.tsv"
 got=$(q clickbench "SELECT count(*) FROM hits")
 [ "$got" = "$ROWS" ] || { echo "the table has $got rows, want $ROWS"; exit 1; }
 du -sbc $(for n in $NODES; do datadir "$n"; done) | awk '/total$/ { print $1 }' > "$OUT/size"
-echo "  loaded in $(( $(now_ms) - t0 )) ms: $(awk '$1 != "total" { printf "%s %d ms, ", $1, $2 }' "$OUT/load.tsv" | sed 's/, $//'); $(cat "$OUT/size") bytes"
+echo "  loaded in $(( $(now_ms) - t0 - confirmed )) ms: $(awk '$1 != "total" { printf "%s %d ms, ", $1, $2 }' "$OUT/load.tsv" | sed 's/, $//'); $(cat "$OUT/size") bytes"
 
 # The statistics: ANALYZE's kept, or an earlier run's restored.
 STATS_SQL="SELECT json_build_object(

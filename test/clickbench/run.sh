@@ -51,7 +51,7 @@
 #                      ~/.cache/pg_accel/postgres
 #   CB_TESTS_MEM       each container's memory, 40g (the port's tests' cap)
 #   CB_SUBSET, CB_REPS, CB_TRIES, CB_TIMEOUT, CB_COLD, CB_QUERIES, CB_WORKERS,
-#   CB_STATS, CB_MT_WITH, CB_VEXEC_ONLY
+#   CB_STATS, CB_MT_WITH, CB_MT_MERGES, CB_SETTINGS, CB_VEXEC_ONLY
 #                      passed to bench.sh, which says what they do
 #   LOADS              the loads of "baseline": all eleven
 #   CHECK_RUN, TIME_RUN, AGAIN_RUN
@@ -336,6 +336,7 @@ run_loads() {
 		echo "== $mode, $load: $(date '+%F %T')"
 		local start=() mt=()
 		[ -n "${CB_MT_WITH+set}" ] && mt=(-e "CB_MT_WITH=$CB_MT_WITH")
+		mt+=(-e "CB_MT_MERGES=${CB_MT_MERGES:-}" -e "CB_SETTINGS=${CB_SETTINGS:-}")
 		{ [ -n "${CB_VEXEC:-}" ] || [ "$route" = vanilla-orca ] || [[ "$storage" == mergetree* ]]; } &&
 			start=(--user root --entrypoint /clickbench/vexec-entry.sh)
 		ORCA_IMAGE="$image" CB_ORCA_STAGE="$orca_stage" compose --profile run run --rm -T "${start[@]}" \
