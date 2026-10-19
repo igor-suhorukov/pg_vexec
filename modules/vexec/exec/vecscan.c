@@ -78,6 +78,15 @@
  * over the units none of whose rows is within it (vexec_source.h,
  * set_keys).
  *
+ * A source's columns in steps (VC2; vexec_source.h, VEXEC_SRC_STEPS): where
+ * the source takes them, the scan asks for the columns of its first vector
+ * qual first -- with the running bound's and the join keys' where those
+ * are checked before the quals, and the TIDs -- then each later qual's of
+ * the eager prefix, then the rest, and node.c reads a step only for a
+ * batch where the quals before it left a row (next_rest()), so that the
+ * source decodes a later step's columns only in its units where a row is
+ * left.
+ *
  * The scan's tuple is the table's row: the plan's quals and target list
  * read Vars of scanrelid, as a SeqScan's do, so custom_scan_tlist is empty.
  * The node reads the attributes they name, the whole row for a whole-row
@@ -179,6 +188,23 @@ typedef struct VexecScanState
 	 * order (VEXEC_SRC_ORDERED), as a VecAgg above takes them
 	 */
 	bool		want_order;
+
+	/*
+	 * A registered source's columns: spec_cols, per column of the spec, the
+	 * input column it is -- the input's order, but in steps where the scan
+	 * asks for them (VC2): nsteps, each step's end in the spec (step_ends),
+	 * each input column's step (step_of, with the TIDs in step 0); the batch
+	 * next() handed, which next_rest() fills; and the batches each step was
+	 * read for.
+	 */
+	int		   *spec_cols;
+	AttrNumber *spec_attnums;
+	int			nsteps;
+	int		   *step_ends;
+	bool	  **step_of;
+	VexecSourceBatch cur;
+	bool		cur_dict;		/* a column of the batch came as a dictionary */
+	int64		step_batches[VEXEC_SRC_MAX_STEPS];
 } VexecScanState;
 
 static bool scan_fetch(VexecNode *node);
@@ -560,6 +586,132 @@ vexec_scan_set_join_filter(PlanState *ps, VexecJoinFilter *filter)
 	return true;
 }
 
+static void scan_load_step(VexecNode *node, int step, const uint64 *rows);
+
+/*
+ * VC2: the order the scan asks its source for its columns in, and the
+ * steps they come in where the source takes steps (next_rest()) and
+ * vexec.enable_source_steps is on: the first vector qual's columns first --
+ * with the running bound's and the join keys' where node.c checks those
+ * before the quals -- then, for each later qual of the eager prefix that
+ * reads a column not read by then, its new columns, up to
+ * VEXEC_SRC_MAX_STEPS - 1 such steps, and every other column last; the
+ * TIDs with the first.  Each step's columns in the input's order.  One
+ * step -- the input's order -- where the prefix reads every column, or
+ * there is no eager qual.
+ */
+static void
+plan_steps(VexecScanState *s)
+{
+	VexecNode  *node = &s->node;
+	CustomScan *cscan = (CustomScan *) node->css.ss.ps.plan;
+	Index		relid = cscan->scan.scanrelid;
+	int8	   *step = palloc(sizeof(int8) * Max(s->nattrs, 1));
+	int			nsteps = 0;
+	int			k = 0;
+	int			j = 0;
+	int			col;
+	ListCell   *lc;
+
+	s->spec_cols = palloc(sizeof(int) * Max(s->nattrs, 1));
+	s->spec_attnums = palloc(sizeof(AttrNumber) * Max(s->nattrs, 1));
+	s->nsteps = 0;
+	node->nsteps = 0;
+	for (col = 0; col < s->nattrs; col++)
+	{
+		s->spec_cols[col] = col;
+		s->spec_attnums[col] = s->attrs[col];
+	}
+	if (s->src == NULL || !VEXEC_SOURCE_HAS(s->src, next_rest) || !vexec_enable_source_steps ||
+		node->first_lazy == 0 || s->nattrs < 2)
+		return;
+
+	memset(step, -1, sizeof(int8) * s->nattrs);
+	if (node->bound != NULL && node->bound->before_quals && !node->bound_in_source)
+		step[node->bound_col] = 0;
+	if (node->jfilter != NULL && node->jfilter->before_quals && !node->jfilter_in_source &&
+		node->jfilter_col < s->nattrs)
+		step[node->jfilter_col] = 0;
+	for (col = 0; col < s->nattrs; col++)
+		if (step[col] == 0)
+			nsteps = 1;
+	node->qual_step = palloc0(sizeof(int8) * Max(node->nquals, 1));
+	foreach(lc, cscan->scan.plan.qual)
+	{
+		Bitmapset  *attrs = NULL;
+		bool		whole;
+		bool		fresh = false;
+		int			last = 0;
+
+		if (k >= node->first_lazy)
+			break;
+		pull_varattnos(lfirst(lc), relid, &attrs);
+		whole = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber, attrs);
+		for (col = 0; col < s->nattrs; col++)
+			if (step[col] < 0 &&
+				(whole || bms_is_member(s->attrs[col] - FirstLowInvalidHeapAttributeNumber, attrs)))
+				fresh = true;
+		if (fresh)
+		{
+			/* the steps left for the quals taken: the qual and those after it last */
+			if (nsteps >= VEXEC_SRC_MAX_STEPS - 1)
+				break;
+			for (col = 0; col < s->nattrs; col++)
+				if (step[col] < 0 &&
+					(whole || bms_is_member(s->attrs[col] - FirstLowInvalidHeapAttributeNumber, attrs)))
+					step[col] = nsteps;
+			nsteps++;
+		}
+		for (col = 0; col < s->nattrs; col++)
+			if (whole || bms_is_member(s->attrs[col] - FirstLowInvalidHeapAttributeNumber, attrs))
+				last = Max(last, step[col]);
+		node->qual_step[k++] = last;
+		bms_free(attrs);
+	}
+	for (col = 0; col < s->nattrs; col++)
+		if (step[col] < 0)
+		{
+			for (int c = col; c < s->nattrs; c++)
+				if (step[c] < 0)
+					step[c] = nsteps;
+			nsteps++;
+			break;
+		}
+	for (; k < node->nquals; k++)
+		node->qual_step[k] = nsteps - 1;
+	if (nsteps < 2)
+	{
+		pfree(step);
+		node->qual_step = NULL;
+		return;
+	}
+
+	/* the spec's columns step by step, each step's in the input's order */
+	s->step_ends = palloc(sizeof(int) * nsteps);
+	s->step_of = palloc(sizeof(bool *) * nsteps);
+	node->in_step = palloc0(sizeof(int8) * Max(node->ninput, 1));
+	for (int st = 0; st < nsteps; st++)
+	{
+		s->step_of[st] = palloc0(sizeof(bool) * Max(node->ninput, 1));
+		for (col = 0; col < s->nattrs; col++)
+			if (step[col] == st)
+			{
+				s->spec_cols[j] = col;
+				s->spec_attnums[j++] = s->attrs[col];
+				s->step_of[st][col] = true;
+				node->in_step[col] = st;
+			}
+		s->step_ends[st] = j;
+	}
+	/* the TIDs come with next() */
+	if (s->need_tid)
+		s->step_of[0][s->nattrs] = true;
+	pfree(step);
+	s->nsteps = nsteps;
+	node->nsteps = nsteps;
+	node->load_step = scan_load_step;
+}
+
 static void
 begin_scan(VexecScanState *s)
 {
@@ -582,22 +734,31 @@ begin_scan(VexecScanState *s)
 		uint8	   *layouts = palloc(Max(s->nattrs, 1));
 		int			i;
 
+		/* VC2: the columns' order, in steps where the source takes them */
+		if (s->spec_cols == NULL)
+			plan_steps(s);
 		for (i = 0; i < s->nattrs; i++)
 		{
 			VexecShape	shape;
 
-			vexec_type_shape(s->node.in->types[i], &s->node.layout, &shape);
+			vexec_type_shape(s->node.in->types[s->spec_cols[i]], &s->node.layout, &shape);
 			layouts[i] = shape.layout;
 		}
 		spec->size = sizeof(VexecSourceSpec);
 		spec->ncolumns = s->nattrs;
-		spec->attnums = s->attrs;
+		spec->attnums = s->spec_attnums;
 		spec->layouts = layouts;
 		spec->quals = pruning_quals((CustomScan *) s->node.css.ss.ps.plan);
 		spec->max_rows = VEXEC_BATCH_ROWS;
 		spec->flags = s->need_tid ? VEXEC_SRC_TIDS : 0;
 		if (s->want_order)
 			spec->flags |= VEXEC_SRC_ORDERED;
+		if (s->nsteps > 0)
+		{
+			spec->flags |= VEXEC_SRC_STEPS;
+			spec->nsteps = s->nsteps;
+			spec->step_ends = s->step_ends;
+		}
 		/* VC5: a source that keeps a column as a dictionary hands it so */
 		if (vexec_batch_dictionary)
 		{
@@ -773,9 +934,9 @@ check_dictionary(VexecScanState *s, const VexecVec *v, int col)
 }
 
 /*
- * vexec's identity for a source column's dictionary: one for each identity
- * the source gives (dictionary_id()), new each time it changes; 0 where the
- * source gives none
+ * vexec's identity for a source column's dictionary -- column `col` of the
+ * spec: one for each identity the source gives (dictionary_id()), new each
+ * time it changes; 0 where the source gives none
  */
 static uint64
 dictionary_identity(VexecScanState *s, int col)
@@ -795,90 +956,115 @@ dictionary_identity(VexecScanState *s, int col)
 	return s->dict_ids[col];
 }
 
+/*
+ * Column j of the source's batch -- of its spec -- into the input column it
+ * is, as the source holds it (fetch_source(), scan_load_step()).
+ */
+static void
+source_column(VexecScanState *s, const VexecSourceBatch *sb, int j)
+{
+	VexecBatch *in = s->node.in;
+	int			i = s->spec_cols[j];
+	const VexecColumn *c = &sb->columns[j];
+	VexecVec   *v = &in->cols[i];
+
+	v->shape.layout = c->layout;
+	v->shape.arrow_values = c->arrow_values;
+	v->shape.scale = c->scale;
+	v->shape.width = c->width;
+	v->shape.stride = c->stride;
+	vexec_shape_normalize(&v->shape);
+	v->encoding = c->encoding;
+	v->nvalues = c->encoding == VEXEC_CONST ? 1 : sb->nrows;
+	v->validity = (uint64 *) c->validity;
+	v->values = (void *) c->values;
+	v->buffers = (char **) c->buffers;
+	v->buffer_sizes = (int64 *) c->buffer_sizes;
+	v->nbuffers = c->nbuffers;
+	v->datums = (Datum *) c->datums;
+	v->codes = NULL;
+	v->dictionary = NULL;
+	v->dict_id = 0;
+	if (c->encoding == VEXEC_DICT)
+	{
+		VexecVec   *d = vexec_batch_alloc0(in, sizeof(VexecVec));
+		const VexecColumn *dc = c->dictionary;
+
+		if (s->dict_ids == NULL || dc == NULL || c->codes == NULL ||
+			c->ndictionary <= 0 || dc->encoding != VEXEC_FLAT)
+			elog(ERROR, "vexec: the batch source \"%s\" gave a dictionary column it was not asked for, or one without its dictionary",
+				 s->src->name);
+		v->codes = (int32 *) c->codes;
+		d->type = v->type;
+		d->shape.layout = dc->layout;
+		d->shape.arrow_values = dc->arrow_values;
+		d->shape.scale = dc->scale;
+		d->shape.width = dc->width;
+		d->shape.stride = dc->stride;
+		vexec_shape_normalize(&d->shape);
+		d->encoding = VEXEC_FLAT;
+		d->nvalues = c->ndictionary;
+		d->validity = (uint64 *) dc->validity;
+		d->values = (void *) dc->values;
+		d->buffers = (char **) dc->buffers;
+		d->buffer_sizes = (int64 *) dc->buffer_sizes;
+		d->nbuffers = dc->nbuffers;
+		d->datums = (Datum *) dc->datums;
+		v->dictionary = d;
+		/* the column is read by its dictionary's shape, whatever it said */
+		v->shape = d->shape;
+		check_dictionary(s, v, i);
+		v->dict_id = dictionary_identity(s, j);
+		s->cur_dict = true;
+	}
+}
+
+/*
+ * VC2: a later step's column until it is read, every row NULL, so that a
+ * read of it before -- none is made -- would find no value of another row.
+ */
+static void
+step_placeholder(VexecBatch *in, VexecVec *v)
+{
+	VexecShape	shape = v->shape;
+
+	vexec_vec_init(in, v, &shape, 1);
+	v->encoding = VEXEC_CONST;
+	v->validity = vexec_bitmap_alloc(in, 1, false);
+}
+
 /* A registered source's next batch, its columns as the source holds them. */
 static bool
 fetch_source(VexecScanState *s)
 {
 	VexecBatch *in = s->node.in;
-	VexecSourceBatch sb;
-	int			i;
+	VexecSourceBatch *sb = &s->cur;
+	int			nfirst = s->nsteps > 0 ? s->step_ends[0] : s->nattrs;
+	int			j;
 
-	memset(&sb, 0, sizeof(sb));
+	memset(sb, 0, sizeof(VexecSourceBatch));
 	vexec_batch_reset(in);
 	bound_to_source(s);
-	if (!s->src->next(s->srcstate, &sb))
+	if (!s->src->next(s->srcstate, sb))
 	{
 		s->done = true;
 		return false;
 	}
-	in->nrows = sb.nrows;
-	in->selection = (uint64 *) sb.visible;
-	for (i = 0; i < s->nattrs; i++)
-	{
-		const VexecColumn *c = &sb.columns[i];
-		VexecVec   *v = &in->cols[i];
-
-		v->shape.layout = c->layout;
-		v->shape.arrow_values = c->arrow_values;
-		v->shape.scale = c->scale;
-		v->shape.width = c->width;
-		v->shape.stride = c->stride;
-		vexec_shape_normalize(&v->shape);
-		v->encoding = c->encoding;
-		v->nvalues = c->encoding == VEXEC_CONST ? 1 : sb.nrows;
-		v->validity = (uint64 *) c->validity;
-		v->values = (void *) c->values;
-		v->buffers = (char **) c->buffers;
-		v->buffer_sizes = (int64 *) c->buffer_sizes;
-		v->nbuffers = c->nbuffers;
-		v->datums = (Datum *) c->datums;
-		if (c->encoding == VEXEC_DICT)
-		{
-			VexecVec   *d = vexec_batch_alloc0(in, sizeof(VexecVec));
-			const VexecColumn *dc = c->dictionary;
-
-			if (s->dict_ids == NULL || dc == NULL || c->codes == NULL ||
-				c->ndictionary <= 0 || dc->encoding != VEXEC_FLAT)
-				elog(ERROR, "vexec: the batch source \"%s\" gave a dictionary column it was not asked for, or one without its dictionary",
-					 s->src->name);
-			v->codes = (int32 *) c->codes;
-			d->type = v->type;
-			d->shape.layout = dc->layout;
-			d->shape.arrow_values = dc->arrow_values;
-			d->shape.scale = dc->scale;
-			d->shape.width = dc->width;
-			d->shape.stride = dc->stride;
-			vexec_shape_normalize(&d->shape);
-			d->encoding = VEXEC_FLAT;
-			d->nvalues = c->ndictionary;
-			d->validity = (uint64 *) dc->validity;
-			d->values = (void *) dc->values;
-			d->buffers = (char **) dc->buffers;
-			d->buffer_sizes = (int64 *) dc->buffer_sizes;
-			d->nbuffers = dc->nbuffers;
-			d->datums = (Datum *) dc->datums;
-			v->dictionary = d;
-			/* the column is read by its dictionary's shape, whatever it said */
-			v->shape = d->shape;
-			check_dictionary(s, v, i);
-			v->dict_id = dictionary_identity(s, i);
-		}
-	}
-	if (s->dict_ids != NULL)
-	{
-		int			k;
-
-		for (k = 0; k < s->nattrs; k++)
-			if (in->cols[k].encoding == VEXEC_DICT)
-				break;
-		if (k < s->nattrs)
-			s->dict_batches++;
-	}
+	in->nrows = sb->nrows;
+	in->selection = (uint64 *) sb->visible;
+	s->cur_dict = false;
+	for (j = 0; j < nfirst; j++)
+		source_column(s, sb, j);
+	/* VC2: the later steps' columns come from next_rest() (scan_load_step()) */
+	for (; j < s->nattrs; j++)
+		step_placeholder(in, &in->cols[s->spec_cols[j]]);
+	if (s->cur_dict)
+		s->dict_batches++;
 	if (s->need_tid)
 	{
 		VexecVec   *v = &in->cols[s->nattrs];
 
-		if (sb.tids == NULL)
+		if (sb->tids == NULL)
 			elog(ERROR, "vexec: the batch source \"%s\" gave no TIDs", s->src->name);
 
 		memset(&v->shape, 0, sizeof(VexecShape));
@@ -886,9 +1072,9 @@ fetch_source(VexecScanState *s)
 		v->shape.width = sizeof(ItemPointerData);
 		v->shape.stride = sizeof(ItemPointerData);
 		v->encoding = VEXEC_FLAT;
-		v->nvalues = sb.nrows;
+		v->nvalues = sb->nrows;
 		v->validity = NULL;
-		v->values = (void *) sb.tids;
+		v->values = (void *) sb->tids;
 	}
 
 	/*
@@ -898,12 +1084,45 @@ fetch_source(VexecScanState *s)
 	 */
 	if (vexec_enable_source_layouts)
 	{
-		s->node.in_kept = vexec_batch_apply_config_keep_bytes(in, &s->node.layout);
+		s->node.in_kept = vexec_batch_apply_config_cols(in, &s->node.layout,
+														s->nsteps > 0 ? s->step_of[0] : NULL, true);
 		s->kept_cols = Max(s->kept_cols, s->node.in_kept);
 	}
 	else
-		vexec_batch_apply_config(in, &s->node.layout);
+		(void) vexec_batch_apply_config_cols(in, &s->node.layout,
+											 s->nsteps > 0 ? s->step_of[0] : NULL, false);
+	if (s->nsteps > 0)
+		s->step_batches[0]++;
 	return true;
+}
+
+/*
+ * VC2: step `step` of the batch now in the input, from the source's
+ * next_rest(), for at least the rows of `rows` (node.c, load_steps()): its
+ * columns into the input, given the format's layouts as fetch_source()
+ * gives the first step's.
+ */
+static void
+scan_load_step(VexecNode *node, int step, const uint64 *rows)
+{
+	VexecScanState *s = (VexecScanState *) node;
+	bool		had_dict = s->cur_dict;
+	int			j;
+
+	Assert(step > 0 && step < s->nsteps);
+	s->src->next_rest(s->srcstate, &s->cur, step, rows);
+	for (j = s->step_ends[step - 1]; j < s->step_ends[step]; j++)
+		source_column(s, &s->cur, j);
+	if (s->cur_dict && !had_dict)
+		s->dict_batches++;
+	if (vexec_enable_source_layouts)
+	{
+		node->in_kept += vexec_batch_apply_config_cols(node->in, &node->layout, s->step_of[step], true);
+		s->kept_cols = Max(s->kept_cols, node->in_kept);
+	}
+	else
+		(void) vexec_batch_apply_config_cols(node->in, &node->layout, s->step_of[step], false);
+	s->step_batches[step]++;
 }
 
 static bool
@@ -1185,6 +1404,24 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 	/* VC5: likewise, only where the source handed a dictionary */
 	if (es->analyze && es->verbose && s->dict_batches > 0)
 		ExplainPropertyInteger("Batches With Dictionaries", NULL, s->dict_batches, es);
+	/*
+	 * VC2: the columns of each step, where the source hands them in steps;
+	 * and the batches each step was read for
+	 */
+	if (es->verbose && s->nsteps > 0)
+	{
+		List	   *steps = NIL;
+		List	   *batches = NIL;
+
+		for (int st = 0; st < s->nsteps; st++)
+		{
+			steps = lappend(steps, psprintf("%d", s->step_ends[st] - (st > 0 ? s->step_ends[st - 1] : 0)));
+			batches = lappend(batches, psprintf(INT64_FORMAT, s->step_batches[st]));
+		}
+		ExplainPropertyList("Columns by Step", steps, es);
+		if (es->analyze)
+			ExplainPropertyList("Batches by Step", batches, es);
+	}
 }
 
 /*

@@ -4,7 +4,7 @@
  * source_test.c
  *	  vexec_test_am, a table access method of the tests, and its batch
  *	  source and sink with every member of their contracts (vexec_source.h
- *	  at minor 4, vexec_sink.h), so that vexec's suite tests the contracts
+ *	  at minor 5, vexec_sink.h), so that vexec's suite tests the contracts
  *	  on vanilla PostgreSQL, where no storage module registers either
  *	  (ch_table_engines.md §3, VC9).
  *
@@ -57,6 +57,12 @@
  *					suite loads the rows in that order, which the source
  *					takes on trust (VC4)
  *	estimate_ex()'s fetch: vexec_test.source_fetch_cost, where it is above 0
+ *	next_rest()		a later step's columns of a scan begun with
+ *					VEXEC_SRC_STEPS, the first step's coming with next(): at
+ *					the rows vexec selects, every other row NULL -- so that a
+ *					read of a row it did not select shows -- and an error
+ *					where a step is asked out of order, twice, or of a batch
+ *					not the last (VC2)
  *
  * A unit a retained batch points into stays until the last such batch is
  * released.  The sink takes every attribute but an xml one -- FIXED for a
@@ -110,14 +116,14 @@ typedef enum Member
 	M_SUPPORTS, M_BEGIN, M_NEXT, M_RETAIN, M_RELEASE, M_RESCAN, M_END, M_ESTIMATE, M_AGGREGATE,
 	M_AGGREGATE_ANSWERED, M_SET_KEYS, M_UNITS_PASSED, M_SINK_SUPPORTS, M_SINK_BEGIN, M_SINK_PUT,
 	M_SINK_END, M_DICTIONARY_ID, M_DICTIONARIES, M_ESTIMATE_EX, M_FETCH_COLUMNS, M_ORDERING,
-	M_ORDERED_SCANS, NMEMBERS
+	M_ORDERED_SCANS, M_NEXT_REST, M_SCANS_IN_STEPS, NMEMBERS
 } Member;
 
 static const char *const member_names[NMEMBERS] = {
 	"supports", "begin", "next", "retain", "release", "rescan", "end", "estimate", "aggregate",
 	"aggregate answered", "set_keys", "units passed by keys", "sink supports", "sink begin",
 	"sink put", "sink end", "dictionary_id", "dictionaries made", "estimate_ex", "fetch_columns",
-	"ordering", "scans in order"
+	"ordering", "scans in order", "next_rest", "scans in steps"
 };
 
 static int64 calls[NMEMBERS];
@@ -270,6 +276,9 @@ typedef struct Out
 	ItemPointerData *tids;
 	Unit	   *unit;			/* what its DATUM columns point into */
 	bool		retained;
+	int			pos;			/* its rows of the unit */
+	int			n;
+	int			steps;			/* VC2: the steps handed */
 } Out;
 
 typedef struct SrcState
@@ -296,6 +305,8 @@ typedef struct SrcState
 	int			nspec_keys;
 	MemoryContext answers;
 	bool		ordered;		/* begun with VEXEC_SRC_ORDERED, serially */
+	int			nsteps;			/* VEXEC_SRC_STEPS: the steps, and each column's */
+	int		   *col_step;
 } SrcState;
 
 static bool
@@ -342,6 +353,29 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 		st->dict[i] = dictionaries && (spec->flags & VEXEC_SRC_DICT) != 0 && att->attlen == -1;
 	}
 	st->ncols = spec->ncolumns;
+	if ((spec->flags & VEXEC_SRC_STEPS) &&
+		spec->size >= offsetof(VexecSourceSpec, step_ends) + sizeof(spec->step_ends))
+	{
+		int			step = 0;
+
+		if (spec->nsteps < 2 || spec->nsteps > VEXEC_SRC_MAX_STEPS ||
+			spec->step_ends[spec->nsteps - 1] != spec->ncolumns)
+			elog(ERROR, "vexec_test: %d steps ending at column %d of %d", spec->nsteps,
+				 spec->nsteps > 0 ? spec->step_ends[spec->nsteps - 1] : 0, spec->ncolumns);
+		st->nsteps = spec->nsteps;
+		st->col_step = palloc(sizeof(int) * Max(spec->ncolumns, 1));
+		for (int i = 0; i < spec->ncolumns; i++)
+		{
+			while (i >= spec->step_ends[step])
+				step++;
+			if (i > 0 && st->col_step[i - 1] == step && spec->attnums[i] <= spec->attnums[i - 1])
+				elog(ERROR, "vexec_test: the columns of step %d are not in order", step);
+			if (i == 0 ? spec->step_ends[0] < 1 : step > 0 && spec->step_ends[step] <= spec->step_ends[step - 1])
+				elog(ERROR, "vexec_test: step %d has no column", step);
+			st->col_step[i] = step;
+		}
+		calls[M_SCANS_IN_STEPS]++;
+	}
 	if (spec->nkeys > 0)
 	{
 		st->keys = palloc(sizeof(ScanKeyData) * spec->nkeys);
@@ -681,6 +715,103 @@ next_out(SrcState *st)
 	return st->out;
 }
 
+/* Column i of a batch's rows of its unit (src_next(), src_next_rest()), in out's memory */
+static void
+fill_column(SrcState *st, Out *out, int i)
+{
+	Unit	   *u = out->unit;
+	int			n = out->n;
+	int			pos = out->pos;
+	Form_pg_attribute att = TupleDescAttr(st->desc, st->attnums[i] - 1);
+	VexecColumn *c = &out->columns[i];
+	uint64	   *validity = NULL;
+
+	c->layout = st->layouts[i];
+	c->encoding = VEXEC_FLAT;
+	for (int r = 0; r < n; r++)
+		if (u->nulls[(pos + r) * st->ncols + i])
+		{
+			if (validity == NULL)
+			{
+				validity = palloc(sizeof(uint64) * ((n + 63) / 64));
+				memset(validity, 0xFF, sizeof(uint64) * ((n + 63) / 64));
+			}
+			validity[r / 64] &= ~(UINT64CONST(1) << (r % 64));
+		}
+	c->validity = validity;
+	if (u->dicts[i] != NULL)
+	{
+		/* the unit's dictionary, and the rows' codes into it */
+		*c = u->dicts[i]->values;
+		c->encoding = VEXEC_DICT;
+		c->validity = validity;
+		c->values = NULL;
+		c->buffers = NULL;
+		c->buffer_sizes = NULL;
+		c->nbuffers = 0;
+		c->codes = u->codes[i] + pos;
+		c->dictionary = &u->dicts[i]->values;
+		c->ndictionary = u->dicts[i]->nvalues;
+	}
+	else if (c->layout == VEXEC_DATUM)
+	{
+		Datum	   *d = palloc(sizeof(Datum) * Max(n, 1));
+
+		for (int r = 0; r < n; r++)
+			d[r] = u->values[(pos + r) * st->ncols + i];
+		c->values = d;
+	}
+	else if (c->layout == VEXEC_OFFSETS)
+	{
+		/* each value's bytes end to end, detoasted, without its header */
+		int32	   *off = palloc(sizeof(int32) * (n + 1));
+		const void **buffers = palloc(sizeof(void *));
+		int64	   *sizes = palloc(sizeof(int64));
+		StringInfoData bytes;
+
+		initStringInfo(&bytes);
+		off[0] = 0;
+		for (int r = 0; r < n; r++)
+		{
+			if (!u->nulls[(pos + r) * st->ncols + i])
+			{
+				varlena    *p = (varlena *) DatumGetPointer(u->values[(pos + r) * st->ncols + i]);
+				varlena    *plain = pg_detoast_datum_packed(p);
+
+				appendBinaryStringInfo(&bytes, VARDATA_ANY(plain), VARSIZE_ANY_EXHDR(plain));
+				if (plain != p)
+					pfree(plain);
+			}
+			off[r + 1] = bytes.len;
+		}
+		buffers[0] = bytes.data;
+		sizes[0] = bytes.len;
+		c->values = off;
+		c->buffers = buffers;
+		c->buffer_sizes = sizes;
+		c->nbuffers = 1;
+	}
+	else
+	{
+		char	   *v = palloc0((Size) att->attlen * Max(n, 1));
+
+		c->width = att->attlen;
+		c->stride = att->attlen;
+		for (int r = 0; r < n; r++)
+		{
+			Datum		d = u->values[(pos + r) * st->ncols + i];
+
+			if (u->nulls[(pos + r) * st->ncols + i])
+				continue;
+			if (att->attbyval)
+				store_att_byval(v + (Size) r * att->attlen, d, att->attlen);
+			else
+				memcpy(v + (Size) r * att->attlen, DatumGetPointer(d), att->attlen);
+		}
+		c->values = v;
+	}
+}
+
 static bool
 src_next(void *arg, VexecSourceBatch *batch)
 {
@@ -700,99 +831,15 @@ src_next(void *arg, VexecSourceBatch *batch)
 	n = Min(st->max_rows, u->nrows - st->pos);
 	out = next_out(st);
 	out->unit = u;
+	out->pos = st->pos;
+	out->n = n;
+	out->steps = 1;
 	old = MemoryContextSwitchTo(out->cxt);
 	out->columns = palloc0(sizeof(VexecColumn) * Max(st->ncols, 1));
+	/* VC2: the first step's columns; a later one's from next_rest() */
 	for (int i = 0; i < st->ncols; i++)
-	{
-		Form_pg_attribute att = TupleDescAttr(st->desc, st->attnums[i] - 1);
-		VexecColumn *c = &out->columns[i];
-		uint64	   *validity = NULL;
-
-		c->layout = st->layouts[i];
-		c->encoding = VEXEC_FLAT;
-		for (int r = 0; r < n; r++)
-			if (u->nulls[(st->pos + r) * st->ncols + i])
-			{
-				if (validity == NULL)
-				{
-					validity = palloc(sizeof(uint64) * ((n + 63) / 64));
-					memset(validity, 0xFF, sizeof(uint64) * ((n + 63) / 64));
-				}
-				validity[r / 64] &= ~(UINT64CONST(1) << (r % 64));
-			}
-		c->validity = validity;
-		if (u->dicts[i] != NULL)
-		{
-			/* the unit's dictionary, and the rows' codes into it */
-			*c = u->dicts[i]->values;
-			c->encoding = VEXEC_DICT;
-			c->validity = validity;
-			c->values = NULL;
-			c->buffers = NULL;
-			c->buffer_sizes = NULL;
-			c->nbuffers = 0;
-			c->codes = u->codes[i] + st->pos;
-			c->dictionary = &u->dicts[i]->values;
-			c->ndictionary = u->dicts[i]->nvalues;
-		}
-		else if (c->layout == VEXEC_DATUM)
-		{
-			Datum	   *d = palloc(sizeof(Datum) * Max(n, 1));
-
-			for (int r = 0; r < n; r++)
-				d[r] = u->values[(st->pos + r) * st->ncols + i];
-			c->values = d;
-		}
-		else if (c->layout == VEXEC_OFFSETS)
-		{
-			/* each value's bytes end to end, detoasted, without its header */
-			int32	   *off = palloc(sizeof(int32) * (n + 1));
-			const void **buffers = palloc(sizeof(void *));
-			int64	   *sizes = palloc(sizeof(int64));
-			StringInfoData bytes;
-
-			initStringInfo(&bytes);
-			off[0] = 0;
-			for (int r = 0; r < n; r++)
-			{
-				if (!u->nulls[(st->pos + r) * st->ncols + i])
-				{
-					varlena    *p = (varlena *) DatumGetPointer(u->values[(st->pos + r) * st->ncols + i]);
-					varlena    *plain = pg_detoast_datum_packed(p);
-
-					appendBinaryStringInfo(&bytes, VARDATA_ANY(plain), VARSIZE_ANY_EXHDR(plain));
-					if (plain != p)
-						pfree(plain);
-				}
-				off[r + 1] = bytes.len;
-			}
-			buffers[0] = bytes.data;
-			sizes[0] = bytes.len;
-			c->values = off;
-			c->buffers = buffers;
-			c->buffer_sizes = sizes;
-			c->nbuffers = 1;
-		}
-		else
-		{
-			char	   *v = palloc0((Size) att->attlen * Max(n, 1));
-
-			c->width = att->attlen;
-			c->stride = att->attlen;
-			for (int r = 0; r < n; r++)
-			{
-				Datum		d = u->values[(st->pos + r) * st->ncols + i];
-
-				if (u->nulls[(st->pos + r) * st->ncols + i])
-					continue;
-				if (att->attbyval)
-					store_att_byval(v + (Size) r * att->attlen, d, att->attlen);
-				else
-					memcpy(v + (Size) r * att->attlen, DatumGetPointer(d), att->attlen);
-			}
-			c->values = v;
-		}
-	}
+		if (st->nsteps == 0 || st->col_step[i] == 0)
+			fill_column(st, out, i);
 	if (st->tids)
 	{
 		out->tids = palloc(sizeof(ItemPointerData) * Max(n, 1));
@@ -806,6 +853,48 @@ src_next(void *arg, VexecSourceBatch *batch)
 	batch->columns = out->columns;
 	batch->owner = out;
 	return true;
+}
+
+/*
+ * VC2: step `step`'s columns of the last batch, in order, each once: NULL at
+ * every row vexec did not select, which it may not read
+ */
+static void
+src_next_rest(void *arg, VexecSourceBatch *batch, int step, const uint64 *selected)
+{
+	SrcState   *st = arg;
+	Out		   *out = batch->owner;
+	int			nwords = (out->n + 63) / 64;
+	bool		any = false;
+	MemoryContext old;
+
+	calls[M_NEXT_REST]++;
+	if (st->nsteps == 0 || step < 1 || step >= st->nsteps)
+		elog(ERROR, "vexec_test: step %d asked of a scan in %d steps", step, st->nsteps);
+	if (out != st->out || batch->columns != out->columns)
+		elog(ERROR, "vexec_test: step %d asked of a batch not the last", step);
+	if (out->steps != step)
+		elog(ERROR, "vexec_test: step %d asked after %d steps", step, out->steps);
+	for (int w = 0; w < nwords && selected != NULL; w++)
+		any |= selected[w] != 0;
+	if (!any)
+		elog(ERROR, "vexec_test: step %d asked for no row", step);
+	old = MemoryContextSwitchTo(out->cxt);
+	for (int i = 0; i < st->ncols; i++)
+	{
+		VexecColumn *c = &out->columns[i];
+		uint64	   *validity;
+
+		if (st->col_step[i] != step)
+			continue;
+		fill_column(st, out, i);
+		validity = palloc(sizeof(uint64) * Max(nwords, 1));
+		for (int w = 0; w < nwords; w++)
+			validity[w] = (c->validity ? c->validity[w] : ~UINT64CONST(0)) & selected[w];
+		c->validity = validity;
+	}
+	MemoryContextSwitchTo(old);
+	out->steps++;
 }
 
 static void
@@ -1210,6 +1299,7 @@ static VexecSourceRoutine source = {
 	.estimate_ex = src_estimate_ex,
 	.fetch_columns = src_fetch_columns,
 	.ordering = src_ordering,
+	.next_rest = src_next_rest,
 };
 
 static VexecSinkRoutine sink = {

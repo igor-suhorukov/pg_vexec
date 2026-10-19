@@ -303,6 +303,9 @@ extern VEXEC_API bool vexec_batch_apply_config(VexecBatch *batch,
 													const VexecLayoutConfig *cfg);
 extern VEXEC_API int vexec_batch_apply_config_keep_bytes(VexecBatch *batch,
 															  const VexecLayoutConfig *cfg);
+extern VEXEC_API int vexec_batch_apply_config_cols(VexecBatch *batch,
+														const VexecLayoutConfig *cfg,
+														const bool *cols, bool keep_bytes);
 extern VEXEC_API bool vexec_vec_convert_rows(VexecBatch *batch, VexecVec *v,
 												  const VexecShape *to, const uint64 *rows);
 

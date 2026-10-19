@@ -42,6 +42,7 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.enable_sort           | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_sorted_agg     | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_source_layouts | on                        |      | user       | bool    |         |              |                             | f
+ vexec.enable_source_steps   | on                        |      | user       | bool    |         |              |                             | f
  vexec.enable_window         | on                        |      | user       | bool    |         |              |                             | t
  vexec.gpu                   | off                       |      | user       | enum    |         |              | {off,auto,force}            | t
  vexec.gpu_arena_mb          | 256                       | MB   | postmaster | integer | 1       | 1073741823   |                             | f
@@ -61,7 +62,7 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.remember_agg_sizes    | on                        |      | user       | bool    |         |              |                             | f
  vexec.repartition_min_rows  | 500000                    |      | user       | integer | 0       | 2147483647   |                             | t
  vexec.scan_rows_per_worker  | 163840                    |      | user       | integer | 0       | 2147483647   |                             | t
-(50 rows)
+(51 rows)
 
 -- the modes
 SET vexec.mode = explain;

@@ -436,6 +436,20 @@ struct VexecNode
 	bool		jfilter_in_source;	/* heap's page reader checks it */
 
 	/*
+	 * VC2: a scan's input in steps, its source's (vexec_source.h,
+	 * VEXEC_SRC_STEPS): nsteps 0 where every column comes at once.  in_step:
+	 * per input column, the step it comes in; qual_step: per qual of the
+	 * eager prefix, the last step its columns are in; steps_loaded: the
+	 * steps of the batch now in `in` read so far, step 0 with it; load_step:
+	 * the scan's read of a step, for the rows of `rows` (node.c)
+	 */
+	int			nsteps;
+	int8	   *in_step;
+	int8	   *qual_step;
+	int			steps_loaded;
+	void		(*load_step) (VexecNode *node, int step, const uint64 *rows);
+
+	/*
 	 * The node read its input in this process.  On a cluster the node a
 	 * segment ran is, on the coordinator, a node that never ran: gp_core
 	 * brings its Instrumentation from the segments, and nothing of a custom

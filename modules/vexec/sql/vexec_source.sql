@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: Apache-2.0
 --
--- The batch-source and batch-sink contracts (vexec_source.h at minor 4,
+-- The batch-source and batch-sink contracts (vexec_source.h at minor 5,
 -- vexec_sink.h) on vanilla PostgreSQL, through vexec_test's access method,
 -- heap's with a source and a sink of every member
 -- (modules/vexec_test/source_test.c): each query run with vexec.mode off,
@@ -23,7 +23,9 @@
 -- vexec_test.source_ordering it says its rows come in an order, which a
 -- serial grouping by a prefix of it takes as they come (VC4); its access
 -- method's fetch by TID leaves the columns fetch_columns() did not name
--- NULL, and vexec_test.source_fetch_cost prices a fetch (VC16).
+-- NULL, and vexec_test.source_fetch_cost prices a fetch (VC16).  It hands
+-- a scan's columns in the steps vexec asks for, a later step's through
+-- next_rest() at the rows vexec selects, every other row NULL (VC2).
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vexec;
@@ -278,6 +280,51 @@ EXPLAIN (COSTS OFF) SELECT a, b, c, d, f FROM src ORDER BY d DESC, a LIMIT 5;
 SELECT source_check('SELECT a, b, c, d, f FROM src ORDER BY d DESC, a LIMIT 5');
 RESET vexec_test.source_fetch_cost;
 RESET vexec.mode;
+
+-- columns in steps (VC2; next_rest(), minor 5): the first vector qual's
+-- columns first, then each later qual's new ones, the rest last -- the TIDs
+-- with the first step -- and a step read only for a batch where the quals
+-- before it left a row, which the source hands, and no other row of it:
+-- every answer as with vexec off, through quals that keep few rows, none,
+-- or all, the TIDs, rows a kernel cannot compute, which PostgreSQL's
+-- evaluator reads whole, lazy quals and targets, an aggregation, a running
+-- bound, dictionaries and text as offsets in a later step; and with
+-- vexec.enable_source_steps off, every column at once
+SET vexec.mode = force;
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT a, b, d, u FROM src WHERE a % 100 = 7 AND c LIKE 'v%7' AND g > 0;
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT a, b, c FROM src WHERE a > 9990;
+RESET vexec.mode;
+SELECT calls AS steps_before FROM vexec_test.source_calls() WHERE member = 'next_rest' \gset
+SELECT source_check('SELECT a, b, d, u FROM src WHERE a % 100 = 7 AND c LIKE ''v%7'' AND g > 0');
+SELECT source_check('SELECT a, b, c FROM src WHERE a > 9990');
+SELECT source_check('SELECT a, b, c FROM src WHERE a > 20000');
+SELECT source_check('SELECT a, b, f FROM src WHERE a > 0');
+SELECT source_check('SELECT ctid, a, f FROM src WHERE b % 1000 = 7');
+SELECT source_check('SELECT a, f, u FROM src WHERE b % 7 = 0 AND (CASE WHEN a % 50 = 0 THEN 0 ELSE 100 / (a % 50) END) > 3');
+SELECT source_check('SELECT a, f, u FROM src WHERE a % 10 = 0 AND 100 / (a % 50) > 3');
+SELECT source_check('SELECT a, regexp_replace(c, ''v'', ''w''), d FROM src WHERE a % 1000 = 1 AND regexp_replace(c, ''v'', '''') <> ''x''');
+SELECT source_check('SELECT d, count(*), sum(f), min(u::text) FROM src WHERE e AND a % 3 = 0 GROUP BY d ORDER BY d LIMIT 5');
+SELECT source_check('SELECT a, b, c FROM src WHERE g > 400 ORDER BY b LIMIT 4');
+SELECT source_check('SELECT a, b, c FROM src WHERE g > 400 ORDER BY b DESC LIMIT 4');
+SELECT calls > :steps_before AS steps_read FROM vexec_test.source_calls() WHERE member = 'next_rest';
+SET vexec_test.source_text_offsets = on;
+SET vexec_test.source_dictionaries = on;
+SET vexec.batch_dictionary = on;
+SELECT source_check('SELECT k, m, t FROM srcd WHERE n = 7 AND k % 3 = 1');
+SELECT source_check('SELECT m, count(*), min(t) FROM srcd WHERE n < 10 AND k % 2 = 0 GROUP BY m');
+SELECT source_check('SELECT k, upper(m), t || ''!'' FROM srcd WHERE k % 1001 = 0');
+RESET vexec.batch_dictionary;
+RESET vexec_test.source_dictionaries;
+RESET vexec_test.source_text_offsets;
+SET vexec.enable_source_steps = off;
+SET vexec.mode = force;
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT a, b, d, u FROM src WHERE a % 100 = 7 AND c LIKE 'v%7' AND g > 0;
+RESET vexec.mode;
+SELECT source_check('SELECT a, b, d, u FROM src WHERE a % 100 = 7 AND c LIKE ''v%7'' AND g > 0');
+RESET vexec.enable_source_steps;
 
 -- rescans: a subquery's scan, for each outer row
 CREATE TABLE src_outer (k int4);

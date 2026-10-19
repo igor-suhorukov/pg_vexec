@@ -741,6 +741,19 @@ bytes_layout(int layout)
 int
 vexec_batch_apply_config_keep_bytes(VexecBatch *batch, const VexecLayoutConfig *cfg)
 {
+	return vexec_batch_apply_config_cols(batch, cfg, NULL, true);
+}
+
+/*
+ * VC2: vexec_batch_apply_config() -- or, with keep_bytes, the variant
+ * above -- for the columns of `cols` alone (NULL: every one), those a
+ * scan's source handed in one step, the others left as they are.  Returns
+ * how many columns of them it left in another layout than the format's.
+ */
+int
+vexec_batch_apply_config_cols(VexecBatch *batch, const VexecLayoutConfig *cfg,
+							  const bool *cols, bool keep_bytes)
+{
 	int			kept = 0;
 	int			i;
 
@@ -749,14 +762,20 @@ vexec_batch_apply_config_keep_bytes(VexecBatch *batch, const VexecLayoutConfig *
 		VexecVec   *v = &batch->cols[i];
 		VexecShape	target;
 
-		vexec_type_shape(v->type, cfg, &target);
-		if (bytes_layout(target.layout) && bytes_layout(v->shape.layout))
-		{
-			if (!vexec_shape_equal(&v->shape, &target))
-				kept++;
+		if (cols != NULL && !cols[i])
 			continue;
+		if (keep_bytes)
+		{
+			vexec_type_shape(v->type, cfg, &target);
+			if (bytes_layout(target.layout) && bytes_layout(v->shape.layout))
+			{
+				if (!vexec_shape_equal(&v->shape, &target))
+					kept++;
+				continue;
+			}
 		}
-		(void) apply_column(batch, v, cfg);
+		if (!apply_column(batch, v, cfg) && !keep_bytes)
+			kept++;
 	}
 	return kept;
 }

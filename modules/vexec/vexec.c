@@ -55,6 +55,7 @@ bool		vexec_enable_scan = true;
 bool		vexec_heap_page_reader = true;
 bool		vexec_enable_prefilter = true;
 bool		vexec_enable_source_layouts = true;
+bool		vexec_enable_source_steps = true;
 bool		vexec_enable_bitmapscan = true;
 bool		vexec_enable_agg = true;
 bool		vexec_enable_repartition = true;
@@ -298,6 +299,14 @@ define_settings(void)
 							 "parents, and makes it the format's only where PostgreSQL's evaluator reads "
 							 "it, at the rows past the scan's vector quals.",
 							 &vexec_enable_source_layouts, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_source_steps",
+							 "Reads a source's columns in steps, the quals' first.",
+							 "A vector scan of a registered source that takes steps asks for the columns of "
+							 "its first vector qual first, then each later qual's, then the rest, each step "
+							 "only for the batches where a row is left, so that the source decodes a later "
+							 "step's columns only in its units where the quals before kept a row.",
+							 &vexec_enable_source_steps, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_bitmapscan",
 							 "Enables vector bitmap heap scans.",

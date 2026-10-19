@@ -698,6 +698,13 @@ vexec_batch_compact(VexecBatch *batch)
 	for (i = 0; i < batch->nrows; i++)
 		if (vexec_bit(batch->selection, i))
 			rows[nkeep++] = i;
+	/* every row selected, as a scan's batch with no qual: nothing to copy (VC18) */
+	if (nkeep == batch->nrows)
+	{
+		pfree(rows);
+		batch->selection = NULL;
+		return;
+	}
 
 	for (c = 0; c < batch->ncols; c++)
 	{

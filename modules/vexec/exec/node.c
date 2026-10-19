@@ -568,6 +568,30 @@ rows_kept(VexecNode *node, uint64 *active, uint64 *redo, int n)
 		vexec_bits_count(redo, n);
 }
 
+/*
+ * VC2: the input's steps up to `upto` read from the scan's source, for the
+ * rows of `active` and `redo` (NULL: none) -- those PostgreSQL's evaluator
+ * redoes read every column.  False, nothing read, where there is no such
+ * row: nothing reads a later step's columns of a batch none of whose rows
+ * is left.
+ */
+static bool
+load_steps(VexecNode *node, int upto, const uint64 *active, const uint64 *redo, int n)
+{
+	uint64	   *rows;
+
+	if (node->steps_loaded > upto)
+		return true;
+	rows = vexec_bits_copy(node->work, active, n);
+	if (redo != NULL)
+		vexec_bits_or_into(rows, redo, n);
+	if (!vexec_bits_any(rows, n))
+		return false;
+	while (node->steps_loaded <= upto)
+		node->load_step(node, node->steps_loaded++, rows);
+	return true;
+}
+
 /* The eager parts of the batch now in `in` (above, part 2). */
 static void
 eval_batch(VexecNode *node)
@@ -595,25 +619,38 @@ eval_batch(VexecNode *node)
 	active = vexec_bits_copy(node->work, node->in->selection, n);
 	if (node->child_redo != NULL)
 		active = vexec_bits_andnot(node->work, active, node->child_redo, n);
-	/* a VecSort's running bound before the quals, where no source checked it */
-	if (node->bound != NULL && node->bound->before_quals && !node->bound_in_source)
+	/*
+	 * a VecSort's running bound before the quals, where no source checked it;
+	 * its column read first where it comes in a later step (VC2)
+	 */
+	if (node->bound != NULL && node->bound->before_quals && !node->bound_in_source &&
+		(node->nsteps == 0 || load_steps(node, node->in_step[node->bound_col], active, NULL, n)))
 		(void) apply_bound(node, active, NULL, n);
 	/* a VecHashJoin's inner keys before the quals, where none may raise (X6) */
-	if (node->jfilter != NULL && node->jfilter->before_quals && !node->jfilter_in_source)
+	if (node->jfilter != NULL && node->jfilter->before_quals && !node->jfilter_in_source &&
+		(node->nsteps == 0 || load_steps(node, node->in_step[node->jfilter_col], active, NULL, n)))
 		(void) apply_join_filter(node, active, NULL, n);
 	selected = vexec_bits_count(active, n);
 
 	/*
 	 * the eager prefix of the quals: each over the rows the ones before
-	 * passed; the rows a bitmap's conditions keep, counted
+	 * passed; the rows a bitmap's conditions keep, counted.  VC2: a qual's
+	 * columns read from the source's later steps first, for those rows --
+	 * where none is left, the quals after it decide none, and no later step
+	 * is read.
 	 */
 	rechecked = selected;
 	for (i = 0; i < node->first_lazy; i++)
 	{
+		if (node->nsteps > 0 && !load_steps(node, node->qual_step[i], active, ev.redo, n))
+			break;
 		active = vexec_eval_qual(&ev, node->quals[i].eager, active);
 		if (i + 1 == nrecheck && node->css.ss.ps.instrument)
 			rechecked = rows_kept(node, active, ev.redo, n);
 	}
+	/* VC2: every column the source has left, for the rows past the prefix */
+	if (node->nsteps > 0)
+		(void) load_steps(node, node->nsteps - 1, active, ev.redo, n);
 
 	/*
 	 * or after them, where every qual is eager; with a lazy one, a row is
@@ -630,14 +667,18 @@ eval_batch(VexecNode *node)
 	 * where PostgreSQL's evaluator is to read it: at the rows past the eager
 	 * prefix and those it redoes, the only ones it reads from here on
 	 */
-	if (node->in_kept > 0 && node->needs_input_datums)
+	if (node->in_kept > 0 && node->needs_input_datums && node->steps_loaded == node->nsteps)
 		convert_kept(node, active, ev.redo);
 
-	/* the eager quals after the first lazy one, over the same rows */
+	/*
+	 * the eager quals after the first lazy one, over the same rows; none
+	 * where a step of the source's was left unread, no row being left (VC2)
+	 */
 	ev.exact = false;
 	for (i = node->first_lazy; i < node->nquals; i++)
-		node->qual_pass[i] = node->quals[i].eager ?
-			vexec_eval_qual(&ev, node->quals[i].eager, active) : NULL;
+		node->qual_pass[i] = node->quals[i].eager == NULL ? NULL :
+			node->steps_loaded < node->nsteps ? vexec_bitmap_alloc(node->work, n, false) :
+			vexec_eval_qual(&ev, node->quals[i].eager, active);
 
 	/*
 	 * The eager targets, over the rows past the eager quals; none where no
@@ -678,10 +719,14 @@ next_batch(VexecNode *node)
 		node->loaded_row = -1;
 		node->ran = true;
 		node->in_kept = 0;
+		node->steps_loaded = 0;
 		if (!node->fetch(node))
 			return false;
 		if (node->in->nrows == 0)
 			continue;
+		/* VC2: the first step comes with the batch */
+		if (node->nsteps > 0)
+			node->steps_loaded = 1;
 		node->stats.batches++;
 		node->stats.rows_in += node->in->nrows;
 		eval_batch(node);

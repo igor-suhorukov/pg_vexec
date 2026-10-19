@@ -46,10 +46,10 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		4	/* 1: aggregate; 2: set_keys; 3:
+#define VEXEC_SOURCE_MINOR		5	/* 1: aggregate; 2: set_keys; 3:
 									 * dictionary_id, estimate_ex; 4:
 									 * fetch_columns, ordering, a fetch's
-									 * price */
+									 * price; 5: columns in steps */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -146,13 +146,21 @@ typedef struct VexecColumn
 #define VEXEC_SRC_ORDERED	0x0008	/* from minor version 4: a serial scan
 									 * hands its rows in ordering()'s order
 									 * where it can */
+#define VEXEC_SRC_STEPS		0x0010	/* from minor version 5: the columns
+									 * come in steps, the first from next(),
+									 * each later one from a call of
+									 * next_rest() (nsteps, step_ends) */
+
+/* At most this many steps */
+#define VEXEC_SRC_MAX_STEPS	8
 
 /* What a scan asks of a source. */
 typedef struct VexecSourceSpec
 {
 	Size		size;			/* sizeof as the caller was built */
 	int			ncolumns;
-	const AttrNumber *attnums;	/* 1..natts, ascending: a TID is asked for
+	const AttrNumber *attnums;	/* 1..natts, ascending -- within each step,
+								 * with VEXEC_SRC_STEPS: a TID is asked for
 								 * with VEXEC_SRC_TIDS, never as a column */
 	const uint8 *layouts;		/* per column: the layout the batch format
 								 * asks for */
@@ -162,6 +170,15 @@ typedef struct VexecSourceSpec
 	ScanKeyData *keys;			/* runtime filters, as scan keys */
 	int			max_rows;		/* 0: the source's own unit */
 	uint32		flags;			/* VEXEC_SRC_* */
+
+	/*
+	 * From minor version 5, with VEXEC_SRC_STEPS: the columns in nsteps
+	 * steps, 2 to VEXEC_SRC_MAX_STEPS, step s the columns [step_ends[s - 1],
+	 * step_ends[s]) -- step 0 from column 0, the last ending at ncolumns,
+	 * none empty
+	 */
+	int			nsteps;
+	const int  *step_ends;
 } VexecSourceSpec;
 
 /* One batch from a source. */
@@ -343,6 +360,25 @@ typedef struct VexecSourceRoutine
 	 * may have changed since the plan was made.  A parallel scan's is none.
 	 */
 	int			(*ordering) (Relation rel, void *state, int max, AttrNumber *attnums);
+
+	/*
+	 * Optional, from minor version 5: the columns of step `step` -- 1 to
+	 * nsteps - 1 of a scan begun with VEXEC_SRC_STEPS -- of the batch next()
+	 * handed last, filled into batch->columns, the batch next() filled.  For
+	 * at least the rows of `selected`, nrows bits, 1 = a row vexec still
+	 * reads, of which there is one; at another row a column may hold any
+	 * value its layout can, NULL among them.  So a source decodes a later
+	 * step's columns only in the units of its own -- a granule -- where a
+	 * row is selected, vexec having evaluated the quals over the columns
+	 * before them: a step whose columns no row needs is never asked for, nor
+	 * any after it.  Called in step order, each step at most once a batch,
+	 * before the next call of next(); vexec reads none of a step's columns
+	 * before.  A batch retained keeps the steps handed by then.  A source
+	 * that cannot skip may decode every column in next() and hand the later
+	 * steps from it.
+	 */
+	void		(*next_rest) (void *state, VexecSourceBatch *batch, int step,
+							  const uint64 *selected);
 } VexecSourceRoutine;
 
 /*
