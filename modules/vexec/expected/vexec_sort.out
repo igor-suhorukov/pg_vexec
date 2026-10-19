@@ -721,21 +721,20 @@ EXPLAIN (VERBOSE, COSTS OFF) SELECT id FROM so WHERE 1000 / (id - 29990) > -1000
          Output: id, k
          Sort Key: so.k
          Bound: 5
-         Columns: the keys and TIDs sorted, the rest fetched by TID
          Running Bound: the first key, after the scan's quals
          Batch Format: postgres
          Kernel Steps: 0
          Fallback Steps: 0
          Input: batches
          ->  Vec Seq Scan on public.so
-               Output: k, ctid
+               Output: id, k
                Filter: ((1000 / (so.id - 29990)) > '-1000'::integer)
                Batch Format: postgres
                Vector Quals: 1 of 1
                Kernel Steps: 3
                Fallback Steps: 0
                Source: heap's pages
-(20 rows)
+(19 rows)
 
 SELECT sort_error('SELECT id FROM so WHERE 1000 / (id - 29990) > -1000 ORDER BY k LIMIT 5');
              sort_error             
@@ -842,9 +841,8 @@ EXPLAIN (COSTS OFF) SELECT id FROM so ORDER BY point(k, id) <-> point(0, 0) LIMI
    ->  Vec Sort
          Sort Key: ((point((k)::double precision, (id)::double precision) <-> '(0,0)'::point))
          Bound: 3
-         Columns: the keys and TIDs sorted, the rest fetched by TID
          ->  Vec Seq Scan on so
-(6 rows)
+(5 rows)
 
 SELECT sort_check('SELECT id FROM so ORDER BY point(k, id) <-> point(0, 0), id LIMIT 3');
       sort_check       

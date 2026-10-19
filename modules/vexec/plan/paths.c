@@ -346,6 +346,32 @@ source_estimate(RelOptInfo *rel, Relation relation, const VexecSourceRoutine *sr
 }
 
 /*
+ * VC4: the order a serial VecScan path's source would hand its rows in, as
+ * the relation's units are now (vexec_source.h's ordering(), minor 4): its
+ * attributes, up to max, into attnums, and how many; 0 for a source with
+ * none.
+ */
+int
+vexec_scan_path_ordering(PlannerInfo *root, Path *path, int max, AttrNumber *attnums)
+{
+	RelOptInfo *rel = path->parent;
+	Relation	relation;
+	const VexecSourceRoutine *src;
+	const char *how;
+	int			k = 0;
+
+	if (!vexec_is_scan_path(path) || path->parallel_aware || path->param_info != NULL ||
+		rel->reloptkind != RELOPT_BASEREL || rel->rtekind != RTE_RELATION)
+		return 0;
+	relation = table_open(planner_rt_fetch(rel->relid, root)->relid, NoLock);
+	src = vexec_source_for(relation, &how);
+	if (src != NULL && VEXEC_SOURCE_HAS(src, ordering))
+		k = src->ordering(relation, NULL, max, attnums);
+	table_close(relation, NoLock);
+	return Max(k, 0);
+}
+
+/*
  * A system column the scan cannot give: VecScan gives ctid, from each row's
  * TID, and tableoid; xmin and its kind are heap's tuple header.
  */
@@ -370,15 +396,19 @@ reads_other_system_column(Bitmapset *attrs)
  * reads only the sort keys' columns, its quals' and each row's TID, as a
  * bounded VecSort over it makes it read (vexec_sort_make_late()) -- the
  * same scan, of as many workers, with the source's estimate of those
- * columns' bytes.  False where the path is no VecScan of a base relation,
- * or no column of its target would be read late: every entry that is no
- * key must be a Var of the relation, and one at least a column of its own.
+ * columns' bytes -- and in *fetch what the source prices a fetch by TID of
+ * the columns read late at (VexecSourceEstimate.fetch, minor 4, VC16), or 0
+ * where it does not.  False where the path is no VecScan of a base
+ * relation, or no column of its target would be read late: every entry
+ * that is no key must be a Var of the relation, and one at least a column
+ * of its own.
  */
 bool
-vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost)
+vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost, Cost *fetch)
 {
 	RelOptInfo *rel = path->parent;
 	Bitmapset  *attrs = NULL;
+	Bitmapset  *late = NULL;
 	Relation	relation;
 	const VexecSourceRoutine *src;
 	const char *how;
@@ -389,6 +419,7 @@ vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost)
 	bool		any_late = false;
 	ListCell   *lc;
 
+	*fetch = 0;
 	if (!vexec_is_scan_path(path) || path->param_info != NULL ||
 		rel->reloptkind != RELOPT_BASEREL || rel->rtekind != RTE_RELATION)
 		return false;
@@ -401,7 +432,10 @@ vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost)
 		if (!IsA(v, Var) || v->varno != rel->relid || v->varlevelsup != 0 || v->varattno == 0)
 			return false;
 		if (v->varattno > 0)
+		{
 			any_late = true;
+			late = bms_add_member(late, v->varattno - FirstLowInvalidHeapAttributeNumber);
+		}
 	}
 	if (!any_late)
 		return false;
@@ -415,6 +449,14 @@ vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost)
 	src = vexec_source_for(relation, &how);
 	if (src != NULL && VEXEC_SOURCE_HAS(src, estimate))
 		source_estimate(rel, relation, src, attrs, &est);
+	/* VC16: a fetch of the late columns alone, where the source prices one */
+	if (src != NULL && VEXEC_SOURCE_HAS(src, estimate_ex) && VEXEC_SOURCE_HAS(src, fetch_columns))
+	{
+		VexecSourceEstimate fest;
+
+		source_estimate(rel, relation, src, late, &fest);
+		*fetch = Max(fest.fetch, 0);
+	}
 	table_close(relation, NoLock);
 
 	memset(&quals, 0, sizeof(quals));

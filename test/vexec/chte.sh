@@ -18,8 +18,12 @@
 #                 table access method, and by VecInsert through the sink;
 #                 every load's rows COPY's, and read back alike through
 #                 ChScan, the plain scan and vexec's source
+#   orders        groupings in a table's key's order, where its parts keep
+#                 it and where they do not, and a VecSort's late columns
+#                 fetched by TID, the columns named (chte_orders.sh; VC4,
+#                 VC16)
 #
-#   CHTE_PARTS    the parts run: "suite chte differential loads"
+#   CHTE_PARTS    the parts run: "suite chte differential loads orders"
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$here/build.sh" > "${RESULTS_DIR:-/tmp}/vexec-build.log" 2>&1 || { tail -30 "${RESULTS_DIR:-/tmp}/vexec-build.log"; exit 1; }
@@ -29,7 +33,7 @@ CHTE_SRC=/chte /chte/test/build.sh > "${RESULTS_DIR:-/tmp}/chte-build.log" 2>&1 
 echo "vexec and ch_table_engines $(git -C /chte rev-parse --short HEAD 2> /dev/null || echo '?') on $("$BINDIR/pg_config" --version)"
 
 rc=0
-for part in ${CHTE_PARTS:-suite chte differential loads}; do
+for part in ${CHTE_PARTS:-suite chte differential loads orders}; do
 	case "$part" in
 		suite)
 			echo "== vexec's suite, ch_table_engines preloaded beside vexec"
@@ -50,6 +54,10 @@ for part in ${CHTE_PARTS:-suite chte differential loads}; do
 		loads)
 			echo "== loads into mergetree tables, both stores"
 			"$here/chte_loads.sh" || rc=1
+			;;
+		orders)
+			echo "== groupings in the keys' order, and late columns' fetches, over mergetree tables"
+			"$here/chte_orders.sh" || rc=1
 			;;
 		*)
 			echo "no part $part"; rc=1 ;;

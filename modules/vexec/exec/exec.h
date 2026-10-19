@@ -99,6 +99,9 @@ typedef struct VexecAggPlan
 	int			ntrans;			/* transition states: aggtransno's range */
 	int64		topk;			/* C5: the groups a LIMIT without ORDER BY
 								 * takes, kept by their hashes; 0: all */
+	bool		sorted_input;	/* VC4: hashed, but the input may come in the
+								 * keys' order, its scan's source's: taken so
+								 * where the scan says so as it begins */
 } VexecAggPlan;
 
 /*
@@ -514,6 +517,7 @@ extern bool vexec_scan_can_aggregate(VexecNode *node);
 extern bool vexec_scan_aggregate(VexecNode *node, int nreqs, const VexecSourceAgg *reqs,
 								 VexecSourceAggAnswer *answers, int64 *nrows);
 extern const char *vexec_scan_source_name(VexecNode *node);
+extern int	vexec_scan_ordering(VexecNode *node, int max, AttrNumber *attnums);
 extern Node *vexec_create_result_state(CustomScan *cscan);
 extern Node *vexec_create_agg_state(CustomScan *cscan);
 extern List *vexec_agg_plan_encode(const VexecAggPlan *plan);
@@ -553,7 +557,7 @@ extern Node *vexec_create_sort_state(CustomScan *cscan);
 extern List *vexec_sort_plan_encode(const VexecSortPlan *plan);
 extern void vexec_sort_plan_decode(CustomScan *cscan, VexecSortPlan *plan);
 extern void vexec_sort_set_bound(CustomScan *cscan, int64 bound);
-extern bool vexec_sort_make_late(CustomScan *cscan, bool parallel_ok);
+extern bool vexec_sort_make_late(CustomScan *cscan, bool serial_ok, bool parallel_ok);
 extern bool vexec_sort_plan_running_bound(CustomScan *cscan);
 extern bool vexec_scan_set_bound(PlanState *ps, VexecSortBound *bound);
 extern pg_atomic_uint64 *vexec_scan_shared_bound(PlanState *ps);

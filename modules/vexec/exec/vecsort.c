@@ -44,7 +44,10 @@
  * them, and each row it gives out is fetched by its TID under the query's
  * snapshot, the scan's (table_tuple_fetch_row_version()), and the scan
  * tuple -- custom_scan_tlist, over the relation's Vars -- computed over it.
- * The row was visible to the scan under that snapshot, so it is still.
+ * The row was visible to the scan under that snapshot, so it is still.  A
+ * source that decodes a column store's granules for a fetch is told the
+ * columns the scan tuple reads (vexec_source.h's fetch_columns(), minor 4,
+ * VC16), which it then decodes alone, the slot's other attributes NULL.
  *
  * The running bound (H6, §3.14).  Where the planner made it so
  * (plan/sort.c), the sort lends its child, a vector scan, the first key of
@@ -75,6 +78,7 @@
  */
 #include "postgres.h"
 
+#include "access/sysattr.h"
 #include "access/tableam.h"
 #include "commands/explain.h"
 #include "commands/explain_format.h"
@@ -83,6 +87,7 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -97,6 +102,7 @@
 #include "batch/batch.h"
 #include "exec/exec.h"
 #include "expr/expr.h"
+#include "source/source.h"
 
 typedef struct VexecSortState
 {
@@ -239,6 +245,38 @@ vexec_sort_set_bound(CustomScan *cscan, int64 bound)
 	linitial((List *) list_nth(p, 4)) = makeInteger((int) Min(Max(bound, 0), PG_INT32_MAX));
 }
 
+/*
+ * VC16: the late columns a fetch into the late slot decodes, where the
+ * relation's source takes them (fetch_columns(), minor 4): the attributes
+ * the scan tuple reads; every one for a whole row.
+ */
+static void
+late_columns(VexecSortState *s, CustomScan *cscan, Index relid)
+{
+	const char *how;
+	const VexecSourceRoutine *src = vexec_source_for(s->late_rel, &how);
+	Bitmapset  *attrs = NULL;
+	AttrNumber *attnums;
+	int			n = 0;
+	int			x = -1;
+
+	if (src == NULL || !VEXEC_SOURCE_HAS(src, fetch_columns))
+		return;
+	pull_varattnos((Node *) cscan->custom_scan_tlist, relid, &attrs);
+	if (bms_is_member(0 - FirstLowInvalidHeapAttributeNumber, attrs))
+		return;
+	attnums = palloc(sizeof(AttrNumber) * Max(bms_num_members(attrs), 1));
+	while ((x = bms_next_member(attrs, x)) >= 0)
+	{
+		AttrNumber	attno = x + FirstLowInvalidHeapAttributeNumber;
+
+		if (attno > 0)
+			attnums[n++] = attno;
+	}
+	src->fetch_columns(s->late_rel, s->late_slot, n, attnums);
+	pfree(attnums);
+}
+
 static void
 sort_begin(CustomScanState *css, EState *estate, int eflags)
 {
@@ -288,6 +326,7 @@ sort_begin(CustomScanState *css, EState *estate, int eflags)
 		foreach(lc, cscan->custom_scan_tlist)
 			s->late_exprs[foreach_current_index(lc)] =
 				ExecInitExpr(lfirst_node(TargetEntry, lc)->expr, NULL);
+		late_columns(s, cscan, childscan->scanrelid);
 	}
 	else if (scandesc->natts != s->desc->natts)
 		elog(ERROR, "vexec: a VecSort's scan tuple of %d columns, its child's %d",

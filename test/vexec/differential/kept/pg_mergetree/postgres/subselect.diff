@@ -1,0 +1,17 @@
+--- reference
++++ session
+@@ -1557,10 +1557,10 @@
+   (select tattle(3, ten) as v, count(*) from tenk1 where unique1 < 3 group by 1) ss
+   where ss.v;
++NOTICE:  x = 3, y = 2
++NOTICE:  x = 3, y = 2
++NOTICE:  x = 3, y = 1
++NOTICE:  x = 3, y = 1
+ NOTICE:  x = 3, y = 0
+ NOTICE:  x = 3, y = 0
+-NOTICE:  x = 3, y = 1
+-NOTICE:  x = 3, y = 1
+-NOTICE:  x = 3, y = 2
+-NOTICE:  x = 3, y = 2
+  v | count 
+ ---+-------

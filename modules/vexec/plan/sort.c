@@ -41,20 +41,27 @@
  * Late columns (H6, §3.14).  A bounded VecSort -- of at most
  * VEXEC_LATE_ROWS rows -- straight over a VecScan sorts the keys and each
  * row's TID alone, where the child's other columns are the relation's
- * own: the scan then reads only the sort keys and its quals' columns, and
- * the other columns of the rows the sort keeps are fetched at the end, by
- * their TIDs, under the scan's snapshot (table_tuple_fetch_row_version()).
- * A Var raises no error, so reading one only for the kept rows changes no
- * answer; a column the child computes keeps it as it is.  The rows that
- * tie at the bound's key are those tuplesort keeps, as without it.
+ * own and the narrower scan saves more than the fetches cost
+ * (late_saving()): the scan then reads only the sort keys and its quals'
+ * columns, and the other columns of the rows the sort keeps are fetched at
+ * the end, by their TIDs, under the scan's snapshot
+ * (table_tuple_fetch_row_version()).  A source that prices its fetches is
+ * taken at its word (VC16): a column store's decodes a granule of each
+ * column it reads, which a narrow row the scan reads anyway does not repay
+ * -- three columns of ClickBench's hits sorted by EventTime, LIMIT 100,
+ * took 1,344 ms serially with late columns and 671 without
+ * (ch_table_engines.md §3, "VC4, VC6 and VC16, researched").  A Var raises
+ * no error, so reading one only for the kept rows changes no answer; a
+ * column the child computes keeps it as it is.  The rows that tie at the
+ * bound's key are those tuplesort keeps, as without it.
  *
  * In parallel, the input's cheapest partial path is sorted so too, in each
  * participant, under a Gather Merge, the bound each participant's; over a
  * parallel VecScan, where the narrower scan saves more than the fetches
- * cost (late_saving()), each participant fetches the rows its sort keeps,
- * by their TIDs, under the query's snapshot, which every participant
- * shares, and the path is priced so -- without which the planner took a
- * row Sort over the Gather, the scan reading every column.  Where the
+ * cost, each participant fetches the rows its sort keeps, by their TIDs,
+ * under the query's snapshot, which every participant shares, and the path
+ * is priced so -- without which the planner took a row Sort over the
+ * Gather, the scan reading every column.  Where the
  * relation's cheapest paths are no VecScan -- ChScan's, cheaper than
  * VecScan's for every column of a wide table -- its VecScan paths, kept
  * aside as paths.c makes them (vexec_sort_keep_scan()), are sorted so too,
@@ -102,14 +109,16 @@ static Plan *plan_vecsort(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_p
 
 /*
  * And over a relation's VecScan kept aside (vexec_sort_keep_scan()), up to
- * this many: there the cheapest scan is a wide table's, and a fetch by TID
- * of a column store reads a block of every column of the row -- a
- * MergeTree granule, 8.8 ms a row of ClickBench's 105 columns, where
- * late_saving() prices a random page.  Measured on those 10M rows with 16
- * workers, a sort of SELECT * bounded at 100 took 597 ms over the kept scan
- * against 2,362 over ChScan's, at 1,000 5,687 against 2,374
- * (ch_table_engines.md §3, "VC4, VC6 and VC16, researched").  Until a
- * source prices its fetches (VC16), the bound keeps them few.
+ * this many where its source does not price its fetches: there the
+ * cheapest scan is a wide table's, and a fetch by TID of a column store
+ * reads a block of every column of the row -- a MergeTree granule, 8.8 ms
+ * a row of ClickBench's 105 columns, where late_saving() would price a
+ * random page.  Measured on those 10M rows with 16 workers, a sort of
+ * SELECT * bounded at 100 took 597 ms over the kept scan against 2,362 over
+ * ChScan's, at 1,000 5,687 against 2,374 (ch_table_engines.md §3, "VC4,
+ * VC6 and VC16, researched").  A source that prices them (minor 4's
+ * VexecSourceEstimate.fetch, VC16) has its fetches priced so, up to
+ * VEXEC_LATE_ROWS.
  */
 #define VEXEC_KEPT_LATE_ROWS	100
 
@@ -194,12 +203,12 @@ index_ordered_path(Path *path)
 
 /*
  * A VecSort path: the row Sort of the same input its one custom path.
- * late_parallel: late columns over a parallel scan, where the planner
- * priced them a saving (late_saving()).
+ * late_ok: late columns, where the planner priced them a saving
+ * (late_saving()).
  */
 static Path *
 vecsort_path(RelOptInfo *rel, PathTarget *target, SortPath *rowpath, const VexecCost *cost,
-			 int64 bound, bool late_parallel)
+			 int64 bound, bool late_ok)
 {
 	CustomPath *cp = makeNode(CustomPath);
 	Path	   *input = rowpath->subpath;
@@ -218,7 +227,7 @@ vecsort_path(RelOptInfo *rel, PathTarget *target, SortPath *rowpath, const Vexec
 	cp->path.pathkeys = rowpath->path.pathkeys;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = list_make1(rowpath);
-	cp->custom_private = list_make2(makeInteger((int) bound), makeInteger(late_parallel ? 1 : 0));
+	cp->custom_private = list_make2(makeInteger((int) bound), makeInteger(late_ok ? 1 : 0));
 	cp->methods = &vecsort_path_methods;
 	return &cp->path;
 }
@@ -267,8 +276,12 @@ sort_key_exprs(List *pathkeys, PathTarget *target)
  * TIDs alone and fetches the rest of each row it keeps
  * (vexec_sort_make_late()), so its input costs what the narrower scan
  * costs (paths.c, vexec_late_scan_cost()), and each participant fetches
- * its kept rows, a random page and a tuple each.  What a sort over the
- * input as it is saves so; 0 where it is not made late, or saves nothing.
+ * its kept rows: at the price the source gives a fetch of the late columns
+ * (VexecSourceEstimate.fetch, minor 4, VC16) -- a column store's decodes a
+ * granule of each -- each participant fetching its own beside the others;
+ * else at a random page and a tuple each.  What a sort over the input as it
+ * is saves so; 0 where it is not made late, or saves nothing.  *priced
+ * says whether the source priced its fetches.
  *
  * Both scans are compared without what each one's cost carries for handing
  * its columns to a row parent (vexec_cost_rowout()): the VecSort reads
@@ -277,23 +290,27 @@ sort_key_exprs(List *pathkeys, PathTarget *target)
  * back twice, and a sort of a hundred columns cost less than nothing.
  */
 static Cost
-late_saving(PlannerInfo *root, Path *input, int64 bound)
+late_saving(PlannerInfo *root, Path *input, int64 bound, bool *priced)
 {
 	List	   *keys;
 	VexecCost	late;
 	double		participants;
 	double		spc_random_page_cost;
+	Cost		fetch;
 	Cost		saved;
 
+	*priced = false;
 	if (bound <= 0 || bound > VEXEC_LATE_ROWS)
 		return 0;
 	keys = sort_key_exprs(root->sort_pathkeys, input->pathtarget);
-	if (keys == NIL || !vexec_late_scan_cost(root, input, keys, &late))
+	if (keys == NIL || !vexec_late_scan_cost(root, input, keys, &late, &fetch))
 		return 0;
 	participants = input->parallel_workers > 0 ? ceil(vexec_parallel_divisor(input)) : 1.0;
 	get_tablespace_page_costs(input->parent->reltablespace, &spc_random_page_cost, NULL);
+	*priced = fetch > 0;
 	saved = (input->total_cost - vexec_cost_rowout(input)) - (late.total - late.rowout) -
-		bound * participants * (spc_random_page_cost + cpu_tuple_cost);
+		(fetch > 0 ? bound * (fetch + cpu_tuple_cost) :
+		 bound * participants * (spc_random_page_cost + cpu_tuple_cost));
 	return Max(saved, 0);
 }
 
@@ -353,12 +370,15 @@ vexec_sort_keep_scan(VexecPlanState *ps, Path *path)
  * (apply_scanjoin_target_to_paths()), which a VecScan projects
  * (CUSTOMPATH_SUPPORT_PROJECTION), and a late sort over it only where that
  * target is the relation's columns (vexec_late_scan_cost()).  Its saving
- * over the input as it is, in *saving; NULL where it saves nothing.
+ * over the input as it is, in *saving; NULL where it saves nothing, or the
+ * bound is past VEXEC_KEPT_LATE_ROWS and the source does not price its
+ * fetches.
  */
 static Path *
 kept_late_input(PlannerInfo *root, Path *kept, PathTarget *target, int64 bound, Cost *saving)
 {
 	CustomPath *copy;
+	bool		priced;
 
 	*saving = 0;
 	if (kept == NULL)
@@ -366,9 +386,10 @@ kept_late_input(PlannerInfo *root, Path *kept, PathTarget *target, int64 bound, 
 	copy = palloc(sizeof(CustomPath));
 	memcpy(copy, kept, sizeof(CustomPath));
 	copy->path.pathtarget = target;
-	*saving = late_saving(root, &copy->path, bound);
-	if (*saving <= 0)
+	*saving = late_saving(root, &copy->path, bound, &priced);
+	if (*saving <= 0 || (!priced && bound > VEXEC_KEPT_LATE_ROWS))
 	{
+		*saving = 0;
 		pfree(copy);
 		return NULL;
 	}
@@ -435,6 +456,15 @@ kept_scans_of(VexecPlanState *ps, RelOptInfo *rel)
 	return NULL;
 }
 
+/* A base relation's serial VecScan kept aside, or NULL: for a grouping in its order (VC4, agg.c) */
+Path *
+vexec_sort_kept_scan(VexecPlanState *ps, RelOptInfo *rel)
+{
+	VexecKeptScan *kept = kept_scans_of(ps, rel);
+
+	return kept != NULL ? kept->path : NULL;
+}
+
 /*
  * VecSort's alternative for the query's ORDER BY (§3.3.3, UPPERREL_ORDERED):
  * recorded for EXPLAIN, and in auto and force mode added.  In parallel, the
@@ -479,6 +509,7 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 	int64		bound;
 	Cost		saving;
 	Cost		psaving;
+	bool		priced;
 	bool		index_kept = false;
 	ListCell   *lc;
 
@@ -541,8 +572,8 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 	}
 	base = input != NULL ? input : pinput;
 	rows = input != NULL ? input->rows : pinput->rows * vexec_parallel_divisor(pinput);
-	saving = input != NULL ? late_saving(root, input, bound) : 0;
-	psaving = pinput != NULL ? late_saving(root, pinput, bound) : 0;
+	saving = input != NULL ? late_saving(root, input, bound, &priced) : 0;
+	psaving = pinput != NULL ? late_saving(root, pinput, bound, &priced) : 0;
 
 	/*
 	 * Where the input's cheapest paths are no VecScan, the relation's own,
@@ -551,7 +582,7 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 	 * under a Gather Merge -- where that saves.
 	 */
 	kept = kept_scans_of(ps, input_rel);
-	if (kept != NULL && bound > 0 && bound <= VEXEC_KEPT_LATE_ROWS)
+	if (kept != NULL && bound > 0 && bound <= VEXEC_LATE_ROWS)
 	{
 		if (input == NULL || !vexec_is_scan_path(input))
 			linput = kept_late_input(root, kept->path, base->pathtarget, bound, &lsaving);
@@ -615,7 +646,7 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 		return;
 	newpaths = NIL;
 	if (input != NULL)
-		newpaths = lappend(newpaths, vecsort_path(output_rel, target, rowpath, &cost, bound, false));
+		newpaths = lappend(newpaths, vecsort_path(output_rel, target, rowpath, &cost, bound, saving > 0));
 	if (pinput != NULL)
 	{
 		Path	   *psort = vecsort_path(output_rel, target, prow, &pcost, bound, psaving > 0);
@@ -626,7 +657,7 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 													root->sort_pathkeys, NULL, &total));
 	}
 	if (linput != NULL)
-		newpaths = lappend(newpaths, vecsort_path(output_rel, target, lrow, &lcost, bound, false));
+		newpaths = lappend(newpaths, vecsort_path(output_rel, target, lrow, &lcost, bound, true));
 	if (lpinput != NULL)
 	{
 		Path	   *psort = vecsort_path(output_rel, target, lprow, &lpcost, bound, true);
@@ -718,7 +749,11 @@ plan_vecsort(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_private = vexec_sort_plan_encode(&plan);
 	cscan->custom_scan_tlist = scan_tlist;
 	cscan->methods = vexec_sort_methods();
-	(void) vexec_sort_make_late(cscan, intVal(lsecond(best_path->custom_private)) != 0);
+	{
+		bool		late_ok = intVal(lsecond(best_path->custom_private)) != 0;
+
+		(void) vexec_sort_make_late(cscan, late_ok, late_ok);
+	}
 	(void) vexec_sort_plan_running_bound(cscan);
 	return &cscan->scan.plan;
 }
@@ -728,9 +763,11 @@ plan_vecsort(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
  * the rest of each kept row fetched by its TID (H6, above), where every
  * column of the child's row that is no key is a Var of the scanned
  * relation, and one at least a column of its own; whether it was.  Over a
- * parallel scan only where parallel_ok: the planner priced a saving there
- * (late_saving()) -- a fetch in a column store reads a granule of every
- * column, which a narrow row the scan reads anyway does not repay.  The
+ * serial scan only where serial_ok, a parallel one only where parallel_ok:
+ * PostgreSQL's planner priced a saving there (late_saving()) -- a fetch in
+ * a column store reads a granule of each column it decodes, which a narrow
+ * row the scan reads anyway does not repay; ORCA's sorts are made late over
+ * a serial scan, unpriced.  The
  * child's target list becomes the keys, then ctid; the scan tuple the
  * child's row as it was, over the relation's Vars.  Its Vars are those of
  * the relation the child scans, whichever form the plan is in --
@@ -739,7 +776,7 @@ plan_vecsort(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
  * relation from the child.
  */
 bool
-vexec_sort_make_late(CustomScan *cscan, bool parallel_ok)
+vexec_sort_make_late(CustomScan *cscan, bool serial_ok, bool parallel_ok)
 {
 	VexecSortPlan plan;
 	Plan	   *child = cscan->scan.plan.lefttree;
@@ -757,7 +794,7 @@ vexec_sort_make_late(CustomScan *cscan, bool parallel_ok)
 		return false;
 	if (child == NULL || !IsA(child, CustomScan) ||
 		((CustomScan *) child)->methods != vexec_scan_methods() ||
-		(child->parallel_aware && !parallel_ok) || ((Scan *) child)->scanrelid == 0 ||
+		(child->parallel_aware ? !parallel_ok : !serial_ok) || ((Scan *) child)->scanrelid == 0 ||
 		contain_subplans((Node *) child->targetlist))
 		return false;
 	relid = ((Scan *) child)->scanrelid;
@@ -1181,7 +1218,7 @@ vexec_orca_limit_bound(Limit *limit)
 		((CustomScan *) below)->methods == vexec_sort_methods())
 	{
 		vexec_sort_set_bound((CustomScan *) below, n + offset);
-		(void) vexec_sort_make_late((CustomScan *) below, false);
+		(void) vexec_sort_make_late((CustomScan *) below, true, false);
 		(void) vexec_sort_plan_running_bound((CustomScan *) below);
 	}
 }

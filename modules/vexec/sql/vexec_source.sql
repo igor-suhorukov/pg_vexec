@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: Apache-2.0
 --
--- The batch-source and batch-sink contracts (vexec_source.h at minor 3,
+-- The batch-source and batch-sink contracts (vexec_source.h at minor 4,
 -- vexec_sink.h) on vanilla PostgreSQL, through vexec_test's access method,
 -- heap's with a source and a sink of every member
 -- (modules/vexec_test/source_test.c): each query run with vexec.mode off,
@@ -19,7 +19,11 @@
 -- distinct values, shared by the units that have the same ones and named by
 -- dictionary_id() -- and the subtrees over one such column are evaluated
 -- over the dictionary's values, once for every batch with it, and an
--- aggregation hashes its keys' values once (VC5).
+-- aggregation hashes its keys' values once (VC5).  Under
+-- vexec_test.source_ordering it says its rows come in an order, which a
+-- serial grouping by a prefix of it takes as they come (VC4); its access
+-- method's fetch by TID leaves the columns fetch_columns() did not name
+-- NULL, and vexec_test.source_fetch_cost prices a fetch (VC16).
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vexec;
@@ -214,6 +218,67 @@ SELECT calls = :made AS none_made FROM vexec_test.source_calls() WHERE member = 
 RESET vexec_test.source_dictionaries;
 RESET vexec.batch_dictionary;
 
+-- groups in their keys' order (VC4): where the source says its rows come
+-- in an order the keys are a prefix of (ordering(), minor 4) -- so_rows is
+-- loaded in (k, t)'s order, k's groups of 2,500 rows across batches, then
+-- k's NULLs -- a serial grouping makes each group as its rows come and
+-- hands it up as the next begins: no table, no spill, with 64 kB of
+-- work_mem too.  Where the scan, as it begins, says its rows do not come so
+-- -- as a storage whose units changed since the plan was made would -- it
+-- hashes.  The keys' order among themselves is free; a key past the
+-- order's prefix keeps the grouping hashed
+CREATE TABLE so_rows (k int4, t text, v int8, n numeric(12,2)) USING vexec_test_am;
+INSERT INTO so_rows
+SELECT i / 2500, 't' || (i % 2500 / 1000), i, i / 3.0 FROM generate_series(0, 49999) i
+UNION ALL SELECT NULL, 'tn', i, NULL FROM generate_series(1, 700) i;
+ANALYZE so_rows;
+SET vexec_test.source_ordering = '1,2';
+SET vexec.mode = auto;
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF) SELECT k, count(*), sum(v) FROM so_rows GROUP BY k;
+EXPLAIN (COSTS OFF) SELECT t, k, count(*) FROM so_rows GROUP BY t, k;
+EXPLAIN (COSTS OFF) SELECT t, count(*) FROM so_rows GROUP BY t;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT k, count(*) FROM so_rows GROUP BY k;
+SELECT source_check('SELECT k, count(*), sum(v), min(t), avg(n), string_agg(v::text, '','' ORDER BY v DESC) FROM so_rows GROUP BY k');
+SELECT source_check('SELECT k, t, count(*), max(v), array_agg(v ORDER BY v)::text FROM so_rows GROUP BY k, t');
+SELECT source_check('SELECT k, count(*) FROM so_rows GROUP BY k HAVING sum(v) > 100000000');
+SELECT source_check('SELECT k, sum(v) FROM so_rows WHERE v % 3 = 0 GROUP BY k');
+SET work_mem = '64kB';
+SELECT source_check('SELECT k, t, count(*), sum(n) FROM so_rows GROUP BY k, t');
+SELECT source_check('SELECT v / 7 AS g, count(*) FROM so_rows GROUP BY k, v / 7');
+RESET work_mem;
+-- the scan says otherwise: hashed, the same answers
+SET vexec_test.source_ordered_scans = off;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT k, count(*) FROM so_rows GROUP BY k;
+SELECT source_check('SELECT k, count(*), sum(v) FROM so_rows GROUP BY k');
+RESET vexec_test.source_ordered_scans;
+-- a grouping for each outer row: rescanned, its groups made again
+SELECT source_check('SELECT o.k, (SELECT count(*) FROM (SELECT k, t FROM so_rows WHERE so_rows.k = o.k GROUP BY k, t) g) FROM (VALUES (0), (7), (19)) o(k)');
+SET vexec.enable_sorted_agg = off;
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM so_rows GROUP BY k;
+RESET vexec.enable_sorted_agg;
+RESET vexec_test.source_ordering;
+RESET max_parallel_workers_per_gather;
+RESET vexec.mode;
+
+-- a bounded VecSort's late columns (H6) with a source that names them
+-- (fetch_columns(), minor 4, VC16): its fetches by TID read only the
+-- columns the sort's rows take, the access method leaving the others NULL
+-- -- a column read but not named would show as NULL; and where the source
+-- prices a fetch (estimate_ex()'s fetch), a serial sort is made late only
+-- where that saves
+SET vexec.mode = force;
+EXPLAIN (COSTS OFF) SELECT a, b, c, d, f FROM src ORDER BY d DESC, a LIMIT 5;
+SELECT source_check('SELECT a, b, c, d, f FROM src ORDER BY d DESC, a LIMIT 5');
+SELECT source_check('SELECT u, c, a FROM src WHERE e ORDER BY b DESC LIMIT 7');
+SET vexec_test.source_fetch_cost = 1000000;
+EXPLAIN (COSTS OFF) SELECT a, b, c, d, f FROM src ORDER BY d DESC, a LIMIT 5;
+SELECT source_check('SELECT a, b, c, d, f FROM src ORDER BY d DESC, a LIMIT 5');
+RESET vexec_test.source_fetch_cost;
+RESET vexec.mode;
+
 -- rescans: a subquery's scan, for each outer row
 CREATE TABLE src_outer (k int4);
 INSERT INTO src_outer VALUES (3), (5000), (9999);
@@ -239,5 +304,5 @@ SELECT count(*) FROM src_xml;
 -- and estimate, which estimate_ex replaces (minor 3)
 SELECT member, calls > 0 AS called FROM vexec_test.source_calls();
 
-DROP TABLE src, src_outer, src_copy, src_xml;
+DROP TABLE src, src_outer, src_copy, src_xml, so_rows;
 DROP FUNCTION source_check(text), source_run(text, text, text);

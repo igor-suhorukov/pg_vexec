@@ -14,6 +14,9 @@
  *
  *	simple		a VecAgg over the input relation's cheapest path, plain or
  *				hashed, AGGSPLIT_SIMPLE;
+ *	in order	(VC4) the same over the relation's serial VecScan, where its
+ *				source hands its rows in an order the keys are a prefix of:
+ *				each group made as its rows come, and handed up as it ends;
  *	the pair	a partial VecAgg (AGGSPLIT_INITIAL_SERIAL) over the input's
  *				cheapest partial path, into the partially grouped relation
  *				core made, under a Gather, and a final VecAgg
@@ -67,6 +70,7 @@
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 #include "vexec.h"
 #include "exec/aggtrans.h"
@@ -87,6 +91,8 @@ typedef struct AggPathInfo
 									 * aggregate's input is a count of the
 									 * distinct values a participant was
 									 * dealt, which it combines as count's */
+	bool		sorted_input;	/* VC4: the input a serial VecScan whose
+								 * source's order the keys are a prefix of */
 } AggPathInfo;
 
 /*
@@ -368,8 +374,9 @@ agg_path(PlannerInfo *root, RelOptInfo *rel, Path *input, PathTarget *target,
 	cp->path.pathkeys = NIL;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = list_make1(input);
-	cp->custom_private = list_make2(makeInteger(info->distinct_ref),
-									makeInteger(info->distinct_combine ? 1 : 0));
+	cp->custom_private = list_make3(makeInteger(info->distinct_ref),
+									makeInteger(info->distinct_combine ? 1 : 0),
+									makeInteger(info->sorted_input ? 1 : 0));
 	cp->custom_private = list_concat(list_make5(makeInteger(info->strategy), makeInteger(info->split),
 												makeFloat(psprintf("%.1f", info->numgroups)),
 												info->groupclause, info->having),
@@ -1025,6 +1032,83 @@ stats_answer(RelOptInfo *input_rel, Path *input, List *aggrefs, double *units)
 }
 
 /*
+ * VC4: the input relation's serial VecScan -- among its paths, or kept
+ * aside where a cheaper one dropped it (sort.c), with the input's target --
+ * where its source hands its rows in an order the grouping's keys are a
+ * prefix of (vexec_source.h's ordering(), minor 4): each key a column of
+ * the relation compared by its type's default equality, a deterministic
+ * collation's for text, as the source's order compares it.  NULL where
+ * there is none.
+ */
+static Path *
+sorted_input_path(PlannerInfo *root, RelOptInfo *input_rel, Path *input, List *groupclause,
+				  VexecPlanState *ps)
+{
+	AttrNumber	order[INDEX_MAX_KEYS];
+	AttrNumber	keys[INDEX_MAX_KEYS];
+	bool		used[INDEX_MAX_KEYS] = {false};
+	Path	   *scan = NULL;
+	int			nkeys = list_length(groupclause);
+	int			k;
+	ListCell   *lc;
+
+	if (!vexec_enable_sorted_agg || input_rel->reloptkind != RELOPT_BASEREL ||
+		input_rel->rtekind != RTE_RELATION || nkeys == 0 || nkeys > INDEX_MAX_KEYS)
+		return NULL;
+	foreach(lc, groupclause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		Var		   *v = (Var *) get_sortgroupclause_expr(sgc, root->processed_tlist);
+		Oid			coll;
+
+		if (!IsA(v, Var) || v->varno != input_rel->relid || v->varlevelsup != 0 || v->varattno < 1)
+			return NULL;
+		coll = exprCollation((Node *) v);
+		if (sgc->eqop != lookup_type_cache(v->vartype, TYPECACHE_EQ_OPR)->eq_opr ||
+			(OidIsValid(coll) && !get_collation_isdeterministic(coll)))
+			return NULL;
+		keys[foreach_current_index(lc)] = v->varattno;
+	}
+	foreach(lc, input_rel->pathlist)
+	{
+		Path	   *p = lfirst(lc);
+
+		if (vexec_is_scan_path(p) && !p->parallel_aware && p->param_info == NULL)
+		{
+			scan = p;
+			break;
+		}
+	}
+	if (scan == NULL)
+	{
+		Path	   *kept = vexec_sort_kept_scan(ps, input_rel);
+		CustomPath *copy;
+
+		if (kept == NULL)
+			return NULL;
+		copy = palloc(sizeof(CustomPath));
+		memcpy(copy, kept, sizeof(CustomPath));
+		copy->path.pathtarget = input->pathtarget;
+		scan = &copy->path;
+	}
+	k = vexec_scan_path_ordering(root, scan, nkeys, order);
+	if (k < nkeys)
+		return NULL;
+	for (int i = 0; i < nkeys; i++)
+	{
+		int			j;
+
+		for (j = 0; j < nkeys; j++)
+			if (order[j] == keys[i] && !used[j])
+				break;
+		if (j == nkeys)
+			return NULL;
+		used[j] = true;
+	}
+	return scan;
+}
+
+/*
  * VecAgg's alternatives for an aggregation (§3.3.3): recorded for EXPLAIN,
  * and in auto and force mode added.
  */
@@ -1192,6 +1276,36 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 	info.having = having;
 	newpaths = lappend(newpaths, agg_path(root, output_rel, input, output_rel->reltarget,
 										  &info, &cost));
+
+	/*
+	 * VC4: over a serial VecScan whose source hands its rows in an order the
+	 * keys are a prefix of, the groups made as they come -- priced as
+	 * PostgreSQL's sorted Agg of that input, which holds no table and so
+	 * never spills, and begins handing groups up at once; hashed where the
+	 * scan's rows do not come so when it runs (exec/vecagg.c).
+	 */
+	if (strategy == AGG_HASHED && !answered)
+	{
+		Path	   *sinput = sorted_input_path(root, input_rel, input, groupclause, ps);
+
+		if (sinput != NULL)
+		{
+			AggPath    *srow = create_agg_path(root, output_rel, sinput, output_rel->reltarget,
+											   AGG_SORTED, AGGSPLIT_SIMPLE, groupclause, having,
+											   &agg_costs, numgroups);
+			VexecCost	scost;
+			AggPathInfo sinfo = info;
+
+			vexec_cost_agg(root, &srow->path, sinput, true, list_length(groupclause),
+						   nkeys_kernel, nvec, numgroups, &scost);
+			/* the savings are the rows', not the start's: the first group closes after a few */
+			scost.startup = sinput->startup_cost + vexec_batch_setup_cost;
+			scost.total = Max(scost.total, scost.startup);
+			sinfo.sorted_input = true;
+			newpaths = lappend(newpaths, agg_path(root, output_rel, sinput, output_rel->reltarget,
+												  &sinfo, &scost));
+		}
+	}
 
 	/*
 	 * The partial and final pair, over the input's cheapest partial path,
@@ -1553,6 +1667,7 @@ plan_vecagg(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *having = list_nth(priv, 4);
 	Index		distinct_ref = list_length(priv) > 5 ? intVal(list_nth(priv, 5)) : 0;
 	bool		distinct_combine = list_length(priv) > 6 && intVal(list_nth(priv, 6)) != 0;
+	bool		sorted_input = list_length(priv) > 7 && intVal(list_nth(priv, 7)) != 0;
 	PathTarget *target = best_path->path.pathtarget;
 	List	   *scan_tlist = NIL;
 	List	   *transnos = NIL;
@@ -1565,6 +1680,7 @@ plan_vecagg(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	plan.strategy = intVal(linitial(priv));
 	plan.split = intVal(lsecond(priv));
 	plan.numgroups = floatVal(lthird(priv));
+	plan.sorted_input = sorted_input;
 
 	/* the keys: the child's grouping columns, by sortgroupref */
 	memset(&as, 0, sizeof(as));

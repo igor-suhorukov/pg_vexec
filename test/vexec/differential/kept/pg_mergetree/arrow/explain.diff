@@ -294,14 +294,22 @@
  ]
  (1 row)
  
-@@ -338,5 +332,5 @@
-    ->  Bitmap Index Scan on tenk1_thous_tenthous  (cost=N.N..N.N rows=N width=N)
-    Recheck Cond: (thousand = $N)
-- Bitmap Heap Scan on tenk1  (cost=N.N..N.N rows=N width=N)
-+ Vec Bitmap Heap Scan on tenk1  (cost=N.N..N.N rows=N width=N)
- (4 rows)
+@@ -333,10 +327,9 @@
+ -- GENERIC_PLAN option
+ select explain_filter('explain (generic_plan) select unique1 from tenk1 where thousand = $1');
+-                        explain_filter                         
+----------------------------------------------------------------
+-   Columns: unique1, thousand
++                    explain_filter                     
++-------------------------------------------------------
+    Filter: (thousand = $N)
+- Custom Scan (ChScan) on tenk1  (cost=N.N..N.N rows=N width=N)
+-(3 rows)
++ Vec Seq Scan on tenk1  (cost=N.N..N.N rows=N width=N)
++(2 rows)
  
-@@ -347,42 +341,38 @@
+ -- should fail
+@@ -346,42 +339,38 @@
  -- MEMORY option
  select explain_filter('explain (memory) select * from int8_tbl i8');
 -                           explain_filter                            
@@ -495,7 +503,7 @@
 +(2 rows)
  
  -- Test EXPLAIN (GENERIC_PLAN) with partition pruning
-@@ -404,10 +394,10 @@
+@@ -403,10 +392,10 @@
  -- should scan gen_part_1_1 and gen_part_1_2, but not gen_part_2
  select explain_filter('explain (generic_plan) select key1, key2 from gen_part where key1 = 1 and key2 = $1');
 -                              explain_filter                               
@@ -510,7 +518,7 @@
 +   ->  Vec Seq Scan on gen_part_1_2 gen_part_2  (cost=N.N..N.N rows=N width=N)
   Append  (cost=N.N..N.N rows=N width=N)
  (5 rows)
-@@ -438,7 +428,7 @@
+@@ -437,7 +426,7 @@
    #- '{0,Plan,Plans,0,Sort Space Type}'
  );
 -                                                                                  jsonb_pretty                                                                                   
@@ -859,7 +867,7 @@
  ]
  (1 row)
  
-@@ -451,19 +441,28 @@
+@@ -450,19 +439,28 @@
                         explain_filter                       
  ------------------------------------------------------------
 +   Batch Format: arrow
@@ -895,7 +903,7 @@
 +(7 rows)
  
  -- Test compute_query_id with utility statements containing plannable query
-@@ -487,47 +486,39 @@
+@@ -486,47 +484,39 @@
  -- Test SERIALIZE option
  select explain_filter('explain (analyze,buffers off,serialize) select * from int8_tbl i8');
 -                                               explain_filter                                                

@@ -173,6 +173,12 @@ typedef struct VexecScanState
 	ScanKeyData bound_key;
 	StrategyNumber bound_strategy;
 	uint64		bound_given;
+
+	/*
+	 * VC4: the scan begun asking its source for its rows in ordering()'s
+	 * order (VEXEC_SRC_ORDERED), as a VecAgg above takes them
+	 */
+	bool		want_order;
 } VexecScanState;
 
 static bool scan_fetch(VexecNode *node);
@@ -590,6 +596,8 @@ begin_scan(VexecScanState *s)
 		spec->quals = pruning_quals((CustomScan *) s->node.css.ss.ps.plan);
 		spec->max_rows = VEXEC_BATCH_ROWS;
 		spec->flags = s->need_tid ? VEXEC_SRC_TIDS : 0;
+		if (s->want_order)
+			spec->flags |= VEXEC_SRC_ORDERED;
 		/* VC5: a source that keeps a column as a dictionary hands it so */
 		if (vexec_batch_dictionary)
 		{
@@ -962,6 +970,35 @@ vexec_scan_aggregate(VexecNode *node, int nreqs, const VexecSourceAgg *reqs,
 		s->stats_rows += *nrows;
 	}
 	return ok;
+}
+
+/*
+ * VC4: the order the scan's rows come in, its source's (vexec_source.h's
+ * ordering(), minor 4): the scan begun now, asking for it, where it has not
+ * begun; the attributes, up to max, into attnums, and how many -- 0 where
+ * the source has no order to give, the scan is parallel, or it began
+ * without asking.
+ */
+int
+vexec_scan_ordering(VexecNode *node, int max, AttrNumber *attnums)
+{
+	VexecScanState *s = (VexecScanState *) node;
+	PlanState  *ps = &node->css.ss.ps;
+
+	Assert(node->kind == VEXEC_NODE_SCAN);
+	if (s->bitmap || s->src == NULL || !VEXEC_SOURCE_HAS(s->src, ordering) || s->pscan != NULL ||
+		ps->plan->parallel_aware)
+		return 0;
+	if (s->scan == NULL)
+	{
+		if (ps->chgParam != NULL)
+			ExecReScan(ps);
+		s->want_order = true;
+		begin_scan(s);
+	}
+	if (!s->want_order)
+		return 0;
+	return s->src->ordering(s->rel, s->srcstate, max, attnums);
 }
 
 /* The scan's source's name, for EXPLAIN. */

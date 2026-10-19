@@ -46,8 +46,10 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		3	/* 1: aggregate; 2: set_keys; 3:
-									 * dictionary_id, estimate_ex */
+#define VEXEC_SOURCE_MINOR		4	/* 1: aggregate; 2: set_keys; 3:
+									 * dictionary_id, estimate_ex; 4:
+									 * fetch_columns, ordering, a fetch's
+									 * price */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -141,6 +143,9 @@ typedef struct VexecColumn
 #define VEXEC_SRC_DICT		0x0004	/* dictionary columns are welcome: a
 									 * column of a type's bytes, its
 									 * dictionary in the layout asked */
+#define VEXEC_SRC_ORDERED	0x0008	/* from minor version 4: a serial scan
+									 * hands its rows in ordering()'s order
+									 * where it can */
 
 /* What a scan asks of a source. */
 typedef struct VexecSourceSpec
@@ -214,6 +219,10 @@ typedef struct VexecSourceEstimate
 	double		units;			/* the units a serial scan reads, each of which
 								 * aggregate() may answer */
 	uint32		flags;			/* VEXEC_EST_* */
+	double		fetch;			/* from minor version 4: a row fetched by its
+								 * TID, the spec's columns alone read
+								 * (fetch_columns()), in the planner's units;
+								 * 0 where the source does not price it */
 } VexecSourceEstimate;
 
 /*
@@ -305,6 +314,35 @@ typedef struct VexecSourceRoutine
 	 */
 	void		(*estimate_ex) (Relation rel, Snapshot snapshot,
 								const VexecSourceSpec *spec, VexecSourceEstimate *est);
+
+	/*
+	 * Optional, from minor version 4: the columns a fetch of a row by its
+	 * TID into `slot` reads -- table_tuple_fetch_row_version() or an index
+	 * fetch, attnums[0 .. n), ascending -- the slot's other attributes
+	 * left NULL, which no one reads: a bounded VecSort's late columns (H6)
+	 * name theirs, where a column store would decode every column of the
+	 * row.  Given before the first fetch into the slot, which then lives
+	 * until its memory context is reset, as an executor's slots do; a fetch
+	 * into any other slot reads every column.  VexecSourceEstimate.fetch
+	 * prices such a fetch.
+	 */
+	void		(*fetch_columns) (Relation rel, TupleTableSlot *slot, int n,
+								  const AttrNumber *attnums);
+
+	/*
+	 * Optional, from minor version 4: an order a serial scan hands its rows
+	 * in -- the attributes it is by, attnums[0 .. k), at most max of them,
+	 * the count returned -- in which, for every j up to k, the rows whose
+	 * first j of them are equal come one after another: equal as each
+	 * type's default equality has them, a NULL equal to a NULL.  Nothing is
+	 * said of which comes first.  With `state` NULL, the planner's
+	 * question: the order a serial scan of rel begun with VEXEC_SRC_ORDERED
+	 * now would hand its rows in.  With a scan's state -- begun with
+	 * VEXEC_SRC_ORDERED, before its first batch -- the order this scan's
+	 * rows come in, which may be shorter, or none (0): the storage's units
+	 * may have changed since the plan was made.  A parallel scan's is none.
+	 */
+	int			(*ordering) (Relation rel, void *state, int max, AttrNumber *attnums);
 } VexecSourceRoutine;
 
 /*

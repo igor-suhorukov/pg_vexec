@@ -165,7 +165,9 @@ extern Node *vexec_reasons_node(VexecPlanState *ps);
 extern int	vexec_planner_extension_id(void);
 extern VexecPlanState *vexec_plan_state(PlannerInfo *root);
 extern const char *vexec_statement_gate(Query *parse, int cursorOptions);
-extern bool vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost);
+extern bool vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost,
+								 Cost *fetch);
+extern int	vexec_scan_path_ordering(PlannerInfo *root, Path *path, int max, AttrNumber *attnums);
 
 /* orca.c: ORCA's front end, through gp_orca's API */
 extern void vexec_orca_install(void);
@@ -197,6 +199,7 @@ extern void vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel,
 								RelOptInfo *output_rel, VexecPlanState *ps,
 								const char *target_name);
 extern void vexec_sort_keep_scan(VexecPlanState *ps, Path *path);
+extern Path *vexec_sort_kept_scan(VexecPlanState *ps, RelOptInfo *rel);
 extern const char *vexec_orca_sort_refusal(Sort *sort);
 extern Plan *vexec_build_sort_from_sort(Sort *sort);
 extern Plan *vexec_unbuild_sort(CustomScan *cscan);

@@ -4,7 +4,7 @@
  * source_test.c
  *	  vexec_test_am, a table access method of the tests, and its batch
  *	  source and sink with every member of their contracts (vexec_source.h
- *	  at minor 3, vexec_sink.h), so that vexec's suite tests the contracts
+ *	  at minor 4, vexec_sink.h), so that vexec's suite tests the contracts
  *	  on vanilla PostgreSQL, where no storage module registers either
  *	  (ch_table_engines.md §3, VC9).
  *
@@ -47,6 +47,16 @@
  *					no TIDs, every column an integer
  *	supports()		every attribute but one of type xml, which keeps a scan
  *					reading it on the slot path
+ *	fetch_columns()	the columns a fetch by TID into a slot keeps: the access
+ *					method's fetch of a row version then leaves the slot's
+ *					others NULL, so that a caller that reads a column it did
+ *					not name reads NULL (VC16)
+ *	ordering()		the attributes vexec_test.source_ordering lists, for the
+ *					planner, and for a scan begun with VEXEC_SRC_ORDERED
+ *					unless vexec_test.source_ordered_scans is off -- the
+ *					suite loads the rows in that order, which the source
+ *					takes on trust (VC4)
+ *	estimate_ex()'s fetch: vexec_test.source_fetch_cost, where it is above 0
  *
  * A unit a retained batch points into stays until the last such batch is
  * released.  The sink takes every attribute but an xml one -- FIXED for a
@@ -80,6 +90,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
+#include "utils/varlena.h"
 #include "varatt.h"
 
 #include "vexec_sink.h"
@@ -98,13 +109,15 @@ typedef enum Member
 {
 	M_SUPPORTS, M_BEGIN, M_NEXT, M_RETAIN, M_RELEASE, M_RESCAN, M_END, M_ESTIMATE, M_AGGREGATE,
 	M_AGGREGATE_ANSWERED, M_SET_KEYS, M_UNITS_PASSED, M_SINK_SUPPORTS, M_SINK_BEGIN, M_SINK_PUT,
-	M_SINK_END, M_DICTIONARY_ID, M_DICTIONARIES, M_ESTIMATE_EX, NMEMBERS
+	M_SINK_END, M_DICTIONARY_ID, M_DICTIONARIES, M_ESTIMATE_EX, M_FETCH_COLUMNS, M_ORDERING,
+	M_ORDERED_SCANS, NMEMBERS
 } Member;
 
 static const char *const member_names[NMEMBERS] = {
 	"supports", "begin", "next", "retain", "release", "rescan", "end", "estimate", "aggregate",
 	"aggregate answered", "set_keys", "units passed by keys", "sink supports", "sink begin",
-	"sink put", "sink end", "dictionary_id", "dictionaries made", "estimate_ex"
+	"sink put", "sink end", "dictionary_id", "dictionaries made", "estimate_ex", "fetch_columns",
+	"ordering", "scans in order"
 };
 
 static int64 calls[NMEMBERS];
@@ -118,6 +131,30 @@ static bool dictionaries = false;
 /* The last dictionary's identity, in this backend */
 static uint64 last_dictionary = 0;
 
+/* vexec_test.source_ordering: the attributes the source says its rows come in the order of */
+static char *ordering_list = NULL;
+
+/* vexec_test.source_ordered_scans: whether a scan asked for that order says it hands it */
+static bool ordered_scans = true;
+
+/* vexec_test.source_fetch_cost: estimate_ex()'s price of a fetch by TID, where above 0 */
+static double fetch_cost = 0;
+
+/*
+ * fetch_columns()'s slots, and the columns each keeps (a bit an attribute,
+ * from 1), until the slot's memory context is reset
+ */
+#define MAX_FETCH_SLOTS 16
+typedef struct FetchSlot
+{
+	TupleTableSlot *slot;
+	TupleDesc	desc;
+	Bitmapset  *attrs;			/* in the slot's context */
+	MemoryContextCallback cb;
+} FetchSlot;
+
+static FetchSlot *fetch_slots[MAX_FETCH_SLOTS];
+
 /*
  * A TOAST table of the access method's is heap's own: heap's callback gives
  * the parent's (heapam_handler.c), and the TOAST index's build reads it with
@@ -129,6 +166,43 @@ test_toast_am(Relation rel)
 	return HEAP_TABLE_AM_OID;
 }
 
+/* A fetch_columns() slot's registration goes with its context */
+static void
+fetch_slot_gone(void *arg)
+{
+	for (int i = 0; i < MAX_FETCH_SLOTS; i++)
+		if (fetch_slots[i] == arg)
+			fetch_slots[i] = NULL;
+}
+
+/*
+ * A row version by its TID, heap's, the columns no fetch_columns() named for
+ * the slot made NULL
+ */
+static bool
+test_fetch_row_version(Relation rel, ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot)
+{
+	FetchSlot  *fs = NULL;
+
+	if (!GetHeapamTableAmRoutine()->tuple_fetch_row_version(rel, tid, snapshot, slot))
+		return false;
+	for (int i = 0; i < MAX_FETCH_SLOTS && fs == NULL; i++)
+		if (fetch_slots[i] != NULL && fetch_slots[i]->slot == slot &&
+			fetch_slots[i]->desc == slot->tts_tupleDescriptor)
+			fs = fetch_slots[i];
+	if (fs != NULL)
+	{
+		slot_getallattrs(slot);
+		for (int a = 1; a <= slot->tts_tupleDescriptor->natts; a++)
+			if (!bms_is_member(a, fs->attrs))
+			{
+				slot->tts_values[a - 1] = (Datum) 0;
+				slot->tts_isnull[a - 1] = true;
+			}
+	}
+	return true;
+}
+
 static const TableAmRoutine *
 routine(void)
 {
@@ -136,6 +210,7 @@ routine(void)
 	{
 		test_am = *GetHeapamTableAmRoutine();
 		test_am.relation_toast_am = test_toast_am;
+		test_am.tuple_fetch_row_version = test_fetch_row_version;
 		test_am_made = true;
 	}
 	return &test_am;
@@ -220,6 +295,7 @@ typedef struct SrcState
 	ScanKeyData *keys;
 	int			nspec_keys;
 	MemoryContext answers;
+	bool		ordered;		/* begun with VEXEC_SRC_ORDERED, serially */
 } SrcState;
 
 static bool
@@ -250,6 +326,7 @@ src_begin(TableScanDesc scan, const VexecSourceSpec *spec)
 	st->max_rows = spec->max_rows > 0 ? spec->max_rows : UNIT_ROWS;
 	st->tids = (spec->flags & VEXEC_SRC_TIDS) != 0;
 	st->compact = (spec->flags & VEXEC_SRC_COMPACT) != 0;
+	st->ordered = (spec->flags & VEXEC_SRC_ORDERED) != 0 && scan->rs_parallel == NULL;
 	st->attnums = palloc(sizeof(AttrNumber) * Max(spec->ncolumns, 1));
 	st->layouts = palloc(Max(spec->ncolumns, 1));
 	st->dict = palloc0(sizeof(bool) * Max(spec->ncolumns, 1));
@@ -839,6 +916,84 @@ src_estimate_ex(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, Ve
 	}
 	est->units = ceil(Max(rel->rd_rel->reltuples, 0) / UNIT_ROWS);
 	est->flags = spec->quals == NIL && !tids && ints ? VEXEC_EST_AGG_EXACT : 0;
+	if (est->size >= offsetof(VexecSourceEstimate, fetch) + sizeof(est->fetch))
+		est->fetch = fetch_cost > 0 ? fetch_cost : 0;
+}
+
+/* The columns a fetch into the slot keeps, the others NULL (test_fetch_row_version()) */
+static void
+src_fetch_columns(Relation rel, TupleTableSlot *slot, int n, const AttrNumber *attnums)
+{
+	MemoryContext cxt = GetMemoryChunkContext(slot);
+	FetchSlot  *fs;
+	int			free = -1;
+
+	calls[M_FETCH_COLUMNS]++;
+	for (int i = 0; i < MAX_FETCH_SLOTS; i++)
+		if (fetch_slots[i] == NULL || fetch_slots[i]->slot == slot)
+		{
+			free = i;
+			break;
+		}
+	if (free < 0)
+		return;					/* every column, as for any other slot */
+	fs = MemoryContextAllocZero(cxt, sizeof(FetchSlot));
+	fs->slot = slot;
+	fs->desc = slot->tts_tupleDescriptor;
+	for (int i = 0; i < n; i++)
+		fs->attrs = bms_add_member(fs->attrs, attnums[i]);
+	if (fs->attrs != NULL && GetMemoryChunkContext(fs->attrs) != cxt)
+	{
+		MemoryContext old = MemoryContextSwitchTo(cxt);
+		Bitmapset  *copy = bms_copy(fs->attrs);
+
+		MemoryContextSwitchTo(old);
+		fs->attrs = copy;
+	}
+	fs->cb.func = fetch_slot_gone;
+	fs->cb.arg = fs;
+	MemoryContextRegisterResetCallback(cxt, &fs->cb);
+	fetch_slots[free] = fs;
+}
+
+/* vexec_test.source_ordering's attributes, up to max */
+static int
+ordering_attnums(Relation rel, int max, AttrNumber *attnums)
+{
+	char	   *copy;
+	List	   *items;
+	ListCell   *lc;
+	int			n = 0;
+
+	if (ordering_list == NULL || ordering_list[0] == '\0')
+		return 0;
+	copy = pstrdup(ordering_list);
+	if (!SplitIdentifierString(copy, ',', &items))
+		return 0;
+	foreach(lc, items)
+	{
+		int			a = atoi(lfirst(lc));
+
+		if (n >= max || a < 1 || a > RelationGetNumberOfAttributes(rel))
+			break;
+		attnums[n++] = (AttrNumber) a;
+	}
+	return n;
+}
+
+static int
+src_ordering(Relation rel, void *arg, int max, AttrNumber *attnums)
+{
+	SrcState   *st = arg;
+	int			n;
+
+	calls[M_ORDERING]++;
+	if (st != NULL && (!st->ordered || !ordered_scans))
+		return 0;
+	n = ordering_attnums(rel, max, attnums);
+	if (st != NULL && n > 0)
+		calls[M_ORDERED_SCANS]++;
+	return n;
 }
 
 static bool
@@ -1053,6 +1208,8 @@ static VexecSourceRoutine source = {
 	.set_keys = src_set_keys,
 	.dictionary_id = src_dictionary_id,
 	.estimate_ex = src_estimate_ex,
+	.fetch_columns = src_fetch_columns,
+	.ordering = src_ordering,
 };
 
 static VexecSinkRoutine sink = {
@@ -1078,6 +1235,20 @@ _PG_init(void)
 	DefineCustomBoolVariable("vexec_test.source_dictionaries",
 							 "Hands the test source's varlena columns as a unit's dictionary, where vexec asks for dictionaries.",
 							 NULL, &dictionaries, false,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomStringVariable("vexec_test.source_ordering",
+							   "The attributes, by number, comma-separated, the test source says its rows come in the order of.",
+							   "The source takes it on trust: the suite loads the rows in that order.",
+							   &ordering_list, "",
+							   PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec_test.source_ordered_scans",
+							 "Whether a scan of the test source asked for its order says its rows come in it.",
+							 "Off, as a storage whose units changed since the plan was made would say: none.",
+							 &ordered_scans, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("vexec_test.source_fetch_cost",
+							 "The test source's price of a fetch by TID, in estimate_ex(); 0 gives none.",
+							 NULL, &fetch_cost, 0, 0, 1e10,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	if (!process_shared_preload_libraries_in_progress)
 		return;

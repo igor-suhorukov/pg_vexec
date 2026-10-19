@@ -80,6 +80,23 @@
  * HAVING are free of volatile functions and subplans, which would otherwise
  * run for fewer groups than they do.
  *
+ * Groups in their keys' order (VC4).  Where the planner found the input a
+ * serial scan whose source hands its rows in an order the keys are a prefix
+ * of (vexec_source.h's ordering(), minor 4) -- the rows of equal keys one
+ * after another -- the node takes it so, if the scan's source says, as it
+ * begins, that its rows come so: a row whose keys are the open group's
+ * goes to it, any other closes it and opens the next, nothing hashed or
+ * looked up but each group's hash once, which a stage above may read (C4).
+ * The groups a batch closes are handed up once it is done, the open one
+ * kept: so no table and no spill, the groups in two generations of memory,
+ * the older one emptied once its groups are out and the open group is the
+ * newer one's.  A scan whose rows do not come so -- its storage's units
+ * changed since the plan was made, or a top n, a LIMIT's groups, a
+ * dealing or a freeze asked of the node -- is hashed as any other.
+ * ClickHouse's MergeTree in one part, TPC-H's lineitem grouped by its key:
+ * 29-47% faster serially than hashing, 45-65% with 4 MB of work_mem
+ * (ch_table_engines.md §3, "VC4, VC6 and VC16, researched").
+ *
  * Its output is a row a call: a group's keys, the columns taken from its
  * first row, and its aggregates' results, in the scan tuple that
  * custom_scan_tlist describes, through the node's HAVING qual and target
@@ -114,6 +131,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/ruleutils.h"
+#include "utils/typcache.h"
 #include "varatt.h"
 
 #include "cb_explain.h"
@@ -434,6 +452,23 @@ struct VexecAggState
 	int64		thawed_after;	/* those handed on before the table thawed */
 
 	/*
+	 * VC4: the input in the keys' order (above): planned, decided at the
+	 * first group asked for, and taken; the open group, its generation,
+	 * the generation new groups go to, and the two generations' memory --
+	 * their groups, and their states' as AggCheckCallContext gives it.
+	 * The groups a batch closes wait in `made` to be handed up.
+	 */
+	bool		sorted_planned;
+	bool		sorted_decided;
+	bool		sorted;
+	bool		sorted_eof;		/* the input is read: the open group is the last */
+	char	   *cur;
+	int			cur_gen;
+	int			sgen;
+	MemoryContext sgroupcxt[2];
+	ExprContext *saggcontext[2];
+
+	/*
 	 * H2: the requests the child's source answers from its statistics, a
 	 * unit of rows at a time; nstats -1 where it is asked none
 	 */
@@ -443,6 +478,7 @@ struct VexecAggState
 	int		   *stats_first;	/* per transition: its first request */
 };
 
+static void agg_batch(VexecAggState *s);
 static void agg_begin(CustomScanState *css, EState *estate, int eflags);
 static TupleTableSlot *agg_exec(CustomScanState *css);
 static void agg_end(CustomScanState *css);
@@ -490,9 +526,10 @@ vexec_create_agg_state(CustomScan *cscan)
 List *
 vexec_agg_plan_encode(const VexecAggPlan *plan)
 {
-	return list_make5(list_make4(makeInteger(plan->strategy), makeInteger(plan->split),
+	return list_make5(list_make5(makeInteger(plan->strategy), makeInteger(plan->split),
 								 makeFloat(psprintf("%.1f", plan->numgroups)),
-								 makeInteger((int) plan->topk)),
+								 makeInteger((int) plan->topk),
+								 makeInteger(plan->sorted_input ? 1 : 0)),
 					  list_make3(plan->keycols, plan->eqops, plan->collations),
 					  list_make2(plan->outkind, plan->outsrc),
 					  plan->aggrefs,
@@ -516,6 +553,7 @@ vexec_agg_plan_decode(CustomScan *cscan, VexecAggPlan *plan)
 	plan->split = intVal(lsecond(head));
 	plan->numgroups = floatVal(lthird(head));
 	plan->topk = list_length(head) > 3 ? intVal(lfourth(head)) : 0;
+	plan->sorted_input = list_length(head) > 4 && intVal(list_nth(head, 4)) != 0;
 	plan->keycols = linitial(keys);
 	plan->eqops = lsecond(keys);
 	plan->collations = lthird(keys);
@@ -753,7 +791,8 @@ batch_keys(VexecAggState *s, const int *rows, int nlist)
 		bool		dict = k->kind == KEY_BYTES && v->encoding == VEXEC_DICT &&
 			(v->dictionary->shape.layout == VEXEC_VIEW ||
 			 v->dictionary->shape.layout == VEXEC_OFFSETS);
-		const uint32 *dhash = dict && hashes == NULL ? dict_key_hashes(s, i, v, nlist) : NULL;
+		const uint32 *dhash = dict && hashes == NULL && !s->sorted ?
+			dict_key_hashes(s, i, v, nlist) : NULL;
 
 		for (j = 0; j < nlist; j++)
 		{
@@ -812,16 +851,18 @@ batch_keys(VexecAggState *s, const int *rows, int nlist)
 
 				probe_set(k, p, d, isnull);
 			}
-			if (!p->isnull && hashes == NULL)
+			/* VC4: in the keys' order, a row is compared, not hashed */
+			if (!p->isnull && hashes == NULL && !s->sorted)
 				h ^= key_hash(k, p);
 			s->rowhash[row] = h;
 		}
 	}
 
 	/* the child's hashes are this node's (C4): the keys are only compared */
-	for (j = 0; j < nlist; j++)
-		s->rowhash[rows[j]] = hashes != NULL ? hashes[rows[j]] :
-			murmurhash32(s->rowhash[rows[j]]);
+	if (!s->sorted)
+		for (j = 0; j < nlist; j++)
+			s->rowhash[rows[j]] = hashes != NULL ? hashes[rows[j]] :
+				murmurhash32(s->rowhash[rows[j]]);
 }
 
 static void
@@ -857,7 +898,8 @@ table_memory(VexecAggState *s)
 static char *
 group_create_in(VexecAggState *s, uint32 hash, TupleTableSlot *slot, int row, bool batch)
 {
-	MemoryContext old = MemoryContextSwitchTo(batch ? s->bgroupcxt : s->groupcxt);
+	MemoryContext old = MemoryContextSwitchTo(batch ? s->bgroupcxt :
+											  s->sorted ? s->sgroupcxt[s->sgen] : s->groupcxt);
 	char	   *g = palloc0(s->groupsize);
 	int			i;
 
@@ -943,7 +985,9 @@ group_create_in(VexecAggState *s, uint32 hash, TupleTableSlot *slot, int row, bo
 	s->ngroups++;
 	if (s->topk > 0)
 		topk_note(s, hash);
-	if (s->strategy == AGG_HASHED)
+	if (s->strategy == AGG_HASHED && s->sorted)
+		s->total_groups++;		/* VC4: in `made` once it closes */
+	else if (s->strategy == AGG_HASHED)
 	{
 		s->total_groups++;
 		if (s->nmade == s->made_size)
@@ -1597,6 +1641,227 @@ array_leave(VexecAggState *s)
 	s->array_left++;
 }
 
+/* ---------------------------------------------------------------------
+ * VC4: groups in their keys' order (above)
+ * ---------------------------------------------------------------------
+ */
+
+/* A closed group, to hand up */
+static void
+sorted_close(VexecAggState *s, char *g)
+{
+	if (s->nmade == s->made_size)
+	{
+		s->made_size = Max(s->made_size * 2, VEXEC_BATCH_ROWS + 1);
+		s->made = s->made == NULL ?
+			MemoryContextAllocHuge(s->node.mcxt, sizeof(char *) * s->made_size) :
+			repalloc_huge(s->made, sizeof(char *) * s->made_size);
+	}
+	s->made[s->nmade++] = g;
+}
+
+/*
+ * A row's group in the keys' order: the open one where the row's keys are
+ * its, else a new one, the open one closed.  A row of the open group made
+ * in the older generation is marked in bmask: its states are in that
+ * generation's memory (agg_batch()).
+ */
+static char *
+sorted_row_group(VexecAggState *s, TupleTableSlot *slot, int row)
+{
+	if (s->cur != NULL && group_equal(s, s->cur))
+	{
+		if (s->cur_gen != s->sgen && row >= 0)
+			vexec_bit_set(s->bmask, row);
+		return s->cur;
+	}
+	if (s->cur != NULL)
+		sorted_close(s, s->cur);
+	/* its hash once, for a stage above that reads it (C4) */
+	s->cur = group_create(s, probe_hash(s), slot, row);
+	s->cur_gen = s->sgen;
+	return s->cur;
+}
+
+/*
+ * The groups closed so far are out: every generation but the open group's
+ * emptied, and new groups made in a freshly emptied one.
+ */
+static void
+sorted_round_end(VexecAggState *s)
+{
+	int			keep = s->cur != NULL ? s->cur_gen : -1;
+	Size		mem = 0;
+
+	for (int g = 0; g < 2; g++)
+		mem += MemoryContextMemAllocated(s->sgroupcxt[g], true) +
+			MemoryContextMemAllocated(s->saggcontext[g]->ecxt_per_tuple_memory, true);
+	s->peak_memory = Max(s->peak_memory, mem);
+	for (int g = 0; g < 2; g++)
+		if (g != keep)
+		{
+			ReScanExprContext(s->saggcontext[g]);	/* AggRegisterCallback()'s run */
+			MemoryContextReset(s->sgroupcxt[g]);
+		}
+	s->sgen = keep >= 0 ? 1 - keep : 0;
+	s->nmade = 0;
+	s->next_made = 0;
+}
+
+/* Both generations emptied, no group open: the node's first, or a rescan's */
+static void
+sorted_reset(VexecAggState *s)
+{
+	s->cur = NULL;
+	(void) sorted_round_end(s);
+	s->sorted_eof = false;
+	s->ngroups = 0;
+}
+
+/*
+ * Whether the input comes in the keys' order: the child a serial VecScan
+ * whose source says, as it begins, that its rows come in an order the
+ * keys -- Vars of its relation, compared by their types' default equality,
+ * a deterministic collation's for text -- are a prefix of, in any order.
+ */
+static bool
+sorted_input_holds(VexecAggState *s)
+{
+	VexecNode  *child = s->node.vec_child;
+	Plan	   *cplan = s->child->plan;
+	AttrNumber	order[INDEX_MAX_KEYS];
+	bool		used[INDEX_MAX_KEYS] = {false};
+	int			k;
+
+	if (!s->child_batches || child == NULL || child->kind != VEXEC_NODE_SCAN ||
+		s->nkeys == 0 || s->nkeys > INDEX_MAX_KEYS)
+		return false;
+	k = vexec_scan_ordering(child, INDEX_MAX_KEYS, order);
+	if (k < s->nkeys)
+		return false;
+	for (int i = 0; i < s->nkeys; i++)
+	{
+		VexecAggKeyCol *key = &s->keys[i];
+		TargetEntry *tle;
+		Var		   *v;
+		int			j;
+
+		if (key->col >= list_length(cplan->targetlist))
+			return false;
+		tle = list_nth_node(TargetEntry, cplan->targetlist, key->col);
+		v = (Var *) tle->expr;
+		if (!IsA(v, Var) || v->varno != ((Scan *) cplan)->scanrelid || v->varlevelsup != 0 ||
+			v->varattno < 1)
+			return false;
+		if (key->eqop != lookup_type_cache(v->vartype, TYPECACHE_EQ_OPR)->eq_opr ||
+			(OidIsValid(key->collation) && !get_collation_isdeterministic(key->collation)))
+			return false;
+		for (j = 0; j < s->nkeys; j++)
+			if (order[j] == v->varattno && !used[j])
+				break;
+		if (j == s->nkeys)
+			return false;
+		used[j] = true;
+	}
+	return true;
+}
+
+/*
+ * At the first group asked for: the input in the keys' order, where the
+ * plan said it may be and nothing else asked of the node hashes; else the
+ * table, as any hashed aggregation's.
+ */
+static void
+sorted_decide(VexecAggState *s)
+{
+	EState	   *estate = s->node.css.ss.ps.state;
+
+	s->sorted_decided = true;
+	s->sorted = s->sorted_planned && vexec_enable_sorted_agg && s->topn == 0 && s->topk == 0 &&
+		s->ndeal == 0 && !s->may_freeze && !s->hashes_from_child && sorted_input_holds(s);
+	if (!s->sorted)
+	{
+		table_reset(s);
+		return;
+	}
+	s->array_ok = false;
+	for (int g = 0; g < 2; g++)
+	{
+		s->sgroupcxt[g] = BumpContextCreate(s->node.mcxt, "VecAgg groups in order",
+											ALLOCSET_DEFAULT_SIZES);
+		s->saggcontext[g] = CreateWorkExprContext(estate);
+	}
+	sorted_reset(s);
+}
+
+/*
+ * Input batches until one closes a group, or the input ends: the open
+ * group's generation the states' memory of its rows, the newer one the
+ * others' (agg_batch()).
+ */
+static void
+sorted_fill(VexecAggState *s)
+{
+	for (;;)
+	{
+		MemoryContext old;
+
+		if (s->nmade > 0)
+			return;
+		if (!vexec_node_next_input(&s->node))
+		{
+			s->sorted_eof = true;
+			return;
+		}
+		old = MemoryContextSwitchTo(s->tmpcontext->ecxt_per_tuple_memory);
+		s->aggstate->curaggcontext = s->saggcontext[s->sgen];
+		agg_batch(s);
+		s->aggstate->curaggcontext = s->aggcontext;
+		MemoryContextSwitchTo(old);
+	}
+}
+
+/*
+ * The next group in the keys' order, or NULL once every one is out: those
+ * the last batch closed, the memory of those handed up before emptied first
+ * -- their rows are their parent's until this call -- and the open one
+ * last.
+ */
+static char *
+sorted_next_group(VexecAggState *s)
+{
+	for (;;)
+	{
+		if (s->next_made < s->nmade)
+			return s->made[s->next_made++];
+		if (s->nmade > 0)
+			sorted_round_end(s);
+		if (s->sorted_eof)
+		{
+			if (s->cur != NULL)
+			{
+				sorted_close(s, s->cur);
+				s->cur = NULL;
+				continue;
+			}
+			s->done = true;
+			return NULL;
+		}
+		sorted_fill(s);
+	}
+}
+
+/*
+ * The states' memory of the rows bmask marks: the batch table's (C2), made
+ * as the table freezes, which it may do within the batch; the open group's
+ * older generation (VC4)
+ */
+static inline ExprContext *
+bmask_context(VexecAggState *s)
+{
+	return s->sorted ? s->saggcontext[1 - s->sgen] : s->baggcontext;
+}
+
 /*
  * A row's group: found, made, or NULL when the table is past its memory
  * and the row's group is not in it.
@@ -1610,6 +1875,8 @@ row_group(VexecAggState *s, TupleTableSlot *slot, int row, uint32 hash)
 
 	if (s->strategy == AGG_PLAIN)
 		return s->plaingroup;
+	if (s->sorted)
+		return sorted_row_group(s, slot, row);
 	*(uint32 *) s->probe_group = hash;
 	if (s->spilling)
 	{
@@ -1779,8 +2046,11 @@ agg_batch(VexecAggState *s)
 	int			i,
 				j;
 
-	/* C2: the rows whose group is the batch table's, once the table froze */
-	s->bmask = s->may_freeze ? vexec_bitmap_alloc(node->work, n, false) : NULL;
+	/*
+	 * C2: the rows whose group is the batch table's, once the table froze;
+	 * VC4: those of the open group of the older generation
+	 */
+	s->bmask = s->may_freeze || s->sorted ? vexec_bitmap_alloc(node->work, n, false) : NULL;
 
 	/* which vectorized transitions take this batch at once */
 	for (i = 0; i < s->ntrans; i++)
@@ -1962,7 +2232,7 @@ agg_batch(VexecAggState *s)
 		}
 		/* a batch table's group keeps its states in that table's memory (C2) */
 		if (s->bmask != NULL && vexec_bit(s->bmask, row))
-			s->aggstate->curaggcontext = s->baggcontext;
+			s->aggstate->curaggcontext = bmask_context(s);
 		for (i = 0; i < s->ntrans; i++)
 		{
 			VexecAggTrans *t = &s->trans[i];
@@ -1984,7 +2254,7 @@ batched:
 	{
 		/* the table's groups, then the batch table's in its memory (C2) */
 		batch_transitions(s, vexec_bits_andnot(node->work, taken, s->bmask, n), n);
-		s->aggstate->curaggcontext = s->baggcontext;
+		s->aggstate->curaggcontext = bmask_context(s);
 		batch_transitions(s, vexec_bits_and(node->work, taken, s->bmask, n), n);
 		s->aggstate->curaggcontext = mainctx;
 	}
@@ -2417,12 +2687,16 @@ next_bgroup(VexecAggState *s)
 static char *
 next_out_group(VexecAggState *s)
 {
+	if (!s->sorted_decided)
+		sorted_decide(s);
 	for (;;)
 	{
 		char	   *g;
 
 		if (s->done)
 			return NULL;
+		if (s->sorted)
+			return sorted_next_group(s);
 		if (s->boutput)
 		{
 			/*
@@ -2982,6 +3256,9 @@ agg_begin(CustomScanState *css, EState *estate, int eflags)
 	s->strategy = plan.strategy;
 	s->split = plan.split;
 	s->numgroups = plan.numgroups;
+	/* VC4: in the keys' order, or hashed, decided at the first group asked for */
+	s->sorted_planned = plan.sorted_input && plan.strategy == AGG_HASHED && plan.keycols != NIL;
+	s->sorted_decided = !s->sorted_planned;
 
 	/* the child: its batches where it hands them up, else its rows */
 	s->child = ExecInitNode(outerPlan(cscan), estate,
@@ -3230,7 +3507,7 @@ agg_begin(CustomScanState *css, EState *estate, int eflags)
 	}
 	s->groupcxt = BumpContextCreate(node->mcxt, "VecAgg groups", ALLOCSET_DEFAULT_SIZES);
 	s->hashcxt = AllocSetContextCreate(node->mcxt, "VecAgg hash table", ALLOCSET_DEFAULT_SIZES);
-	if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+	if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY) && s->sorted_decided)
 		table_reset(s);
 }
 
@@ -3254,7 +3531,10 @@ agg_rescan(CustomScanState *css)
 	/* C5: the heap of hashes again, from none */
 	s->ntheap = 0;
 	s->tbound = PG_UINT32_MAX;
-	table_reset(s);
+	if (s->sorted)
+		sorted_reset(s);		/* VC4: the child's order is the same scan's */
+	else if (s->sorted_decided)
+		table_reset(s);
 	/*
 	 * X9: the groups dealt as before, the parent's choice, each partition's
 	 * batch empty -- a child rescans lazily, at the first batch its parent
@@ -3279,6 +3559,9 @@ agg_end(CustomScanState *css)
 	spill_close_all(s);
 	if (s->aggcontext)
 		ReScanExprContext(s->aggcontext);
+	for (int g = 0; g < 2; g++)
+		if (s->saggcontext[g])
+			ReScanExprContext(s->saggcontext[g]);
 	if (s->spillslot)
 		ExecDropSingleTupleTableSlot(s->spillslot);
 	if (s->readslot)
@@ -3303,7 +3586,8 @@ agg_label(VexecAggState *s)
 		split = "Partial ";
 	else if (DO_AGGSPLIT_COMBINE(s->split))
 		split = "Finalize ";
-	return psprintf("Vec %s%s", split, s->strategy == AGG_HASHED ? "HashAggregate" : "Aggregate");
+	return psprintf("Vec %s%s", split, s->sorted_planned ? "GroupAggregate" :
+					s->strategy == AGG_HASHED ? "HashAggregate" : "Aggregate");
 }
 
 static void
@@ -3329,6 +3613,11 @@ agg_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		}
 		ExplainPropertyList("Group Key", keys, es);
 	}
+	/* VC4: the input in the keys' order, its source's, where the scan says so as it begins */
+	if (s->sorted_planned)
+		ExplainPropertyText("Group Order", "the scan's", es);
+	if (s->sorted_planned && es->analyze && node->ran && s->sorted_decided)
+		ExplainPropertyText("Groups In Order", s->sorted ? "yes" : "no: hashed", es);
 	if (es->verbose)
 	{
 		StringInfoData buf;

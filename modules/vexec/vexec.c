@@ -58,6 +58,7 @@ bool		vexec_enable_source_layouts = true;
 bool		vexec_enable_bitmapscan = true;
 bool		vexec_enable_agg = true;
 bool		vexec_enable_repartition = true;
+bool		vexec_enable_sorted_agg = true;
 int			vexec_partial_agg_limit = 16384;
 bool		vexec_remember_agg_sizes = true;
 bool		vexec_enable_group_topk = true;
@@ -313,6 +314,13 @@ define_settings(void)
 							 "and each finalizes its own; the Gather receives final groups.  A count(DISTINCT) "
 							 "runs in parallel the same way, its pairs of keys and argument dealt out first.",
 							 &vexec_enable_repartition, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_sorted_agg",
+							 "Enables vector grouping of input in its keys' order, which a source's serial scan hands.",
+							 "A row whose keys are the open group's goes to it, any other closes it: no table, "
+							 "no spill, each group handed up as it closes.  Where the scan's rows turn out not to "
+							 "come in that order as it begins, the grouping hashes.",
+							 &vexec_enable_sorted_agg, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 	DefineCustomIntVariable("vexec.repartition_min_rows",
 							"The input rows from which a grouping under ORCA's parallel plan is repartitioned.",
