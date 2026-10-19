@@ -98,6 +98,9 @@ typedef struct VexecPlanState
 								 * vexec.debug_require_vector asks of a plan */
 	bool		joins_built;	/* a VecHashJoin's plan was made */
 	bool		sorts_built;	/* a VecSort's path was added */
+	List	   *kept_scans;		/* base relations' VecScan paths, kept aside
+								 * for an ORDER BY's late columns
+								 * (plan/sort.c, vexec_sort_keep_scan()) */
 	Query	   *parse;			/* ORCA's: the statement, while it is planned */
 	bool		orca_costed;	/* ORCA's search priced vexec's nodes
 								 * (CCostModelVec): translation builds them
@@ -139,6 +142,7 @@ extern void vexec_cost_plan_agg(Plan *agg, int ngroupcols, int naggs, int naggs_
 								bool input_vector, VexecCost *cost);
 extern void vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, bool input_vector,
 							VexecCost *cost);
+extern Cost vexec_cost_rowout(Path *path);
 extern void vexec_cost_plan_sort(Plan *sort, bool input_vector, VexecCost *cost);
 extern void vexec_cost_topn(VexecCost *cost, Path *input, int64 bound);
 extern void vexec_cost_bitmapscan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
@@ -192,6 +196,7 @@ extern bool vexec_expr_may_raise(Node *node);
 extern void vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel,
 								RelOptInfo *output_rel, VexecPlanState *ps,
 								const char *target_name);
+extern void vexec_sort_keep_scan(VexecPlanState *ps, Path *path);
 extern const char *vexec_orca_sort_refusal(Sort *sort);
 extern Plan *vexec_build_sort_from_sort(Sort *sort);
 extern Plan *vexec_unbuild_sort(CustomScan *cscan);

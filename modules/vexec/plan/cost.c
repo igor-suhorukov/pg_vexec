@@ -170,6 +170,17 @@ path_width_cols(Path *path)
 }
 
 /*
+ * What a vector path's cost carries for handing its rows to a row parent
+ * (vexec_cost_scan()'s rowout), which a vector parent reading its batches
+ * gives back (vexec_cost_sort()'s convert_in).
+ */
+Cost
+vexec_cost_rowout(Path *path)
+{
+	return vexec_convert_cost * path_width_cols(path) * path->rows;
+}
+
+/*
  * A hash join's vector alternative.  rowpath is PostgreSQL's HashPath for
  * the same inputs (initial_cost_hashjoin, final_cost_hashjoin): a
  * cpu_operator_cost a hash clause and a cpu_tuple_cost an inner row to

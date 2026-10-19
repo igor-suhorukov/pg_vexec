@@ -13,9 +13,9 @@ CREATE TABLE so AS
   FROM generate_series(1, 30000) g;
 CREATE TABLE sd AS SELECT g AS k, 'name' || g AS name FROM generate_series(0, 10006, 3) g;
 ANALYZE so, sd;
--- off and force, compared in order: 'same' and whether force's plan sorts
--- with a VecSort, bounded or not
-CREATE FUNCTION sort_check(q text) RETURNS text LANGUAGE plpgsql AS $$
+-- off and force -- or the mode given -- compared in order: 'same' and
+-- whether the mode's plan sorts with a VecSort, bounded or not
+CREATE FUNCTION sort_check(q text, mode text DEFAULT 'force') RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
 	n bigint;
 	plan text := '';
@@ -24,7 +24,7 @@ BEGIN
 	PERFORM set_config('vexec.mode', 'off', true);
 	EXECUTE 'CREATE TEMP TABLE sort_off AS SELECT row_number() OVER () AS rn, q::text AS r FROM (' ||
 		q || ') q';
-	PERFORM set_config('vexec.mode', 'force', true);
+	PERFORM set_config('vexec.mode', mode, true);
 	FOR r IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		plan := plan || r."QUERY PLAN" || E'\n';
 	END LOOP;
@@ -924,7 +924,81 @@ EXPLAIN (COSTS OFF) SELECT k, name FROM sd WHERE k < 30 ORDER BY name;
          Filter: (k < 30)
 (4 rows)
 
-DROP FUNCTION sort_check(text);
+-- auto mode, a wide table: its cheapest scan is the row scan, VecScan's
+-- prices transposing each of its 122 columns, and add_path() drops the
+-- VecScan's path; a bounded sort still reads the keys and TIDs of the
+-- relation's VecScan, kept aside, and fetches the rest of the rows it
+-- keeps -- up to a bound of 100, past which a row sort.  No cost is below
+-- nothing: the late columns' handing out to rows was given back twice, and
+-- force mode's sort of this table cost less than nothing
+DO $$
+BEGIN
+	EXECUTE (SELECT format('CREATE TABLE sw AS SELECT g AS id, (g * 7919) %% 10007 AS k, %s '
+						   'FROM generate_series(1, 30000) g',
+						   string_agg(format('(g * %s) %% 1000 AS c%s', i, i), ', '))
+			 FROM generate_series(1, 120) i);
+END $$;
+ANALYZE sw;
+CREATE FUNCTION sort_costs(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	r record;
+BEGIN
+	FOR r IN EXECUTE 'EXPLAIN ' || q LOOP
+		IF r."QUERY PLAN" ~ '(cost=|\.\.)-' THEN
+			RETURN 'a cost below nothing';
+		END IF;
+	END LOOP;
+	RETURN 'no cost below nothing';
+END $$;
+EXPLAIN (COSTS OFF) SELECT * FROM sw ORDER BY k, id LIMIT 10;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Limit
+   ->  Vec Sort
+         Sort Key: k, id
+         Bound: 10
+         Columns: the keys and TIDs sorted, the rest fetched by TID
+         ->  Vec Seq Scan on sw
+(6 rows)
+
+SELECT sort_check('SELECT * FROM sw ORDER BY k, id LIMIT 10', 'auto');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT * FROM sw ORDER BY k DESC, id LIMIT 3 OFFSET 7', 'auto');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_costs('SELECT * FROM sw ORDER BY k, id LIMIT 10');
+      sort_costs       
+-----------------------
+ no cost below nothing
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT * FROM sw ORDER BY k, id LIMIT 101;
+         QUERY PLAN         
+----------------------------
+ Limit
+   ->  Sort
+         Sort Key: k, id
+         ->  Seq Scan on sw
+(4 rows)
+
+SET vexec.mode = force;
+SELECT sort_costs('SELECT * FROM sw ORDER BY k, id LIMIT 10');
+      sort_costs       
+-----------------------
+ no cost below nothing
+(1 row)
+
+SET vexec.mode = auto;
+DROP FUNCTION sort_costs(text);
+DROP TABLE sw;
+DROP FUNCTION sort_check(text, text);
 DROP FUNCTION sort_error(text);
 DROP FUNCTION sort_explain(text, text);
 DROP TABLE so, sd;

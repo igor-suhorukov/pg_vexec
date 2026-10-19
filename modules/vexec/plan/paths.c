@@ -605,6 +605,9 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 			rel->pathlist = keep;
 			index_kept = keep != NIL;
 		}
+		/* kept aside for an ORDER BY's late columns, where add_path() drops it */
+		if (rel->reloptkind == RELOPT_BASEREL && required_outer == NULL)
+			vexec_sort_keep_scan(ps, path);
 		add_path(rel, path);
 		foreach(lc, bitmap_paths)
 			add_path(rel, lfirst(lc));
@@ -654,13 +657,17 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 			{
 				Path	   *prowpath = create_seqscan_path(root, rel, NULL, workers);
 				VexecCost	pcost;
+				Path	   *ppath;
 
 				vexec_cost_scan(root, rel, prowpath, &quals, &target,
 								bms_num_members(attrs), list_length(rel->reltarget->exprs),
 								est.rows, est.bytes, &pcost);
 				if (ps->mode == VEXEC_MODE_FORCE)
 					rel->partial_pathlist = NIL;
-				add_partial_path(rel, vexec_scan_path(root, rel, prowpath, &pcost));
+				ppath = vexec_scan_path(root, rel, prowpath, &pcost);
+				if (rel->reloptkind == RELOPT_BASEREL)
+					vexec_sort_keep_scan(ps, ppath);
+				add_partial_path(rel, ppath);
 			}
 		}
 	}
