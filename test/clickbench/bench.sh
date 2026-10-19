@@ -43,6 +43,8 @@
 #   CB_WORKERS   port: parallel workers per segment, 0 (as the tpc suite's
 #                TPC_WORKERS, gp.enable_parallel on above 0)
 #   CB_PAX_WITH  PAX's table options in place of the suite's
+#   CB_MT_WITH   mergetree's table options in place of the suite's, but for
+#                order_by and storage: '' for none, the table's defaults
 #   CB_VEXEC     vexec's sessions, each one more configuration of each
 #                planner, "<planner>+<session>": force-postgres, force-arrow
 #                (vexec.mode = force in that format), auto-postgres,
@@ -52,6 +54,7 @@
 #                workers are allowed.  vexec is then preloaded on every node,
 #                and the planners without a session run it in off mode.  The
 #                container starts through vexec-entry.sh, which installs it
+#   CB_VEXEC_ONLY  1: CB_VEXEC's configurations alone, none in off mode
 #   CB_OUT       the run's directory under /runs, which run.sh names
 #   KEEP         keep the servers' data directories
 #
@@ -90,7 +93,7 @@ VEXEC="${CB_VEXEC:-}"
 if [ -n "$VEXEC" ]; then
 	all=""
 	for p in $PLANNERS; do
-		all="$all $p"
+		[ "${CB_VEXEC_ONLY:-}" = 1 ] || all="$all $p"
 		for v in $VEXEC; do
 			case "$v" in force-postgres|force-arrow|auto-postgres|auto-arrow) ;;
 				force-postgres-serial|force-arrow-serial|auto-postgres-serial|auto-arrow-serial) ;;
@@ -286,12 +289,22 @@ fi
 # 3388 returned NULL", numeric_poly_sum; their bloom filters stay.
 PK="CounterID, EventDate, UserID, EventTime, WatchID"
 MINMAX="advengineid,counterid,eventdate,dontcounthits,isrefresh,islink,isdownload,traficsourceid"
+# mergetree's options beside its key, tuned as ClickBench's "-tuned" entries
+# are (ClickBench/README.md:107-109): the text columns of few distinct values
+# LowCardinality -- ClickHouse's dictionaries, which vexec evaluates over
+# their values (ch_table_engines.md §3, "VC5 as built"; SearchPhrase, of
+# 892,232 values in 10M rows, left out) -- granules of 1,024 rows, as
+# ClickHouse's own tuned entry has them (clickhouse/create-tuned.sql), and
+# no compression codec
+LC="flashminor2, useragentminor, mobilephonemodel, params, pagecharset, hitcolor, browserlanguage, browsercountry, socialnetwork, socialaction, socialsourcepage, paramorderid, paramcurrency, openstatservicename, openstatcampaignid, openstatsourceid, utmsource, utmmedium, utmcampaign, utmcontent, utmterm, fromtag"
+MT_WITH="${CB_MT_WITH-low_cardinality = '$LC', index_granularity = 1024, compression = 'none'}"
 case "$STORAGE" in
 	heap|heap_pk) CLAUSE="" ;;
 	# ordered by the suite's primary key, the one sort key ClickBench's rules
-	# allow; no OPTIMIZE before the queries (ClickBench/README.md:133)
-	mergetree) CLAUSE="USING mergetree WITH (order_by = '$(echo "$PK" | tr 'A-Z' 'a-z')')" ;;
-	mergetree_files) CLAUSE="USING mergetree WITH (order_by = '$(echo "$PK" | tr 'A-Z' 'a-z')', storage = 'files')" ;;
+	# allow; no OPTIMIZE before the queries (ClickBench/README.md:133); and
+	# MT_WITH's options
+	mergetree) CLAUSE="USING mergetree WITH (order_by = '$(echo "$PK" | tr 'A-Z' 'a-z')'${MT_WITH:+, $MT_WITH})" ;;
+	mergetree_files) CLAUSE="USING mergetree WITH (order_by = '$(echo "$PK" | tr 'A-Z' 'a-z')', storage = 'files'${MT_WITH:+, $MT_WITH})" ;;
 	aoco) CLAUSE="USING ao_column WITH (compresstype=zstd) DISTRIBUTED BY (UserID)" ;;
 	porc|porc_vec)
 		CLAUSE="USING pax WITH (${CB_PAX_WITH:-storage_format=$STORAGE, compresstype=zstd, cluster_type='lexical', cluster_columns='counterid,eventdate', minmax_columns='$MINMAX', bloomfilter_columns='userid,urlhash,refererhash'}) DISTRIBUTED BY (UserID)" ;;

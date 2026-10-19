@@ -51,7 +51,8 @@
 #                      ~/.cache/pg_accel/postgres
 #   CB_TESTS_MEM       each container's memory, 40g (the port's tests' cap)
 #   CB_SUBSET, CB_REPS, CB_TRIES, CB_TIMEOUT, CB_COLD, CB_QUERIES, CB_WORKERS,
-#   CB_STATS           passed to bench.sh, which says what they do
+#   CB_STATS, CB_MT_WITH, CB_VEXEC_ONLY
+#                      passed to bench.sh, which says what they do
 #   LOADS              the loads of "baseline": all eleven
 #   CHECK_RUN, TIME_RUN, AGAIN_RUN
 #                      runs of the cache "baseline" goes on with, rather than
@@ -333,12 +334,13 @@ run_loads() {
 		# a load's statistics from another run (CB_STATS_RUN): its plans then
 		[ -n "${CB_STATS_RUN:-}" ] && stats="/runs/$CB_STATS_RUN/$load/stats.json"
 		echo "== $mode, $load: $(date '+%F %T')"
-		local start=()
+		local start=() mt=()
+		[ -n "${CB_MT_WITH+set}" ] && mt=(-e "CB_MT_WITH=$CB_MT_WITH")
 		{ [ -n "${CB_VEXEC:-}" ] || [ "$route" = vanilla-orca ] || [[ "$storage" == mergetree* ]]; } &&
 			start=(--user root --entrypoint /clickbench/vexec-entry.sh)
 		ORCA_IMAGE="$image" CB_ORCA_STAGE="$orca_stage" compose --profile run run --rm -T "${start[@]}" \
 			-e CB_MODE="$mode" -e CB_ROUTE="$route" -e CB_STORAGE="$storage" -e CB_SEGMENTS="$seg" \
-			-e CB_VEXEC="${CB_VEXEC:-}" \
+			-e CB_VEXEC="${CB_VEXEC:-}" -e CB_VEXEC_ONLY="${CB_VEXEC_ONLY:-}" "${mt[@]}" \
 			-e CB_SUBSET="${CB_SUBSET:-1m}" -e CB_REPS="${CB_REPS:-3}" -e CB_TRIES="${CB_TRIES:-3}" \
 			-e CB_TIMEOUT="${CB_TIMEOUT:-1800}" -e CB_COLD="${CB_COLD:-evict}" \
 			-e CB_QUERIES="${CB_QUERIES:-}" -e CB_WORKERS="${CB_WORKERS:-0}" \
