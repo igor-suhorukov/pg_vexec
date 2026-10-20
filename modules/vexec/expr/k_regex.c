@@ -43,7 +43,16 @@
  * bytes is in a negated class and in no other, and . is any character,
  * newlines too.  Its backtracking is bounded: a row past
  * REGEX_MAX_STEPS steps is the function's to answer (`failed`), so that no
- * value's time grows past a bound.  The replacement is regexp_replace()'s
+ * value's time grows past a bound.  So is a value the encoding does not
+ * take whole (pg_encoding_verifymbstr()): PostgreSQL's engine matches a
+ * value's wide characters, which pg_mb2wchar_with_len() ends at a NUL byte
+ * and makes without a truncated last character, where the matcher reads
+ * the bytes -- 'caf' and a lone 0xc3, or 'café', a NUL and more, would be
+ * answered otherwise (PostgreSQL's encoding test).  Where a batch's values
+ * lie one after another in one buffer -- offsets, a source's text and
+ * Arrow's -- their bytes are checked at once, with every offset a
+ * character's start: whole, and cut only between characters, each value is
+ * whole.  Any other batch's values are checked one by one.  The replacement is regexp_replace()'s
  * (appendStringInfoRegexpSubstr(), PG19:src/backend/utils/adt/
  * varlena.c:3247-3331): \1 to \9 a group's text, \& the match's, \\ a
  * backslash, and any other backslash itself; a value the pattern does not
@@ -60,6 +69,7 @@
 #include "mb/pg_wchar.h"
 #include "nodes/nodeFuncs.h"
 #include "port/pg_bitutils.h"
+#include "utils/ascii.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "varatt.h"
@@ -115,6 +125,7 @@ typedef struct RegexCall
 	RegexPart  *parts;
 	char	   *repl;			/* the replacement's bytes */
 	bool		utf8;
+	int			encoding;		/* the database's: each value checked in it */
 } RegexCall;
 
 /* ---- the pattern ---- */
@@ -135,6 +146,59 @@ regex_charlen(bool utf8, const char *p, int left)
 		return 1;
 	l = pg_utf_mblen((const unsigned char *) p);
 	return Min(Max(l, 1), left);
+}
+
+/*
+ * Whether a value's bytes are its encoding's whole.  Its ASCII prefix without
+ * a NUL -- which every server encoding takes as it is, and which ends where a
+ * character begins -- is found a chunk at a time (is_valid_ascii()); the
+ * rest, from the first chunk that is not, is checked by
+ * pg_encoding_verifymbstr().  So a URL pays the cheap pass alone, and a value
+ * of other text the verifier's from its first such byte's chunk.
+ */
+static inline bool
+regex_value_whole(int encoding, const char *s, int len)
+{
+	int			i = 0;
+
+	while (i + (int) sizeof(Vector8) <= len &&
+		   is_valid_ascii((const unsigned char *) s + i, (int) sizeof(Vector8)))
+		i += (int) sizeof(Vector8);
+	/* the tail's bytes, where the chunks reached it: none 0, none past 0x7F */
+	if (i + (int) sizeof(Vector8) > len)
+	{
+		int			j = i;
+
+		while (j < len && (unsigned char) (s[j] - 1) < 0x7F)
+			j++;
+		if (j == len)
+			return true;
+	}
+	return pg_encoding_verifymbstr(encoding, s + i, len - i) == len - i;
+}
+
+/*
+ * Whether every value of an OFFSETS column's nrows is whole at once: their
+ * bytes, from the first's start to the last's end, the encoding's whole,
+ * and in UTF8 no offset within them at a continuation byte, so that no
+ * value begins or ends inside a character.  The rows not active are
+ * checked too; one not whole sends the batch to the check of each value.
+ */
+static bool
+regex_batch_whole(const RegexCall *rc, const VexecVec *s, int nrows)
+{
+	const int32 *off = (const int32 *) s->values;
+	const char *b = s->buffers[0];
+	int32		lo = off[0];
+	int32		hi = off[nrows];
+
+	if (!regex_value_whole(rc->encoding, b + lo, hi - lo))
+		return false;
+	if (rc->utf8)
+		for (int i = 1; i < nrows; i++)
+			if (off[i] < hi && ((unsigned char) b[off[i]] & 0xC0) == 0x80)
+				return false;
+	return true;
 }
 
 /* The quantifier after an atom: ?, * or +, or none; *? and the like refused. */
@@ -649,6 +713,7 @@ regex_bind(VexecExpr *call, const void *info)
 		return false;
 	rc = palloc0(sizeof(RegexCall));
 	rc->utf8 = GetDatabaseEncoding() == PG_UTF8;
+	rc->encoding = GetDatabaseEncoding();
 	t = DatumGetTextPP(pat->constvalue);
 	if (!regex_parse(rc, VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t)))
 		return false;
@@ -675,8 +740,11 @@ regex_kernel(VexecKernelCall *kc)
 	int64		size = 0;
 	int64		used = 0;
 	char	   *data;
+	bool		whole;
 
 	m.rc = rc;
+	whole = s->shape.layout == VEXEC_OFFSETS && s->encoding == VEXEC_FLAT &&
+		regex_batch_whole(rc, s, kc->nrows);
 	VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
 	{
 		const char *a;
@@ -685,6 +753,13 @@ regex_kernel(VexecKernelCall *kc)
 		int			r;
 
 		vexec_vec_value_bytes(s, vexec_arg_row(s, i), &a, &alen);
+		if (!whole && !regex_value_whole(rc->encoding, a, (int) alen))
+		{
+			/* a NUL, or a character the encoding refuses: PostgreSQL's answer */
+			vexec_fail(kc, i);
+			c[0] = -2;
+			continue;
+		}
 		m.s = a;
 		m.len = (int) alen;
 		m.steps = 0;

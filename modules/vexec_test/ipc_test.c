@@ -61,6 +61,7 @@ PG_FUNCTION_INFO_V1(vexec_test_ipc_reencode);
 PG_FUNCTION_INFO_V1(vexec_test_ipc_messages);
 PG_FUNCTION_INFO_V1(vexec_test_ipc_patch);
 PG_FUNCTION_INFO_V1(vexec_test_raw);
+PG_FUNCTION_INFO_V1(vexec_test_text_of_bytes);
 
 static void
 na_ok(int code, struct ArrowError *error, const char *what)
@@ -750,6 +751,20 @@ vexec_test_ipc_patch(PG_FUNCTION_ARGS)
 	for (i = 0; i < width; i++)
 		m[at + i] = (uint8) ((uint64) value >> (8 * i));
 	PG_RETURN_BYTEA_P(out);
+}
+
+/*
+ * vexec_test.text_of_bytes(bytes bytea) RETURNS text: the bytes as a text,
+ * not checked against the encoding, as PostgreSQL's regression library's
+ * test_bytea_to_text() makes one -- a NUL, a truncated character: the
+ * corrupt values a kernel must answer as PostgreSQL's function does
+ */
+Datum
+vexec_test_text_of_bytes(PG_FUNCTION_ARGS)
+{
+	bytea	   *b = PG_GETARG_BYTEA_PP(0);
+
+	PG_RETURN_TEXT_P(cstring_to_text_with_len(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b)));
 }
 
 /* vexec_test.raw(value anyelement) RETURNS bytea */

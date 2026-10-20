@@ -89,6 +89,15 @@ RETURNS bytea
 AS 'MODULE_PATHNAME', 'vexec_test_raw'
 LANGUAGE C STRICT IMMUTABLE;
 
+-- Bytes as a text, not checked against the encoding, as PostgreSQL's
+-- regression library's test_bytea_to_text() makes one: a NUL, a truncated
+-- character -- corrupt values, which a kernel answers as PostgreSQL's
+-- function does.
+CREATE FUNCTION text_of_bytes(bytes bytea)
+RETURNS text
+AS 'MODULE_PATHNAME', 'vexec_test_text_of_bytes'
+LANGUAGE C STRICT IMMUTABLE;
+
 -- The egress (V10, vexec_egress.h): a query through vexec's receiver, as a
 -- Flight session's statement goes, and the stream of IPC messages it wrote
 -- -- its schema, its batches, the end-of-stream marker -- with what the

@@ -7,7 +7,8 @@
 -- patterns of those items -- and of items outside them, which keep
 -- PostgreSQL's function -- over values made of the same pieces, multibyte
 -- characters and newlines among them; every answer compared, off and in
--- force mode.
+-- force mode.  Values the encoding does not take whole keep PostgreSQL's
+-- function.
 
 SET vexec.mode = force;
 
@@ -287,6 +288,76 @@ DROP TABLE rx_cases;
 -- a pattern whose backtracking passes the bound: its rows PostgreSQL's
 INSERT INTO rx VALUES (14, repeat('a', 300) || 'b'), (15, repeat('a', 30) || 'c');
 SELECT id, regexp_replace(v, '^a*a*a*a*a*c$', 'x') = v AS unchanged FROM rx WHERE id >= 14 ORDER BY id;
+
+-- values the encoding does not take whole, made as PostgreSQL's encoding
+-- test makes them: its engine matches their wide characters, which end at
+-- a NUL and drop a truncated last character, so the kernel leaves them to
+-- PostgreSQL's function and keeps the valid values beside them.  Their
+-- answers' bytes, in force mode and off: the kernel's answers made below
+-- the row function that shows them
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec_test CASCADE;
+RESET client_min_messages;
+CREATE TABLE rx_bad (id int, v text);
+INSERT INTO rx_bad VALUES
+  (1, 'café'),
+  (2, 'caf' || vexec_test.text_of_bytes('\xc3')),
+  (3, 'café' || vexec_test.text_of_bytes('\x00') || 'dcba'),
+  (4, 'caf' || vexec_test.text_of_bytes('\xc300') || 'dcba'),
+  (5, vexec_test.text_of_bytes('\xff') || 'caf'),
+  (6, 'caf' || vexec_test.text_of_bytes('\xe282')),
+  (7, 'cafx');
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT id, vexec_test.raw(one) AS one, vexec_test.raw(dcba) AS dcba, vexec_test.raw(rot) AS rot
+FROM (SELECT id, regexp_replace(v, '^caf(.)$', '\1') AS one, regexp_replace(v, '^caf(.)dcba$', '\1') AS dcba,
+             regexp_replace(v, '^(.)(.*)$', '\2<\1>') AS rot
+      FROM rx_bad OFFSET 0) r
+ORDER BY id;
+SELECT id, vexec_test.raw(one) AS one, vexec_test.raw(dcba) AS dcba, vexec_test.raw(rot) AS rot
+FROM (SELECT id, regexp_replace(v, '^caf(.)$', '\1') AS one, regexp_replace(v, '^caf(.)dcba$', '\1') AS dcba,
+             regexp_replace(v, '^(.)(.*)$', '\2<\1>') AS rot
+      FROM rx_bad OFFSET 0) r
+ORDER BY id;
+SET vexec.mode = off;
+SELECT id, vexec_test.raw(one) AS one, vexec_test.raw(dcba) AS dcba, vexec_test.raw(rot) AS rot
+FROM (SELECT id, regexp_replace(v, '^caf(.)$', '\1') AS one, regexp_replace(v, '^caf(.)dcba$', '\1') AS dcba,
+             regexp_replace(v, '^(.)(.*)$', '\2<\1>') AS rot
+      FROM rx_bad OFFSET 0) r
+ORDER BY id;
+SET vexec.mode = force;
+-- the same in each layout: a batch's values as offsets -- one check where
+-- their bytes are whole and cut between characters, else each value's --
+-- as views and as Datums, each value's; and in each, a character split
+-- between two values, whose bytes together are whole, and a batch of whole
+-- values, multibyte ones among them, which the kernel answers whole
+CREATE FUNCTION rx_same(q text) RETURNS text LANGUAGE plpgsql AS $f$
+DECLARE
+	ref text;
+	got text;
+	lay text;
+	res text := '';
+BEGIN
+	PERFORM set_config('vexec.mode', 'off', true);
+	EXECUTE format('SELECT string_agg(x::text, %L ORDER BY x::text) FROM (%s) x', '|', q) INTO ref;
+	FOREACH lay IN ARRAY ARRAY['datum', 'view', 'offsets'] LOOP
+		PERFORM set_config('vexec.mode', 'force', true);
+		PERFORM set_config('vexec.batch_varlena_layout', lay, true);
+		EXECUTE format('SELECT string_agg(x::text, %L ORDER BY x::text) FROM (%s) x', '|', q) INTO got;
+		res := res || format('%s %s; ', lay, CASE WHEN got IS NOT DISTINCT FROM ref THEN 'same' ELSE 'DIFFERS: ' || got || ' off ' || ref END);
+	END LOOP;
+	RETURN res;
+END $f$;
+CREATE TABLE rx_split (id int, v text);
+INSERT INTO rx_split VALUES
+  (1, 'caf' || vexec_test.text_of_bytes('\xc3')), (2, vexec_test.text_of_bytes('\xa9') || 'caf'), (3, 'café');
+CREATE TABLE rx_ok (id int, v text);
+INSERT INTO rx_ok VALUES (1, 'café'), (2, 'naïve'), (3, 'http://ünï.cödé/päth'), (4, 'caf€'), (5, 'caf😀'), (6, '');
+SELECT t, rx_same(format($q$SELECT id, vexec_test.raw(one), vexec_test.raw(dcba), vexec_test.raw(rot)
+  FROM (SELECT id, regexp_replace(v, '^caf(.)$', '\1') AS one, regexp_replace(v, '^caf(.)dcba$', '\1') AS dcba,
+               regexp_replace(v, '^(.)(.*)$', '\2<\1>') AS rot FROM %I OFFSET 0) r$q$, t))
+FROM unnest(ARRAY['rx_bad', 'rx_split', 'rx_ok']) t;
+DROP FUNCTION rx_same(text);
+DROP TABLE rx_bad, rx_split, rx_ok;
 
 DROP FUNCTION rx_fuzz(int, int);
 DROP FUNCTION rx_pattern();
