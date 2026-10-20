@@ -32,6 +32,7 @@ OBJS = \
 	exec/methods.o \
 	exec/node.o \
 	exec/vecagg.o \
+	exec/vecaggjoin.o \
 	exec/vecingest.o \
 	exec/vecinsert.o \
 	exec/vechashjoin.o \
@@ -48,6 +49,7 @@ OBJS = \
 	expr/k_datetime.o \
 	expr/k_numeric.o \
 	expr/k_text.o \
+	expr/k_regex.o \
 	expr/kernels.o \
 	expr/packs.o \
 	expr/strsearch.o \
@@ -87,7 +89,7 @@ DATA = vexec--1.0.sql
 HEADERS = ../../include/vexec_source.h ../../include/vexec_kernels.h ../../include/vexec_egress.h \
 	../../include/vexec_sink.h
 
-REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_ingest vexec_insert vexec_frames vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs vexec_source
+REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_ingest vexec_insert vexec_frames vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs vexec_source vexec_regex
 
 PG_CPPFLAGS = -I$(srcdir) -I$(srcdir)/pgxs/include -I$(srcdir)/../../include
 

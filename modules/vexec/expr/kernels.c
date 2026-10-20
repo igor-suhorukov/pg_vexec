@@ -71,6 +71,7 @@ build_table(void)
 	vexec_kernels_text(add_kernel);
 	vexec_kernels_numeric(add_kernel);
 	vexec_kernels_datetime(add_kernel);
+	vexec_kernels_regex(add_kernel);
 }
 
 /*

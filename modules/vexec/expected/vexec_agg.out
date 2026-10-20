@@ -1009,6 +1009,208 @@ SELECT agg_check('SELECT c, count(*), sum(id) FROM af GROUP BY c');
 DROP TABLE af;
 RESET max_parallel_workers;
 RESET vexec.partial_agg_limit;
+-- D2: a first stage whose every state is one of vexec's own without a
+-- pointer packs its groups into the partitions, and the final stage merges
+-- them as they lie: counts, integer sums and averages, int8's sums, min and
+-- max of by-value types, bool_and and bool_or; keys of bits, bytes and the
+-- type's functions, NULL keys, the first row's columns, compressed text
+-- among them; in shared memory, or past vexec.repartition_shared_memory in
+-- files; a frozen table's batch groups made packed, or, where its rows are
+-- groups of their own, each row one with no lookup (the bypass); either
+-- stage spilling; no worker; rescanned.  Not where a state holds a pointer:
+-- sum(n), min(t)
+CREATE TABLE ap (id int PRIMARY KEY, k int, t text, big text, n numeric, d date);
+INSERT INTO ap
+  SELECT g, (g::int8 * 7919 % 30000)::int, CASE WHEN g % 7 = 0 THEN NULL ELSE 'v' || (g % 9000) END,
+         repeat(md5((g % 500)::text), 80), (g % 97)::numeric / 8, date '2020-01-01' + (g % 365)
+  FROM generate_series(1, 200000) g;
+-- big's values, too wide for ANALYZE to count, are 500
+ALTER TABLE ap ALTER COLUMN big SET (n_distinct = 500);
+CREATE TABLE apk (id int PRIMARY KEY, big text, t text);
+INSERT INTO apk
+  SELECT g, repeat(md5(g::text), 80), CASE WHEN g % 9 = 0 THEN NULL ELSE 'w' || g END
+  FROM generate_series(1, 5000) g;
+ANALYZE ap, apk;
+SET cpu_operator_cost = 0.25;
+SELECT agg_explain($$SELECT k, count(*), sum(id), avg((id % 1000)::int2), sum(id::int8), max(d)
+       FROM ap GROUP BY k$$, 'Input|Partition Format');
+                  agg_explain                  
+-----------------------------------------------
+         Input: packed groups
+               Input: batches
+               Partition Format: packed groups
+                     Input: batches
+(4 rows)
+
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ap GROUP BY k', 'Partition Format');
+              agg_explain               
+----------------------------------------
+               Partition Format: frames
+(1 row)
+
+SELECT agg_explain('SELECT k, count(*), min(t) FROM ap GROUP BY k', 'Partition Format');
+              agg_explain               
+----------------------------------------
+               Partition Format: frames
+(1 row)
+
+SELECT agg_explain($$SELECT s.id, s.big, s.t, count(*), sum(a.k) FROM ap a JOIN apk s ON s.id = a.id % 5000
+       GROUP BY s.id$$, 'Repartition|Partition Format');
+                          agg_explain                           
+----------------------------------------------------------------
+         ->  Parallel Vec Repartition (actual rows=N.N loops=N)
+               Partition Format: packed groups
+(2 rows)
+
+CREATE FUNCTION agg_packed() RETURNS SETOF text LANGUAGE sql AS $f$
+SELECT agg_check($$SELECT k, count(*), count(t), sum(id), avg((id % 1000)::int2), sum(id::int8),
+       avg(id::int8), min(id), max(d), bool_and(id > 5), bool_or(id % 1000 = 0) FROM ap GROUP BY k$$)
+UNION ALL
+SELECT agg_check('SELECT t, k % 5, count(*), sum(id) FROM ap GROUP BY 1, 2')
+UNION ALL
+SELECT agg_check('SELECT n, d, count(*), max(id) FROM ap GROUP BY n, d')
+UNION ALL
+SELECT agg_check('SELECT big, count(*), sum(k), min(d) FROM ap GROUP BY big')
+UNION ALL
+SELECT agg_check($$SELECT s.id, s.big, s.t, count(*), sum(a.k) FROM ap a JOIN apk s ON s.id = a.id % 5000
+       GROUP BY s.id$$)
+UNION ALL
+SELECT agg_check('SELECT k % 100, count(DISTINCT t), count(*), sum(id) FROM ap GROUP BY 1')
+UNION ALL
+SELECT agg_check('SELECT k, d, count(*), sum(id), max(id) FROM ap GROUP BY k, d')
+$f$;
+SELECT agg_packed();
+  agg_packed  
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(7 rows)
+
+SET vexec.repartition_shared_memory = 0;
+SELECT agg_packed();
+  agg_packed  
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(7 rows)
+
+SET vexec.repartition_shared_memory = '64kB';
+SELECT agg_packed();
+  agg_packed  
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(7 rows)
+
+RESET vexec.repartition_shared_memory;
+-- a frozen table whose rows are groups of their own, (k, d)'s, bypassed
+SET vexec.partial_agg_limit = 100;
+SELECT agg_packed();
+  agg_packed  
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(7 rows)
+
+SET vexec.partial_agg_bypass = off;
+SELECT agg_check('SELECT k, d, count(*), sum(id), max(id) FROM ap GROUP BY k, d');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.partial_agg_bypass;
+RESET vexec.partial_agg_limit;
+SET work_mem = '64kB';
+SELECT agg_packed();
+  agg_packed  
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(7 rows)
+
+RESET work_mem;
+SET max_parallel_workers = 0;
+SELECT agg_packed();
+  agg_packed  
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(7 rows)
+
+RESET max_parallel_workers;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_material = off;
+SET enable_memoize = off;
+SELECT agg_check($$WITH o AS MATERIALIZED (SELECT i FROM generate_series(0, 3) i)
+SELECT o.i, count(x.k), sum(x.s) FROM o LEFT JOIN (SELECT k, count(*) c, sum(id) s FROM ap GROUP BY k) x
+  ON x.c >= o.i + 6 GROUP BY o.i$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_material;
+RESET enable_memoize;
+SET vexec.enable_packed_groups = off;
+SELECT agg_explain('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Input|Partition Format');
+              agg_explain               
+----------------------------------------
+         Input: batches
+               Input: batches
+               Partition Format: frames
+                     Input: batches
+(4 rows)
+
+SELECT agg_packed();
+  agg_packed  
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(7 rows)
+
+RESET vexec.enable_packed_groups;
+RESET cpu_operator_cost;
+DROP FUNCTION agg_packed();
+DROP TABLE ap, apk;
 -- C3: a bounded VecSort lends the final VecAgg below it its keys and bound,
 -- and the aggregation keeps its n best groups, ranked after HAVING, finishing
 -- only those; not where the output holds a volatile function
@@ -1571,6 +1773,110 @@ SELECT agg_check('SELECT k % 100, count(DISTINCT t), sum(n) FROM ah GROUP BY 1')
 (1 row)
 
 SELECT agg_check('SELECT count(DISTINCT t), sum(id) FROM ah');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET max_parallel_workers;
+-- the other aggregates apart (VecAggJoin): H5's pair for them by the keys
+-- alone, X1's stages for the DISTINCT one with no other state, the two
+-- gathered and joined by their keys -- NULL keys meeting -- the HAVING
+-- above; where the pairs are many to a group, d's 100 days over 25,000
+-- t's; the same answers either way
+SET vexec.enable_agg_split = off;
+EXPLAIN (COSTS OFF) SELECT d, count(DISTINCT t), sum(id), count(*) FROM ah GROUP BY d;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Gather
+   Workers Planned: 4
+   ->  Vec Finalize HashAggregate
+         Group Key: d
+         ->  Parallel Vec Repartition
+               Partition Key: d
+               ->  Vec Combine HashAggregate
+                     Group Key: d
+                     ->  Vec Combine HashAggregate
+                           Group Key: d, t
+                           ->  Parallel Vec Repartition
+                                 Partition Key: d, t
+                                 ->  Vec Partial HashAggregate
+                                       Group Key: d, t
+                                       ->  Parallel Vec Seq Scan on ah
+(15 rows)
+
+RESET vexec.enable_agg_split;
+EXPLAIN (COSTS OFF) SELECT d, count(DISTINCT t), sum(id), count(*) FROM ah GROUP BY d;
+                                 QUERY PLAN                                  
+-----------------------------------------------------------------------------
+ Vec Aggregate Join
+   Join Keys: 1
+   ->  Gather
+         Workers Planned: 4
+         ->  Vec Finalize HashAggregate
+               Group Key: d
+               ->  Parallel Vec Repartition
+                     Partition Key: d
+                     ->  Vec Partial HashAggregate
+                           Group Key: d
+                           ->  Parallel Vec Seq Scan on ah
+   ->  Gather
+         Workers Planned: 4
+         ->  Vec Finalize HashAggregate
+               Group Key: d
+               ->  Parallel Vec Repartition
+                     Partition Key: d
+                     ->  Vec Combine HashAggregate
+                           Group Key: d
+                           ->  Vec Combine HashAggregate
+                                 Group Key: d, t
+                                 ->  Parallel Vec Repartition
+                                       Partition Key: d, t
+                                       ->  Vec Partial HashAggregate
+                                             Group Key: d, t
+                                             ->  Parallel Vec Seq Scan on ah
+(26 rows)
+
+SELECT agg_check('SELECT d, count(DISTINCT t), sum(id), count(*), avg(id), max(k), sum(n) FROM ah GROUP BY d');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check($$SELECT d, count(DISTINCT t) AS u, sum(n) FROM ah GROUP BY d
+       HAVING count(DISTINCT t) > 1190 AND sum(id) > 0$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check($$SELECT d, count(DISTINCT t) + count(*), min(id) FROM ah GROUP BY d ORDER BY 2 DESC, 1 LIMIT 5$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT t, count(DISTINCT id), count(*), sum(b), max(d) FROM at GROUP BY t');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT t, count(DISTINCT id), count(*) FROM at WHERE id < 0 GROUP BY t');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_explain('SELECT t, count(DISTINCT id), count(*), sum(b) FROM at GROUP BY t', 'Aggregate Join|Groups Joined');
+                 agg_explain                  
+----------------------------------------------
+ Vec Aggregate Join (actual rows=N.N loops=N)
+   Groups Joined: N
+(2 rows)
+
+SET max_parallel_workers = 0;
+SELECT agg_check('SELECT d, count(DISTINCT t), sum(id), count(*) FROM ah GROUP BY d');
   agg_check   
 --------------
  same, VecAgg

@@ -987,7 +987,8 @@ finish_walker(Plan *plan)
 			{
 				CustomScan *cscan = (CustomScan *) plan;
 
-				if (cscan->methods == vexec_hashjoin_methods() &&
+				if ((cscan->methods == vexec_hashjoin_methods() ||
+					 cscan->methods == vexec_aggjoin_methods()) &&
 					plan->lefttree != NULL && plan->righttree != NULL)
 				{
 					List	   *scan_tlist = NIL;

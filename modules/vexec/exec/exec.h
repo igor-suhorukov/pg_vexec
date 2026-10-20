@@ -57,6 +57,7 @@
 #define VEXEC_INGEST_NAME	"VecIngest"
 #define VEXEC_MOTION_SEND_NAME	"VecMotionSend"
 #define VEXEC_MOTION_RECV_NAME	"VecMotionRecv"
+#define VEXEC_AGGJOIN_NAME	"VecAggJoin"
 
 typedef enum VexecNodeKind
 {
@@ -485,6 +486,7 @@ extern const CustomScanMethods *vexec_insert_methods(void);
 extern const CustomScanMethods *vexec_ingest_methods(void);
 extern const CustomScanMethods *vexec_motion_send_methods(void);
 extern const CustomScanMethods *vexec_motion_recv_methods(void);
+extern const CustomScanMethods *vexec_aggjoin_methods(void);
 
 /*
  * Each kind's exec methods, which pg_otel_probe's reporter of vector nodes
@@ -558,6 +560,22 @@ extern void vexec_agg_deal(VexecNode *node, int npartitions,
 extern int	vexec_agg_dealt_partition(VexecNode *node);
 extern void vexec_agg_allow_freeze(VexecNode *node);
 
+/*
+ * D2 (§3.20): a partial VecAgg's groups handed on as they lie -- a group's
+ * header, keys, extras and states as the table holds them, a
+ * by-reference value's bytes after them, at the offset its Datum then
+ * holds -- into a VecRepartition's partitions, which hold them in chunks
+ * of the parallel query's shared memory, and a final VecAgg above that
+ * merges them as they lie (vecagg.c, vecrepart.c)
+ */
+typedef struct VexecPackSink VexecPackSink;
+extern char *vexec_pack_alloc(VexecPackSink *sink, int partition, Size len);
+extern void vexec_pack_batch_end(VexecPackSink *sink);
+extern bool vexec_agg_pack_ok(VexecNode *node);
+extern void vexec_agg_pack(VexecNode *node, VexecPackSink *sink, int npartitions,
+						   int (*deal) (void *arg, uint32 hash), void *arg);
+extern int64 vexec_agg_pack_all(VexecNode *node);
+
 /* aggsizes.c: the groups VecAgg's tables reached, in shared memory (C6) */
 extern void vexec_aggsize_install(void);
 extern uint64 vexec_aggsize_key(EState *estate, int plan_node_id);
@@ -584,6 +602,10 @@ extern void vexec_repart_plan_decode(CustomScan *cscan, VexecRepartPlan *plan);
 extern bool vexec_repart_hashes_keys(VexecNode *node, List *keycols, List *eqops,
 									 List *collations);
 extern const uint32 *vexec_repart_batch_hashes(VexecNode *node);
+extern VexecNode *vexec_repart_child_agg(VexecNode *node);
+extern bool vexec_repart_offer_unpack(VexecNode *node);
+extern bool vexec_repart_packed(VexecNode *node);
+extern bool vexec_repart_next_chunk(VexecNode *node, const char **groups, Size *len);
 
 /* vecwindow.c */
 extern Node *vexec_create_window_state(CustomScan *cscan);
@@ -592,6 +614,9 @@ extern void vexec_window_plan_decode(CustomScan *cscan, VexecWindowPlan *plan);
 
 /* vecinsert.c */
 extern Node *vexec_create_insert_state(CustomScan *cscan);
+
+/* vecaggjoin.c: a row node, two aggregations' groups joined by their keys */
+extern Node *vexec_create_aggjoin_state(CustomScan *cscan);
 
 /* vecingest.c */
 extern Node *vexec_create_ingest_state(CustomScan *cscan);

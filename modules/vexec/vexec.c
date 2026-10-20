@@ -59,8 +59,12 @@ bool		vexec_enable_source_steps = true;
 bool		vexec_enable_bitmapscan = true;
 bool		vexec_enable_agg = true;
 bool		vexec_enable_repartition = true;
+bool		vexec_enable_packed_groups = true;
+bool		vexec_enable_agg_split = true;
+int			vexec_repartition_shared_memory = -1;
 bool		vexec_enable_sorted_agg = true;
 int			vexec_partial_agg_limit = 16384;
+bool		vexec_partial_agg_bypass = true;
 bool		vexec_remember_agg_sizes = true;
 bool		vexec_enable_group_topk = true;
 bool		vexec_enable_shared_exprs = true;
@@ -324,6 +328,27 @@ define_settings(void)
 							 "runs in parallel the same way, its pairs of keys and argument dealt out first.",
 							 &vexec_enable_repartition, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_agg_split",
+							 "Plans a count(DISTINCT) grouping's other aggregates apart, by the keys alone.",
+							 "The other aggregates group the input by the keys, its count(DISTINCT) runs "
+							 "its stages with no other state, and the two aggregations' groups are joined "
+							 "by their keys; it competes with the grouping planned whole by cost.",
+							 &vexec_enable_agg_split, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_packed_groups",
+							 "Hands a parallel aggregation's partial groups on to its final stage as they lie.",
+							 "A partial stage under a VecRepartition makes its groups in the partitions they "
+							 "go to, their keys and states side by side in vexec's own layout, which the final "
+							 "stage merges as they lie; the partitions in the parallel query's shared memory, "
+							 "in files only past hash_mem.  Off, the groups go on as batches of PostgreSQL's "
+							 "partial states.",
+							 &vexec_enable_packed_groups, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomIntVariable("vexec.repartition_shared_memory",
+							"The shared memory each participant's packed groups may take in a parallel aggregation's partitions.",
+							"Past it, they go to files; -1 is hash_mem, 0 none.",
+							&vexec_repartition_shared_memory, -1, -1, MAX_KILOBYTES,
+							PGC_USERSET, GUC_UNIT_KB, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_sorted_agg",
 							 "Enables vector grouping of input in its keys' order, which a source's serial scan hands.",
 							 "A row whose keys are the open group's goes to it, any other closes it: no table, "
@@ -347,6 +372,13 @@ define_settings(void)
 							"repeat; 0 keeps every group.",
 							&vexec_partial_agg_limit, 16384, 0, INT_MAX,
 							PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.partial_agg_bypass",
+							 "Lets a frozen first stage whose rows make groups of their own hand them on with no lookup.",
+							 "Where its rows seldom meet a key it holds or one of their batch's, each row "
+							 "of the next batches is a group of its own in the partition it goes to, its "
+							 "packed groups' only.",
+							 &vexec_partial_agg_bypass, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_shared_exprs",
 							 "Computes once a batch the subexpressions a vector node's targets share.",
 							 "Equal subtrees of kernels, over columns and constants, are one, and its "

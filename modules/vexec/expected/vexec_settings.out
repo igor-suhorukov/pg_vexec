@@ -9,60 +9,64 @@ SELECT name,
        unit, context, vartype, min_val, max_val, enumvals,
        (pg_settings_get_flags(name) @> ARRAY['EXPLAIN']) AS explain
 FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
-            name             |          setting          | unit |  context   | vartype | min_val |   max_val    |          enumvals           | explain 
------------------------------+---------------------------+------+------------+---------+---------+--------------+-----------------------------+---------
- vexec.aggregate_statistics  | on                        |      | user       | bool    |         |              |                             | f
- vexec.batch_bool_layout     | format                    |      | user       | enum    |         |              | {format,byte,bit}           | t
- vexec.batch_dictionary      | on                        |      | user       | bool    |         |              |                             | t
- vexec.batch_format          | postgres                  |      | user       | enum    |         |              | {postgres,arrow}            | t
- vexec.batch_numeric_layout  | format                    |      | user       | enum    |         |              | {format,scaled,varlena}     | t
- vexec.batch_setup_cost      | 1                         |      | user       | real    | 0       | 1.79769e+308 |                             | t
- vexec.batch_temporal_layout | format                    |      | user       | enum    |         |              | {format,postgres,arrow}     | t
- vexec.batch_varlena_layout  | format                    |      | user       | enum    |         |              | {format,datum,view,offsets} | t
- vexec.compact_threshold     | 0.25                      |      | user       | real    | 0       | 1            |                             | f
- vexec.convert_cost          | 0.001                     |      | user       | real    | 0       | 1.79769e+308 |                             | t
- vexec.cpu_operator_factor   | 0.35                      |      | user       | real    | 0       | 100          |                             | t
- vexec.cpu_tuple_factor      | 0.35                      |      | user       | real    | 0       | 100          |                             | t
- vexec.debug_check_plans     | (on where assertions are) |      | superuser  | bool    |         |              |                             | f
- vexec.debug_layout_seed     | 0                         |      | superuser  | integer | 0       | 2147483647   |                             | f
- vexec.debug_require_vector  | off                       |      | superuser  | bool    |         |              |                             | f
- vexec.enable_agg            | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_bitmapscan     | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_group_topk     | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_hashjoin       | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_insert         | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_join_filter    | on                        |      | user       | bool    |         |              |                             | f
- vexec.enable_motion_frames  | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_prefilter      | on                        |      | user       | bool    |         |              |                             | f
- vexec.enable_repartition    | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_row_memo       | on                        |      | user       | bool    |         |              |                             | f
- vexec.enable_running_bound  | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_scan           | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_shared_exprs   | on                        |      | user       | bool    |         |              |                             | f
- vexec.enable_sort           | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_sorted_agg     | on                        |      | user       | bool    |         |              |                             | t
- vexec.enable_source_layouts | on                        |      | user       | bool    |         |              |                             | f
- vexec.enable_source_steps   | on                        |      | user       | bool    |         |              |                             | f
- vexec.enable_window         | on                        |      | user       | bool    |         |              |                             | t
- vexec.gpu                   | off                       |      | user       | enum    |         |              | {off,auto,force}            | t
- vexec.gpu_arena_mb          | 256                       | MB   | postmaster | integer | 1       | 1073741823   |                             | f
- vexec.gpu_devices           |                           |      | postmaster | string  |         |              |                             | f
- vexec.gpu_memory_limit_mb   | 0                         | MB   | postmaster | integer | 0       | 1073741823   |                             | f
- vexec.gpu_operator_factor   | 0.0625                    |      | user       | real    | 0       | 100          |                             | t
- vexec.gpu_segments          | off                       |      | sighup     | bool    |         |              |                             | f
- vexec.gpu_setup_cost        | 100                       |      | user       | real    | 0       | 1.79769e+308 |                             | t
- vexec.gpu_transfer_cost     | 1e-05                     |      | user       | real    | 0       | 1.79769e+308 |                             | t
- vexec.heap_page_reader      | on                        |      | user       | bool    |         |              |                             | f
- vexec.min_rows              | 10000                     |      | user       | integer | 0       | 2147483647   |                             | t
- vexec.mode                  | off                       |      | user       | enum    |         |              | {off,explain,auto,force}    | t
- vexec.orca                  | on                        |      | user       | bool    |         |              |                             | t
- vexec.orca_cost_model       | on                        |      | user       | bool    |         |              |                             | t
- vexec.orca_settings         |                           |      | user       | string  |         |              |                             | t
- vexec.partial_agg_limit     | 16384                     |      | user       | integer | 0       | 2147483647   |                             | f
- vexec.remember_agg_sizes    | on                        |      | user       | bool    |         |              |                             | f
- vexec.repartition_min_rows  | 500000                    |      | user       | integer | 0       | 2147483647   |                             | t
- vexec.scan_rows_per_worker  | 163840                    |      | user       | integer | 0       | 2147483647   |                             | t
-(51 rows)
+              name               |          setting          | unit |  context   | vartype | min_val |   max_val    |          enumvals           | explain 
+---------------------------------+---------------------------+------+------------+---------+---------+--------------+-----------------------------+---------
+ vexec.aggregate_statistics      | on                        |      | user       | bool    |         |              |                             | f
+ vexec.batch_bool_layout         | format                    |      | user       | enum    |         |              | {format,byte,bit}           | t
+ vexec.batch_dictionary          | on                        |      | user       | bool    |         |              |                             | t
+ vexec.batch_format              | postgres                  |      | user       | enum    |         |              | {postgres,arrow}            | t
+ vexec.batch_numeric_layout      | format                    |      | user       | enum    |         |              | {format,scaled,varlena}     | t
+ vexec.batch_setup_cost          | 1                         |      | user       | real    | 0       | 1.79769e+308 |                             | t
+ vexec.batch_temporal_layout     | format                    |      | user       | enum    |         |              | {format,postgres,arrow}     | t
+ vexec.batch_varlena_layout      | format                    |      | user       | enum    |         |              | {format,datum,view,offsets} | t
+ vexec.compact_threshold         | 0.25                      |      | user       | real    | 0       | 1            |                             | f
+ vexec.convert_cost              | 0.001                     |      | user       | real    | 0       | 1.79769e+308 |                             | t
+ vexec.cpu_operator_factor       | 0.35                      |      | user       | real    | 0       | 100          |                             | t
+ vexec.cpu_tuple_factor          | 0.35                      |      | user       | real    | 0       | 100          |                             | t
+ vexec.debug_check_plans         | (on where assertions are) |      | superuser  | bool    |         |              |                             | f
+ vexec.debug_layout_seed         | 0                         |      | superuser  | integer | 0       | 2147483647   |                             | f
+ vexec.debug_require_vector      | off                       |      | superuser  | bool    |         |              |                             | f
+ vexec.enable_agg                | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_agg_split          | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_bitmapscan         | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_group_topk         | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_hashjoin           | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_insert             | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_join_filter        | on                        |      | user       | bool    |         |              |                             | f
+ vexec.enable_motion_frames      | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_packed_groups      | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_prefilter          | on                        |      | user       | bool    |         |              |                             | f
+ vexec.enable_repartition        | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_row_memo           | on                        |      | user       | bool    |         |              |                             | f
+ vexec.enable_running_bound      | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_scan               | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_shared_exprs       | on                        |      | user       | bool    |         |              |                             | f
+ vexec.enable_sort               | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_sorted_agg         | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_source_layouts     | on                        |      | user       | bool    |         |              |                             | f
+ vexec.enable_source_steps       | on                        |      | user       | bool    |         |              |                             | f
+ vexec.enable_window             | on                        |      | user       | bool    |         |              |                             | t
+ vexec.gpu                       | off                       |      | user       | enum    |         |              | {off,auto,force}            | t
+ vexec.gpu_arena_mb              | 256                       | MB   | postmaster | integer | 1       | 1073741823   |                             | f
+ vexec.gpu_devices               |                           |      | postmaster | string  |         |              |                             | f
+ vexec.gpu_memory_limit_mb       | 0                         | MB   | postmaster | integer | 0       | 1073741823   |                             | f
+ vexec.gpu_operator_factor       | 0.0625                    |      | user       | real    | 0       | 100          |                             | t
+ vexec.gpu_segments              | off                       |      | sighup     | bool    |         |              |                             | f
+ vexec.gpu_setup_cost            | 100                       |      | user       | real    | 0       | 1.79769e+308 |                             | t
+ vexec.gpu_transfer_cost         | 1e-05                     |      | user       | real    | 0       | 1.79769e+308 |                             | t
+ vexec.heap_page_reader          | on                        |      | user       | bool    |         |              |                             | f
+ vexec.min_rows                  | 10000                     |      | user       | integer | 0       | 2147483647   |                             | t
+ vexec.mode                      | off                       |      | user       | enum    |         |              | {off,explain,auto,force}    | t
+ vexec.orca                      | on                        |      | user       | bool    |         |              |                             | t
+ vexec.orca_cost_model           | on                        |      | user       | bool    |         |              |                             | t
+ vexec.orca_settings             |                           |      | user       | string  |         |              |                             | t
+ vexec.partial_agg_bypass        | on                        |      | user       | bool    |         |              |                             | f
+ vexec.partial_agg_limit         | 16384                     |      | user       | integer | 0       | 2147483647   |                             | f
+ vexec.remember_agg_sizes        | on                        |      | user       | bool    |         |              |                             | f
+ vexec.repartition_min_rows      | 500000                    |      | user       | integer | 0       | 2147483647   |                             | t
+ vexec.repartition_shared_memory | -1                        | kB   | user       | integer | -1      | 2147483647   |                             | f
+ vexec.scan_rows_per_worker      | 163840                    |      | user       | integer | 0       | 2147483647   |                             | t
+(55 rows)
 
 -- the modes
 SET vexec.mode = explain;

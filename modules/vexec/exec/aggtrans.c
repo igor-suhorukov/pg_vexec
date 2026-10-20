@@ -2454,3 +2454,170 @@ vexec_aggtrans_result(VexecAggTrans *t, AggState *aggstate, int aggno, void *sta
 	}
 	MemoryContextSwitchTo(old);
 }
+
+/* ---------------------------------------------------------------------
+ * D2: states handed on as they lie
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * Whether a final stage's result of the aggregate is the int64 its state
+ * holds first -- a count's, which has no final function -- so that a
+ * ranking may read it there.
+ */
+bool
+vexec_aggtrans_int64_result(const VexecAggTrans *t, AggState *aggstate, int aggno)
+{
+	AggStatePerAgg peragg = &aggstate->peragg[aggno];
+
+	return (t->kind == VEXEC_AGG_COUNT_STAR || t->kind == VEXEC_AGG_COUNT ||
+			t->kind == VEXEC_AGG_COMBINE_COUNT) &&
+		!DO_AGGSPLIT_SKIPFINAL(peragg->aggref->aggsplit) && !OidIsValid(peragg->finalfn_oid) &&
+		offsetof(CountState, n) == 0;
+}
+
+bool
+vexec_aggtrans_packable(const VexecAggTrans *t)
+{
+	switch (t->kind)
+	{
+		case VEXEC_AGG_COUNT_STAR:
+		case VEXEC_AGG_COUNT:
+		case VEXEC_AGG_SUM_INT:
+		case VEXEC_AGG_AVG_INT:
+		case VEXEC_AGG_SUM_INT128:
+		case VEXEC_AGG_MINMAX:
+		case VEXEC_AGG_BOOL:
+		case VEXEC_AGG_SUM_OFFSET:
+		case VEXEC_AGG_COMBINE_COUNT:
+		case VEXEC_AGG_COMBINE_SUM_INT:
+		case VEXEC_AGG_COMBINE_AVG_INT:
+		case VEXEC_AGG_COMBINE_INT128:
+			return true;
+		default:
+			return false;
+	}
+}
+
+bool
+vexec_aggtrans_merges(const VexecAggTrans *t, const VexecAggTrans *producer)
+{
+	switch (t->kind)
+	{
+		case VEXEC_AGG_COMBINE_COUNT:
+			return producer->kind == VEXEC_AGG_COUNT_STAR ||
+				producer->kind == VEXEC_AGG_COUNT ||
+				producer->kind == VEXEC_AGG_COMBINE_COUNT;
+		case VEXEC_AGG_COMBINE_SUM_INT:
+			return producer->kind == VEXEC_AGG_SUM_INT ||
+				producer->kind == VEXEC_AGG_COMBINE_SUM_INT ||
+				producer->kind == VEXEC_AGG_SUM_OFFSET;
+		case VEXEC_AGG_COMBINE_AVG_INT:
+			return producer->kind == VEXEC_AGG_AVG_INT ||
+				producer->kind == VEXEC_AGG_COMBINE_AVG_INT;
+		case VEXEC_AGG_COMBINE_INT128:
+			return producer->kind == VEXEC_AGG_SUM_INT128 ||
+				producer->kind == VEXEC_AGG_COMBINE_INT128;
+		case VEXEC_AGG_MINMAX:
+			/* the combine function is the transition: the same type's */
+			return producer->kind == VEXEC_AGG_MINMAX && producer->cmp == t->cmp &&
+				producer->larger == t->larger && producer->width == t->width;
+		case VEXEC_AGG_BOOL:
+			return producer->kind == VEXEC_AGG_BOOL && producer->is_and == t->is_and;
+		default:
+			return false;
+	}
+}
+
+/*
+ * A producer's state into a combining kind's, as the combine function
+ * would take the producer's partial state as pg_state() makes it: a NULL
+ * one -- a sum of no values, an int8 sum never called -- skipped, as the
+ * strict and the non-strict combine functions alike leave the state.
+ */
+void
+vexec_aggtrans_merge(VexecAggTrans *t, AggState *aggstate, void *state,
+					 const VexecAggTrans *producer, const void *pstate)
+{
+	switch (t->kind)
+	{
+		case VEXEC_AGG_COMBINE_COUNT:
+			count_add((CountState *) state, ((const CountState *) pstate)->n);
+			break;
+		case VEXEC_AGG_COMBINE_SUM_INT:
+			{
+				SumIntState *s = state;
+				int64		v;
+
+				if (producer->kind == VEXEC_AGG_SUM_OFFSET)
+				{
+					const OffsetState *p = pstate;
+
+					if (p->count == 0)
+						return;
+					v = wrap_add64(p->sum, (int64) ((uint64) producer->offset * (uint64) p->count));
+				}
+				else
+				{
+					const SumIntState *p = pstate;
+
+					if (!p->any)
+						return;
+					v = p->sum;
+				}
+				s->sum = s->any ? add_states(s->sum, v) : v;
+				s->any = true;
+			}
+			break;
+		case VEXEC_AGG_COMBINE_AVG_INT:
+			{
+				AvgIntState *s = state;
+				const AvgIntState *p = pstate;
+
+				/* int4_avg_combine() adds them unchecked */
+				s->count = wrap_add64(s->count, p->count);
+				s->sum = wrap_add64(s->sum, p->sum);
+			}
+			break;
+		case VEXEC_AGG_COMBINE_INT128:
+			{
+				Int128State *s = state;
+				const Int128State *p = pstate;
+
+				if (!p->called)
+					return;
+				s->called = true;
+				if (p->n > 0)
+				{
+					s->n += p->n;
+					s->sum += p->sum;
+				}
+			}
+			break;
+		case VEXEC_AGG_MINMAX:
+		case VEXEC_AGG_BOOL:
+			{
+				const MinMaxState *mp = pstate;
+				const BoolState *bp = pstate;
+				Datum		v;
+				bool		isnull = false;
+
+				if (t->kind == VEXEC_AGG_MINMAX)
+				{
+					if (!mp->any)
+						return;
+					v = mp->value;
+				}
+				else
+				{
+					if (!bp->any)
+						return;
+					v = BoolGetDatum(bp->value);
+				}
+				vexec_aggtrans_advance(t, aggstate, state, &v, &isnull);
+			}
+			break;
+		default:
+			elog(ERROR, "vexec: a %s state merged into a %s one", producer->kindname, t->kindname);
+	}
+}

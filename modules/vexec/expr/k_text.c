@@ -84,8 +84,8 @@ typedef struct TextCall
  * column whose compressed or external values are detoasted into the work
  * batch.  Views and offsets hold plain bytes already.
  */
-static VexecVec *
-plain(VexecKernelCall *kc, VexecVec *v)
+VexecVec *
+vexec_text_plain(VexecKernelCall *kc, VexecVec *v)
 {
 	const Datum *d;
 	Datum	   *copy = NULL;
@@ -227,8 +227,8 @@ text_bind(VexecExpr *call, const void *info)
 static bool
 text_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
 {
-	args[0] = plain(kc, args[0]);
-	args[1] = plain(kc, args[1]);
+	args[0] = vexec_text_plain(kc, args[0]);
+	args[1] = vexec_text_plain(kc, args[1]);
 	v->fn = text_cmp;
 	v->result = vexec_bool_bits;
 	return true;
@@ -438,7 +438,7 @@ like_kernel(VexecKernelCall *kc)
 static bool
 like_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
 {
-	args[0] = plain(kc, args[0]);
+	args[0] = vexec_text_plain(kc, args[0]);
 	v->fn = like_kernel;
 	v->result = vexec_bool_bits;
 	return true;
@@ -564,7 +564,7 @@ len_kernel(VexecKernelCall *kc)
 static bool
 len_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
 {
-	args[0] = plain(kc, args[0]);
+	args[0] = vexec_text_plain(kc, args[0]);
 	memset(&v->result, 0, sizeof(VexecShape));
 	v->result.layout = VEXEC_FIXED;
 	v->result.width = 4;
@@ -760,7 +760,7 @@ coerce_kernel(VexecKernelCall *kc)
 static bool
 coerce_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
 {
-	args[0] = plain(kc, args[0]);
+	args[0] = vexec_text_plain(kc, args[0]);
 	memset(&v->result, 0, sizeof(VexecShape));
 	v->result.layout = VEXEC_OFFSETS;
 	v->fn = coerce_kernel;

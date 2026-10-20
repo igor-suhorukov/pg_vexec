@@ -193,6 +193,19 @@ extern int	vexec_aggtrans_stats_requests(const VexecAggTrans *t, Oid argtype,
 extern void vexec_aggtrans_stats_apply(VexecAggTrans *t, AggState *aggstate, void *state,
 									   const VexecSourceAggAnswer *answers, int64 nrows);
 
+/*
+ * D2 (§3.20): whether the transition's state holds no pointer, so that a
+ * group may be handed on to the next stage as it lies, and whether a
+ * combining kind takes such a producer's state; and the merge, the
+ * producer's state into the kind's as its combine function would take the
+ * partial state the producer would have handed on.
+ */
+extern bool vexec_aggtrans_packable(const VexecAggTrans *t);
+extern bool vexec_aggtrans_int64_result(const VexecAggTrans *t, AggState *aggstate, int aggno);
+extern bool vexec_aggtrans_merges(const VexecAggTrans *t, const VexecAggTrans *producer);
+extern void vexec_aggtrans_merge(VexecAggTrans *t, AggState *aggstate, void *state,
+								 const VexecAggTrans *producer, const void *pstate);
+
 /* H8's SUM(x + k): over x, from the state of `share` where it is >= 0. */
 extern void vexec_aggtrans_set_offset(VexecAggTrans *t, int64 offset, int share);
 

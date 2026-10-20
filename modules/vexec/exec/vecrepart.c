@@ -69,6 +69,39 @@
  * drivers in memory (LocalPartition); here they go through the store's
  * files, which a parallel hash join's batches go through too.
  *
+ * Groups as they lie (D2, §3.20).  Where the partial VecAgg below can make
+ * its groups in vexec's own layout -- every state one without a pointer --
+ * and the final VecAgg above can merge them so, the partitions hold the
+ * groups themselves, not frames: the partial stage makes each group of a
+ * batch's table (C2) in its partition's chunk as the batch finds it, and
+ * puts its table's groups there once its input is read (vecagg.c).  A
+ * chunk is in shared memory while this participant's take less than
+ * vexec.repartition_shared_memory: carved from DSM segments of the
+ * participant's own, which it makes as it needs them, 4 MB and doubling to
+ * 64 MB, their handles in the node's chunk of the DSM -- no lock taken, as
+ * the parallel query's DSA takes one for each allocation, and holds while
+ * it zeroes a new segment -- and pushed onto its partition's list there.
+ A chunk goes onto its list once the batch whose groups it may
+ * hold is done with them, so that a chunk on a list is as it will stay.
+ * While other participants still write, one that has written claims its
+ * share of the partitions -- their number over the participants' -- and
+ * merges the chunks already on their lists, mapping a segment as a chunk of
+ * it first comes: the time a participant waits for the slowest writer, a
+ * process sharing a core with another, is spent on the final stage's work.
+ * Once every participant has written, each maps every other's segments,
+ * and the barrier passes once more, so that none may go before every
+ * reader has them; a participant that comes later reads nothing.  The
+ * participant that claims a partition walks its list, handing the final
+ * VecAgg each chunk where it lies, and once it is read gives its pages
+ * back (madvise's MADV_REMOVE), so that no participant frees the
+ * partitions' gigabyte at the end.  Past the budget, or with no DSM
+ * segment to be had, a chunk is made in local memory and written, once the
+ * batch that filled it is done with its groups, as one record of the
+ * partition's SharedTuplestore, as a frame is.  No slot, no PostgreSQL's
+ * form of a state, no frame and, under the budget, no file: Q32's
+ * partitions were 900 MB of files.  Only with a DSM: run serially, the node
+ * passes batches on as before.  vexec.enable_packed_groups off, frames.
+ *
  * Its scan tuple, which custom_scan_tlist describes, is its child's row, as
  * VecSort's (vecsort.c); its keys are columns of it.
  *
@@ -93,7 +126,10 @@
 #include "storage/buffile.h"
 #include "storage/dsm.h"
 #include "storage/sharedfileset.h"
+#include <sys/mman.h>
+
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/sharedtuplestore.h"
 #include "utils/ruleutils.h"
 #include "utils/wait_event.h"
@@ -113,6 +149,34 @@
 /* X9: a frame's record: its length, then 4 bytes, then the frame */
 #define REPART_FRAME_PREFIX	8
 
+/*
+ * D2 (above): a chunk of a partition's packed groups, local or in shared
+ * memory, its header first; written to a file, its first 4 bytes are the
+ * record's length, as a MinimalTuple's t_len is
+ */
+typedef uint64 PackPointer;		/* a shared chunk: its participant, segment
+								 * and offset (pack_pointer()) */
+
+#define PACK_NONE			PG_UINT64_MAX
+
+typedef struct PackChunk
+{
+	uint32		len;			/* in a file: the header and the groups' bytes */
+	uint32		used;			/* the groups' bytes after the header */
+	uint32		size;			/* the bytes it has room for after the header */
+	int32		partition;
+	PackPointer self;			/* its own place, a shared one's */
+	PackPointer next;			/* the partition's next chunk in shared memory */
+} PackChunk;
+
+#define PACK_CHUNK_HEADER	MAXALIGN(sizeof(PackChunk))
+#define PACK_PAGE			((Size) 4096)	/* a shared chunk's alignment */
+#define PACK_CHUNK_FIRST	((Size) 16 * 1024)	/* a partition's first chunk */
+#define PACK_CHUNK_MAX		((Size) 256 * 1024)	/* and its largest */
+#define PACK_SEGMENTS		16	/* a participant's DSM segments, at most */
+#define PACK_SEGMENT_FIRST	((Size) 4 * 1024 * 1024)
+#define PACK_SEGMENT_MAX	((Size) 64 * 1024 * 1024)
+
 /* the wait at the barrier, as pg_stat_activity names it */
 static uint32 repart_wait_event = 0;
 
@@ -127,6 +191,15 @@ typedef struct RepartShared
 	int			nparticipants;	/* the leader and the workers planned */
 	int			npartitions;
 	bool		frames;			/* the partitions hold frames (X9) */
+	bool		packed;			/* or packed groups (D2) */
+	Size		heads_off;		/* D2: from the struct, each partition's
+								 * list of chunks in shared memory, a
+								 * pg_atomic_uint64 a partition; */
+	Size		segs_off;		/* each participant's segments' handles,
+								 * PACK_SEGMENTS of them; */
+	Size		nsegs_off;		/* and how many it made, a uint32 each */
+	pg_atomic_uint32 writing;	/* D2: participants writing, which others
+								 * read beside (above) */
 	pg_atomic_uint32 topk_bound;	/* C5: the first stages' boundary */
 	Size		sts_size;		/* each partition's SharedTuplestore */
 	char		stores[FLEXIBLE_ARRAY_MEMBER];
@@ -170,7 +243,59 @@ typedef struct VexecRepartState
 	int			reading;		/* the partition being read, or -1 */
 	int			npartitions;	/* the DSM's, for EXPLAIN ANALYZE: the DSM
 								 * goes before EXPLAIN prints */
+
+	/*
+	 * D2 (above): the partitions may hold packed groups -- the child and
+	 * the parent both can -- and, with a DSM, do; this participant's sink,
+	 * the shared chunk read last and the next, and figures
+	 */
+	bool		pack_ok;
+	VexecPackSink *sink;
+	int			me;				/* this participant: the leader 0 */
+	bool		pk_reads;		/* it came before the barrier passed */
+	dsm_segment **pk_maps;		/* every participant's segments, mapped */
+	int			pk_nmaps;
+	PackPointer pk_next;		/* the claimed partition's next shared chunk */
+	PackChunk  *pk_done;		/* the one read last: its pages to give back */
+
+	/*
+	 * D2: read while others write (above): the partitions claimed then, how
+	 * many it may claim, the next to look at in this pass over them, and
+	 * whether the pass found a chunk; then each claimed partition read to
+	 * its end in turn, pk_cur the next
+	 */
+	bool		pk_early;
+	int		   *pk_claimed;
+	int			pk_nclaimed;
+	int			pk_quota;
+	int			pk_scan;
+	bool		pk_found;
+	int			pk_cur;
+	int64		pk_chunks_early;
+	int64		pk_groups;		/* written by this participant */
+	Size		pk_shared;		/* the bytes of its chunks in shared memory */
+	Size		pk_files;		/* and in files */
+	int64		pk_chunks_read;
 } VexecRepartState;
+
+/* D2: a participant's chunks as they fill (above). */
+struct VexecPackSink
+{
+	VexecRepartState *s;
+	Size		budget;			/* the bytes its segments may take */
+	int			npartitions;
+	PackChunk **cur;			/* per partition: the chunk being filled */
+	PackPointer *cur_ptr;		/* its place; PACK_NONE: a local one */
+	Size	   *next_size;		/* per partition: the next chunk's bytes */
+	List	   *full;			/* chunks filled -- local ones to be written,
+								 * shared ones to go onto their lists --
+								 * once the batch is done with their groups */
+	MemoryContext cxt;
+	int			nsegs;			/* the segments made, the last being cut */
+	Size		seg_used;
+	Size		seg_size;
+	bool		no_segments;	/* none to be had: local chunks from now */
+};
 
 static bool repart_fetch(VexecNode *node);
 static void frames_begin(VexecRepartState *s, VexecType **types);
@@ -312,6 +437,7 @@ repart_begin(CustomScanState *css, EState *estate, int eflags)
 
 	s->read_slot = ExecInitExtraTupleSlot(estate, s->desc, &TTSOpsMinimalTuple);
 	s->reading = -1;
+	s->pk_next = PACK_NONE;
 	if (s->frames)
 		frames_begin(s, types);
 }
@@ -384,6 +510,313 @@ static int
 deal_partition(void *arg, uint32 hash)
 {
 	return hash_partition((VexecRepartState *) arg, hash);
+}
+
+/* ---------------------------------------------------------------------
+ * D2: packed groups (above)
+ * ---------------------------------------------------------------------
+ */
+
+/* Each partition's list of chunks in shared memory. */
+static pg_atomic_uint64 *
+pack_heads(RepartShared *sh)
+{
+	return (pg_atomic_uint64 *) ((char *) sh + sh->heads_off);
+}
+
+/* Each participant's segments' handles, PACK_SEGMENTS a participant. */
+static dsm_handle *
+pack_handles(RepartShared *sh)
+{
+	return (dsm_handle *) ((char *) sh + sh->segs_off);
+}
+
+/* How many segments each participant made. */
+static uint32 *
+pack_nsegs(RepartShared *sh)
+{
+	return (uint32 *) ((char *) sh + sh->nsegs_off);
+}
+
+static inline PackPointer
+pack_pointer(int participant, int seg, Size offset)
+{
+	return ((uint64) participant << 48) | ((uint64) seg << 32) | (uint64) offset;
+}
+
+/* A shared chunk's address in this participant, whose maps hold its segment. */
+static PackChunk *
+pack_chunk(VexecRepartState *s, PackPointer ptr)
+{
+	int			participant = (int) (ptr >> 48);
+	int			seg = (int) ((ptr >> 32) & 0xFFFF);
+	dsm_segment *m = s->pk_maps[participant * PACK_SEGMENTS + seg];
+
+	/*
+	 * mapped as a chunk of it first comes: its writer is writing, or waits
+	 * at the barrier, and the segment is there; its handle went into the
+	 * DSM before any chunk of it onto a list
+	 */
+	if (m == NULL)
+	{
+		m = dsm_attach(pack_handles(s->shared)[participant * PACK_SEGMENTS + seg]);
+		if (m == NULL)
+			elog(ERROR, "vexec: a parallel aggregation's segment is gone before it was read");
+		s->pk_maps[participant * PACK_SEGMENTS + seg] = m;
+	}
+	return (PackChunk *) ((char *) dsm_segment_address(m) + (ptr & 0xFFFFFFFF));
+}
+
+/*
+ * A shared chunk read: its pages given back to the system, so that its
+ * memory goes as it is read, not as the last participant detaches.
+ */
+static void
+pack_release(PackChunk *c)
+{
+#ifdef MADV_REMOVE
+	(void) madvise((void *) c, PACK_CHUNK_HEADER + c->size, MADV_REMOVE);
+#else
+	(void) c;
+#endif
+}
+
+/* A shared chunk onto its partition's list, which other participants push onto too. */
+static void
+pack_push(VexecRepartState *s, int p, PackChunk *c, PackPointer ptr)
+{
+	pg_atomic_uint64 *head = &pack_heads(s->shared)[p];
+	uint64		old = pg_atomic_read_u64(head);
+
+	do
+		c->next = (PackPointer) old;
+	while (!pg_atomic_compare_exchange_u64(head, &old, (uint64) ptr));
+}
+
+/* A local chunk's groups as one record of its partition's store. */
+static void
+pack_write_chunk(VexecRepartState *s, PackChunk *c)
+{
+	uint32		used = c->used;
+
+	c->len = (uint32) (PACK_CHUNK_HEADER + c->used);
+	sts_puttuple(s->parts[c->partition], &used, (MinimalTuple) c);
+	s->pk_files += c->len;
+}
+
+/*
+ * A partition's chunk done with: once the batch whose groups it may hold is
+ * done with them, a shared one goes onto its list, which others may read
+ * while this participant writes, and a local one is written.
+ */
+static void
+pack_retire(VexecPackSink *k, int p)
+{
+	/* a batch's row context is current: the list is the sink's */
+	MemoryContext old = MemoryContextSwitchTo(k->cxt);
+
+	k->cur[p]->self = k->cur_ptr[p];
+	k->full = lappend(k->full, k->cur[p]);
+	MemoryContextSwitchTo(old);
+	k->cur[p] = NULL;
+	k->cur_ptr[p] = PACK_NONE;
+}
+
+/*
+ * A shared chunk of `bytes`, a multiple of PACK_PAGE, cut from this
+ * participant's last segment, or from a new one -- PACK_SEGMENT_FIRST and
+ * doubling to PACK_SEGMENT_MAX, within the budget -- whose handle goes into
+ * the DSM for the others to map; NULL where none is to be had.
+ */
+static PackChunk *
+pack_shared_chunk(VexecPackSink *k, Size bytes, PackPointer *ptr)
+{
+	VexecRepartState *s = k->s;
+	RepartShared *sh = s->shared;
+	int			me = s->me;
+
+	if (k->nsegs == 0 || k->seg_size - k->seg_used < bytes)
+	{
+		Size		size = k->nsegs == 0 ? PACK_SEGMENT_FIRST :
+			Min(k->seg_size * 2, PACK_SEGMENT_MAX);
+		dsm_segment *seg;
+
+		size = Max(size, bytes);
+		if (k->no_segments || k->nsegs == PACK_SEGMENTS || s->pk_shared + size > k->budget)
+			return NULL;
+		seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
+		if (seg == NULL)
+		{
+			k->no_segments = true;
+			return NULL;
+		}
+		s->pk_maps[me * PACK_SEGMENTS + k->nsegs] = seg;
+		pack_handles(sh)[me * PACK_SEGMENTS + k->nsegs] = dsm_segment_handle(seg);
+		pack_nsegs(sh)[me] = ++k->nsegs;
+		k->seg_size = size;
+		k->seg_used = 0;
+		s->pk_shared += size;
+	}
+	*ptr = pack_pointer(me, k->nsegs - 1, k->seg_used);
+	k->seg_used += bytes;
+	return pack_chunk(s, *ptr);
+}
+
+/*
+ * len bytes for a group of partition p, MAXALIGNed: in its chunk, or a new
+ * one, from PACK_CHUNK_FIRST and doubling to PACK_CHUNK_MAX -- shared while
+ * there is a segment to cut it from, else local.
+ */
+char *
+vexec_pack_alloc(VexecPackSink *k, int p, Size len)
+{
+	PackChunk  *c = k->cur[p];
+	char	   *g;
+
+	Assert(len == MAXALIGN(len));
+	if (c == NULL || c->size - c->used < len)
+	{
+		Size		bytes = TYPEALIGN(PACK_PAGE, Max(k->next_size[p], PACK_CHUNK_HEADER + len));
+		PackPointer ptr = PACK_NONE;
+
+		if (c != NULL)
+			pack_retire(k, p);
+		k->next_size[p] = Min(k->next_size[p] * 2, PACK_CHUNK_MAX);
+		c = pack_shared_chunk(k, bytes, &ptr);
+		if (c == NULL)
+			c = (PackChunk *) MemoryContextAllocHuge(k->cxt, bytes);
+		c->len = 0;
+		c->used = 0;
+		c->size = (uint32) (bytes - PACK_CHUNK_HEADER);
+		c->partition = p;
+		c->self = ptr;
+		c->next = PACK_NONE;
+		k->cur[p] = c;
+		k->cur_ptr[p] = ptr;
+	}
+	g = (char *) c + PACK_CHUNK_HEADER + c->used;
+	c->used += (uint32) len;
+	k->s->pk_groups++;
+	return g;
+}
+
+/*
+ * The batch is done with its groups: the chunks it filled onto their lists,
+ * the shared ones, or written, the local ones.
+ */
+void
+vexec_pack_batch_end(VexecPackSink *k)
+{
+	ListCell   *lc;
+
+	if (k->full == NIL)
+		return;
+	foreach(lc, k->full)
+	{
+		PackChunk  *c = lfirst(lc);
+
+		if (c->self != PACK_NONE)
+			pack_push(k->s, c->partition, c, c->self);
+		else
+		{
+			pack_write_chunk(k->s, c);
+			pfree(c);
+		}
+	}
+	list_free(k->full);
+	k->full = NIL;
+}
+
+/*
+ * This participant's groups, made by the partial VecAgg below in their
+ * partitions' chunks; then each partition's last chunk retired.
+ */
+static void
+write_packed(VexecRepartState *s)
+{
+	RepartShared *sh = s->shared;
+	MemoryContext mcxt = s->node.mcxt;
+	VexecPackSink *k = MemoryContextAllocZero(mcxt, sizeof(VexecPackSink));
+	int			p;
+
+	k->s = s;
+	k->budget = vexec_repartition_shared_memory < 0 ? get_hash_memory_limit() :
+		(Size) vexec_repartition_shared_memory * 1024;
+	k->npartitions = sh->npartitions;
+	k->cur = MemoryContextAllocZero(mcxt, sizeof(PackChunk *) * sh->npartitions);
+	k->cur_ptr = MemoryContextAlloc(mcxt, sizeof(PackPointer) * sh->npartitions);
+	k->next_size = MemoryContextAlloc(mcxt, sizeof(Size) * sh->npartitions);
+	for (p = 0; p < sh->npartitions; p++)
+	{
+		k->cur_ptr[p] = PACK_NONE;
+		k->next_size[p] = PACK_CHUNK_FIRST;
+	}
+	k->cxt = AllocSetContextCreate(mcxt, "VecRepartition chunks", ALLOCSET_DEFAULT_SIZES);
+	s->sink = k;
+
+	vexec_agg_pack((VexecNode *) s->child, k, sh->npartitions, deal_partition, s);
+	vexec_agg_pack_all((VexecNode *) s->child);
+
+	for (p = 0; p < sh->npartitions; p++)
+		if (k->cur[p] != NULL)
+			pack_retire(k, p);
+	vexec_pack_batch_end(k);
+	MemoryContextDelete(k->cxt);
+	s->sink = NULL;
+}
+
+/*
+ * Every other participant's segments mapped, once every one has written:
+ * none goes, then, before this participant is done with it.
+ */
+static void
+pack_map_all(VexecRepartState *s)
+{
+	RepartShared *sh = s->shared;
+
+	for (int q = 0; q < sh->nparticipants; q++)
+	{
+		if (q == s->me)
+			continue;
+		for (uint32 i = 0; i < pack_nsegs(sh)[q]; i++)
+		{
+			dsm_segment *m;
+
+			if (s->pk_maps[q * PACK_SEGMENTS + i] != NULL)
+				continue;		/* mapped as one of its chunks came */
+			m = dsm_attach(pack_handles(sh)[q * PACK_SEGMENTS + i]);
+			if (m == NULL)
+				elog(ERROR, "vexec: a parallel aggregation's segment is gone before it was read");
+			s->pk_maps[q * PACK_SEGMENTS + i] = m;
+		}
+	}
+}
+
+/* The segments this participant mapped, its own too, let go. */
+static void
+pack_unmap_all(VexecRepartState *s)
+{
+	if (s->pk_maps == NULL)
+		return;
+	for (int i = 0; i < s->pk_nmaps; i++)
+		if (s->pk_maps[i] != NULL)
+		{
+			dsm_detach(s->pk_maps[i]);
+			s->pk_maps[i] = NULL;
+		}
+}
+
+/* The shared chunks of a list, from ptr on, given back: no one reads them now. */
+static void
+pack_release_list(VexecRepartState *s, PackPointer ptr)
+{
+	while (ptr != PACK_NONE)
+	{
+		PackChunk  *c = pack_chunk(s, ptr);
+
+		ptr = c->next;
+		pack_release(c);
+	}
 }
 
 /*
@@ -504,7 +937,12 @@ write_groups(VexecRepartState *s)
 
 	if (BarrierAttach(&sh->barrier) == REPART_WRITING)
 	{
-		if (s->frames)
+		if (sh->packed)
+		{
+			pg_atomic_fetch_add_u32(&sh->writing, 1);
+			write_packed(s);
+		}
+		else if (s->frames)
 			write_frames(s);
 		else
 			write_tuples(s);
@@ -512,7 +950,27 @@ write_groups(VexecRepartState *s)
 			sts_end_write(s->parts[p]);
 		if (repart_wait_event == 0)
 			repart_wait_event = WaitEventExtensionNew("VexecRepartition");
-		BarrierArriveAndWait(&sh->barrier, repart_wait_event);
+		if (sh->packed)
+		{
+			/*
+			 * D2: its share of the partitions read while others write, the
+			 * barrier after (vexec_repart_next_chunk())
+			 */
+			pg_atomic_fetch_sub_u32(&sh->writing, 1);
+			s->pk_early = true;
+			s->pk_quota = Max(sh->npartitions / sh->nparticipants, 1);
+			s->pk_nclaimed = 0;
+			s->pk_scan = 0;
+			s->pk_found = false;
+			s->pk_cur = 0;
+		}
+		else
+			BarrierArriveAndWait(&sh->barrier, repart_wait_event);
+	}
+	else if (sh->packed)
+	{
+		/* D2: too late to be sure of the segments: the others read it all */
+		BarrierDetach(&sh->barrier);
 	}
 	s->written = true;
 }
@@ -522,13 +980,76 @@ static bool
 claim_partition(VexecRepartState *s)
 {
 	RepartShared *sh = s->shared;
-	uint32		p = pg_atomic_fetch_add_u32(&sh->next_partition, 1);
+	uint32		p;
 
-	if (p >= (uint32) sh->npartitions)
+	if (sh->packed && !s->pk_reads)
 		return false;
+	/* D2: the partitions claimed while others wrote, first */
+	if (sh->packed && s->pk_cur < s->pk_nclaimed)
+		p = (uint32) s->pk_claimed[s->pk_cur++];
+	else
+	{
+		p = pg_atomic_fetch_add_u32(&sh->next_partition, 1);
+		if (p >= (uint32) sh->npartitions)
+			return false;
+	}
 	s->reading = (int) p;
 	sts_begin_parallel_scan(s->parts[p]);
+	/* D2: the partition's shared chunks first -- those left -- then its records */
+	if (sh->packed)
+		s->pk_next = (PackPointer) pg_atomic_exchange_u64(&pack_heads(sh)[p], (uint64) PACK_NONE);
 	return true;
+}
+
+/*
+ * D2: while other participants write, the next chunk of the partitions this
+ * one has claimed -- taken from their lists as they come -- claiming more
+ * up to its share; NULL once none has a chunk now, or no participant
+ * writes any more.
+ */
+static PackChunk *
+take_early(VexecRepartState *s)
+{
+	RepartShared *sh = s->shared;
+
+	for (;;)
+	{
+		if (s->pk_next != PACK_NONE)
+		{
+			PackChunk  *c = pack_chunk(s, s->pk_next);
+
+			s->pk_next = c->next;
+			return c;
+		}
+		if (pg_atomic_read_u32(&sh->writing) == 0)
+			return NULL;		/* the rest after the barrier, at once */
+		if (s->pk_scan < s->pk_nclaimed)
+		{
+			int			p = s->pk_claimed[s->pk_scan++];
+
+			s->pk_next = (PackPointer) pg_atomic_exchange_u64(&pack_heads(sh)[p],
+															  (uint64) PACK_NONE);
+			if (s->pk_next != PACK_NONE)
+				s->pk_found = true;
+			continue;
+		}
+		if (s->pk_nclaimed < s->pk_quota)
+		{
+			uint32		p = pg_atomic_fetch_add_u32(&sh->next_partition, 1);
+
+			if (p < (uint32) sh->npartitions)
+			{
+				s->pk_claimed[s->pk_nclaimed++] = (int) p;
+				continue;
+			}
+			s->pk_quota = s->pk_nclaimed;	/* none left to claim */
+		}
+		if (!s->pk_found)
+			return NULL;
+		/* another pass: more chunks may have come */
+		s->pk_found = false;
+		s->pk_scan = 0;
+	}
 }
 
 /* A partition's store's name, which its files' names begin with. */
@@ -556,6 +1077,13 @@ end_reading(VexecRepartState *s)
 		char		file[MAXPGPATH];
 
 		sts_end_parallel_scan(s->parts[s->reading]);
+		/* D2: its shared chunks given back, the one read last and any left */
+		if (s->pk_done != NULL)
+			pack_release(s->pk_done);
+		if (s->shared->packed)
+			pack_release_list(s, s->pk_next);
+		s->pk_done = NULL;
+		s->pk_next = PACK_NONE;
 		partition_name(s, s->reading, name);
 		for (int i = 0; i < s->shared->nparticipants; i++)
 		{
@@ -741,6 +1269,133 @@ vexec_repart_batch_hashes(VexecNode *node)
 	return ((VexecRepartState *) node)->hashes;
 }
 
+/*
+ * D2: the partial VecAgg below, whose groups go into the partitions by its
+ * own keys' hash: the one that may pack them; else NULL.
+ */
+VexecNode *
+vexec_repart_child_agg(VexecNode *node)
+{
+	VexecRepartState *s = (VexecRepartState *) node;
+
+	if (node->kind != VEXEC_NODE_REPART || !s->hashes_from_child)
+		return NULL;
+	return (VexecNode *) s->child;
+}
+
+/*
+ * D2: the final VecAgg above can merge the child's groups as they lie --
+ * before the DSM is made, so that every participant's plan says the same;
+ * whether the partitions will hold them so where there is a DSM.
+ */
+bool
+vexec_repart_offer_unpack(VexecNode *node)
+{
+	VexecRepartState *s = (VexecRepartState *) node;
+
+	s->pack_ok = vexec_enable_packed_groups && s->hashes_from_child &&
+		vexec_agg_pack_ok((VexecNode *) s->child);
+	return s->pack_ok;
+}
+
+/* D2: whether this run's partitions hold packed groups: with a DSM only. */
+bool
+vexec_repart_packed(VexecNode *node)
+{
+	VexecRepartState *s = (VexecRepartState *) node;
+
+	return s->shared != NULL && s->shared->packed;
+}
+
+/*
+ * D2: the next chunk of packed groups of the partitions this participant
+ * claims, once its own are written: its groups, *len bytes of them, where
+ * they lie -- in shared memory, or the record of a file -- until the next
+ * call, which frees a shared one; false once none is left.  The groups'
+ * count is the parent's to add to the node's rows.
+ */
+bool
+vexec_repart_next_chunk(VexecNode *node, const char **groups, Size *len)
+{
+	VexecRepartState *s = (VexecRepartState *) node;
+	PlanState  *ps = &node->css.ss.ps;
+
+	Assert(vexec_repart_packed(node));
+	/* a Gather run again rescans its subtree here, as ExecProcNode would */
+	if (ps->chgParam != NULL)
+		ExecReScan(ps);
+	CHECK_FOR_INTERRUPTS();
+	if (ps->instrument)
+		InstrStartNode(ps->instrument);
+	if (!s->written)
+		write_groups(s);
+	for (;;)
+	{
+		if (s->pk_done != NULL)
+		{
+			pack_release(s->pk_done);
+			s->pk_done = NULL;
+		}
+		if (s->pk_early)
+		{
+			PackChunk  *c = take_early(s);
+
+			if (c != NULL)
+			{
+				s->pk_done = c;
+				s->pk_chunks_early++;
+				*groups = (const char *) c + PACK_CHUNK_HEADER;
+				*len = c->used;
+				break;
+			}
+			/* the writers done, every segment mapped before any may go */
+			BarrierArriveAndWait(&s->shared->barrier, repart_wait_event);
+			pack_map_all(s);
+			BarrierArriveAndWait(&s->shared->barrier, repart_wait_event);
+			s->pk_early = false;
+			s->pk_reads = true;
+			continue;
+		}
+		if (s->reading < 0 && !claim_partition(s))
+		{
+			if (ps->instrument)
+				InstrStopNode(ps->instrument, 0);
+			return false;
+		}
+		if (s->pk_next != PACK_NONE)
+		{
+			PackChunk  *c = pack_chunk(s, s->pk_next);
+
+			s->pk_next = c->next;
+			s->pk_done = c;
+			*groups = (const char *) c + PACK_CHUNK_HEADER;
+			*len = c->used;
+			break;
+		}
+		else
+		{
+			uint32		used;
+			MinimalTuple rec = sts_parallel_scan_next(s->parts[s->reading], &used);
+
+			if (rec == NULL)
+			{
+				end_reading(s);
+				continue;
+			}
+			if (rec->t_len < PACK_CHUNK_HEADER ||
+				((PackChunk *) rec)->used != rec->t_len - PACK_CHUNK_HEADER)
+				elog(ERROR, "vexec: a parallel aggregation's partition holds a record that is no chunk of groups");
+			*groups = (const char *) rec + PACK_CHUNK_HEADER;
+			*len = ((PackChunk *) rec)->used;
+			break;
+		}
+	}
+	s->pk_chunks_read++;
+	if (ps->instrument)
+		InstrStopNode(ps->instrument, 0);
+	return true;
+}
+
 /* ---------------------------------------------------------------------
  * The DSM: the shared file set, the barrier, a SharedTuplestore a partition
  * ---------------------------------------------------------------------
@@ -757,9 +1412,14 @@ repart_estimate_dsm(CustomScanState *css, ParallelContext *pcxt)
 {
 	int			nparticipants = pcxt->nworkers + 1;
 
-	return add_size(offsetof(RepartShared, stores),
-					mul_size(repart_partitions(nparticipants),
-							 MAXALIGN(sts_estimate(nparticipants))));
+	Size		size = add_size(offsetof(RepartShared, stores),
+								mul_size(repart_partitions(nparticipants),
+										 MAXALIGN(sts_estimate(nparticipants))));
+
+	/* D2: the lists, the segments' handles and their counts */
+	size = add_size(size, mul_size(repart_partitions(nparticipants), sizeof(pg_atomic_uint64)));
+	size = add_size(size, mul_size(nparticipants, PACK_SEGMENTS * sizeof(dsm_handle)));
+	return add_size(size, mul_size(nparticipants, sizeof(uint32)));
 }
 
 /* Each partition's store, made: the leader's, participant 0. */
@@ -789,10 +1449,22 @@ repart_initialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordin
 	sh->nparticipants = pcxt->nworkers + 1;
 	sh->npartitions = repart_partitions(sh->nparticipants);
 	sh->frames = s->frames;
+	sh->packed = s->pack_ok;
 	pg_atomic_init_u32(&sh->topk_bound, PG_UINT32_MAX);
 	if (vexec_is_vector_state(s->child))
 		vexec_agg_set_topk_shared((VexecNode *) s->child, &sh->topk_bound);
 	sh->sts_size = MAXALIGN(sts_estimate(sh->nparticipants));
+	sh->heads_off = offsetof(RepartShared, stores) + sh->npartitions * sh->sts_size;
+	sh->segs_off = sh->heads_off + sh->npartitions * sizeof(pg_atomic_uint64);
+	sh->nsegs_off = sh->segs_off + sh->nparticipants * PACK_SEGMENTS * sizeof(dsm_handle);
+	for (int p = 0; p < sh->npartitions; p++)
+		pg_atomic_init_u64(&pack_heads(sh)[p], (uint64) PACK_NONE);
+	memset(pack_nsegs(sh), 0, sizeof(uint32) * sh->nparticipants);
+	pg_atomic_init_u32(&sh->writing, 0);
+	s->me = 0;
+	s->pk_nmaps = sh->nparticipants * PACK_SEGMENTS;
+	s->pk_maps = MemoryContextAllocZero(s->node.mcxt, sizeof(dsm_segment *) * s->pk_nmaps);
+	s->pk_claimed = MemoryContextAlloc(s->node.mcxt, sizeof(int) * sh->npartitions);
 	sh->seg = dsm_segment_handle(pcxt->seg);
 	SharedFileSetInit(&sh->fileset, pcxt->seg);
 	BarrierInit(&sh->barrier, 0);
@@ -818,6 +1490,16 @@ repart_reinitialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coord
 
 	(void) pcxt;
 	end_reading(s);
+	/* D2: the segments let go, the lists empty: the participants are new */
+	pack_unmap_all(s);
+	for (int p = 0; p < sh->npartitions; p++)
+		pg_atomic_write_u64(&pack_heads(sh)[p], (uint64) PACK_NONE);
+	memset(pack_nsegs(sh), 0, sizeof(uint32) * sh->nparticipants);
+	pg_atomic_write_u32(&sh->writing, 0);
+	s->pk_reads = false;
+	s->pk_early = false;
+	s->pk_nclaimed = 0;
+	s->pk_cur = 0;
 	SharedFileSetDeleteAll(&sh->fileset);
 	BarrierInit(&sh->barrier, 0);
 	pg_atomic_write_u32(&sh->next_partition, 0);
@@ -837,13 +1519,17 @@ repart_initialize_worker(CustomScanState *css, shm_toc *toc, void *coordinate)
 	(void) toc;
 	if (seg == NULL)
 		elog(ERROR, "vexec: a worker has no mapping of its parallel query's segment");
-	if (sh->frames != s->frames)
+	if (sh->frames != s->frames || sh->packed != s->pack_ok)
 		elog(ERROR, "vexec: a VecRepartition's participants differ on its partitions' format");
 	if (vexec_is_vector_state(s->child))
 		vexec_agg_set_topk_shared((VexecNode *) s->child, &sh->topk_bound);
 	SharedFileSetAttach(&sh->fileset, seg);
 	s->shared = sh;
 	s->npartitions = sh->npartitions;
+	s->me = ParallelWorkerNumber + 1;
+	s->pk_nmaps = sh->nparticipants * PACK_SEGMENTS;
+	s->pk_maps = MemoryContextAllocZero(s->node.mcxt, sizeof(dsm_segment *) * s->pk_nmaps);
+	s->pk_claimed = MemoryContextAlloc(s->node.mcxt, sizeof(int) * sh->npartitions);
 	s->parts = MemoryContextAllocZero(s->node.mcxt,
 									  sizeof(SharedTuplestoreAccessor *) * sh->npartitions);
 	for (p = 0; p < sh->npartitions; p++)
@@ -879,6 +1565,7 @@ repart_shutdown(CustomScanState *css)
 	VexecRepartState *s = (VexecRepartState *) css;
 
 	end_reading(s);
+	pack_unmap_all(s);
 	s->shared = NULL;
 	s->parts = NULL;
 }
@@ -916,9 +1603,20 @@ repart_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 	{
 		ExplainPropertyText("Key Hashes", s->hashes_from_child ? "the child's" : "computed", es);
 		ExplainPropertyText("Input", s->child_batches ? "batches" : "rows", es);
-		ExplainPropertyText("Partition Format", s->frames ? "frames" : "tuples", es);
+		ExplainPropertyText("Partition Format", s->pack_ok ? "packed groups" :
+							s->frames ? "frames" : "tuples", es);
 	}
 	vexec_node_explain_properties(&s->node, ancestors, es);
 	if (es->analyze && s->npartitions > 0)
 		ExplainPropertyInteger("Partitions", NULL, s->npartitions, es);
+	if (es->analyze && (s->pk_groups > 0 || s->pk_chunks_read > 0))
+	{
+		ExplainPropertyInteger("Packed Groups Written", NULL, s->pk_groups, es);
+		ExplainPropertyInteger("Shared Memory", "kB", (int64) ((s->pk_shared + 1023) / 1024), es);
+		if (s->pk_files > 0)
+			ExplainPropertyInteger("Files", "kB", (int64) ((s->pk_files + 1023) / 1024), es);
+		ExplainPropertyInteger("Chunks Read", NULL, s->pk_chunks_read, es);
+		if (s->pk_chunks_early > 0)
+			ExplainPropertyInteger("Chunks Read Beside Writers", NULL, s->pk_chunks_early, es);
+	}
 }

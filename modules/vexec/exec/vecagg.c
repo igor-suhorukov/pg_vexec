@@ -97,6 +97,33 @@
  * 29-47% faster serially than hashing, 45-65% with 4 MB of work_mem
  * (ch_table_engines.md §3, "VC4, VC6 and VC16, researched").
  *
+ * Groups handed on as they lie (D2, §3.20).  A first stage under a
+ * VecRepartition whose every state is one of vexec's own without a pointer
+ * -- counts, integer sums and averages, int128 sums, min and max of a
+ * by-value type, bool_and and bool_or -- and whose final stage can merge
+ * them packs its groups into the partitions (vecrepart.c): a packed group
+ * is a group as the table lays it out -- its hash, keys, extras and states
+ * -- its length beside the hash, and each by-reference value's bytes after
+ * the states, at the offset from the group's start its Datum then holds.
+ * A frozen table's batch table (C2) makes its groups packed, in their
+ * partitions' chunks, as the batch finds them, so that handing them on
+ * copies nothing; the table's own groups are packed once the input is read.
+ * The final stage merges each packed group into its table as it lies: its
+ * keys looked up where they lie, its states added to the group's as the
+ * combine functions would add the partial states PostgreSQL's forms of
+ * them would be (aggtrans.c), with no slot, array or bytea between.
+ *
+ * The first stage bypassed (§3.20, as DuckDB's sink skips its lookups,
+ * DD:src/execution/radix_partitioned_hashtable.cpp).  A frozen table whose
+ * keys a batch's rows seldom meet, in the table or among the batch's own
+ * groups -- a key a row or two, Q32's (WatchID, ClientIP) -- reduces
+ * nothing, and still looks each row up twice.  Once the rows of
+ * VEXEC_AGG_BYPASS_EVIDENCE make VEXEC_AGG_BYPASS_SHARE groups a row or
+ * more, each row of the next VEXEC_AGG_BYPASS_BATCHES batches is a packed
+ * group of its own, made in its partition with no lookup; the batches
+ * after them are looked up again, to measure again.  The final stage
+ * merges a key's groups however many there are.
+ *
  * Its output is a row a call: a group's keys, the columns taken from its
  * first row, and its aggregates' results, in the scan tuple that
  * custom_scan_tlist describes, through the node's HAVING qual and target
@@ -219,6 +246,15 @@ typedef struct VexecAggPartition
  */
 #define VEXEC_AGG_THAW_EVIDENCE		16384
 #define VEXEC_AGG_THAW_REPEAT		1.5
+
+/*
+ * The first stage bypassed (above): rows a frozen table measures over, the
+ * share of them that must be groups of their own, and the batches then
+ * bypassed before it measures again
+ */
+#define VEXEC_AGG_BYPASS_EVIDENCE	8192
+#define VEXEC_AGG_BYPASS_SHARE		0.98
+#define VEXEC_AGG_BYPASS_BATCHES	64
 
 #define VEXEC_AGG_PARTITION_BITS	5
 #define VEXEC_AGG_PARTITIONS		(1 << VEXEC_AGG_PARTITION_BITS)
@@ -392,6 +428,8 @@ struct VexecAggState
 								 * its index, read as it is; else -1 */
 	int		   *topcols;		/* the scan tuple's columns ranking reads */
 	int			ntopcols;
+	Size		topdirect;		/* a lone key that is a count: its state in
+								 * a group, read as it lies; else 0 */
 
 	/*
 	 * C5 (§3.19): under a LIMIT without ORDER BY, the groups of the topk
@@ -434,6 +472,44 @@ struct VexecAggState
 	int			deal_rest;		/* at the end: the next partition to hand up */
 	Datum	   *dealvals;
 	bool	   *dealnulls;
+
+	/*
+	 * D2 (above): a first stage's groups packed into a VecRepartition's
+	 * partitions -- whether every key, extra and state can be, and where
+	 * they go -- and a final stage's taken from them: the stage below, and
+	 * where each of this one's keys, extras and states lie in its groups
+	 */
+	bool		pack_ok;
+	VexecPackSink *sink;		/* NULL: none packed */
+	Datum	   *pk_keyvals;		/* a group's by-reference keys and extras, */
+	Datum	   *pk_extravals;	/* as they are packed */
+	bool	   *pk_extranulls;
+	int64		packed_groups;
+	bool		unpack_ok;
+	bool		unpacking;		/* this run's input is packed groups */
+	struct VexecAggState *producer;
+	int		   *pk_key;			/* per key: the producer's */
+	int		   *pk_extra;		/* per extra: the producer's key, or -1 less
+								 * its extra */
+	Size	   *pk_stateoff;	/* per transition: the producer's state */
+	VexecAggTrans **pk_trans;	/* and the producer's transition */
+	VexecAggProbe *pk_probe;	/* a packed group's keys, looked up */
+	const char *pack_rec;		/* the packed group a new group takes its
+								 * extras from */
+	char	  **pk_recs;		/* packed groups, a batch's worth */
+	MemoryContext pk_readcxt;	/* those read back from a spill file */
+	int64		unpacked_groups;
+
+	/*
+	 * The first stage bypassed (above): the frozen table's rows measured,
+	 * those that made a group, whether the rows bypass the tables now, and
+	 * for how many batches more
+	 */
+	int64		by_rows;
+	int64		by_groups;
+	bool		bypass;
+	int			bypass_left;
+	int64		bypassed_rows;	/* EXPLAIN ANALYZE's */
 
 	/* figures */
 	int64		ngroups;
@@ -598,6 +674,41 @@ group_state(VexecAggState *s, char *g, VexecAggTrans *t)
 	return g + s->stateoff + t->stateoff;
 }
 
+/* D2: whether a group is packed: its length beside its hash, 0 in the table's */
+static inline bool
+group_packed(const char *g)
+{
+	return *(const uint32 *) (g + sizeof(uint32)) != 0;
+}
+
+/* D2: a packed group's by-reference value, whose Datum holds its offset */
+static inline Datum
+packed_ref(const char *g, Datum d)
+{
+	return PointerGetDatum(g + DatumGetUInt32(d));
+}
+
+/*
+ * D2: a by-reference value as a packed group holds it: a varlena flat and
+ * uncompressed -- a toast pointer, compressed bytes or an expanded object
+ * made plain, in the current context -- and the bytes it takes there
+ */
+static inline Datum
+packed_value(Datum d, int16 typlen, Size *size)
+{
+	if (typlen == -1)
+	{
+		varlena    *vl = (varlena *) DatumGetPointer(d);
+
+		if (VARATT_IS_EXTENDED(vl) && !VARATT_IS_SHORT(vl))
+			vl = pg_detoast_datum_packed(vl);
+		*size = VARSIZE_ANY(vl);
+		return PointerGetDatum(vl);
+	}
+	*size = (Size) typlen;
+	return d;
+}
+
 /* A text or bytea Datum's bytes, detoasted into the current context. */
 static void
 varlena_bytes(Datum d, const char **p, int32 *len)
@@ -619,6 +730,7 @@ group_equal(VexecAggState *s, const char *group)
 {
 	Datum	   *gk = group_keys(s, (char *) group);
 	bool	   *gn = group_keynulls(s, (char *) group);
+	bool		packed = group_packed(group);	/* D2: a batch table's */
 	int			i;
 
 	for (i = 0; i < s->nkeys; i++)
@@ -638,7 +750,8 @@ group_equal(VexecAggState *s, const char *group)
 				break;
 			case KEY_BYTES:
 				{
-					varlena    *vl = (varlena *) DatumGetPointer(gk[i]);
+					varlena    *vl = (varlena *) DatumGetPointer(packed ? packed_ref(group, gk[i]) :
+																gk[i]);
 
 					if (VARSIZE(vl) - VARHDRSZ != (Size) p->len ||
 						memcmp(VARDATA(vl), p->bytes, p->len) != 0)
@@ -646,7 +759,10 @@ group_equal(VexecAggState *s, const char *group)
 				}
 				break;
 			case KEY_FMGR:
-				if (!DatumGetBool(FunctionCall2Coll(&k->eq, k->collation, gk[i], p->value)))
+				if (!DatumGetBool(FunctionCall2Coll(&k->eq, k->collation,
+													packed && !k->typbyval ?
+													packed_ref(group, gk[i]) : gk[i],
+													p->value)))
 					return false;
 				break;
 		}
@@ -891,6 +1007,234 @@ table_memory(VexecAggState *s)
 }
 
 /*
+ * A new group's extra i: the input row's, where PostgreSQL's evaluator has
+ * it in slot, else the input batch's `row`; a packed group's that the
+ * group is made for (D2); or none, for a plain aggregation's group made
+ * before any row.
+ */
+static void
+row_extra(VexecAggState *s, int i, TupleTableSlot *slot, int row, Datum *d, bool *isnull)
+{
+	int			col = s->extracol[i];
+
+	if (slot != NULL)
+	{
+		*d = slot->tts_values[col];
+		*isnull = slot->tts_isnull[col];
+	}
+	else if (row >= 0)
+		*d = vexec_vec_datum(s->node.work, &s->node.in->cols[col], row, isnull);
+	else if (s->pack_rec != NULL)
+	{
+		VexecAggState *p = s->producer;
+		const char *rec = s->pack_rec;
+		int			src = s->pk_extra[i];
+		bool		byval;
+
+		if (src >= 0)
+		{
+			*isnull = group_keynulls(p, (char *) rec)[src];
+			*d = group_keys(p, (char *) rec)[src];
+			byval = p->keys[src].typbyval;
+		}
+		else
+		{
+			src = -1 - src;
+			*isnull = group_extranulls(p, (char *) rec)[src];
+			*d = group_extras(p, (char *) rec)[src];
+			byval = TupleDescAttr(p->indesc, p->extracol[src])->attbyval;
+		}
+		if (!*isnull && !byval)
+			*d = packed_ref(rec, *d);
+	}
+	else
+	{
+		*d = (Datum) 0;
+		*isnull = true;
+	}
+}
+
+/* A KEY_BITS key's Datum, as a tuple's value would be: fetch_att's. */
+static inline Datum
+key_datum(VexecAggKeyCol *k, Datum bits)
+{
+	switch (k->typlen)
+	{
+		case 1:
+			return CharGetDatum((char) bits);
+		case 2:
+			return Int16GetDatum((int16) bits);
+		case 4:
+			return Int32GetDatum((int32) bits);
+		default:
+			return bits;
+	}
+}
+
+/*
+ * D2: a batch table's new group (C2), packed in the partition its hash
+ * goes to: the probe's keys and the row's extras, their by-reference bytes
+ * after the states, its states begun.  It lies there from now on: the
+ * batch's rows advance its states in place, and the batch's end hands it
+ * on, copying nothing.
+ */
+static char *
+group_create_packed(VexecAggState *s, uint32 hash, TupleTableSlot *slot, int row)
+{
+	Size		len = s->groupsize;
+	Size		off;
+	Size		n;
+	char	   *g;
+	int			i;
+
+	for (i = 0; i < s->nkeys; i++)
+	{
+		VexecAggKeyCol *k = &s->keys[i];
+		VexecAggProbe *p = &s->probe[i];
+
+		if (p->isnull || k->typbyval)
+			continue;
+		if (k->kind == KEY_BYTES)
+			len += MAXALIGN(VARHDRSZ + p->len);
+		else
+		{
+			s->pk_keyvals[i] = packed_value(p->value, k->typlen, &n);
+			len += MAXALIGN(n);
+		}
+	}
+	for (i = 0; i < s->nextra; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(s->indesc, s->extracol[i]);
+
+		row_extra(s, i, slot, row, &s->pk_extravals[i], &s->pk_extranulls[i]);
+		if (!s->pk_extranulls[i] && !att->attbyval)
+		{
+			s->pk_extravals[i] = packed_value(s->pk_extravals[i], att->attlen, &n);
+			len += MAXALIGN(n);
+		}
+	}
+	g = vexec_pack_alloc(s->sink, s->deal(s->deal_arg, hash), len);
+	memset(g, 0, s->groupsize);
+	*(uint32 *) g = hash;
+	*(uint32 *) (g + sizeof(uint32)) = (uint32) len;
+	off = s->groupsize;
+	for (i = 0; i < s->nkeys; i++)
+	{
+		VexecAggKeyCol *k = &s->keys[i];
+		VexecAggProbe *p = &s->probe[i];
+
+		group_keynulls(s, g)[i] = p->isnull;
+		if (p->isnull)
+			continue;
+		if (k->kind == KEY_BYTES)
+		{
+			varlena    *vl = (varlena *) (g + off);
+
+			SET_VARSIZE(vl, VARHDRSZ + p->len);
+			memcpy(VARDATA(vl), p->bytes, p->len);
+			group_keys(s, g)[i] = UInt32GetDatum((uint32) off);
+			off += MAXALIGN(VARHDRSZ + p->len);
+		}
+		else if (k->kind == KEY_BITS)
+			group_keys(s, g)[i] = key_datum(k, p->value);
+		else if (k->typbyval)
+			group_keys(s, g)[i] = p->value;
+		else
+		{
+			n = k->typlen == -1 ? VARSIZE_ANY(DatumGetPointer(s->pk_keyvals[i])) : (Size) k->typlen;
+			memcpy(g + off, DatumGetPointer(s->pk_keyvals[i]), n);
+			group_keys(s, g)[i] = UInt32GetDatum((uint32) off);
+			off += MAXALIGN(n);
+		}
+	}
+	for (i = 0; i < s->nextra; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(s->indesc, s->extracol[i]);
+
+		group_extranulls(s, g)[i] = s->pk_extranulls[i];
+		if (s->pk_extranulls[i])
+			continue;
+		if (att->attbyval)
+			group_extras(s, g)[i] = s->pk_extravals[i];
+		else
+		{
+			n = att->attlen == -1 ? VARSIZE_ANY(DatumGetPointer(s->pk_extravals[i])) :
+				(Size) att->attlen;
+			memcpy(g + off, DatumGetPointer(s->pk_extravals[i]), n);
+			group_extras(s, g)[i] = UInt32GetDatum((uint32) off);
+			off += MAXALIGN(n);
+		}
+	}
+	Assert(off == len);
+	for (i = 0; i < s->ntrans; i++)
+		vexec_aggtrans_init(&s->trans[i], s->aggstate, group_state(s, g, &s->trans[i]));
+	s->passed_groups++;
+	s->passed_since++;
+	s->packed_groups++;
+	addHyperLogLog(&s->passed_keys, murmurhash32(hash));
+	return g;
+}
+
+/*
+ * D2: a group of the table, packed into the partition its hash goes to:
+ * its fixed part as it is, its by-reference values' bytes after it.
+ */
+static void
+pack_group(VexecAggState *s, char *g)
+{
+	Size		len = s->groupsize;
+	Size		off;
+	Size		n;
+	char	   *r;
+	int			i;
+
+	for (i = 0; i < s->nkeys; i++)
+		if (!s->keys[i].typbyval && !group_keynulls(s, g)[i])
+		{
+			s->pk_keyvals[i] = packed_value(group_keys(s, g)[i], s->keys[i].typlen, &n);
+			len += MAXALIGN(n);
+		}
+	for (i = 0; i < s->nextra; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(s->indesc, s->extracol[i]);
+
+		if (!att->attbyval && !group_extranulls(s, g)[i])
+		{
+			s->pk_extravals[i] = packed_value(group_extras(s, g)[i], att->attlen, &n);
+			len += MAXALIGN(n);
+		}
+	}
+	r = vexec_pack_alloc(s->sink, s->deal(s->deal_arg, *(uint32 *) g), len);
+	memcpy(r, g, s->groupsize);
+	*(uint32 *) (r + sizeof(uint32)) = (uint32) len;
+	off = s->groupsize;
+	for (i = 0; i < s->nkeys; i++)
+		if (!s->keys[i].typbyval && !group_keynulls(s, g)[i])
+		{
+			n = s->keys[i].typlen == -1 ? VARSIZE_ANY(DatumGetPointer(s->pk_keyvals[i])) :
+				(Size) s->keys[i].typlen;
+			memcpy(r + off, DatumGetPointer(s->pk_keyvals[i]), n);
+			group_keys(s, r)[i] = UInt32GetDatum((uint32) off);
+			off += MAXALIGN(n);
+		}
+	for (i = 0; i < s->nextra; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(s->indesc, s->extracol[i]);
+
+		if (!att->attbyval && !group_extranulls(s, g)[i])
+		{
+			n = att->attlen == -1 ? VARSIZE_ANY(DatumGetPointer(s->pk_extravals[i])) :
+				(Size) att->attlen;
+			memcpy(r + off, DatumGetPointer(s->pk_extravals[i]), n);
+			group_extras(s, r)[i] = UInt32GetDatum((uint32) off);
+			off += MAXALIGN(n);
+		}
+	}
+	Assert(off == len);
+	s->packed_groups++;
+}
+
+/*
  * A new group: the probe's keys and the row's extras copied, its states
  * begun.  slot is the input row where PostgreSQL's evaluator has it, else
  * the row is the input batch's `row`.
@@ -898,10 +1242,16 @@ table_memory(VexecAggState *s)
 static char *
 group_create_in(VexecAggState *s, uint32 hash, TupleTableSlot *slot, int row, bool batch)
 {
-	MemoryContext old = MemoryContextSwitchTo(batch ? s->bgroupcxt :
-											  s->sorted ? s->sgroupcxt[s->sgen] : s->groupcxt);
-	char	   *g = palloc0(s->groupsize);
+	MemoryContext old;
+	char	   *g;
 	int			i;
+
+	/* D2: a batch table's group made where it is handed on */
+	if (batch && s->sink != NULL)
+		return group_create_packed(s, hash, slot, row);
+	old = MemoryContextSwitchTo(batch ? s->bgroupcxt :
+								s->sorted ? s->sgroupcxt[s->sgen] : s->groupcxt);
+	g = palloc0(s->groupsize);
 
 	*(uint32 *) g = hash;
 	for (i = 0; i < s->nkeys; i++)
@@ -921,47 +1271,17 @@ group_create_in(VexecAggState *s, uint32 hash, TupleTableSlot *slot, int row, bo
 			group_keys(s, g)[i] = PointerGetDatum(vl);
 		}
 		else if (k->kind == KEY_BITS)
-		{
-			/* the Datum a tuple's value would be: fetch_att's */
-			switch (k->typlen)
-			{
-				case 1:
-					group_keys(s, g)[i] = CharGetDatum((char) p->value);
-					break;
-				case 2:
-					group_keys(s, g)[i] = Int16GetDatum((int16) p->value);
-					break;
-				case 4:
-					group_keys(s, g)[i] = Int32GetDatum((int32) p->value);
-					break;
-				default:
-					group_keys(s, g)[i] = p->value;
-					break;
-			}
-		}
+			group_keys(s, g)[i] = key_datum(k, p->value);
 		else
 			group_keys(s, g)[i] = datumCopy(p->value, k->typbyval, k->typlen);
 	}
 	for (i = 0; i < s->nextra; i++)
 	{
-		int			col = s->extracol[i];
-		Form_pg_attribute att = TupleDescAttr(s->indesc, col);
+		Form_pg_attribute att = TupleDescAttr(s->indesc, s->extracol[i]);
 		bool		isnull;
 		Datum		d;
 
-		if (slot != NULL)
-		{
-			d = slot->tts_values[col];
-			isnull = slot->tts_isnull[col];
-		}
-		else if (row >= 0)
-			d = vexec_vec_datum(s->node.work, &s->node.in->cols[col], row, &isnull);
-		else
-		{
-			/* a plain aggregation's group, made before any row */
-			d = (Datum) 0;
-			isnull = true;
-		}
+		row_extra(s, i, slot, row, &d, &isnull);
 		group_extranulls(s, g)[i] = isnull;
 		group_extras(s, g)[i] = isnull ? (Datum) 0 : datumCopy(d, att->attbyval, att->attlen);
 	}
@@ -1118,6 +1438,9 @@ table_reset(VexecAggState *s)
 	s->ngroups = 0;
 	s->frozen = false;
 	s->thawed = false;
+	s->bypass = false;
+	s->by_rows = 0;
+	s->by_groups = 0;
 	batch_table_reset(s);
 	if (s->strategy == AGG_HASHED)
 	{
@@ -1885,6 +2208,14 @@ row_group(VexecAggState *s, TupleTableSlot *slot, int row, uint32 hash)
 	}
 	if (s->frozen)
 	{
+		/* bypassed: a group of the row's own, in its partition (above) */
+		if (s->bypass)
+		{
+			vexec_bit_set(s->bmask, row);
+			s->bypassed_rows++;
+			return group_create_packed(s, hash, slot, row);
+		}
+		s->by_rows++;
 		/* C2: a key the table holds updates it; the batch table takes the others */
 		if (s->array_mode)
 		{
@@ -1899,7 +2230,10 @@ row_group(VexecAggState *s, TupleTableSlot *slot, int row, uint32 hash)
 		}
 		e = vagg_insert_hash(s->btable, s->probe_group, hash, &found);
 		if (!found)
+		{
 			e->group = group_create_in(s, hash, slot, row, true);
+			s->by_groups++;
+		}
 		vexec_bit_set(s->bmask, row);
 		return e->group;
 	}
@@ -2269,15 +2603,68 @@ batched:
  * nodeAgg.c's tmpcontext: what a key's or an argument's detoasting, or a
  * hash, equality or transition function, allocates is freed as it goes.
  */
+static void agg_fill_packed(VexecAggState *s);
+static char *next_group(VexecAggState *s);
+
+/*
+ * The first stage bypassed (above), decided at a batch's end: for the next
+ * VEXEC_AGG_BYPASS_BATCHES batches where its frozen table's rows made
+ * groups of their own; looked up again after them.  Packed groups only,
+ * which go where they are made; never once the table thaws.
+ */
+static void
+bypass_decide(VexecAggState *s)
+{
+	if (s->bypass)
+	{
+		if (--s->bypass_left <= 0 || !s->frozen)
+			s->bypass = false;
+		return;
+	}
+	if (!s->frozen || s->by_rows < VEXEC_AGG_BYPASS_EVIDENCE || !vexec_partial_agg_bypass)
+		return;
+	if (s->by_groups >= VEXEC_AGG_BYPASS_SHARE * s->by_rows)
+	{
+		s->bypass = true;
+		s->bypass_left = VEXEC_AGG_BYPASS_BATCHES;
+	}
+	s->by_rows = 0;
+	s->by_groups = 0;
+}
+
 static void
 agg_fill(VexecAggState *s)
 {
+	/* D2: the child's packed groups, where this run's partitions hold them */
+	if (s->unpack_ok && s->reading == NULL && s->depth == 0)
+		s->unpacking = vexec_repart_packed(s->node.vec_child);
+	if (s->unpacking)
+	{
+		agg_fill_packed(s);
+		return;
+	}
 	while (vexec_node_next_input(&s->node))
 	{
 		MemoryContext old = MemoryContextSwitchTo(s->tmpcontext->ecxt_per_tuple_memory);
 
 		agg_batch(s);
 		MemoryContextSwitchTo(old);
+
+		/*
+		 * D2: a frozen table's batch, its groups packed in their partitions
+		 * already -- the batch table's, or the bypassed rows' -- handed on
+		 * as the batch ends; the table thaws where they repeat their keys
+		 */
+		if (s->frozen && s->sink != NULL)
+		{
+			if (s->passed_since >= s->thaw_next)
+				maybe_thaw(s);
+			if (s->btable->members > 0)
+				batch_table_reset(s);
+			vexec_pack_batch_end(s->sink);
+			bypass_decide(s);
+			continue;
+		}
 
 		/*
 		 * C2: the batch table's groups go on before the next batch; the
@@ -2307,6 +2694,379 @@ agg_fill(VexecAggState *s)
 		vexec_aggsize_put(s->size_key, s->ngroups);
 		s->buckets_final = Max(s->buckets_final, s->table->size);
 	}
+}
+
+/* ---------------------------------------------------------------------
+ * D2: packed groups taken (above)
+ * ---------------------------------------------------------------------
+ */
+
+/* A packed group of the producer's: its keys, as this stage looks them up. */
+static void
+unpack_probe(VexecAggState *s, const char *rec)
+{
+	VexecAggState *p = s->producer;
+	int			i;
+
+	for (i = 0; i < s->nkeys; i++)
+	{
+		VexecAggKeyCol *k = &s->keys[i];
+		VexecAggProbe *pr = &s->pk_probe[i];
+		int			j = s->pk_key[i];
+		Datum		d = group_keys(p, (char *) rec)[j];
+
+		pr->isnull = group_keynulls(p, (char *) rec)[j];
+		if (pr->isnull)
+			continue;
+		if (k->kind == KEY_BYTES)
+		{
+			const varlena *vl = (const varlena *) DatumGetPointer(packed_ref(rec, d));
+
+			pr->bytes = VARDATA_ANY(vl);
+			pr->len = VARSIZE_ANY_EXHDR(vl);
+		}
+		else if (k->kind == KEY_BITS)
+			pr->value = key_bits(d, k->typlen);
+		else
+			pr->value = k->typbyval ? d : packed_ref(rec, d);
+	}
+	s->probe = s->pk_probe;
+}
+
+/* A packed group to the partition the hash's next bits choose, as it lies. */
+static void
+spill_packed(VexecAggState *s, uint32 hash, const char *rec)
+{
+	int			shift = 32 - VEXEC_AGG_PARTITION_BITS * (s->depth + 1);
+	VexecAggPartition *part = &s->parts[(hash >> shift) & (VEXEC_AGG_PARTITIONS - 1)];
+
+	if (part->file == NULL)
+	{
+		MemoryContext old = MemoryContextSwitchTo(s->node.mcxt);
+
+		part->file = BufFileCreateTemp(false);
+		MemoryContextSwitchTo(old);
+	}
+	BufFileWrite(part->file, rec, *(const uint32 *) (rec + sizeof(uint32)));
+	part->rows++;
+	s->spilled_rows++;
+}
+
+/*
+ * The packed groups of pk_recs[0 .. n) into the table: each one's group
+ * found or made, its keys and extras taken where they lie, its states
+ * merged into the group's (aggtrans.c); past the table's memory, a group
+ * not in it goes to a partition as it is.  C5's groups past the boundary
+ * are passed over, as their rows would be.
+ */
+static void
+take_packed(VexecAggState *s, int n)
+{
+	MemoryContext old = MemoryContextSwitchTo(s->tmpcontext->ecxt_per_tuple_memory);
+	uint32		bound = s->topk_skip ? topk_bound(s) : PG_UINT32_MAX;
+	int			i,
+				j;
+
+	for (j = 0; j < n; j++)
+	{
+		const char *rec = s->pk_recs[j];
+		uint32		hash = *(const uint32 *) rec;
+		char	   *g;
+
+		if (j + 8 < n && s->table != NULL)
+			__builtin_prefetch(&s->table->data[*(const uint32 *) s->pk_recs[j + 8] &
+											   s->table->sizemask]);
+		if (hash > bound)
+		{
+			s->rows_skipped++;
+			continue;
+		}
+		unpack_probe(s, rec);
+		s->pack_rec = rec;
+		g = row_group(s, NULL, -1, hash);
+		s->pack_rec = NULL;
+		if (g == NULL)
+		{
+			spill_packed(s, hash, rec);
+			continue;
+		}
+		for (i = 0; i < s->ntrans; i++)
+			vexec_aggtrans_merge(&s->trans[i], s->aggstate, group_state(s, g, &s->trans[i]),
+								 s->pk_trans[i], rec + s->pk_stateoff[i]);
+	}
+	s->unpacked_groups += n;
+	MemoryContextSwitchTo(old);
+	ResetExprContext(s->tmpcontext);
+	CHECK_FOR_INTERRUPTS();
+}
+
+/*
+ * D2: the table filled from packed groups: the chunks of the partitions
+ * the VecRepartition below claims, or a partition of this node's own read
+ * back; then as agg_fill() ends.
+ */
+static void
+agg_fill_packed(VexecAggState *s)
+{
+	VexecNode  *child = s->node.vec_child;
+
+	if (s->reading != NULL)
+	{
+		BufFile    *f = s->reading->file;
+
+		for (;;)
+		{
+			int			n;
+
+			MemoryContextReset(s->pk_readcxt);
+			for (n = 0; n < VEXEC_BATCH_ROWS; n++)
+			{
+				uint32		head[2];
+				char	   *rec;
+
+				if (BufFileReadMaybeEOF(f, head, sizeof(head), true) == 0)
+					break;
+				rec = MemoryContextAllocHuge(s->pk_readcxt, head[1]);
+				memcpy(rec, head, sizeof(head));
+				BufFileReadExact(f, rec + sizeof(head), head[1] - sizeof(head));
+				s->pk_recs[n] = rec;
+			}
+			if (n == 0)
+				break;
+			take_packed(s, n);
+		}
+		MemoryContextReset(s->pk_readcxt);
+		BufFileClose(s->reading->file);
+		s->reading->file = NULL;
+		s->reading = NULL;
+	}
+	else
+	{
+		const char *groups;
+		Size		len;
+
+		while (vexec_repart_next_chunk(child, &groups, &len))
+		{
+			const char *end = groups + len;
+
+			while (groups < end)
+			{
+				int			n = 0;
+
+				while (groups < end && n < VEXEC_BATCH_ROWS)
+				{
+					s->pk_recs[n++] = (char *) groups;
+					groups += *(const uint32 *) (groups + sizeof(uint32));
+				}
+				take_packed(s, n);
+				if (child->css.ss.ps.instrument)
+					InstrUpdateTupleCount(child->css.ss.ps.instrument, n);
+			}
+		}
+	}
+	spill_finish(s);
+	s->filled = true;
+	vexec_aggsize_put(s->size_key, s->ngroups);
+	s->buckets_final = Max(s->buckets_final, s->table->size);
+}
+
+/*
+ * D2: whether the node can pack its groups: a first stage, hashed, whose
+ * every key and extra has a length and every state is one without a
+ * pointer (aggtrans.c), its output its scan tuple as it is
+ */
+bool
+vexec_agg_pack_ok(VexecNode *node)
+{
+	return node->kind == VEXEC_NODE_AGG && ((VexecAggState *) node)->pack_ok;
+}
+
+/*
+ * D2: the groups to be packed into sink's npartitions partitions, by
+ * deal(arg, hash): before the node's first row, and in place of handing
+ * any up.
+ */
+void
+vexec_agg_pack(VexecNode *node, VexecPackSink *sink, int npartitions,
+			   int (*deal) (void *arg, uint32 hash), void *arg)
+{
+	VexecAggState *s = (VexecAggState *) node;
+
+	Assert(s->pack_ok && s->ndeal == 0);
+	(void) npartitions;
+	/* a Gather run again rescans the node here, as ExecProcNode would */
+	if (node->css.ss.ps.chgParam != NULL)
+		ExecReScan(&node->css.ss.ps);
+	s->sink = sink;
+	s->deal = deal;
+	s->deal_arg = arg;
+	if (s->pk_keyvals == NULL)
+	{
+		s->pk_keyvals = MemoryContextAllocZero(node->mcxt, sizeof(Datum) * Max(s->nkeys, 1));
+		s->pk_extravals = MemoryContextAllocZero(node->mcxt, sizeof(Datum) * Max(s->nextra, 1));
+		s->pk_extranulls = MemoryContextAllocZero(node->mcxt, sizeof(bool) * Max(s->nextra, 1));
+	}
+}
+
+/*
+ * D2: every group of the input packed: a frozen table's batch tables' as
+ * each batch ends (agg_fill()), then the table's, then each partition's of
+ * a spill as it is aggregated in turn.  The groups packed, the node's rows
+ * for EXPLAIN ANALYZE.
+ */
+int64
+vexec_agg_pack_all(VexecNode *node)
+{
+	VexecAggState *s = (VexecAggState *) node;
+	PlanState  *ps = &node->css.ss.ps;
+	int64		before = s->packed_groups;
+	char	   *g;
+
+	Assert(s->sink != NULL && ps->chgParam == NULL);
+	if (ps->instrument)
+		InstrStartNode(ps->instrument);
+	for (;;)
+	{
+		if (!s->filled)
+			agg_fill(s);
+		while ((g = next_group(s)) != NULL)
+		{
+			MemoryContext old = MemoryContextSwitchTo(s->tmpcontext->ecxt_per_tuple_memory);
+
+			pack_group(s, g);
+			MemoryContextSwitchTo(old);
+			ResetExprContext(s->tmpcontext);
+		}
+		vexec_pack_batch_end(s->sink);
+		if (s->pending == NIL)
+			break;
+		s->reading = linitial(s->pending);
+		s->pending = list_delete_first(s->pending);
+		s->depth = s->reading->depth;
+		table_reset(s);
+		vexec_node_rescan(&s->node);
+		s->filled = false;
+	}
+	s->done = true;
+	s->sink = NULL;
+	if (ps->instrument)
+		InstrStopNode(ps->instrument, (double) (s->packed_groups - before));
+	return s->packed_groups - before;
+}
+
+/*
+ * D2: column col of the VecRepartition rep's output, from 0, as the column
+ * of the scan tuple of the stage p below it -- through rep's target list
+ * and p's, each a Var of the scan tuple's column -- or -1.
+ */
+static int
+producer_col(VexecNode *rep, VexecAggState *p, int col)
+{
+	List	   *rtl = rep->css.ss.ps.plan->targetlist;
+	List	   *ptl = p->node.css.ss.ps.plan->targetlist;
+	TargetEntry *tle;
+	Var		   *v;
+
+	if (col < 0 || col >= list_length(rtl))
+		return -1;
+	tle = list_nth_node(TargetEntry, rtl, col);
+	if (!IsA(tle->expr, Var) || ((Var *) tle->expr)->varno != INDEX_VAR)
+		return -1;
+	col = ((Var *) tle->expr)->varattno - 1;
+	if (col < 0 || col >= list_length(ptl))
+		return -1;
+	tle = list_nth_node(TargetEntry, ptl, col);
+	if (!IsA(tle->expr, Var))
+		return -1;
+	v = (Var *) tle->expr;
+	if (v->varno != INDEX_VAR || v->varattno < 1 || v->varattno > p->noutcols)
+		return -1;
+	return v->varattno - 1;
+}
+
+/*
+ * D2: a final stage over a VecRepartition of a stage that can pack its
+ * groups takes them as they lie where each of its keys is one of the
+ * producer's, of its kind; each extra a key or extra of the producer's;
+ * and each transition a combining one over a column of the producer's
+ * states that it merges (aggtrans.c).  The VecRepartition is told, before
+ * any DSM is made.
+ */
+static void
+unpack_setup(VexecAggState *s)
+{
+	VexecNode  *rep = s->node.vec_child;
+	VexecAggState *p;
+	int			i;
+
+	if (rep == NULL || rep->kind != VEXEC_NODE_REPART || !s->hashes_from_child ||
+		s->strategy != AGG_HASHED || s->sorted_planned || s->nstats >= 0 ||
+		!DO_AGGSPLIT_COMBINE(s->split))
+		return;
+	p = (VexecAggState *) vexec_repart_child_agg(rep);
+	if (p == NULL || !vexec_agg_pack_ok(&p->node))
+		return;
+
+	s->pk_key = palloc(sizeof(int) * Max(s->nkeys, 1));
+	s->pk_extra = palloc(sizeof(int) * Max(s->nextra, 1));
+	s->pk_stateoff = palloc(sizeof(Size) * Max(s->ntrans, 1));
+	s->pk_trans = palloc(sizeof(VexecAggTrans *) * Max(s->ntrans, 1));
+	for (i = 0; i < s->nkeys; i++)
+	{
+		VexecAggKeyCol *k = &s->keys[i];
+		int			pc = producer_col(rep, p, k->col);
+		VexecAggKeyCol *pk;
+
+		if (pc < 0 || p->outkind[pc] != VEXEC_AGGCOL_KEY)
+			return;
+		pk = &p->keys[p->outsrc[pc]];
+		if (pk->kind != k->kind || pk->typlen != k->typlen || pk->typbyval != k->typbyval ||
+			pk->eqop != k->eqop || pk->collation != k->collation)
+			return;
+		s->pk_key[i] = p->outsrc[pc];
+	}
+	for (i = 0; i < s->nextra; i++)
+	{
+		int			pc = producer_col(rep, p, s->extracol[i]);
+
+		if (pc < 0)
+			return;
+		if (p->outkind[pc] == VEXEC_AGGCOL_KEY)
+			s->pk_extra[i] = p->outsrc[pc];
+		else if (p->outkind[pc] == VEXEC_AGGCOL_EXTRA)
+			s->pk_extra[i] = -1 - p->outsrc[pc];
+		else
+			return;
+	}
+	for (i = 0; i < s->ntrans; i++)
+	{
+		VexecAggTrans *t = &s->trans[i];
+		Expr	   *arg;
+		int			pc;
+		VexecAggTrans *pt;
+		VexecAggTrans *st;
+
+		if (t->nargs != 1 || t->filter >= 0 || t->share >= 0 || t->aggref->args == NIL)
+			return;
+		arg = linitial_node(TargetEntry, t->aggref->args)->expr;
+		if (!IsA(arg, Var) || ((Var *) arg)->varno != OUTER_VAR)
+			return;
+		pc = producer_col(rep, p, ((Var *) arg)->varattno - 1);
+		if (pc < 0 || p->outkind[pc] != VEXEC_AGGCOL_AGG)
+			return;
+		pt = &p->trans[p->aggstate->peragg[p->outsrc[pc]].transno];
+		st = pt->share >= 0 ? &p->trans[pt->share] : pt;
+		if (!vexec_aggtrans_merges(t, pt))
+			return;
+		s->pk_trans[i] = pt;
+		s->pk_stateoff[i] = p->stateoff + st->stateoff;
+	}
+	s->producer = p;
+	s->pk_probe = palloc0_array(VexecAggProbe, Max(s->nkeys, 1));
+	s->pk_recs = palloc0_array(char *, VEXEC_BATCH_ROWS);
+	s->pk_readcxt = AllocSetContextCreate(s->node.mcxt, "VecAgg packed groups read back",
+										  ALLOCSET_DEFAULT_SIZES);
+	s->unpack_ok = vexec_repart_offer_unpack(rep);
 }
 
 /* ---------------------------------------------------------------------
@@ -2467,23 +3227,32 @@ top_consider(VexecAggState *s, char *g)
 
 	ResetExprContext(econtext);
 	s->top_ranked++;
-	econtext->ecxt_scantuple = group_output_cols(s, g, s->topneeded);
-	if (css->ss.ps.qual != NULL && !ExecQual(css->ss.ps.qual, econtext))
+	if (s->topdirect > 0)
 	{
-		InstrCountFiltered1(css, 1);
-		return;
+		/* a count: its state, as it lies, with no slot made (above) */
+		kv[0] = Int64GetDatum(*(const int64 *) (g + s->topdirect));
+		kn[0] = false;
 	}
-	for (int k = 0; k < s->ntopkeys; k++)
+	else
 	{
-		int			col = s->topkeycol[k];
-
-		if (col >= 0)
+		econtext->ecxt_scantuple = group_output_cols(s, g, s->topneeded);
+		if (css->ss.ps.qual != NULL && !ExecQual(css->ss.ps.qual, econtext))
 		{
-			kv[k] = econtext->ecxt_scantuple->tts_values[col];
-			kn[k] = econtext->ecxt_scantuple->tts_isnull[col];
+			InstrCountFiltered1(css, 1);
+			return;
 		}
-		else
-			kv[k] = ExecEvalExpr(s->topkey[k], econtext, &kn[k]);
+		for (int k = 0; k < s->ntopkeys; k++)
+		{
+			int			col = s->topkeycol[k];
+
+			if (col >= 0)
+			{
+				kv[k] = econtext->ecxt_scantuple->tts_values[col];
+				kn[k] = econtext->ecxt_scantuple->tts_isnull[col];
+			}
+			else
+				kv[k] = ExecEvalExpr(s->topkey[k], econtext, &kn[k]);
+		}
 	}
 	if (s->ntop == s->topn &&
 		top_compare(s, kv, kn, s->top[0].keys, s->top[0].nulls) >= 0)
@@ -2580,6 +3349,16 @@ vexec_agg_set_topn(VexecNode *node, int64 bound, List *keycols, List *sortops,
 		PrepareSortSupportFromOrderingOp(list_nth_oid(sortops, k), ssup);
 	}
 	scan_cols_walker((Node *) plan->qual, s->topneeded);
+	/* a lone key that is a count, under no HAVING: read from its state */
+	if (s->ntopkeys == 1 && plan->qual == NIL && s->topkeycol[0] >= 0 &&
+		s->outkind[s->topkeycol[0]] == VEXEC_AGGCOL_AGG)
+	{
+		int			aggno = s->outsrc[s->topkeycol[0]];
+		VexecAggTrans *t = &s->trans[s->aggstate->peragg[aggno].transno];
+
+		if (t->share < 0 && vexec_aggtrans_int64_result(t, s->aggstate, aggno))
+			s->topdirect = s->stateoff + t->stateoff;
+	}
 	s->topcols = palloc(sizeof(int) * Max(s->noutcols, 1));
 	for (int i = 0; i < s->noutcols; i++)
 		if (s->topneeded[i])
@@ -3457,7 +4236,7 @@ agg_begin(CustomScanState *css, EState *estate, int eflags)
 		s->trans[i].stateoff = off;
 		off += MAXALIGN(s->trans[i].statesize);
 	}
-	s->keyoff = MAXALIGN(sizeof(uint32));
+	s->keyoff = MAXALIGN(2 * sizeof(uint32));	/* the hash; D2's length */
 	s->extraoff = s->keyoff + MAXALIGN((sizeof(Datum) + sizeof(bool)) * s->nkeys);
 	s->stateoff = s->extraoff + MAXALIGN((sizeof(Datum) + sizeof(bool)) * s->nextra);
 	s->groupsize = s->stateoff + off;
@@ -3507,6 +4286,23 @@ agg_begin(CustomScanState *css, EState *estate, int eflags)
 	}
 	s->groupcxt = BumpContextCreate(node->mcxt, "VecAgg groups", ALLOCSET_DEFAULT_SIZES);
 	s->hashcxt = AllocSetContextCreate(node->mcxt, "VecAgg hash table", ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * D2: a first stage may pack its groups where every key, extra and
+	 * state can lie in them as it is (above); a final stage over a
+	 * VecRepartition of such a stage may take them so
+	 */
+	s->pack_ok = s->strategy == AGG_HASHED && DO_AGGSPLIT_SKIPFINAL(s->split) &&
+		s->nkeys > 0 && !s->sorted_planned && s->nstats < 0 &&
+		css->ss.ps.qual == NULL && css->ss.ps.ps_ProjInfo == NULL;
+	for (i = 0; i < s->nkeys && s->pack_ok; i++)
+		s->pack_ok = s->keys[i].typlen != -2;
+	for (i = 0; i < s->nextra && s->pack_ok; i++)
+		s->pack_ok = TupleDescAttr(s->indesc, s->extracol[i])->attlen != -2;
+	for (i = 0; i < s->ntrans && s->pack_ok; i++)
+		s->pack_ok = vexec_aggtrans_packable(&s->trans[i]);
+	unpack_setup(s);
+
 	if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY) && s->sorted_decided)
 		table_reset(s);
 }
@@ -3521,6 +4317,8 @@ agg_rescan(CustomScanState *css)
 	s->filled = false;
 	s->done = false;
 	s->child_done = false;
+	s->sink = NULL;
+	s->unpacking = false;
 	if (s->topn > 0)
 	{
 		MemoryContextReset(s->topcxt);
@@ -3642,8 +4440,11 @@ agg_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		if (node->nshared > 0)
 			ExplainPropertyInteger("Shared Steps", NULL, node->nshared, es);
 		vexec_node_explain_declared(node, es);
-		ExplainPropertyText("Input", s->child_batches ? "batches" : "rows", es);
-		if (es->analyze && node->stats.batches_out > 0)
+		ExplainPropertyText("Input", s->unpack_ok ? "packed groups" :
+							s->child_batches ? "batches" : "rows", es);
+		if (es->analyze && s->packed_groups > 0)
+			ExplainPropertyText("Output", "packed groups", es);
+		else if (es->analyze && node->stats.batches_out > 0)
 			ExplainPropertyText("Output", "batches", es);
 		if (s->hashes_from_child)
 			ExplainPropertyText("Key Hashes", "the child's", es);
@@ -3692,6 +4493,13 @@ agg_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 				ExplainPropertyInteger("Table Thawed After", "groups handed on",
 									   s->thawed_after, es);
 		}
+		/* D2: the groups packed into the partitions, or merged from them */
+		if (s->packed_groups > 0)
+			ExplainPropertyInteger("Groups Packed", NULL, s->packed_groups, es);
+		if (s->bypassed_rows > 0)
+			ExplainPropertyInteger("Rows Bypassing the Table", NULL, s->bypassed_rows, es);
+		if (s->unpacked_groups > 0)
+			ExplainPropertyInteger("Packed Groups Merged", NULL, s->unpacked_groups, es);
 		if (s->topn > 0)
 		{
 			ExplainPropertyInteger("Top N Kept", NULL, s->ntop, es);

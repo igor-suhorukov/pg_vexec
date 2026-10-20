@@ -126,6 +126,13 @@ extern void vexec_kernels_arith(void (*add) (Oid, const VexecKernelDef *, const 
 extern void vexec_kernels_text(void (*add) (Oid, const VexecKernelDef *, const void *));
 extern void vexec_kernels_numeric(void (*add) (Oid, const VexecKernelDef *, const void *));
 extern void vexec_kernels_datetime(void (*add) (Oid, const VexecKernelDef *, const void *));
+extern void vexec_kernels_regex(void (*add) (Oid, const VexecKernelDef *, const void *));
+
+/*
+ * k_text.c: a varlena argument whose active values can be read as bytes,
+ * its compressed or external values detoasted into the work batch
+ */
+extern VexecVec *vexec_text_plain(VexecKernelCall *kc, VexecVec *v);
 
 /* Iterating a bitmap's set bits, a word at a time. */
 #define VEXEC_FOREACH_ROW(bits, nrows, i) \

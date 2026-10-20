@@ -82,6 +82,12 @@ static const CustomScanMethods motion_recv_methods = {
 	.CreateCustomScanState = vexec_create_motion_recv_state,
 };
 
+/* a row node, not a vector one: vexec_is_vector_node() says no */
+static const CustomScanMethods aggjoin_methods = {
+	.CustomName = VEXEC_AGGJOIN_NAME,
+	.CreateCustomScanState = vexec_create_aggjoin_state,
+};
+
 void
 vexec_exec_install(void)
 {
@@ -97,6 +103,7 @@ vexec_exec_install(void)
 	RegisterCustomScanMethods(&ingest_methods);
 	RegisterCustomScanMethods(&motion_send_methods);
 	RegisterCustomScanMethods(&motion_recv_methods);
+	RegisterCustomScanMethods(&aggjoin_methods);
 }
 
 const CustomScanMethods *
@@ -169,6 +176,12 @@ const CustomScanMethods *
 vexec_motion_recv_methods(void)
 {
 	return &motion_recv_methods;
+}
+
+const CustomScanMethods *
+vexec_aggjoin_methods(void)
+{
+	return &aggjoin_methods;
 }
 
 /* Whether a plan node is one of vexec's vector nodes. */
