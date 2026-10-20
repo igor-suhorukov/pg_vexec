@@ -154,6 +154,9 @@ typedef struct VexecScanState
 	Size		pscan_len;
 	pg_atomic_uint64 *shared_bound; /* the participants' sort bound, in the
 									 * DSM before pscan; NULL: none */
+	int			late_slots;		/* M4: the rows each participant's sort above
+								 * publishes, 0 for none */
+	VexecLateShare *late_share; /* and their exchange, in the DSM after pscan */
 	int			nattrs;			/* input columns that are attributes */
 	AttrNumber *attrs;			/* their attnos */
 	bool		need_tid;		/* the last input column is ctid */
@@ -1613,28 +1616,65 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
  * first keys each one's sort has kept its N rows within, encoded so that
  * less is better, PG_UINT64_MAX for none.
  */
-#define SCAN_SHARED_SIZE	MAXALIGN(sizeof(pg_atomic_uint64))
+typedef struct ScanShared
+{
+	pg_atomic_uint64 bound;		/* the participants' sort bound */
+	Size		late_off;		/* M4: the late columns' exchange, from the
+								 * chunk's start; 0 for none */
+} ScanShared;
+
+#define SCAN_SHARED_SIZE	MAXALIGN(sizeof(ScanShared))
+
+/* M4: the exchange of a sort above publishing n rows a participant */
+static Size
+late_share_size(int nslots, int n)
+{
+	return add_size(add_size(MAXALIGN(sizeof(VexecLateShare)), MAXALIGN(sizeof(int32) * nslots)),
+					mul_size(mul_size(nslots, n), sizeof(VexecLateEntry)));
+}
+
+static void
+late_share_reset(VexecLateShare *ls)
+{
+	BarrierInit(&ls->barrier, 0);
+	pg_atomic_write_u32(&ls->next, 0);
+	memset(VEXEC_LATE_COUNTS(ls), 0, sizeof(int32) * ls->nslots);
+}
 
 static Size
 scan_estimate_dsm(CustomScanState *css, ParallelContext *pcxt)
 {
 	VexecScanState *s = (VexecScanState *) css;
+	Size		size;
 
-	(void) pcxt;
 	s->pscan_len = table_parallelscan_estimate(s->rel, css->ss.ps.state->es_snapshot);
-	return SCAN_SHARED_SIZE + s->pscan_len;
+	size = SCAN_SHARED_SIZE + MAXALIGN(s->pscan_len);
+	if (s->late_slots > 0)
+		size = add_size(size, late_share_size(pcxt->nworkers + 1, s->late_slots));
+	return size;
 }
 
 static void
 scan_initialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordinate)
 {
 	VexecScanState *s = (VexecScanState *) css;
+	ScanShared *ss = (ScanShared *) coordinate;
 
-	(void) pcxt;
-	s->shared_bound = (pg_atomic_uint64 *) coordinate;
+	s->shared_bound = &ss->bound;
 	pg_atomic_init_u64(s->shared_bound, PG_UINT64_MAX);
 	s->pscan = (ParallelTableScanDesc) ((char *) coordinate + SCAN_SHARED_SIZE);
 	table_parallelscan_initialize(s->rel, s->pscan, css->ss.ps.state->es_snapshot);
+	ss->late_off = 0;
+	s->late_share = NULL;
+	if (s->late_slots > 0)
+	{
+		ss->late_off = SCAN_SHARED_SIZE + MAXALIGN(s->pscan_len);
+		s->late_share = (VexecLateShare *) ((char *) coordinate + ss->late_off);
+		s->late_share->nslots = pcxt->nworkers + 1;
+		s->late_share->n = s->late_slots;
+		pg_atomic_init_u32(&s->late_share->next, 0);
+		late_share_reset(s->late_share);
+	}
 }
 
 static void
@@ -1648,16 +1688,42 @@ scan_reinitialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordin
 		pg_atomic_write_u64(s->shared_bound, PG_UINT64_MAX);
 	if (s->pscan != NULL)
 		table_parallelscan_reinitialize(s->rel, s->pscan);
+	/* M4: the participants are new; the sort above detached from the barrier */
+	if (s->late_share != NULL)
+		late_share_reset(s->late_share);
 }
 
 static void
 scan_initialize_worker(CustomScanState *css, shm_toc *toc, void *coordinate)
 {
 	VexecScanState *s = (VexecScanState *) css;
+	ScanShared *ss = (ScanShared *) coordinate;
 
 	(void) toc;
-	s->shared_bound = (pg_atomic_uint64 *) coordinate;
+	s->shared_bound = &ss->bound;
 	s->pscan = (ParallelTableScanDesc) ((char *) coordinate + SCAN_SHARED_SIZE);
+	s->late_share = ss->late_off > 0 ? (VexecLateShare *) ((char *) coordinate + ss->late_off) : NULL;
+}
+
+/*
+ * M4: a bounded VecSort above, of late columns, publishing n rows a
+ * participant: asked as the plan begins, before the Gather sizes the DSM
+ */
+void
+vexec_scan_reserve_late(PlanState *ps, int n)
+{
+	if (!IsA(ps, CustomScanState) || ((CustomScanState *) ps)->methods != &scan_exec_methods)
+		return;
+	((VexecScanState *) ps)->late_slots = n;
+}
+
+/* M4: the late columns' exchange, once the DSM is made; NULL: none */
+VexecLateShare *
+vexec_scan_late_share(PlanState *ps)
+{
+	if (!IsA(ps, CustomScanState) || ((CustomScanState *) ps)->methods != &scan_exec_methods)
+		return NULL;
+	return ((VexecScanState *) ps)->late_share;
 }
 
 /*

@@ -281,6 +281,32 @@ SET vexec_test.source_fetch_cost = 1000000;
 EXPLAIN (COSTS OFF) SELECT a, b, c, d, f FROM src ORDER BY d DESC, a LIMIT 5;
 SELECT source_check('SELECT a, b, c, d, f FROM src ORDER BY d DESC, a LIMIT 5');
 RESET vexec_test.source_fetch_cost;
+-- in parallel (M4, §3.21): the late columns fetched for the whole sort's
+-- rows alone, through the source's fetches by TID, whichever participant
+-- is free fetching a row another one's sort holds
+CREATE FUNCTION source_explain(q text, pattern text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+	r record;
+BEGIN
+	FOR r IN EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF r."QUERY PLAN" ~ pattern THEN
+			RETURN NEXT regexp_replace(r."QUERY PLAN", '[0-9]+', 'N', 'g');
+		END IF;
+	END LOOP;
+END $$;
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SELECT source_explain('SELECT a, b, c, d, f FROM src ORDER BY d DESC, a LIMIT 5', 'Gather Merge|Vec Sort|Columns');
+SELECT source_check('SELECT a, b, c, d, f FROM src ORDER BY d DESC, a LIMIT 5');
+SELECT source_check('SELECT u, c, a FROM src WHERE e ORDER BY b DESC LIMIT 7');
+SELECT source_check('SELECT a, c, f FROM src ORDER BY g, a LIMIT 12');
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+DROP FUNCTION source_explain(text, text);
 RESET vexec.mode;
 
 -- columns in steps (VC2; next_rest(), minor 5): the first vector qual's

@@ -28,6 +28,7 @@ OBJS = \
 	egress/routine.o \
 	egress/run.o \
 	exec/aggsizes.o \
+	exec/exchange.o \
 	exec/aggtrans.o \
 	exec/methods.o \
 	exec/node.o \

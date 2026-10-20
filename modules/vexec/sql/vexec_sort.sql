@@ -204,6 +204,60 @@ SELECT sort_check('SELECT id, d, f FROM so WHERE s < 10 ORDER BY d, f NULLS FIRS
 SELECT sort_explain('SELECT id, t, n FROM so WHERE k < 5000 ORDER BY t, n, id LIMIT 20',
                     'Gather Merge|Vec Sort|Bound|Sort Method');
 
+-- M4 (§3.21): a bounded sort's late columns in parallel, fetched for the
+-- whole sort's rows alone: each participant publishes its rows' first keys
+-- and TIDs, the N-th least of them all bounds the rows fetched -- every row
+-- whose first key is at most it, ties among them -- and whichever
+-- participant is free fetches each, for the one whose sort holds it.  Ties
+-- at the boundary, a NULL first key either side, descending, an OFFSET, a
+-- qual, a bound of a batch's rows, rows this transaction deleted; no
+-- worker launched; and with vexec.enable_late_exchange off, as H6 fetches
+-- them, each participant's own
+SELECT sort_check('SELECT * FROM so ORDER BY k, id LIMIT 12');
+SELECT sort_check('SELECT * FROM so ORDER BY s DESC, id LIMIT 30');
+SELECT sort_check('SELECT * FROM so ORDER BY f NULLS FIRST, id LIMIT 12');
+SELECT sort_check('SELECT * FROM so ORDER BY f DESC NULLS LAST, id LIMIT 12');
+SELECT sort_check('SELECT * FROM so ORDER BY f DESC, id LIMIT 12');
+SELECT sort_check('SELECT * FROM so ORDER BY k, id OFFSET 5 LIMIT 10');
+SELECT sort_check($$SELECT id, t, n, d FROM so WHERE t LIKE '%v1%' ORDER BY d DESC, id LIMIT 30$$);
+SELECT sort_check('SELECT * FROM so ORDER BY t, id LIMIT 20');
+SELECT sort_check('SELECT * FROM so ORDER BY k, id LIMIT 1024');
+BEGIN;
+DELETE FROM so WHERE id % 1000 = 1;
+SELECT sort_check('SELECT * FROM so ORDER BY f, id LIMIT 50');
+ROLLBACK;
+SELECT sort_explain('SELECT * FROM so ORDER BY k, id LIMIT 12', 'Gather Merge|Vec Sort|Late Columns|Fetched');
+SET max_parallel_workers = 0;
+SELECT sort_check('SELECT * FROM so ORDER BY k, id LIMIT 12');
+SELECT sort_explain('SELECT * FROM so ORDER BY k, id LIMIT 12', 'Workers|Late Columns|Fetched');
+RESET max_parallel_workers;
+SET vexec.enable_late_exchange = off;
+SELECT sort_check('SELECT * FROM so ORDER BY k, id LIMIT 12');
+SELECT sort_explain('SELECT * FROM so ORDER BY k, id LIMIT 12', 'Late Columns|Fetched');
+RESET vexec.enable_late_exchange;
+
+-- M5 (§3.21): VecSort and core's Sort of the same vector input under a
+-- Gather Merge, their costs the same within add_path()'s fuzz: core's,
+-- cheaper by a hair, would keep its path and VecSort's go;
+-- vexec.prefer_vector_sort takes core's out where the first key is
+-- compared as an integer -- an int4's, a date's -- and keeps it for text,
+-- whose VecSort is no faster (ClickBench's Q25)
+SET vexec.mode = auto;
+SET vexec.min_rows = 0;
+SET vexec.cpu_tuple_factor = 0.1;
+SET vexec.cpu_operator_factor = 0.1;
+EXPLAIN (COSTS OFF) SELECT * FROM so WHERE id % 1000 = 7 ORDER BY k, id LIMIT 10;
+SELECT sort_check('SELECT * FROM so WHERE id % 1000 = 7 ORDER BY k, id LIMIT 10', 'auto');
+SELECT sort_check('SELECT * FROM so WHERE id % 100 = 7 ORDER BY d, id LIMIT 10', 'auto');
+SELECT sort_check('SELECT * FROM so WHERE id % 100 = 7 ORDER BY t, id LIMIT 10', 'auto');
+SET vexec.prefer_vector_sort = off;
+SELECT sort_check('SELECT * FROM so WHERE id % 1000 = 7 ORDER BY k, id LIMIT 10', 'auto');
+RESET vexec.prefer_vector_sort;
+RESET vexec.cpu_tuple_factor;
+RESET vexec.cpu_operator_factor;
+RESET vexec.min_rows;
+SET vexec.mode = force;
+
 -- the input's cheapest path freed before VecSort is considered:
 -- create_ordered_paths() hands a path already in the order -- here the
 -- Gather Merge the scan's relation made -- to the ordered relation itself,

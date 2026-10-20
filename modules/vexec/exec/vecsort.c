@@ -78,6 +78,8 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "access/parallel.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
 #include "commands/explain.h"
@@ -95,6 +97,7 @@
 #include "utils/ruleutils.h"
 #include "utils/tuplesort.h"
 #include "utils/typcache.h"
+#include "utils/wait_event.h"
 
 #include "cb_explain.h"
 
@@ -148,7 +151,26 @@ typedef struct VexecSortState
 	pg_atomic_uint64 *shared;	/* the scan's, once its DSM is made */
 	bool		out_done;		/* a kept row past it: the rest are too */
 	int64		rows_unfetched; /* kept rows not fetched for it */
+
+	/*
+	 * M4 (§3.21, below): the late columns of a parallel sort fetched for the
+	 * rows the whole sort can return alone, by whichever participant is free
+	 */
+	VexecLateShare *coop;		/* the scan's exchange; NULL: as H6 */
+	bool		coop_late;		/* came once the others had published */
+	bool		coop_ready;		/* the candidates fetched */
+	int			coop_me;		/* this participant's slot: the leader 0 */
+	int			coop_n;			/* its rows published */
+	int			coop_out;		/* the next of them to give out */
+	uint64		coop_boundary;	/* the least first key past which no row is
+								 * the sort's */
+	dsa_area   *coop_dsa;		/* the query's, where fetched rows go */
+	TupleTableSlot *coop_slot;	/* a fetched row, read back */
+	int64		coop_fetched;	/* rows this participant fetched, any one's */
 } VexecSortState;
+
+/* the wait at the late columns' barrier, as pg_stat_activity names it */
+static uint32 sort_wait_event = 0;
 
 static bool sort_fetch(VexecNode *node);
 static void sort_begin(CustomScanState *css, EState *estate, int eflags);
@@ -354,6 +376,17 @@ sort_begin(CustomScanState *css, EState *estate, int eflags)
 	s->get_slot = ExecInitExtraTupleSlot(estate, s->desc, &TTSOpsMinimalTuple);
 	if (s->plan.bound_attno > 0 && s->plan.bound > 0)
 		bound_begin(s);
+
+	/*
+	 * M4: a bounded sort of late columns over a parallel VecScan, its first
+	 * key shared: the scan's DSM gets an exchange for its participants' rows
+	 */
+	if (s->late_rel != NULL && s->share_len > 0 && s->plan.bound > 0 &&
+		s->plan.bound <= VEXEC_BATCH_ROWS && !s->random_access && vexec_enable_late_exchange)
+	{
+		vexec_scan_reserve_late(s->child, (int) s->plan.bound);
+		s->coop_slot = ExecInitExtraTupleSlot(estate, scandesc, &TTSOpsMinimalTuple);
+	}
 
 	/*
 	 * C3: a bounded sort over a VecAgg lends it its keys and bound; the
@@ -744,6 +777,209 @@ do_sort(VexecSortState *s)
 	s->sorted = true;
 }
 
+/* ---------------------------------------------------------------------
+ * The late columns' exchange (M4, §3.21)
+ *
+ * The participants' bound above lets a participant give out no row past
+ * the least of the tops published so far, which the sorts still running
+ * leave loose: ClickBench's Q23 over MergeTree fetched 38 rows' late columns
+ * -- 105 of them, a granule of each decoded a row -- for the LIMIT's 10, ten
+ * of them in one worker, one after another, the query's last 70 ms.  Where
+ * the scan below has the exchange (vexec_scan_late_share()), each
+ * participant, attached to its barrier before its scan, publishes its sorted
+ * rows' first keys and TIDs once its sort is done, and waits for the others:
+ * the N-th least first key of them all then bounds the rows the whole sort
+ * can return, as one sort's N-th row bounds its own, and only the rows within
+ * it are fetched -- each by the next participant free, through the scan's
+ * snapshot, which they share, into the query's DSA -- and given out by the
+ * participant whose sort holds them, in its order.  A row whose first key
+ * equals the boundary is fetched: its later keys decide it, in the Gather
+ * Merge.  A participant that attaches once the others have published came
+ * after the scan's units were all handed out, and has no row.
+ * ---------------------------------------------------------------------
+ */
+
+/* A row's first key as the exchange orders it: less is better, a NULL first or last. */
+static uint64
+coop_key(VexecSortState *s, TupleTableSlot *slot)
+{
+	bool		isnull;
+	Datum		d = slot_getattr(slot, s->bound_keycol, &isnull);
+
+	if (isnull)
+		return linitial_int(s->plan.nullsfirst) != 0 ? 0 : PG_UINT64_MAX;
+	return share_encode(s, d);
+}
+
+/* At the sort's first fetch, before its scan: the exchange's barrier attached. */
+static void
+coop_attach(VexecSortState *s)
+{
+	VexecLateShare *ls;
+
+	s->coop = NULL;
+	s->coop_ready = false;
+	s->coop_late = false;
+	if (s->coop_slot == NULL || (ls = vexec_scan_late_share(s->child)) == NULL ||
+		ls->n < s->plan.bound || s->node.css.ss.ps.state->es_query_dsa == NULL)
+		return;
+	if (sort_wait_event == 0)
+		sort_wait_event = WaitEventExtensionNew("VexecLateColumns");
+	s->coop = ls;
+	s->coop_dsa = s->node.css.ss.ps.state->es_query_dsa;
+	s->coop_me = IsParallelWorker() ? ParallelWorkerNumber + 1 : 0;
+	if (s->coop_me >= ls->nslots)
+		elog(ERROR, "vexec: a participant of a parallel sort past its exchange's %d", ls->nslots);
+	if (BarrierAttach(&ls->barrier) > 0)
+	{
+		/* the others published: the scan's units are all handed out */
+		BarrierDetach(&ls->barrier);
+		s->coop_late = true;
+	}
+}
+
+/* An entry's row fetched by its TID, its scan tuple's columns into the DSA. */
+static void
+coop_fetch(VexecSortState *s, VexecLateEntry *e)
+{
+	EState	   *estate = s->node.css.ss.ps.state;
+	ExprContext *econtext = s->node.css.ss.ps.ps_ExprContext;
+	TupleDesc	desc = s->node.css.ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+	MinimalTuple mt;
+	dsa_pointer dp;
+
+	if (!table_tuple_fetch_row_version(s->late_rel, &e->tid, estate->es_snapshot, s->late_slot))
+		elog(ERROR, "vexec: a row a sort kept is not visible by its TID");
+	ResetExprContext(econtext);
+	econtext->ecxt_scantuple = s->late_slot;
+	for (int i = 0; i < s->nlate; i++)
+		s->late_values[i] = ExecEvalExprSwitchContext(s->late_exprs[i], econtext,
+													  &s->late_nulls[i]);
+	mt = heap_form_minimal_tuple(desc, s->late_values, s->late_nulls, 0);
+	dp = dsa_allocate(s->coop_dsa, mt->t_len);
+	memcpy(dsa_get_address(s->coop_dsa, dp), mt, mt->t_len);
+	e->row = dp;
+	heap_free_minimal_tuple(mt);
+	ExecClearTuple(s->late_slot);
+	s->coop_fetched++;
+}
+
+static int
+uint64_cmp(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a;
+	uint64		y = *(const uint64 *) b;
+
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/*
+ * Once the sort is done: its rows published, the boundary of them all
+ * found, the rows within it fetched by whoever is free, and the barrier let
+ * go of once every one is.
+ */
+static void
+coop_run(VexecSortState *s)
+{
+	VexecLateShare *ls = s->coop;
+	int32	   *counts = VEXEC_LATE_COUNTS(ls);
+	VexecLateEntry *all = VEXEC_LATE_ENTRIES(ls);
+	VexecLateEntry *mine = all + (Size) s->coop_me * ls->n;
+	uint64	   *keys;
+	int		   *cands;
+	int			nkeys = 0;
+	int			ncands = 0;
+	int			n = 0;
+
+	while (n < s->plan.bound && tuplesort_gettupleslot(s->sort, true, false, s->get_slot, NULL))
+	{
+		bool		isnull;
+		Datum		tid = slot_getattr(s->get_slot, s->plan.late_tidcol, &isnull);
+
+		if (isnull)
+			elog(ERROR, "vexec: a row a sort kept has no TID");
+		mine[n].key = coop_key(s, s->get_slot);
+		mine[n].tid = *(ItemPointer) DatumGetPointer(tid);
+		mine[n].row = InvalidDsaPointer;
+		n++;
+	}
+	ExecClearTuple(s->get_slot);
+	s->coop_n = n;
+	s->coop_out = 0;
+	if (s->coop_late)
+	{
+		if (n > 0)
+			elog(ERROR, "vexec: a participant of a parallel sort that came last has rows");
+		s->coop_ready = true;
+		return;
+	}
+	counts[s->coop_me] = n;
+	BarrierArriveAndWait(&ls->barrier, sort_wait_event);
+
+	/* the N-th least first key of every participant's rows, or none */
+	keys = palloc(sizeof(uint64) * Max((Size) ls->nslots * ls->n, 1));
+	for (int p = 0; p < ls->nslots; p++)
+		for (int i = 0; i < counts[p]; i++)
+			keys[nkeys++] = all[(Size) p * ls->n + i].key;
+	s->coop_boundary = PG_UINT64_MAX;
+	if (nkeys > s->plan.bound)
+	{
+		qsort(keys, nkeys, sizeof(uint64), uint64_cmp);
+		s->coop_boundary = keys[s->plan.bound - 1];
+	}
+	pfree(keys);
+
+	/* the rows within it, in an order every participant makes alike, each fetched once */
+	cands = palloc(sizeof(int) * Max((Size) ls->nslots * ls->n, 1));
+	for (int p = 0; p < ls->nslots; p++)
+		for (int i = 0; i < counts[p]; i++)
+			if (all[(Size) p * ls->n + i].key <= s->coop_boundary)
+				cands[ncands++] = p * ls->n + i;
+	for (;;)
+	{
+		uint32		j = pg_atomic_fetch_add_u32(&ls->next, 1);
+
+		if (j >= (uint32) ncands)
+			break;
+		CHECK_FOR_INTERRUPTS();
+		coop_fetch(s, &all[cands[j]]);
+	}
+	pfree(cands);
+	BarrierArriveAndWait(&ls->barrier, sort_wait_event);
+	BarrierDetach(&ls->barrier);
+	s->coop_ready = true;
+}
+
+/* The next of this participant's rows within the boundary, fetched, into the batch. */
+static bool
+coop_emit(VexecSortState *s, VexecBatch *in)
+{
+	VexecLateEntry *e;
+	MinimalTuple mt;
+
+	if (s->coop_out >= s->coop_n)
+		return false;
+	e = VEXEC_LATE_ENTRIES(s->coop) + (Size) s->coop_me * s->coop->n + s->coop_out;
+	if (e->key > s->coop_boundary)
+	{
+		/* this row and those after it, sorted, are none of the sort's */
+		s->rows_unfetched = s->coop_n - s->coop_out;
+		s->coop_out = s->coop_n;
+		return false;
+	}
+	if (!DsaPointerIsValid(e->row))
+		elog(ERROR, "vexec: a row within a parallel sort's boundary was not fetched");
+	mt = (MinimalTuple) dsa_get_address(s->coop_dsa, e->row);
+	ExecStoreMinimalTuple(mt, s->coop_slot, false);
+	slot_getallattrs(s->coop_slot);
+	vexec_batch_add_values(in, s->coop_slot->tts_values, s->coop_slot->tts_isnull);
+	ExecClearTuple(s->coop_slot);
+	dsa_free(s->coop_dsa, e->row);
+	e->row = InvalidDsaPointer;
+	s->coop_out++;
+	return true;
+}
+
 /*
  * A kept row of late columns: fetched by its TID, and its scan tuple's
  * columns computed over it into the batch.
@@ -782,10 +1018,27 @@ sort_fetch(VexecNode *node)
 	VexecBatch *in = node->in;
 
 	if (!s->sorted)
+	{
+		/* M4: the exchange's barrier attached before the scan is read */
+		if (s->coop_slot != NULL)
+			coop_attach(s);
 		do_sort(s);
+	}
 
 	vexec_batch_reset(in);
 	vexec_batch_begin_rows(in);
+	if (s->coop != NULL)
+	{
+		/* M4: the rows within the whole sort's boundary, fetched by any participant */
+		if (!s->coop_ready)
+			coop_run(s);
+		while (in->nrows < VEXEC_BATCH_ROWS && coop_emit(s, in))
+			s->rows_out++;
+		if (in->nrows == 0)
+			return false;
+		vexec_batch_apply_config(in, &node->layout);
+		return true;
+	}
 	while (in->nrows < VEXEC_BATCH_ROWS && !s->out_done &&
 		   (s->plan.bound <= 0 || s->rows_out < s->plan.bound) &&
 		   tuplesort_gettupleslot(s->sort, true, false, s->get_slot, NULL))
@@ -960,7 +1213,10 @@ sort_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		if (es->verbose)
 			ExplainPropertyInteger("Rows Sorted", NULL, s->rows_sorted, es);
 		if (es->verbose && s->late_rel != NULL)
-			ExplainPropertyInteger("Rows Fetched by TID", NULL, s->rows_out, es);
+			ExplainPropertyInteger("Rows Fetched by TID", NULL,
+								   s->coop != NULL ? s->coop_fetched : s->rows_out, es);
+		if (es->verbose && s->coop != NULL)
+			ExplainPropertyText("Late Columns", "fetched for the whole sort's rows alone, by any participant", es);
 		if (es->verbose && s->rows_unfetched > 0)
 			ExplainPropertyInteger("Rows Left Past the Workers' Bound", NULL, s->rows_unfetched, es);
 	}

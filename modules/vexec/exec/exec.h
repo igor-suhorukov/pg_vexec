@@ -37,6 +37,9 @@
 #include "port/atomics.h"
 #include "nodes/execnodes.h"
 #include "nodes/extensible.h"
+#include "storage/barrier.h"
+#include "storage/itemptr.h"
+#include "utils/dsa.h"
 #include "utils/sortsupport.h"
 
 #include "vexec_source.h"
@@ -585,6 +588,16 @@ extern void vexec_agg_pack(VexecNode *node, VexecPackSink *sink, int npartitions
 						   int (*deal) (void *arg, uint32 hash), void *arg);
 extern int64 vexec_agg_pack_all(VexecNode *node);
 
+/* exchange.c: blocks of the main shared memory for D2's partitions (M1, §3.21) */
+#define VEXEC_EXCHANGE_BLOCK	((Size) 4 * 1024 * 1024)
+extern void vexec_exchange_install(void);
+extern bool vexec_exchange_enabled(void);
+extern int32 vexec_exchange_claim(void);
+extern void vexec_exchange_release(int32 block);
+extern char *vexec_exchange_block(int32 block);
+extern bool vexec_exchange_holds(const void *p);
+extern void vexec_exchange_counts(int32 *nfree, int32 *nblocks);
+
 /* aggsizes.c: the groups VecAgg's tables reached, in shared memory (C6) */
 extern void vexec_aggsize_install(void);
 extern uint64 vexec_aggsize_key(EState *estate, int plan_node_id);
@@ -602,6 +615,37 @@ extern bool vexec_sort_make_late(CustomScan *cscan, bool serial_ok, bool paralle
 extern bool vexec_sort_plan_running_bound(CustomScan *cscan);
 extern bool vexec_scan_set_bound(PlanState *ps, VexecSortBound *bound);
 extern pg_atomic_uint64 *vexec_scan_shared_bound(PlanState *ps);
+
+/*
+ * M4 (§3.21): a parallel bounded VecSort's late columns, fetched for the
+ * rows the whole sort can return and by whichever participant is free, in
+ * the parallel VecScan's DSM below it: a barrier, the next candidate to
+ * fetch, then each participant's count of the rows it publishes, and its
+ * entries, n of them (vecsort.c).
+ */
+typedef struct VexecLateShare
+{
+	Barrier		barrier;
+	int			nslots;			/* the participants planned: the leader 0 */
+	int			n;				/* the rows each one publishes, at most */
+	pg_atomic_uint32 next;		/* the next candidate to fetch */
+} VexecLateShare;
+
+typedef struct VexecLateEntry
+{
+	uint64		key;			/* the first key, encoded so that less is
+								 * better (vecsort.c) */
+	ItemPointerData tid;
+	dsa_pointer row;			/* the fetched scan tuple, a MinimalTuple */
+} VexecLateEntry;
+
+#define VEXEC_LATE_COUNTS(ls)	((int32 *) ((char *) (ls) + MAXALIGN(sizeof(VexecLateShare))))
+#define VEXEC_LATE_ENTRIES(ls) \
+	((VexecLateEntry *) ((char *) (ls) + MAXALIGN(sizeof(VexecLateShare)) + \
+						 MAXALIGN(sizeof(int32) * (ls)->nslots)))
+
+extern void vexec_scan_reserve_late(PlanState *ps, int n);
+extern VexecLateShare *vexec_scan_late_share(PlanState *ps);
 extern bool vexec_scan_set_join_filter(PlanState *ps, VexecJoinFilter *filter);
 extern bool vexec_scan_takes_join_keys(PlanState *ps, AttrNumber attno);
 

@@ -3,9 +3,11 @@
 -- vexec's settings (pg_vector_executor.md §3.12): every one, its default and
 -- its context; the values each takes; the prefix reserved; and the
 -- planner's among those EXPLAIN (SETTINGS) shows.  GPU execution is off at
--- every level by default (§3.11).
+-- every level by default (§3.11).  vexec.exchange_memory's is its default:
+-- the suite's server has an area (test/vexec/suite.sh).
 SELECT name,
-       CASE WHEN name = 'vexec.debug_check_plans' THEN '(on where assertions are)' ELSE setting END AS setting,
+       CASE WHEN name = 'vexec.debug_check_plans' THEN '(on where assertions are)'
+            WHEN name = 'vexec.exchange_memory' THEN boot_val ELSE setting END AS setting,
        unit, context, vartype, min_val, max_val, enumvals,
        (pg_settings_get_flags(name) @> ARRAY['EXPLAIN']) AS explain
 FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
@@ -26,13 +28,16 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.debug_check_plans         | (on where assertions are) |      | superuser  | bool    |         |              |                             | f
  vexec.debug_layout_seed         | 0                         |      | superuser  | integer | 0       | 2147483647   |                             | f
  vexec.debug_require_vector      | off                       |      | superuser  | bool    |         |              |                             | f
+ vexec.drop_implied_keys         | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_agg                | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_agg_split          | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_bitmapscan         | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_exchange_area      | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_group_topk         | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_hashjoin           | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_insert             | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_join_filter        | on                        |      | user       | bool    |         |              |                             | f
+ vexec.enable_late_exchange      | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_motion_frames      | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_packed_groups      | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_prefilter          | on                        |      | user       | bool    |         |              |                             | f
@@ -47,6 +52,7 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.enable_source_layouts     | on                        |      | user       | bool    |         |              |                             | f
  vexec.enable_source_steps       | on                        |      | user       | bool    |         |              |                             | f
  vexec.enable_window             | on                        |      | user       | bool    |         |              |                             | t
+ vexec.exchange_memory           | 0                         | MB   | postmaster | integer | 0       | 1073741823   |                             | f
  vexec.gpu                       | off                       |      | user       | enum    |         |              | {off,auto,force}            | t
  vexec.gpu_arena_mb              | 256                       | MB   | postmaster | integer | 1       | 1073741823   |                             | f
  vexec.gpu_devices               |                           |      | postmaster | string  |         |              |                             | f
@@ -63,11 +69,12 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.orca_settings             |                           |      | user       | string  |         |              |                             | t
  vexec.partial_agg_bypass        | on                        |      | user       | bool    |         |              |                             | f
  vexec.partial_agg_limit         | 16384                     |      | user       | integer | 0       | 2147483647   |                             | f
+ vexec.prefer_vector_sort        | on                        |      | user       | bool    |         |              |                             | t
  vexec.remember_agg_sizes        | on                        |      | user       | bool    |         |              |                             | f
  vexec.repartition_min_rows      | 500000                    |      | user       | integer | 0       | 2147483647   |                             | t
  vexec.repartition_shared_memory | -1                        | kB   | user       | integer | -1      | 2147483647   |                             | f
  vexec.scan_rows_per_worker      | 163840                    |      | user       | integer | 0       | 2147483647   |                             | t
-(56 rows)
+(61 rows)
 
 -- the modes
 SET vexec.mode = explain;

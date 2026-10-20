@@ -44,11 +44,17 @@
 #include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
 #include "nodes/nodeFuncs.h"
+#include "port/simd.h"
+#include "utils/ascii.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/varlena.h"
 #include "varatt.h"
+
+#ifdef __SSE2__
+#include <emmintrin.h>
+#endif
 
 #include "vexec.h"
 #include "expr/expr.h"
@@ -224,13 +230,59 @@ text_bind(VexecExpr *call, const void *info)
 	return true;
 }
 
+/*
+ * M5 (§3.21): equality of an OFFSETS column with a constant -- a qual's
+ * `col <> ''`, `col = 'x'` -- the constant's bytes read once and each row's
+ * from the column's offsets, where text_cmp() reads both sides of every row
+ * through the layouts' accessor; against '' a row's length alone decides.
+ */
+static void
+text_eq_const_offsets(VexecKernelCall *kc)
+{
+	const TextCall *tc = kc->call->extra;
+	bool		ne = tc->info.op == TOP_NE;
+	int			ci = kc->args[0]->encoding == VEXEC_CONST ? 0 : 1;
+	const VexecVec *col = kc->args[1 - ci];
+	const int32 *off = (const int32 *) col->values;
+	const char *b = col->buffers[0];
+	const char *c;
+	int			clen;
+
+	bytes_at(kc->args[ci], 0, &c, &clen);
+	if (clen == 0)
+	{
+		VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+			vexec_result_bit(kc->result, i, (off[i + 1] == off[i]) != ne);
+		return;
+	}
+	VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+	{
+		int32		len = off[i + 1] - off[i];
+
+		vexec_result_bit(kc->result, i,
+						 (len == clen && memcmp(b + off[i], c, clen) == 0) != ne);
+	}
+}
+
 static bool
 text_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
 {
+	const TextCall *tc = kc->call->extra;
+
 	args[0] = vexec_text_plain(kc, args[0]);
 	args[1] = vexec_text_plain(kc, args[1]);
 	v->fn = text_cmp;
 	v->result = vexec_bool_bits;
+	if ((tc->info.op == TOP_EQ || tc->info.op == TOP_NE) && !tc->info.bpchar &&
+		(args[0]->encoding == VEXEC_CONST) != (args[1]->encoding == VEXEC_CONST))
+	{
+		const VexecVec *col = args[0]->encoding == VEXEC_CONST ? args[1] : args[0];
+		const VexecVec *cst = args[0]->encoding == VEXEC_CONST ? args[0] : args[1];
+
+		if (col->encoding == VEXEC_FLAT && col->shape.layout == VEXEC_OFFSETS &&
+			col->nbuffers == 1 && !vexec_vec_isnull(cst, 0))
+			v->fn = text_eq_const_offsets;
+	}
 	return true;
 }
 
@@ -491,6 +543,92 @@ utf8_char_len(unsigned char c)
 }
 
 /*
+ * Whether the values of an OFFSETS column's nrows rows are each their
+ * encoding's whole, checked at once (H10, M2): their bytes, from the first's
+ * start to the last's end, the encoding's whole -- no NUL, no truncated or
+ * invalid character -- and in UTF8 no offset within them at a continuation
+ * byte, so that no value begins or ends inside a character.  The ASCII
+ * prefix without a NUL is found a chunk at a time (is_valid_ascii()), the
+ * rest checked by pg_encoding_verifymbstr(); *ascii says whether every byte
+ * was ASCII.  The rows not active are checked too; one not whole sends the
+ * caller to its check of each value.
+ */
+bool
+vexec_text_batch_whole(const VexecVec *s, int nrows, int encoding, bool *ascii)
+{
+	const int32 *off = (const int32 *) s->values;
+	const char *b = s->buffers[0];
+	int32		lo = off[0];
+	int32		hi = off[nrows];
+	const char *p = b + lo;
+	int			len = hi - lo;
+	int			i = 0;
+
+	*ascii = false;
+	while (i + (int) sizeof(Vector8) <= len &&
+		   is_valid_ascii((const unsigned char *) p + i, (int) sizeof(Vector8)))
+		i += (int) sizeof(Vector8);
+	/* the tail's bytes, where the chunks reached it: none 0, none past 0x7F */
+	if (i + (int) sizeof(Vector8) > len)
+	{
+		int			j = i;
+
+		while (j < len && (unsigned char) (p[j] - 1) < 0x7F)
+			j++;
+		if (j == len)
+		{
+			*ascii = true;
+			return true;
+		}
+	}
+	if (pg_encoding_verifymbstr(encoding, p + i, len - i) != len - i)
+		return false;
+	if (encoding == PG_UTF8)
+		for (int r = 1; r < nrows; r++)
+			if (off[r] < hi && ((unsigned char) b[off[r]] & 0xC0) == 0x80)
+				return false;
+	return true;
+}
+
+/*
+ * The characters of a UTF8 value its encoding takes whole: its bytes less
+ * its continuation bytes, 10xxxxxx -- each character's first byte counted,
+ * as pg_mbstrlen_with_len()'s walk counts them where every character is
+ * whole and none is a NUL.  Sixteen bytes at a time where SSE2 is, a
+ * continuation byte being below -64 as a signed byte; eight at a time
+ * otherwise, its top bit set and the next one clear.
+ */
+static inline int32
+utf8_chars_whole(const char *a, int alen)
+{
+	int32		n = alen;
+	int			j = 0;
+
+#ifdef __SSE2__
+	{
+		const __m128i lim = _mm_set1_epi8((char) 0xC0);
+
+		for (; j + 16 <= alen; j += 16)
+		{
+			__m128i		v = _mm_loadu_si128((const __m128i *) (a + j));
+
+			n -= pg_popcount32((uint32) _mm_movemask_epi8(_mm_cmplt_epi8(v, lim)));
+		}
+	}
+#endif
+	for (; j + 8 <= alen; j += 8)
+	{
+		uint64		w;
+
+		memcpy(&w, a + j, 8);
+		n -= pg_popcount64(w & ~(w << 1) & UINT64CONST(0x8080808080808080));
+	}
+	for (; j < alen; j++)
+		n -= ((unsigned char) a[j] & 0xC0) == 0x80;
+	return n;
+}
+
+/*
  * The characters of a UTF8 value, or -1 where a character runs past its
  * end.  Eight bytes at a time while they are ASCII and none is a NUL.
  */
@@ -538,6 +676,37 @@ len_kernel(VexecKernelCall *kc)
 	const VexecVec *s = kc->args[0];
 	bool		bytes = li->octets || pg_database_encoding_max_length() == 1;
 	int32	   *out = (int32 *) kc->result->values;
+
+	/*
+	 * M2 (§3.21): an OFFSETS column whose batch is UTF8's whole at once --
+	 * no value of it walked, as below -- its lengths are its offsets'
+	 * differences where every byte is ASCII, else each value's bytes less
+	 * its continuation bytes.  A batch not whole, and the other layouts,
+	 * walk each value.
+	 */
+	if (!bytes && s->encoding == VEXEC_FLAT && s->shape.layout == VEXEC_OFFSETS &&
+		s->nbuffers == 1 && kc->nrows > 0 && s->nvalues >= kc->nrows)
+	{
+		bool		ascii;
+
+		if (vexec_text_batch_whole(s, kc->nrows, PG_UTF8, &ascii))
+		{
+			const int32 *off = (const int32 *) s->values;
+			const char *b = s->buffers[0];
+
+			if (ascii)
+			{
+				VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+					out[i] = off[i + 1] - off[i];
+			}
+			else
+			{
+				VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+					out[i] = utf8_chars_whole(b + off[i], off[i + 1] - off[i]);
+			}
+			return;
+		}
+	}
 
 	VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
 	{

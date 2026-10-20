@@ -27,6 +27,15 @@ RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'vexec_sinks'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
 
+-- The exchange area (vexec.exchange_memory): its blocks in all, those free
+-- now, and a block's bytes.  A parallel aggregation's partitions take blocks
+-- of it before segments of their own, and give them back as the query ends
+-- (pg_vector_executor.md §3.21, M1).
+CREATE FUNCTION exchange_area(OUT blocks int4, OUT free int4, OUT block_bytes int8)
+RETURNS record
+AS 'MODULE_PATHNAME', 'vexec_exchange_area'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
 -- How a batch holds a type: its class, its layout in the PostgreSQL format
 -- and in the Arrow format, and every layout it can be held in.  The type is
 -- named as SQL names it, typmod and all: 'numeric(10,2)'.

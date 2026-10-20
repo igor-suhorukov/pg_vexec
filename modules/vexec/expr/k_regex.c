@@ -181,24 +181,16 @@ regex_value_whole(int encoding, const char *s, int len)
  * Whether every value of an OFFSETS column's nrows is whole at once: their
  * bytes, from the first's start to the last's end, the encoding's whole,
  * and in UTF8 no offset within them at a continuation byte, so that no
- * value begins or ends inside a character.  The rows not active are
- * checked too; one not whole sends the batch to the check of each value.
+ * value begins or ends inside a character (vexec_text_batch_whole(), which
+ * length() shares, M2).  The rows not active are checked too; one not whole
+ * sends the batch to the check of each value.
  */
 static bool
 regex_batch_whole(const RegexCall *rc, const VexecVec *s, int nrows)
 {
-	const int32 *off = (const int32 *) s->values;
-	const char *b = s->buffers[0];
-	int32		lo = off[0];
-	int32		hi = off[nrows];
+	bool		ascii;
 
-	if (!regex_value_whole(rc->encoding, b + lo, hi - lo))
-		return false;
-	if (rc->utf8)
-		for (int i = 1; i < nrows; i++)
-			if (off[i] < hi && ((unsigned char) b[off[i]] & 0xC0) == 0x80)
-				return false;
-	return true;
+	return vexec_text_batch_whole(s, nrows, rc->encoding, &ascii);
 }
 
 /* The quantifier after an atom: ?, * or +, or none; *? and the like refused. */

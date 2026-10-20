@@ -9,7 +9,10 @@
 # vexec, which the packs' registry allows (vexec_kernels.h): vexec_packs
 # binds its declarations.  vexec_test is preloaded after vexec, which it
 # reaches by symbol: the batch source and sink of its access method are
-# registered only then (vexec_source).
+# registered only then (vexec_source).  The server has an exchange area of
+# two blocks (vexec.exchange_memory, M1 of pg_vector_executor.md §3.21):
+# a parallel aggregation's third participant cuts its partitions from a
+# segment of its own while the others take the blocks (vexec_agg).
 #
 #   VEXEC_PRELOAD   the server's shared_preload_libraries:
 #                   vexec_testpack,vexec,vexec_test
@@ -20,7 +23,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/lib.sh"
 
 D="$(mktemp -d "${TMPDIR:-/tmp}/vexec-suite-XXXXXX")"
-settings=("shared_preload_libraries = '${VEXEC_PRELOAD:-vexec_testpack,vexec,vexec_test}'")
+settings=("shared_preload_libraries = '${VEXEC_PRELOAD:-vexec_testpack,vexec,vexec_test}'"
+	"vexec.exchange_memory = 8")
 while IFS= read -r line; do [ -n "$line" ] && settings+=("$line"); done <<< "${VEXEC_SETTINGS:-}"
 server_init "$D" "${settings[@]}" || exit 1
 server_start "$D" || { echo "the server did not start"; tail -20 "$D/log"; exit 1; }

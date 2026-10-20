@@ -81,6 +81,12 @@
  * 64 MB, their handles in the node's chunk of the DSM -- no lock taken, as
  * the parallel query's DSA takes one for each allocation, and holds while
  * it zeroes a new segment -- and pushed onto its partition's list there.
+ * Where the server has an exchange area (vexec.exchange_memory, M1 of
+ * §3.21; exchange.c), a participant's first chunks are cut from its 4 MB
+ * blocks instead, mapped in every process since the postmaster started and
+ * neither zeroed nor given back to the system -- 48 of them at most, then
+ * segments as without it -- and the last process of the parallel query to
+ * let go of its DSM gives them back to the area.
  A chunk goes onto its list once the batch whose groups it may
  * hold is done with them, so that a chunk on a list is as it will stay.
  * While other participants still write, one that has written claims its
@@ -173,7 +179,13 @@ typedef struct PackChunk
 #define PACK_PAGE			((Size) 4096)	/* a shared chunk's alignment */
 #define PACK_CHUNK_FIRST	((Size) 16 * 1024)	/* a partition's first chunk */
 #define PACK_CHUNK_MAX		((Size) 256 * 1024)	/* and its largest */
-#define PACK_SEGMENTS		16	/* a participant's DSM segments, at most */
+#define PACK_SEGMENTS		64	/* a participant's segments and exchange
+								 * area blocks (M1), at most */
+#define PACK_AREA_BLOCKS	48	/* M1: of them, the area's blocks at most --
+								 * taken first, the segments after them
+								 * growing as without it, past its 16's sum */
+#define PACK_KIND_DSM		0	/* a segment's entry: a DSM segment's handle */
+#define PACK_KIND_AREA		1	/* or an exchange area block's index (M1) */
 #define PACK_SEGMENT_FIRST	((Size) 4 * 1024 * 1024)
 #define PACK_SEGMENT_MAX	((Size) 64 * 1024 * 1024)
 
@@ -197,7 +209,12 @@ typedef struct RepartShared
 								 * pg_atomic_uint64 a partition; */
 	Size		segs_off;		/* each participant's segments' handles,
 								 * PACK_SEGMENTS of them; */
-	Size		nsegs_off;		/* and how many it made, a uint32 each */
+	Size		nsegs_off;		/* and how many it made, a uint32 each; */
+	Size		kinds_off;		/* each segment's kind, PACK_KIND_*, a byte */
+	bool		area;			/* M1: blocks of the exchange area may be cut
+								 * from, the leader's say */
+	pg_atomic_uint32 area_users;	/* M1: the processes holding the DSM that
+									 * may read the area's blocks */
 	pg_atomic_uint32 writing;	/* D2: participants writing, which others
 								 * read beside (above) */
 	pg_atomic_uint32 topk_bound;	/* C5: the first stages' boundary */
@@ -274,6 +291,7 @@ typedef struct VexecRepartState
 	int64		pk_chunks_early;
 	int64		pk_groups;		/* written by this participant */
 	Size		pk_shared;		/* the bytes of its chunks in shared memory */
+	int64		pk_area_blocks; /* M1: of them, the exchange area's blocks */
 	Size		pk_files;		/* and in files */
 	int64		pk_chunks_read;
 } VexecRepartState;
@@ -292,6 +310,7 @@ struct VexecPackSink
 								 * once the batch is done with their groups */
 	MemoryContext cxt;
 	int			nsegs;			/* the segments made, the last being cut */
+	int			nblocks;		/* M1: of them, exchange area blocks */
 	Size		seg_used;
 	Size		seg_size;
 	bool		no_segments;	/* none to be had: local chunks from now */
@@ -538,6 +557,13 @@ pack_nsegs(RepartShared *sh)
 	return (uint32 *) ((char *) sh + sh->nsegs_off);
 }
 
+/* Each participant's segments' kinds, PACK_KIND_*. */
+static uint8 *
+pack_kinds(RepartShared *sh)
+{
+	return (uint8 *) sh + sh->kinds_off;
+}
+
 static inline PackPointer
 pack_pointer(int participant, int seg, Size offset)
 {
@@ -550,7 +576,13 @@ pack_chunk(VexecRepartState *s, PackPointer ptr)
 {
 	int			participant = (int) (ptr >> 48);
 	int			seg = (int) ((ptr >> 32) & 0xFFFF);
-	dsm_segment *m = s->pk_maps[participant * PACK_SEGMENTS + seg];
+	dsm_segment *m;
+
+	/* M1: an exchange area block, mapped since the postmaster's start */
+	if (pack_kinds(s->shared)[participant * PACK_SEGMENTS + seg] == PACK_KIND_AREA)
+		return (PackChunk *) (vexec_exchange_block((int32) pack_handles(s->shared)[participant * PACK_SEGMENTS + seg]) +
+							  (ptr & 0xFFFFFFFF));
+	m = s->pk_maps[participant * PACK_SEGMENTS + seg];
 
 	/*
 	 * mapped as a chunk of it first comes: its writer is writing, or waits
@@ -574,6 +606,9 @@ pack_chunk(VexecRepartState *s, PackPointer ptr)
 static void
 pack_release(PackChunk *c)
 {
+	/* M1: an exchange area block's pages stay, for the next query */
+	if (vexec_exchange_holds(c))
+		return;
 #ifdef MADV_REMOVE
 	(void) madvise((void *) c, PACK_CHUNK_HEADER + c->size, MADV_REMOVE);
 #else
@@ -642,6 +677,31 @@ pack_shared_chunk(VexecPackSink *k, Size bytes, PackPointer *ptr)
 		dsm_segment *seg;
 
 		size = Max(size, bytes);
+		/*
+		 * M1: a block of the exchange area first, where the leader gave the
+		 * query it and one is free; then a segment of this participant's own,
+		 * and only segments after it
+		 */
+		if (sh->area && !k->no_segments && k->nblocks == k->nsegs && k->nsegs < PACK_AREA_BLOCKS &&
+			bytes <= VEXEC_EXCHANGE_BLOCK && s->pk_shared + VEXEC_EXCHANGE_BLOCK <= k->budget)
+		{
+			int32		b = vexec_exchange_claim();
+
+			if (b >= 0)
+			{
+				pack_kinds(sh)[me * PACK_SEGMENTS + k->nsegs] = PACK_KIND_AREA;
+				pack_handles(sh)[me * PACK_SEGMENTS + k->nsegs] = (dsm_handle) b;
+				pack_nsegs(sh)[me] = ++k->nsegs;
+				k->nblocks++;
+				k->seg_size = VEXEC_EXCHANGE_BLOCK;
+				k->seg_used = 0;
+				s->pk_shared += VEXEC_EXCHANGE_BLOCK;
+				s->pk_area_blocks++;
+				*ptr = pack_pointer(me, k->nsegs - 1, k->seg_used);
+				k->seg_used += bytes;
+				return pack_chunk(s, *ptr);
+			}
+		}
 		if (k->no_segments || k->nsegs == PACK_SEGMENTS || s->pk_shared + size > k->budget)
 			return NULL;
 		seg = dsm_create(size, DSM_CREATE_NULL_IF_MAXSEGMENTS);
@@ -651,6 +711,7 @@ pack_shared_chunk(VexecPackSink *k, Size bytes, PackPointer *ptr)
 			return NULL;
 		}
 		s->pk_maps[me * PACK_SEGMENTS + k->nsegs] = seg;
+		pack_kinds(sh)[me * PACK_SEGMENTS + k->nsegs] = PACK_KIND_DSM;
 		pack_handles(sh)[me * PACK_SEGMENTS + k->nsegs] = dsm_segment_handle(seg);
 		pack_nsegs(sh)[me] = ++k->nsegs;
 		k->seg_size = size;
@@ -782,8 +843,9 @@ pack_map_all(VexecRepartState *s)
 		{
 			dsm_segment *m;
 
-			if (s->pk_maps[q * PACK_SEGMENTS + i] != NULL)
-				continue;		/* mapped as one of its chunks came */
+			if (s->pk_maps[q * PACK_SEGMENTS + i] != NULL ||
+				pack_kinds(sh)[q * PACK_SEGMENTS + i] == PACK_KIND_AREA)
+				continue;		/* mapped as one of its chunks came, or the area's */
 			m = dsm_attach(pack_handles(sh)[q * PACK_SEGMENTS + i]);
 			if (m == NULL)
 				elog(ERROR, "vexec: a parallel aggregation's segment is gone before it was read");
@@ -1419,7 +1481,64 @@ repart_estimate_dsm(CustomScanState *css, ParallelContext *pcxt)
 	/* D2: the lists, the segments' handles and their counts */
 	size = add_size(size, mul_size(repart_partitions(nparticipants), sizeof(pg_atomic_uint64)));
 	size = add_size(size, mul_size(nparticipants, PACK_SEGMENTS * sizeof(dsm_handle)));
-	return add_size(size, mul_size(nparticipants, sizeof(uint32)));
+	size = add_size(size, mul_size(nparticipants, sizeof(uint32)));
+	/* M1: the segments' kinds */
+	return add_size(size, mul_size(nparticipants, PACK_SEGMENTS * sizeof(uint8)));
+}
+
+/*
+ * M1: every participant's exchange area blocks given back, once no process
+ * holding the parallel query's DSM reads them -- by the last to let go of
+ * it: the leader at the query's end, or a worker that outlived the leader's
+ * part in an error's cleanup.  The DSM holds the lists, and is still mapped
+ * while its detach callbacks run.
+ */
+static void
+area_release(RepartShared *sh)
+{
+	for (int q = 0; q < sh->nparticipants; q++)
+	{
+		uint32		n = pack_nsegs(sh)[q];
+
+		for (uint32 i = 0; i < n; i++)
+		{
+			int			k = q * PACK_SEGMENTS + (int) i;
+
+			if (pack_kinds(sh)[k] != PACK_KIND_AREA)
+				continue;
+			pack_kinds(sh)[k] = PACK_KIND_DSM;	/* given back once */
+			vexec_exchange_release((int32) pack_handles(sh)[k]);
+		}
+	}
+}
+
+static void
+area_detach(dsm_segment *seg, Datum arg)
+{
+	RepartShared *sh = (RepartShared *) DatumGetPointer(arg);
+
+	(void) seg;
+	if (pg_atomic_sub_fetch_u32(&sh->area_users, 1) == 0)
+		area_release(sh);
+}
+
+/*
+ * M1: a worker counted among the area's users, where the leader still is
+ * one: a worker that comes once the others let go -- the query ending in an
+ * error -- finds blocks given back, which it must not read.
+ */
+static void
+area_join(RepartShared *sh, dsm_segment *seg)
+{
+	uint32		n = pg_atomic_read_u32(&sh->area_users);
+
+	while (n > 0)
+		if (pg_atomic_compare_exchange_u32(&sh->area_users, &n, n + 1))
+		{
+			on_dsm_detach(seg, area_detach, PointerGetDatum(sh));
+			return;
+		}
+	elog(ERROR, "vexec: a parallel aggregation's partitions are gone before a worker came to read them");
 }
 
 /* Each partition's store, made: the leader's, participant 0. */
@@ -1457,9 +1576,16 @@ repart_initialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordin
 	sh->heads_off = offsetof(RepartShared, stores) + sh->npartitions * sh->sts_size;
 	sh->segs_off = sh->heads_off + sh->npartitions * sizeof(pg_atomic_uint64);
 	sh->nsegs_off = sh->segs_off + sh->nparticipants * PACK_SEGMENTS * sizeof(dsm_handle);
+	sh->kinds_off = sh->nsegs_off + sh->nparticipants * sizeof(uint32);
 	for (int p = 0; p < sh->npartitions; p++)
 		pg_atomic_init_u64(&pack_heads(sh)[p], (uint64) PACK_NONE);
 	memset(pack_nsegs(sh), 0, sizeof(uint32) * sh->nparticipants);
+	memset(pack_kinds(sh), PACK_KIND_DSM, sh->nparticipants * PACK_SEGMENTS);
+	/* M1: the area, where the server has one and the session takes it; the leader its first user */
+	sh->area = sh->packed && vexec_exchange_enabled();
+	pg_atomic_init_u32(&sh->area_users, sh->area ? 1 : 0);
+	if (sh->area)
+		on_dsm_detach(pcxt->seg, area_detach, PointerGetDatum(sh));
 	pg_atomic_init_u32(&sh->writing, 0);
 	s->me = 0;
 	s->pk_nmaps = sh->nparticipants * PACK_SEGMENTS;
@@ -1490,11 +1616,18 @@ repart_reinitialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coord
 
 	(void) pcxt;
 	end_reading(s);
-	/* D2: the segments let go, the lists empty: the participants are new */
+	/*
+	 * D2: the segments let go, the lists empty: the participants are new.
+	 * M1: the last run's area blocks given back -- its workers have exited,
+	 * and the leader alone holds the DSM (ReinitializeParallelDSM())
+	 */
 	pack_unmap_all(s);
+	if (sh->area)
+		area_release(sh);
 	for (int p = 0; p < sh->npartitions; p++)
 		pg_atomic_write_u64(&pack_heads(sh)[p], (uint64) PACK_NONE);
 	memset(pack_nsegs(sh), 0, sizeof(uint32) * sh->nparticipants);
+	memset(pack_kinds(sh), PACK_KIND_DSM, sh->nparticipants * PACK_SEGMENTS);
 	pg_atomic_write_u32(&sh->writing, 0);
 	s->pk_reads = false;
 	s->pk_early = false;
@@ -1524,6 +1657,8 @@ repart_initialize_worker(CustomScanState *css, shm_toc *toc, void *coordinate)
 	if (vexec_is_vector_state(s->child))
 		vexec_agg_set_topk_shared((VexecNode *) s->child, &sh->topk_bound);
 	SharedFileSetAttach(&sh->fileset, seg);
+	if (sh->area)
+		area_join(sh, seg);
 	s->shared = sh;
 	s->npartitions = sh->npartitions;
 	s->me = ParallelWorkerNumber + 1;
@@ -1613,6 +1748,8 @@ repart_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 	{
 		ExplainPropertyInteger("Packed Groups Written", NULL, s->pk_groups, es);
 		ExplainPropertyInteger("Shared Memory", "kB", (int64) ((s->pk_shared + 1023) / 1024), es);
+		if (s->pk_area_blocks > 0)
+			ExplainPropertyInteger("Exchange Area Blocks", NULL, s->pk_area_blocks, es);
 		if (s->pk_files > 0)
 			ExplainPropertyInteger("Files", "kB", (int64) ((s->pk_files + 1023) / 1024), es);
 		ExplainPropertyInteger("Chunks Read", NULL, s->pk_chunks_read, es);

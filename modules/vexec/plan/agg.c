@@ -57,6 +57,7 @@
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -289,6 +290,146 @@ agg_refusal(PlannerInfo *root, List *groupclause, PathTarget *target, List *havi
 			return "a column the aggregation's input does not give";
 	}
 	return NULL;
+}
+
+/*
+ * M3 (§3.21): whether a grouping equality is the identity of its values, so
+ * that a function of the column gives every row of a group the same result:
+ * integers, oids, booleans, "char", dates and timestamps by their bits, and
+ * text, varchar and bytea by their bytes under a deterministic collation --
+ * not floats, whose -0 equals 0, nor numeric, whose 1.0 equals 1.00, nor
+ * bpchar, whose trailing blanks do not count.
+ */
+static bool
+identity_equality(Oid eqop, Oid collation)
+{
+	switch (get_opcode(eqop))
+	{
+		case F_INT2EQ:
+		case F_INT4EQ:
+		case F_INT8EQ:
+		case F_OIDEQ:
+		case F_BOOLEQ:
+		case F_CHAREQ:
+		case F_DATE_EQ:
+		case F_TIME_EQ:
+		case F_TIMESTAMP_EQ:
+		case F_TIMESTAMPTZ_EQ:
+		case F_CASH_EQ:
+		case F_BYTEAEQ:
+			return true;
+		case F_TEXTEQ:
+			return OidIsValid(collation) && get_collation_isdeterministic(collation);
+		default:
+			return false;
+	}
+}
+
+/*
+ * M3 (§3.21): the grouping clause without its keys that are functions of
+ * the others -- an immutable expression whose every variable is another key
+ * of the clause, a column compared by identity -- which ClickHouse drops too
+ * (optimize_group_by_function_keys).  Equal kept keys then make equal
+ * dropped ones, so the groups are the same; the input still computes them
+ * for every row, as before, and an output that reads one computes it from
+ * the group's keys (fix_upper_expr() finding the key's column inside it).
+ * Q35's GROUP BY ClientIP, ClientIP - 1, ClientIP - 2, ClientIP - 3 hashes
+ * ClientIP alone.  *ndropped says how many went.
+ */
+static List *
+independent_keys(List *groupclause, List *groupexprs, int *ndropped, List **keptexprs)
+{
+	List	   *kept = NIL;
+	List	   *exprs = NIL;
+	ListCell   *lc1,
+			   *lc2;
+
+	*ndropped = 0;
+	*keptexprs = groupexprs;
+	if (!vexec_drop_implied_keys || list_length(groupclause) < 2)
+		return groupclause;
+	forboth(lc1, groupclause, lc2, groupexprs)
+	{
+		Node	   *e = lfirst(lc2);
+		List	   *vars;
+		bool		implied;
+		ListCell   *lv;
+
+		if (IsA(e, Var) || IsA(e, PlaceHolderVar) || contain_mutable_functions(e) ||
+			contain_subplans(e))
+		{
+			kept = lappend(kept, lfirst(lc1));
+			exprs = lappend(exprs, e);
+			continue;
+		}
+		vars = pull_var_clause(e, PVC_RECURSE_PLACEHOLDERS);
+		implied = vars != NIL;
+		foreach(lv, vars)
+		{
+			Var		   *v = lfirst(lv);
+			bool		found = false;
+			ListCell   *k1,
+					   *k2;
+
+			if (v->varlevelsup != 0)
+			{
+				implied = false;
+				break;
+			}
+			forboth(k1, groupclause, k2, groupexprs)
+			{
+				SortGroupClause *sgc = lfirst_node(SortGroupClause, k1);
+
+				if (IsA(lfirst(k2), Var) && equal(lfirst(k2), v) &&
+					identity_equality(sgc->eqop, exprCollation((Node *) v)))
+				{
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+			{
+				implied = false;
+				break;
+			}
+		}
+		if (implied)
+			(*ndropped)++;
+		else
+		{
+			kept = lappend(kept, lfirst(lc1));
+			exprs = lappend(exprs, e);
+		}
+	}
+	if (*ndropped == 0)
+		return groupclause;
+	*keptexprs = exprs;
+	return kept;
+}
+
+/*
+ * M3 (§3.21): a partial stage's target without the grouping expressions its
+ * keys imply, which it then neither computes nor hands on, so that its
+ * groups stay as they lie (D2): the final stage computes them from its keys
+ * for the groups it hands up -- with a bound above it, for those alone.
+ */
+static PathTarget *
+without_implied(PlannerInfo *root, PathTarget *target, List *implied)
+{
+	PathTarget *t;
+	int			i = 0;
+	ListCell   *lc;
+
+	if (implied == NIL)
+		return target;
+	t = create_empty_pathtarget();
+	foreach(lc, target->exprs)
+	{
+		if (!list_member(implied, lfirst(lc)))
+			add_column_to_pathtarget(t, lfirst(lc), get_pathtarget_sortgroupref(target, i));
+		i++;
+	}
+	return set_pathtarget_cost_width(root, t);
 }
 
 /* How many of the aggregates have a vector transition, for the cost. */
@@ -1405,6 +1546,10 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 	double		units = 0;
 	List	   *names = NIL;
 	List	   *newpaths = NIL;
+	List	   *vgroupclause;	/* M3: VecAgg's keys, the implied ones out */
+	List	   *vgroupexprs;
+	List	   *implied = NIL;
+	int			nimplied;
 	ListCell   *lc;
 
 	if (ps->record)
@@ -1489,6 +1634,12 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 		}
 	}
 
+	/* M3: the keys the others imply, out of VecAgg's; core's paths keep them all */
+	vgroupclause = independent_keys(groupclause, as.groupexprs, &nimplied, &vgroupexprs);
+	foreach(lc, as.groupexprs)
+		if (!list_member_ptr(vgroupexprs, lfirst(lc)))
+			implied = lappend(implied, lfirst(lc));
+
 	/* PostgreSQL's own Agg over the same input, which the cost derives from */
 	MemSet(&agg_costs, 0, sizeof(AggClauseCosts));
 	get_agg_clause_costs(root, AGGSPLIT_SIMPLE, &agg_costs);
@@ -1496,9 +1647,9 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 							  AGGSPLIT_SIMPLE, groupclause, having, &agg_costs,
 							  strategy == AGG_PLAIN ? 1 : numgroups);
 	nvec = count_vector_aggs(as.aggrefs, AGGSPLIT_SIMPLE, &names);
-	nkeys_kernel = count_kernel_keys(groupclause, as.groupexprs);
+	nkeys_kernel = count_kernel_keys(vgroupclause, vgroupexprs);
 	vexec_cost_agg(root, &rowpath->path, input, vexec_is_vector_path(input),
-				   list_length(groupclause), nkeys_kernel, nvec,
+				   list_length(vgroupclause), nkeys_kernel, nvec,
 				   strategy == AGG_PLAIN ? 1 : numgroups, &cost);
 
 	/*
@@ -1521,9 +1672,10 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 			appendStringInfo(&buf, "%s%s", foreach_current_index(lc) > 0 ? ", " : "",
 							 (char *) lfirst(lc));
 		vexec_alt_costed(ps, alt, &cost,
-						 psprintf("%s, %s, %s, %d with vector transitions (%s)",
+						 psprintf("%s, %s%s, %s, %d with vector transitions (%s)",
 								  strategy == AGG_HASHED ? "hashed" : "plain",
-								  count_of(list_length(groupclause), "grouping column", "grouping columns"),
+								  count_of(list_length(vgroupclause), "grouping column", "grouping columns"),
+								  nimplied > 0 ? psprintf(" (%d more implied by them)", nimplied) : "",
 								  count_of(list_length(as.aggrefs), "aggregate", "aggregates"),
 								  nvec, buf.data));
 	}
@@ -1534,7 +1686,7 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 	info.strategy = strategy;
 	info.split = AGGSPLIT_SIMPLE;
 	info.numgroups = numgroups;
-	info.groupclause = groupclause;
+	info.groupclause = vgroupclause;
 	info.having = having;
 	newpaths = lappend(newpaths, agg_path(root, output_rel, input, output_rel->reltarget,
 										  &info, &cost));
@@ -1548,7 +1700,7 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 	 */
 	if (strategy == AGG_HASHED && !answered)
 	{
-		Path	   *sinput = sorted_input_path(root, input_rel, input, groupclause, ps);
+		Path	   *sinput = sorted_input_path(root, input_rel, input, vgroupclause, ps);
 
 		if (sinput != NULL)
 		{
@@ -1558,7 +1710,7 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 			VexecCost	scost;
 			AggPathInfo sinfo = info;
 
-			vexec_cost_agg(root, &srow->path, sinput, true, list_length(groupclause),
+			vexec_cost_agg(root, &srow->path, sinput, true, list_length(vgroupclause),
 						   nkeys_kernel, nvec, numgroups, &scost);
 			/* the savings are the rows', not the start's: the first group closes after a few */
 			scost.startup = sinput->startup_cost + vexec_batch_setup_cost;
@@ -1584,6 +1736,8 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 		if (prel != NULL && pinput->parallel_workers > 0 &&
 			agg_refusal(root, groupclause, prel->reltarget, NIL, pinput->pathtarget, &pas) == NULL)
 		{
+			/* M3: the partial groups without the expressions their keys imply */
+			PathTarget *ptarget = without_implied(root, prel->reltarget, implied);
 			AggPathInfo pinfo = info;
 			AggPathInfo finfo = info;
 			AggPath    *prow;
@@ -1608,23 +1762,23 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 			prow = create_agg_path(root, prel, pinput, prel->reltarget, strategy,
 								   AGGSPLIT_INITIAL_SERIAL, groupclause, NIL, &pcosts, pgroups);
 			vexec_cost_agg(root, &prow->path, pinput, vexec_is_vector_path(pinput),
-						   list_length(groupclause), nkeys_kernel,
+						   list_length(vgroupclause), nkeys_kernel,
 						   count_vector_aggs(pas.aggrefs, AGGSPLIT_INITIAL_SERIAL, NULL),
 						   pgroups, &pcost);
 			pinfo.split = AGGSPLIT_INITIAL_SERIAL;
 			pinfo.numgroups = pgroups;
 			pinfo.having = NIL;
-			partial = agg_path(root, prel, pinput, prel->reltarget, &pinfo, &pcost);
+			partial = agg_path(root, prel, pinput, ptarget, &pinfo, &pcost);
 			partial->parallel_safe = true;
 
 			total_groups = partial->rows * partial->parallel_workers;
-			gather = (Path *) create_gather_path(root, prel, partial, prel->reltarget, NULL,
+			gather = (Path *) create_gather_path(root, prel, partial, ptarget, NULL,
 												 &total_groups);
 
 			frow = create_agg_path(root, output_rel, gather, output_rel->reltarget, strategy,
 								   AGGSPLIT_FINAL_DESERIAL, groupclause, having, &fcosts,
 								   strategy == AGG_PLAIN ? 1 : numgroups);
-			vexec_cost_agg(root, &frow->path, gather, false, list_length(groupclause),
+			vexec_cost_agg(root, &frow->path, gather, false, list_length(vgroupclause),
 						   nkeys_kernel, 0, strategy == AGG_PLAIN ? 1 : numgroups, &fcost);
 			finfo.split = AGGSPLIT_FINAL_DESERIAL;
 			newpaths = lappend(newpaths, agg_path(root, output_rel, gather,
@@ -1637,7 +1791,7 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 			 */
 			if (strategy == AGG_HASHED && vexec_enable_repartition && groupclause != NIL)
 			{
-				Path	   *repart = repart_path(root, prel, partial, groupclause);
+				Path	   *repart = repart_path(root, prel, partial, vgroupclause);
 				double		each = clamp_row_est(numgroups / Max(partial->parallel_workers, 1));
 				AggPath    *erow;
 				VexecCost	ecost;
@@ -1647,7 +1801,7 @@ vexec_consider_agg(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_
 
 				erow = create_agg_path(root, output_rel, repart, output_rel->reltarget, strategy,
 									   AGGSPLIT_FINAL_DESERIAL, groupclause, having, &fcosts, each);
-				vexec_cost_agg(root, &erow->path, repart, true, list_length(groupclause),
+				vexec_cost_agg(root, &erow->path, repart, true, list_length(vgroupclause),
 							   nkeys_kernel, 0, each, &ecost);
 				einfo.numgroups = each;
 				pfinal = agg_path(root, output_rel, repart, output_rel->reltarget, &einfo, &ecost);

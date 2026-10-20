@@ -112,6 +112,26 @@ SELECT agg_check('SELECT id, k, t, count(*) FROM at WHERE id < 100 GROUP BY id')
 SELECT agg_check('SELECT count(*) FROM at HAVING count(*) > 1');
 SELECT agg_check('SELECT count(*) FROM at HAVING count(*) < 1');
 SELECT agg_check('SELECT 1 FROM at HAVING sum(k) > 0');
+-- M3 (§3.21): a key that is an immutable expression of other keys --
+-- columns compared by identity: integers, dates, timestamps, text under a
+-- deterministic collation -- makes no group the others do not, and is left
+-- out of the hash's keys; the output computes it from them, NULLs and all,
+-- HAVING and ORDER BY too.  Kept: a key over a column compared otherwise --
+-- a float, a numeric -- or over no other key, or a volatile one
+SELECT agg_check('SELECT k, k - 1, k - 2, k - 3, count(*) FROM at GROUP BY 1, 2, 3, 4');
+SELECT agg_check('SELECT s, s::int8 * 2, b, b / 1000, count(*), sum(id) FROM at GROUP BY 1, 2, 3, 4');
+SELECT agg_check($$SELECT d, extract(year FROM d), ts, date_trunc('day', ts), count(*) FROM at GROUP BY 1, 2, 3, 4$$);
+SELECT agg_check($$SELECT t, length(t), upper(t), t || 'x', coalesce(t, 'none'), count(*), min(id) FROM at GROUP BY 1, 2, 3, 4, 5$$);
+SELECT agg_check('SELECT k, s, k + s, k * s, count(*) FROM at GROUP BY k, s, k + s, k * s');
+SELECT agg_check('SELECT k, k * 2 AS k2, count(*) FROM at GROUP BY 1, 2 HAVING k * 2 > 6 ORDER BY k2 DESC');
+SELECT agg_check('SELECT k + 1, k + 2, count(*) FROM at GROUP BY 1, 2');
+SELECT agg_check('SELECT f, f * 2, n, n * 2, count(*) FROM at GROUP BY 1, 2, 3, 4');
+SELECT agg_check('SELECT k, k + (random() * 0)::int, count(*) FROM at GROUP BY 1, 2');
+SELECT agg_explain('SELECT k, k - 1, k - 2, count(*) FROM at GROUP BY 1, 2, 3', 'Group Key|Vec [A-Za-z ]*Aggregate');
+SELECT agg_explain('SELECT f, f * 2, count(*) FROM at GROUP BY 1, 2', 'Group Key|Vec [A-Za-z ]*Aggregate');
+SET vexec.drop_implied_keys = off;
+SELECT agg_explain('SELECT k, k - 1, k - 2, count(*) FROM at GROUP BY 1, 2, 3', 'Group Key');
+RESET vexec.drop_implied_keys;
 -- no rows: a plain aggregation's one row, a hashed one's none
 SELECT agg_check('SELECT count(*), sum(id), avg(n), min(t), bool_and(bo), sum(f), variance(r) FROM ae');
 SELECT agg_check('SELECT k, count(*) FROM ae GROUP BY k');
@@ -431,6 +451,35 @@ RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_material;
 RESET enable_memoize;
+-- M3 under the partitions: the partial groups made and packed without the
+-- keys the others imply, which the final stage computes from its keys for
+-- the groups it hands up; a bound above it ranks them by one
+SELECT agg_check('SELECT k, k - 1, k - 2, count(*), sum(id) FROM ap GROUP BY 1, 2, 3');
+SELECT agg_check($$SELECT d, d + 1, t, t || '!', count(*), max(id) FROM ap GROUP BY 1, 2, 3, 4$$);
+SELECT agg_check('SELECT k, k - 1 AS k1, count(*) FROM ap GROUP BY 1, 2 ORDER BY k1 DESC LIMIT 7');
+SELECT agg_check('SELECT k, k - 1 AS k1, sum(id) s FROM ap GROUP BY 1, 2 ORDER BY s DESC, k1 LIMIT 7');
+SELECT agg_explain('SELECT k, k - 1, k - 2, count(*), sum(id) FROM ap GROUP BY 1, 2, 3',
+                   'Group Key|Partition Key|Partition Format');
+-- M1 (§3.21): the suite's server has an exchange area of two blocks
+-- (test/vexec/suite.sh), which the partitions above took: a participant's
+-- chunks cut from a block where one is free, from a segment of its own
+-- where none is.  Each block is given back as its query ends, and after an
+-- error in the partial stage or the final one: every block is free between
+-- queries.  With vexec.enable_exchange_area off, none is taken
+SELECT blocks, block_bytes, free = blocks AS all_free FROM vexec.exchange_area();
+SET max_parallel_workers = 0;
+SELECT agg_explain('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Exchange Area');
+SET vexec.enable_exchange_area = off;
+SELECT agg_explain('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Exchange Area');
+RESET vexec.enable_exchange_area;
+RESET max_parallel_workers;
+SELECT agg_error('SELECT k, count(*), sum(1 / (id - 150000)) FROM ap GROUP BY k');
+SELECT agg_error('SELECT k, sum(id) / (count(*) - count(*)) FROM ap GROUP BY k');
+SELECT free = blocks AS all_free FROM vexec.exchange_area();
+SET vexec.enable_exchange_area = off;
+SELECT agg_packed();
+RESET vexec.enable_exchange_area;
+SELECT free = blocks AS all_free FROM vexec.exchange_area();
 SET vexec.enable_packed_groups = off;
 SELECT agg_explain('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Input|Partition Format');
 SELECT agg_packed();

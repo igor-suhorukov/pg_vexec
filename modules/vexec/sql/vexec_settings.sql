@@ -3,10 +3,12 @@
 -- vexec's settings (pg_vector_executor.md §3.12): every one, its default and
 -- its context; the values each takes; the prefix reserved; and the
 -- planner's among those EXPLAIN (SETTINGS) shows.  GPU execution is off at
--- every level by default (§3.11).
+-- every level by default (§3.11).  vexec.exchange_memory's is its default:
+-- the suite's server has an area (test/vexec/suite.sh).
 
 SELECT name,
-       CASE WHEN name = 'vexec.debug_check_plans' THEN '(on where assertions are)' ELSE setting END AS setting,
+       CASE WHEN name = 'vexec.debug_check_plans' THEN '(on where assertions are)'
+            WHEN name = 'vexec.exchange_memory' THEN boot_val ELSE setting END AS setting,
        unit, context, vartype, min_val, max_val, enumvals,
        (pg_settings_get_flags(name) @> ARRAY['EXPLAIN']) AS explain
 FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;

@@ -134,6 +134,12 @@ extern void vexec_kernels_regex(void (*add) (Oid, const VexecKernelDef *, const 
  */
 extern VexecVec *vexec_text_plain(VexecKernelCall *kc, VexecVec *v);
 
+/*
+ * k_text.c: whether every value of an OFFSETS column's nrows rows is its
+ * encoding's whole, checked at once, and whether every byte is ASCII
+ */
+extern bool vexec_text_batch_whole(const VexecVec *s, int nrows, int encoding, bool *ascii);
+
 /* Iterating a bitmap's set bits, a word at a time. */
 #define VEXEC_FOREACH_ROW(bits, nrows, i) \
 	for (int _w = 0, _nw = VEXEC_WORDS(nrows); _w < _nw; _w++) \

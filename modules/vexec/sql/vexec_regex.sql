@@ -329,7 +329,8 @@ SET vexec.mode = force;
 -- their bytes are whole and cut between characters, else each value's --
 -- as views and as Datums, each value's; and in each, a character split
 -- between two values, whose bytes together are whole, and a batch of whole
--- values, multibyte ones among them, which the kernel answers whole
+-- values, multibyte ones among them, which the kernel answers whole.  An
+-- error is compared as its message, PostgreSQL's shown
 CREATE FUNCTION rx_same(q text) RETURNS text LANGUAGE plpgsql AS $f$
 DECLARE
 	ref text;
@@ -338,14 +339,22 @@ DECLARE
 	res text := '';
 BEGIN
 	PERFORM set_config('vexec.mode', 'off', true);
-	EXECUTE format('SELECT string_agg(x::text, %L ORDER BY x::text) FROM (%s) x', '|', q) INTO ref;
+	BEGIN
+		EXECUTE format('SELECT string_agg(x::text, %L ORDER BY x::text) FROM (%s) x', '|', q) INTO ref;
+	EXCEPTION WHEN OTHERS THEN
+		ref := 'ERROR: ' || SQLERRM;
+	END;
 	FOREACH lay IN ARRAY ARRAY['datum', 'view', 'offsets'] LOOP
 		PERFORM set_config('vexec.mode', 'force', true);
 		PERFORM set_config('vexec.batch_varlena_layout', lay, true);
-		EXECUTE format('SELECT string_agg(x::text, %L ORDER BY x::text) FROM (%s) x', '|', q) INTO got;
+		BEGIN
+			EXECUTE format('SELECT string_agg(x::text, %L ORDER BY x::text) FROM (%s) x', '|', q) INTO got;
+		EXCEPTION WHEN OTHERS THEN
+			got := 'ERROR: ' || SQLERRM;
+		END;
 		res := res || format('%s %s; ', lay, CASE WHEN got IS NOT DISTINCT FROM ref THEN 'same' ELSE 'DIFFERS: ' || got || ' off ' || ref END);
 	END LOOP;
-	RETURN res;
+	RETURN res || CASE WHEN ref LIKE 'ERROR: %' THEN ref ELSE '' END;
 END $f$;
 CREATE TABLE rx_split (id int, v text);
 INSERT INTO rx_split VALUES
@@ -356,8 +365,29 @@ SELECT t, rx_same(format($q$SELECT id, vexec_test.raw(one), vexec_test.raw(dcba)
   FROM (SELECT id, regexp_replace(v, '^caf(.)$', '\1') AS one, regexp_replace(v, '^caf(.)dcba$', '\1') AS dcba,
                regexp_replace(v, '^(.)(.*)$', '\2<\1>') AS rot FROM %I OFFSET 0) r$q$, t))
 FROM unnest(ARRAY['rx_bad', 'rx_split', 'rx_ok']) t;
+-- M2 and M5 (§3.21): length() of a batch of offsets whose bytes are whole
+-- at once -- all ASCII, its offsets' differences; else each value's bytes
+-- less its continuation bytes, sixteen at a time -- and each value's walk
+-- where they are not; and a column's = and <> with a constant on either
+-- side, '' among them, its bytes against each row's, NULLs kept
+CREATE TABLE rx_ascii (id int, v text);
+INSERT INTO rx_ascii VALUES (1, 'abc'), (2, ''), (3, repeat('x', 40)), (4, NULL), (5, 'caf'), (6, 'cafe');
+CREATE TABLE rx_long (id int, v text);
+INSERT INTO rx_long VALUES (1, repeat('é', 40)), (2, repeat('a€😀', 9)), (3, NULL), (4, ''), (5, 'caf'),
+  (6, repeat('ab', 20) || 'é'), (7, 'café');
+SET vexec.batch_varlena_layout = offsets;
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id, length(v), v = '', 'café' <> v FROM rx_long WHERE v <> '';
+RESET vexec.batch_varlena_layout;
+SELECT t, rx_same(format($q$SELECT id, length(v), v = '', v <> '', '' = v, v = 'caf', 'café' <> v FROM %I$q$, t))
+FROM unnest(ARRAY['rx_bad', 'rx_split', 'rx_ok', 'rx_ascii', 'rx_long']) t;
+-- PostgreSQL's length() of each value rx_bad has, alone: a truncated
+-- character raises, as the walk that leaves it to PostgreSQL's raises
+SELECT id, rx_same(format('SELECT length(v) FROM rx_bad WHERE id = %s', id)) FROM rx_bad ORDER BY id;
+SELECT t, rx_same(format($q$SELECT id FROM %I WHERE v <> ''$q$, t)) AS ne,
+       rx_same(format($q$SELECT id FROM %I WHERE '' = v OR v = 'café'$q$, t)) AS eq
+FROM unnest(ARRAY['rx_bad', 'rx_split', 'rx_ok', 'rx_ascii', 'rx_long']) t;
 DROP FUNCTION rx_same(text);
-DROP TABLE rx_bad, rx_split, rx_ok;
+DROP TABLE rx_bad, rx_split, rx_ok, rx_ascii, rx_long;
 
 DROP FUNCTION rx_fuzz(int, int);
 DROP FUNCTION rx_pattern();

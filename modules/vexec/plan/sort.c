@@ -104,6 +104,9 @@
 static Plan *plan_vecsort(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 						  List *tlist, List *clauses, List *custom_plans);
 
+/* add_path()'s fuzz, STD_FUZZ_FACTOR (PG19:src/backend/optimizer/util/pathnode.c:47) */
+#define VEXEC_PATH_FUZZ		1.01
+
 /* A bounded sort keeps its columns late up to this many rows (H6). */
 #define VEXEC_LATE_ROWS		VEXEC_BATCH_ROWS
 
@@ -272,6 +275,84 @@ sort_key_exprs(List *pathkeys, PathTarget *target)
 }
 
 /*
+ * M4, M5 (§3.21): whether a sort key is of a type the participants' shared
+ * bound encodes, compared as an integer -- an integer, a date, a timestamp
+ * (vecsort.c's bound_begin()).
+ */
+static bool
+key_compared_as_integer(Expr *key)
+{
+	switch (exprType((Node *) key))
+	{
+		case INT2OID:
+		case INT4OID:
+		case DATEOID:
+		case INT8OID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/* M5: whether the first sort key is compared as an integer (above). */
+static bool
+first_key_integer(List *pathkeys, PathTarget *target)
+{
+	List	   *keys = sort_key_exprs(pathkeys, target);
+
+	return keys != NIL && key_compared_as_integer(linitial(keys));
+}
+
+/*
+ * M5 (§3.21): core's Gather Merge over a row Sort of the partial path pinput
+ * -- create_ordered_paths()'s, or a scan relation's sorted one -- taken out
+ * of the ordered relation where VecSort's of the same input, gm, costs no
+ * more to start and no more in all, by add_path()'s fuzz.  Within the fuzz
+ * add_path() keeps the path it had, core's, though the vector sort saves
+ * handing every row of the scan to a row Sort as a tuple, which its price
+ * holds at a column's conversion: ClickBench's Q24 and Q26 on MergeTree took
+ * 34 ms so and 25 with VecSort.  Only where the first key is compared as an
+ * integer: over text keys VecSort's running bound, checked before the
+ * scan's quals, made Q25 slower (29 -> 34 ms).
+ */
+static void
+drop_row_sort_gather(RelOptInfo *output_rel, Path *pinput, Path *gm)
+{
+	ListCell   *lc;
+
+	foreach(lc, output_rel->pathlist)
+	{
+		Path	   *p = lfirst(lc);
+		Path	   *sub;
+
+		if (!IsA(p, GatherMergePath))
+			continue;
+		sub = ((GatherMergePath *) p)->subpath;
+		if (!IsA(sub, SortPath) || ((SortPath *) sub)->subpath != pinput)
+			continue;
+		if (!pathkeys_contained_in(gm->pathkeys, p->pathkeys) ||
+			gm->startup_cost > p->startup_cost * VEXEC_PATH_FUZZ ||
+			gm->total_cost > p->total_cost * VEXEC_PATH_FUZZ)
+			continue;
+		output_rel->pathlist = foreach_delete_current(output_rel->pathlist, lc);
+	}
+}
+
+/*
+ * M4 (§3.21): whether a parallel sort's participants fetch its late columns
+ * for the whole sort's rows alone, whichever of them is free fetching each
+ * (vecsort.c): where its first key is a column the shared bound encodes.
+ */
+static bool
+late_exchanged(List *keys)
+{
+	return vexec_enable_late_exchange && IsA(linitial(keys), Var) &&
+		key_compared_as_integer(linitial(keys));
+}
+
+/*
  * H6, priced: a bounded VecSort straight over a VecScan sorts the keys and
  * TIDs alone and fetches the rest of each row it keeps
  * (vexec_sort_make_late()), so its input costs what the narrower scan
@@ -279,9 +360,10 @@ sort_key_exprs(List *pathkeys, PathTarget *target)
  * its kept rows: at the price the source gives a fetch of the late columns
  * (VexecSourceEstimate.fetch, minor 4, VC16) -- a column store's decodes a
  * granule of each -- each participant fetching its own beside the others;
- * else at a random page and a tuple each.  What a sort over the input as it
- * is saves so; 0 where it is not made late, or saves nothing.  *priced
- * says whether the source priced its fetches.
+ * else at a random page and a tuple each, the whole sort's N rows once
+ * where the participants exchange them (late_exchanged()).  What a sort
+ * over the input as it is saves so; 0 where it is not made late, or saves
+ * nothing.  *priced says whether the source priced its fetches.
  *
  * Both scans are compared without what each one's cost carries for handing
  * its columns to a row parent (vexec_cost_rowout()): the VecSort reads
@@ -305,7 +387,8 @@ late_saving(PlannerInfo *root, Path *input, int64 bound, bool *priced)
 	keys = sort_key_exprs(root->sort_pathkeys, input->pathtarget);
 	if (keys == NIL || !vexec_late_scan_cost(root, input, keys, &late, &fetch))
 		return 0;
-	participants = input->parallel_workers > 0 ? ceil(vexec_parallel_divisor(input)) : 1.0;
+	participants = input->parallel_workers > 0 && !late_exchanged(keys) ?
+		ceil(vexec_parallel_divisor(input)) : 1.0;
 	get_tablespace_page_costs(input->parent->reltablespace, &spc_random_page_cost, NULL);
 	*priced = fetch > 0;
 	saved = (input->total_cost - vexec_cost_rowout(input)) - (late.total - late.rowout) -
@@ -651,10 +734,14 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 	{
 		Path	   *psort = vecsort_path(output_rel, target, prow, &pcost, bound, psaving > 0);
 		double		total = compute_gather_rows(psort);
+		Path	   *gm = (Path *) create_gather_merge_path(root, output_rel, psort, target,
+														   root->sort_pathkeys, NULL, &total);
 
-		newpaths = lappend(newpaths,
-						   create_gather_merge_path(root, output_rel, psort, target,
-													root->sort_pathkeys, NULL, &total));
+		/* M5: a vector partial input's VecSort over core's row Sort, within the fuzz */
+		if (vexec_prefer_vector_sort && vexec_is_vector_path(pinput) &&
+			first_key_integer(root->sort_pathkeys, pinput->pathtarget))
+			drop_row_sort_gather(output_rel, pinput, gm);
+		newpaths = lappend(newpaths, gm);
 	}
 	if (linput != NULL)
 		newpaths = lappend(newpaths, vecsort_path(output_rel, target, lrow, &lcost, bound, true));

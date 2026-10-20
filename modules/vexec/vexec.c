@@ -62,6 +62,9 @@ bool		vexec_enable_agg = true;
 bool		vexec_enable_repartition = true;
 bool		vexec_enable_packed_groups = true;
 bool		vexec_enable_agg_split = true;
+int			vexec_exchange_memory = 0;
+bool		vexec_enable_exchange_area = true;
+bool		vexec_drop_implied_keys = true;
 int			vexec_repartition_shared_memory = -1;
 bool		vexec_enable_sorted_agg = true;
 int			vexec_partial_agg_limit = 16384;
@@ -74,6 +77,8 @@ bool		vexec_aggregate_statistics = true;
 bool		vexec_enable_hashjoin = true;
 bool		vexec_enable_join_filter = true;
 bool		vexec_enable_sort = true;
+bool		vexec_prefer_vector_sort = true;
+bool		vexec_enable_late_exchange = true;
 bool		vexec_enable_running_bound = true;
 bool		vexec_enable_window = true;
 bool		vexec_enable_insert = true;
@@ -204,6 +209,8 @@ _PG_init(void)
 	vexec_exec_install();
 	/* the groups VecAgg's tables reached, in shared memory (C6) */
 	vexec_aggsize_install();
+	/* the exchange area, D2's partitions' blocks, in shared memory (M1) */
+	vexec_exchange_install();
 	/* pg_otel_probe's spans of vector nodes and statements, where it is loaded */
 	vexec_report_install();
 	vexec_planner_install();
@@ -345,6 +352,14 @@ define_settings(void)
 							 "by their keys; it competes with the grouping planned whole by cost.",
 							 &vexec_enable_agg_split, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.drop_implied_keys",
+							 "Leaves out of a vector grouping's keys those the other keys imply.",
+							 "A key that is an immutable expression of other keys -- columns compared by "
+							 "identity, as integers, dates, timestamps and text are -- makes no group the "
+							 "others do not; it is computed from them where the output reads it "
+							 "(pg_vector_executor.md §3.21, M3).",
+							 &vexec_drop_implied_keys, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_packed_groups",
 							 "Hands a parallel aggregation's partial groups on to its final stage as they lie.",
 							 "A partial stage under a VecRepartition makes its groups in the partitions they "
@@ -353,6 +368,18 @@ define_settings(void)
 							 "in files only past hash_mem.  Off, the groups go on as batches of PostgreSQL's "
 							 "partial states.",
 							 &vexec_enable_packed_groups, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomIntVariable("vexec.exchange_memory",
+							"The main shared memory a parallel aggregation's partitions are cut from first.",
+							"Kept from the server's start and never given back, so that its pages are not "
+							"reserved, zeroed and released again with each query's own segments; 0 makes none "
+							"(pg_vector_executor.md §3.21, M1).",
+							&vexec_exchange_memory, 0, 0, INT_MAX / 2,
+							PGC_POSTMASTER, GUC_UNIT_MB, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_exchange_area",
+							 "Lets a parallel aggregation's partitions take blocks of the exchange area.",
+							 "Off, they are cut from segments of each participant's own, as without an area.",
+							 &vexec_enable_exchange_area, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 	DefineCustomIntVariable("vexec.repartition_shared_memory",
 							"The shared memory each participant's packed groups may take in a parallel aggregation's partitions.",
@@ -436,6 +463,21 @@ define_settings(void)
 	DefineCustomBoolVariable("vexec.enable_sort",
 							 "Enables vector sorts.",
 							 NULL, &vexec_enable_sort, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.prefer_vector_sort",
+							 "Lets a vector sort under a Gather Merge replace core's row sort of the same input "
+							 "where it costs no more.",
+							 "Where the two cost the same within the planner's fuzz, the row sort's path is "
+							 "kept; this takes it out where the first sort key is compared as an integer "
+							 "(pg_vector_executor.md §3.21, M5).",
+							 &vexec_prefer_vector_sort, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_late_exchange",
+							 "Lets a parallel bounded vector sort fetch its late columns for the whole sort's rows alone.",
+							 "Its participants publish their rows' first keys and TIDs, the bound of all of them "
+							 "decides which rows are fetched, and whichever participant is free fetches each "
+							 "(pg_vector_executor.md §3.21, M4).",
+							 &vexec_enable_late_exchange, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_running_bound",
 							 "Lets a bounded vector sort bound the vector scan below it.",
