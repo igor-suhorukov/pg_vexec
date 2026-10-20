@@ -46,10 +46,11 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		5	/* 1: aggregate; 2: set_keys; 3:
+#define VEXEC_SOURCE_MINOR		6	/* 1: aggregate; 2: set_keys; 3:
 									 * dictionary_id, estimate_ex; 4:
 									 * fetch_columns, ordering, a fetch's
-									 * price; 5: columns in steps */
+									 * price; 5: columns in steps; 6:
+									 * set_join_keys */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -379,6 +380,34 @@ typedef struct VexecSourceRoutine
 	 */
 	void		(*next_rest) (void *state, VexecSourceBatch *batch, int step,
 							  const uint64 *selected);
+
+	/*
+	 * Optional, from minor version 6: a hash join's inner keys, lent to the
+	 * scan on its outer side (ch_table_engines.md §3, VC3) -- keys ANDed,
+	 * replacing the last given, none where nkeys is 0 -- each on an
+	 * attribute of the spec, under its type's default btree operator
+	 * family, in one of three forms:
+	 *
+	 *	attnum >= v		BTGreaterEqualStrategyNumber: the inner keys' least
+	 *	attnum <= v		BTLessEqualStrategyNumber: their greatest
+	 *	attnum = ANY (a)	BTEqualStrategyNumber with SK_SEARCHARRAY: an
+	 *					array of the attribute's type, its elements the
+	 *					inner keys' distinct values, ascending, none NULL
+	 *
+	 * A row whose attribute is NULL satisfies none.  Pruning only, as
+	 * set_keys(): from the next unit the source begins it may pass over
+	 * one -- or the smaller units of its own it would read of it, granules
+	 * -- whose statistics or index show that none of its rows satisfies
+	 * them, and never a row of what it reads: vexec checks every row
+	 * itself.  vexec gives them only to the outer side of an inner, semi or
+	 * right join, which drops an outer row no inner row meets, and only
+	 * where passing a row over unread raises no error PostgreSQL would
+	 * raise.  Called between batches -- before the first, where the join's
+	 * table is built before the scan begins -- and again where the table
+	 * is built anew; a rescan forgets them.  The source copies what it
+	 * keeps.
+	 */
+	void		(*set_join_keys) (void *state, int nkeys, const ScanKeyData *keys);
 } VexecSourceRoutine;
 
 /*

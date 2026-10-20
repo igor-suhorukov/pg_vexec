@@ -4,7 +4,7 @@
  * source_test.c
  *	  vexec_test_am, a table access method of the tests, and its batch
  *	  source and sink with every member of their contracts (vexec_source.h
- *	  at minor 5, vexec_sink.h), so that vexec's suite tests the contracts
+ *	  at minor 6, vexec_sink.h), so that vexec's suite tests the contracts
  *	  on vanilla PostgreSQL, where no storage module registers either
  *	  (ch_table_engines.md §3, VC9).
  *
@@ -63,6 +63,12 @@
  *					read of a row it did not select shows -- and an error
  *					where a step is asked out of order, twice, or of a batch
  *					not the last (VC2)
+ *	set_join_keys()	a hash join's keys: a unit none of whose rows is within
+ *					them -- the range by its least and greatest values, the
+ *					values by whether one lies between them -- is passed
+ *					over; an error where a key is of no form the contract
+ *					gives, on a column not read, or its values out of order
+ *					(VC3)
  *
  * A unit a retained batch points into stays until the last such batch is
  * released.  The sink takes every attribute but an xml one -- FIXED for a
@@ -90,9 +96,11 @@
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
@@ -116,14 +124,15 @@ typedef enum Member
 	M_SUPPORTS, M_BEGIN, M_NEXT, M_RETAIN, M_RELEASE, M_RESCAN, M_END, M_ESTIMATE, M_AGGREGATE,
 	M_AGGREGATE_ANSWERED, M_SET_KEYS, M_UNITS_PASSED, M_SINK_SUPPORTS, M_SINK_BEGIN, M_SINK_PUT,
 	M_SINK_END, M_DICTIONARY_ID, M_DICTIONARIES, M_ESTIMATE_EX, M_FETCH_COLUMNS, M_ORDERING,
-	M_ORDERED_SCANS, M_NEXT_REST, M_SCANS_IN_STEPS, NMEMBERS
+	M_ORDERED_SCANS, M_NEXT_REST, M_SCANS_IN_STEPS, M_SET_JOIN_KEYS, M_UNITS_PASSED_JOIN, NMEMBERS
 } Member;
 
 static const char *const member_names[NMEMBERS] = {
 	"supports", "begin", "next", "retain", "release", "rescan", "end", "estimate", "aggregate",
 	"aggregate answered", "set_keys", "units passed by keys", "sink supports", "sink begin",
 	"sink put", "sink end", "dictionary_id", "dictionaries made", "estimate_ex", "fetch_columns",
-	"ordering", "scans in order", "next_rest", "scans in steps"
+	"ordering", "scans in order", "next_rest", "scans in steps", "set_join_keys",
+	"units passed by join keys"
 };
 
 static int64 calls[NMEMBERS];
@@ -303,6 +312,12 @@ typedef struct SrcState
 	int			nkeys;			/* the spec's and set_keys()'s, ANDed */
 	ScanKeyData *keys;
 	int			nspec_keys;
+	int			njoin_keys;		/* set_join_keys()'s, each key's column and values */
+	ScanKeyData *join_keys;
+	int		   *join_cols;
+	int64	  **join_values;
+	int		   *join_nvalues;
+	MemoryContext join_cxt;
 	MemoryContext answers;
 	bool		ordered;		/* begun with VEXEC_SRC_ORDERED, serially */
 	int			nsteps;			/* VEXEC_SRC_STEPS: the steps, and each column's */
@@ -436,6 +451,53 @@ within_keys(SrcState *st, Unit *u)
 		bound = att->atttypid == INT2OID ? Int16GetDatum((int16) bound) :
 			att->atttypid == INT4OID ? Int32GetDatum((int32) bound) : Int64GetDatum((int64) bound);
 		if (!DatumGetBool(FunctionCall2Coll(&key->sk_func, key->sk_collation, bound, key->sk_argument)))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Whether a unit may hold a row within the join's keys (VC3): an integer
+ * column's range by its least and greatest values, its values by whether
+ * one lies between them
+ */
+static bool
+within_join_keys(SrcState *st, Unit *u)
+{
+	for (int k = 0; k < st->njoin_keys; k++)
+	{
+		ScanKeyData *key = &st->join_keys[k];
+		ColStats   *cs = &u->stats[st->join_cols[k]];
+
+		if (cs->count == 0)
+			return false;		/* every value NULL, which no key keeps */
+		if (!cs->ints)
+			continue;
+		if (key->sk_flags & SK_SEARCHARRAY)
+		{
+			const int64 *v = st->join_values[k];
+			int			lo = 0;
+			int			hi = st->join_nvalues[k];
+
+			/* the first value at least the least */
+			while (lo < hi)
+			{
+				int			mid = (lo + hi) / 2;
+
+				if (v[mid] < cs->min)
+					lo = mid + 1;
+				else
+					hi = mid;
+			}
+			if (lo >= st->join_nvalues[k] || v[lo] > cs->max)
+				return false;
+		}
+		else if (key->sk_strategy == BTGreaterEqualStrategyNumber)
+		{
+			if (cs->max < st->join_values[k][0])
+				return false;
+		}
+		else if (cs->min > st->join_values[k][0])
 			return false;
 	}
 	return true;
@@ -689,6 +751,12 @@ load_unit(SrcState *st)
 			unit_free(u);
 			continue;
 		}
+		if (st->njoin_keys > 0 && !within_join_keys(st, u))
+		{
+			calls[M_UNITS_PASSED_JOIN]++;
+			unit_free(u);
+			continue;
+		}
 		u->current = true;
 		u->dicts = MemoryContextAllocZero(u->cxt, sizeof(UnitDict *) * Max(st->ncols, 1));
 		u->codes = MemoryContextAllocZero(u->cxt, sizeof(int32 *) * Max(st->ncols, 1));
@@ -938,6 +1006,7 @@ src_rescan(void *arg)
 	unit_done(st);
 	st->done = false;
 	st->nkeys = st->nspec_keys;
+	st->njoin_keys = 0;			/* a rescan forgets the join's keys */
 }
 
 /* The identity of the dictionary of a column of the last batch: its unit's (minor 3) */
@@ -1180,6 +1249,92 @@ src_set_keys(void *arg, int nkeys, const ScanKeyData *keys)
 	MemoryContextSwitchTo(old);
 }
 
+/*
+ * A hash join's keys (minor 6, VC3), checked against the contract: each on a
+ * column the scan reads, an integer one, of type int2, int4 or int8, and
+ * >=, <= or = ANY of an array of its type, the array's values ascending,
+ * distinct and none NULL.  Kept as each key's values, in int64.
+ */
+static void
+src_set_join_keys(void *arg, int nkeys, const ScanKeyData *keys)
+{
+	SrcState   *st = arg;
+	MemoryContext old;
+
+	calls[M_SET_JOIN_KEYS]++;
+	if (st->join_cxt == NULL)
+		st->join_cxt = AllocSetContextCreate(st->cxt, "vexec_test join keys", ALLOCSET_SMALL_SIZES);
+	MemoryContextReset(st->join_cxt);
+	st->njoin_keys = 0;
+	if (nkeys <= 0)
+		return;
+	old = MemoryContextSwitchTo(st->join_cxt);
+	st->join_keys = palloc(sizeof(ScanKeyData) * nkeys);
+	st->join_cols = palloc(sizeof(int) * nkeys);
+	st->join_values = palloc(sizeof(int64 *) * nkeys);
+	st->join_nvalues = palloc(sizeof(int) * nkeys);
+	for (int k = 0; k < nkeys; k++)
+	{
+		const ScanKeyData *key = &keys[k];
+		int			col = -1;
+		Oid			typid;
+
+		for (int i = 0; i < st->ncols; i++)
+			if (st->attnums[i] == key->sk_attno)
+				col = i;
+		if (col < 0)
+			elog(ERROR, "vexec_test: a join key on attribute %d, which the scan does not read", key->sk_attno);
+		typid = TupleDescAttr(st->desc, key->sk_attno - 1)->atttypid;
+		if ((typid != INT2OID && typid != INT4OID && typid != INT8OID) || key->sk_subtype != typid ||
+			(key->sk_flags & ~SK_SEARCHARRAY) != 0)
+			elog(ERROR, "vexec_test: a join key of type %u, flags %d", key->sk_subtype, key->sk_flags);
+		st->join_keys[k] = *key;
+		st->join_cols[k] = col;
+		if (key->sk_flags & SK_SEARCHARRAY)
+		{
+			ArrayType  *a = DatumGetArrayTypeP(key->sk_argument);
+			Datum	   *elems;
+			bool	   *nulls;
+			int			n;
+			int16		typlen;
+			bool		typbyval;
+			char		typalign;
+
+			if (key->sk_strategy != BTEqualStrategyNumber || ARR_ELEMTYPE(a) != typid)
+				elog(ERROR, "vexec_test: a join key's array of strategy %d, of type %u",
+					 key->sk_strategy, ARR_ELEMTYPE(a));
+			get_typlenbyvalalign(typid, &typlen, &typbyval, &typalign);
+			deconstruct_array(a, typid, typlen, typbyval, typalign, &elems, &nulls, &n);
+			st->join_values[k] = palloc(sizeof(int64) * Max(n, 1));
+			for (int i = 0; i < n; i++)
+			{
+				int64		v;
+
+				if (nulls[i])
+					elog(ERROR, "vexec_test: a join key's array holds a NULL");
+				v = typid == INT2OID ? DatumGetInt16(elems[i]) :
+					typid == INT4OID ? DatumGetInt32(elems[i]) : DatumGetInt64(elems[i]);
+				if (i > 0 && v <= st->join_values[k][i - 1])
+					elog(ERROR, "vexec_test: a join key's values are not ascending and distinct");
+				st->join_values[k][i] = v;
+			}
+			st->join_nvalues[k] = n;
+		}
+		else
+		{
+			if (key->sk_strategy != BTGreaterEqualStrategyNumber &&
+				key->sk_strategy != BTLessEqualStrategyNumber)
+				elog(ERROR, "vexec_test: a join key of strategy %d", key->sk_strategy);
+			st->join_values[k] = palloc(sizeof(int64));
+			st->join_values[k][0] = typid == INT2OID ? DatumGetInt16(key->sk_argument) :
+				typid == INT4OID ? DatumGetInt32(key->sk_argument) : DatumGetInt64(key->sk_argument);
+			st->join_nvalues[k] = 1;
+		}
+	}
+	st->njoin_keys = nkeys;
+	MemoryContextSwitchTo(old);
+}
+
 /* ---- the sink ---- */
 
 typedef struct SinkState
@@ -1300,6 +1455,7 @@ static VexecSourceRoutine source = {
 	.fetch_columns = src_fetch_columns,
 	.ordering = src_ordering,
 	.next_rest = src_next_rest,
+	.set_join_keys = src_set_join_keys,
 };
 
 static VexecSinkRoutine sink = {

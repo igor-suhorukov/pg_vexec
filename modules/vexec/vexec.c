@@ -56,6 +56,7 @@ bool		vexec_heap_page_reader = true;
 bool		vexec_enable_prefilter = true;
 bool		vexec_enable_source_layouts = true;
 bool		vexec_enable_source_steps = true;
+bool		vexec_enable_source_join_keys = true;
 bool		vexec_enable_bitmapscan = true;
 bool		vexec_enable_agg = true;
 bool		vexec_enable_repartition = true;
@@ -311,6 +312,15 @@ define_settings(void)
 							 "only for the batches where a row is left, so that the source decodes a later "
 							 "step's columns only in its units where the quals before kept a row.",
 							 &vexec_enable_source_steps, true,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_source_join_keys",
+							 "Gives a source a hash join's inner keys, to pass its units over by.",
+							 "A vector scan on the outer side of an inner, semi or right hash join gives "
+							 "a registered source that takes them the inner keys' range, and their values "
+							 "where they are few, so that the source passes over the units -- parts, "
+							 "granules -- none of whose rows any inner row meets; the join builds its "
+							 "table before it reads an outer row.",
+							 &vexec_enable_source_join_keys, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_bitmapscan",
 							 "Enables vector bitmap heap scans.",

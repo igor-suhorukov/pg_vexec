@@ -78,6 +78,16 @@
  * over the units none of whose rows is within it (vexec_source.h,
  * set_keys).
  *
+ * A VecHashJoin's inner keys (X6; exec.h).  The join above lends the scan
+ * on its outer side its keys' range and values once its table is built,
+ * and the scan drops a row whose key no inner row has: heap's page reader
+ * before the row is deformed, else among a batch's rows.  A source that
+ * takes a join's keys is given them as its keys -- the range, and the
+ * distinct values where they are few -- to pass over the units none of
+ * whose rows any inner row meets (VC3; vexec_source.h, set_join_keys):
+ * only where nothing of the scan's may raise, and again for each table the
+ * join builds; the join builds it before the scan reads a row.
+ *
  * A source's columns in steps (VC2; vexec_source.h, VEXEC_SRC_STEPS): where
  * the source takes them, the scan asks for the columns of its first vector
  * qual first -- with the running bound's and the join keys' where those
@@ -110,7 +120,9 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "access/stratnum.h"
+#include "utils/array.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/typcache.h"
 
@@ -182,6 +194,18 @@ typedef struct VexecScanState
 	ScanKeyData bound_key;
 	StrategyNumber bound_strategy;
 	uint64		bound_given;
+
+	/*
+	 * VC3: a VecHashJoin's inner keys given to the source as its join keys
+	 * (vexec_source.h, set_join_keys): whether they are, the version of the
+	 * join's filter last given -- 0 none, as after a rescan -- what the
+	 * last were, in their memory, and how many times they were given
+	 */
+	bool		jkeys_on;
+	uint64		jkeys_given;
+	MemoryContext jkeys_cxt;
+	const char *jkeys_form;
+	int64		jkeys_calls;
 
 	/*
 	 * VC4: the scan begun asking its source for its rows in ordering()'s
@@ -549,6 +573,146 @@ join_filter_to_reader(VexecScanState *s)
 }
 
 /*
+ * VC3: whether the scan's source takes a join's inner keys on attribute
+ * attno, a column it reads (vexec_source.h, set_join_keys): one that has
+ * the member, an integer column, as X6's keys are, and nothing of the
+ * scan's that may raise -- a unit the source passes over leaves its rows'
+ * quals and targets unevaluated.
+ */
+static bool
+source_takes_join_keys(VexecScanState *s, AttrNumber attno)
+{
+	Plan	   *plan = s->node.css.ss.ps.plan;
+	Oid			typid;
+
+	if (!vexec_enable_source_join_keys || s->bitmap || s->src == NULL ||
+		!VEXEC_SOURCE_HAS(s->src, set_join_keys) ||
+		attno < 1 || attno > RelationGetNumberOfAttributes(s->rel))
+		return false;
+	typid = getBaseType(TupleDescAttr(RelationGetDescr(s->rel), attno - 1)->atttypid);
+	if (typid != INT2OID && typid != INT4OID && typid != INT8OID)
+		return false;
+	return !vexec_expr_may_raise((Node *) plan->targetlist) &&
+		!vexec_expr_may_raise((Node *) plan->qual) &&
+		!vexec_expr_may_raise((Node *) ((CustomScan *) plan)->custom_exprs);
+}
+
+/*
+ * VC3: whether a VecHashJoin's inner keys on attno, lent to ps, would go to
+ * its source: the join then builds its table before it reads an outer row.
+ */
+bool
+vexec_scan_takes_join_keys(PlanState *ps, AttrNumber attno)
+{
+	VexecScanState *s;
+
+	if (!IsA(ps, CustomScanState) || ((CustomScanState *) ps)->methods != &scan_exec_methods)
+		return false;
+	s = (VexecScanState *) ps;
+	for (int col = 0; col < s->nattrs; col++)
+		if (s->attrs[col] == attno)
+			return source_takes_join_keys(s, attno);
+	return false;
+}
+
+/*
+ * VC3: the join's inner keys as the source's join keys, in the column's
+ * type -- at least the least, at most the greatest, and one of the values
+ * where the join counted them -- clamped to the type's range: how many,
+ * none where no value of the type is within it.
+ */
+static int
+make_join_keys(VexecScanState *s, VexecJoinFilter *f, ScanKeyData *keys)
+{
+	Oid			typid = getBaseType(TupleDescAttr(RelationGetDescr(s->rel), f->attno - 1)->atttypid);
+	TypeCacheEntry *tc = lookup_type_cache(typid, TYPECACHE_BTREE_OPFAMILY);
+	int64		tmin = typid == INT2OID ? PG_INT16_MIN : typid == INT4OID ? PG_INT32_MIN : PG_INT64_MIN;
+	int64		tmax = typid == INT2OID ? PG_INT16_MAX : typid == INT4OID ? PG_INT32_MAX : PG_INT64_MAX;
+	int64		lo = Max(f->min, tmin);
+	int64		hi = Min(f->max, tmax);
+	StrategyNumber strategies[3] = {BTGreaterEqualStrategyNumber, BTLessEqualStrategyNumber,
+	BTEqualStrategyNumber};
+	Oid			procs[3];
+	int			n = 2;
+
+	if (lo > hi || !OidIsValid(tc->btree_opf))
+		return 0;
+	for (int k = 0; k < 3; k++)
+	{
+		Oid			opno = get_opfamily_member(tc->btree_opf, typid, typid, strategies[k]);
+
+		if (!OidIsValid(opno))
+			return 0;
+		procs[k] = get_opcode(opno);
+	}
+#define INT_DATUM(v) (typid == INT2OID ? Int16GetDatum((int16) (v)) : \
+					  typid == INT4OID ? Int32GetDatum((int32) (v)) : Int64GetDatum(v))
+	ScanKeyEntryInitialize(&keys[0], 0, f->attno, BTGreaterEqualStrategyNumber, typid, InvalidOid,
+						   procs[0], INT_DATUM(lo));
+	ScanKeyEntryInitialize(&keys[1], 0, f->attno, BTLessEqualStrategyNumber, typid, InvalidOid,
+						   procs[1], INT_DATUM(hi));
+	s->jkeys_form = "range";
+	if (f->nvalues > 0)
+	{
+		Datum	   *elems = palloc(sizeof(Datum) * f->nvalues);
+		int			m = 0;
+
+		for (int i = 0; i < f->nvalues; i++)
+			if (f->values[i] >= lo && f->values[i] <= hi)
+				elems[m++] = INT_DATUM(f->values[i]);
+		if (m > 0)
+		{
+			int16		typlen;
+			bool		typbyval;
+			char		typalign;
+
+			get_typlenbyvalalign(typid, &typlen, &typbyval, &typalign);
+			ScanKeyEntryInitialize(&keys[n++], SK_SEARCHARRAY, f->attno, BTEqualStrategyNumber, typid,
+								   InvalidOid, procs[2],
+								   PointerGetDatum(construct_array(elems, m, typid, typlen, typbyval, typalign)));
+			s->jkeys_form = psprintf("range and %d values", m);
+		}
+	}
+#undef INT_DATUM
+	return n;
+}
+
+/*
+ * VC3: the join's keys, of a table built since the source was last given
+ * them, given to it; taken back where the join's table holds none to lend
+ * -- it spilled, or is to be built again.
+ */
+static void
+join_keys_to_source(VexecScanState *s)
+{
+	VexecJoinFilter *f = s->node.jfilter;
+	MemoryContext old;
+	ScanKeyData keys[3];
+	int			n;
+
+	if (!s->jkeys_on || s->srcstate == NULL)
+		return;
+	if (!f->active)
+	{
+		if (s->jkeys_given != 0)
+			s->src->set_join_keys(s->srcstate, 0, NULL);
+		s->jkeys_given = 0;
+		return;
+	}
+	if (f->version == s->jkeys_given)
+		return;
+	MemoryContextReset(s->jkeys_cxt);
+	s->jkeys_form = NULL;
+	old = MemoryContextSwitchTo(s->jkeys_cxt);
+	n = make_join_keys(s, f, keys);
+	MemoryContextSwitchTo(old);
+	s->src->set_join_keys(s->srcstate, n, keys);
+	s->jkeys_given = f->version;
+	if (n > 0)
+		s->jkeys_calls++;
+}
+
+/*
  * A VecHashJoin's inner keys lent to this scan, the vector scan on its outer
  * side (X6, exec.h): the scan drops a row whose key no inner row has.
  * Before the quals where none of them may raise, else after them, where
@@ -581,6 +745,10 @@ vexec_scan_set_join_filter(PlanState *ps, VexecJoinFilter *filter)
 	s->node.jfilter = filter;
 	s->node.jfilter_col = col;
 	s->node.jfilter_in_source = false;
+	/* VC3: and to the source, where it takes them */
+	s->jkeys_on = filter->before_quals && source_takes_join_keys(s, filter->attno);
+	if (s->jkeys_on && s->jkeys_cxt == NULL)
+		s->jkeys_cxt = AllocSetContextCreate(s->node.mcxt, "vexec join keys", ALLOCSET_SMALL_SIZES);
 	if (s->scan != NULL)
 		join_filter_to_reader(s);
 	return true;
@@ -1045,6 +1213,7 @@ fetch_source(VexecScanState *s)
 	memset(sb, 0, sizeof(VexecSourceBatch));
 	vexec_batch_reset(in);
 	bound_to_source(s);
+	join_keys_to_source(s);
 	if (!s->src->next(s->srcstate, sb))
 	{
 		s->done = true;
@@ -1241,6 +1410,7 @@ scan_rescan(CustomScanState *css)
 	VexecScanState *s = (VexecScanState *) css;
 
 	s->bound_given = 0;			/* a source forgets the running bound's keys */
+	s->jkeys_given = 0;			/* and the join's (VC3) */
 	if (s->bitmap)
 	{
 		/* as ExecReScanBitmapHeapScan(): the bitmap made again */
@@ -1388,6 +1558,17 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		if (s->node.jfilter->off_batches > 0 || es->format != EXPLAIN_FORMAT_TEXT)
 			ExplainPropertyInteger("Batches Join Keys Were Off", NULL,
 								   s->node.jfilter->off_batches, es);
+	}
+	/*
+	 * VC3: the join's keys given to the source, how many times, and the
+	 * last's form
+	 */
+	if (es->analyze && s->node.ran && s->jkeys_on &&
+		(s->jkeys_calls > 0 || es->format != EXPLAIN_FORMAT_TEXT))
+	{
+		ExplainPropertyInteger("Join Keys Given to Source", NULL, s->jkeys_calls, es);
+		if (es->verbose && s->jkeys_form != NULL)
+			ExplainPropertyText("Join Keys Given", s->jkeys_form, es);
 	}
 	/* a VecSort's running bound (H6): text gives no zero, as for a filter */
 	if (es->analyze && s->node.ran && s->node.bound != NULL &&

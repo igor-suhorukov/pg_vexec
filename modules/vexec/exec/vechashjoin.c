@@ -396,6 +396,7 @@ typedef struct HjState
 	AttrNumber	jf_attno;
 	VexecJoinFilter *jfilter;
 	bool		jf_lent;
+	bool		jf_source;		/* VC3: the scan's source takes them */
 
 	/*
 	 * a shared table: the DSM's chunk, or NULL for a table of the
@@ -2823,7 +2824,79 @@ join_filter_setup(HjState *s, List *okeys)
 	{
 		s->jfilter = palloc0(sizeof(VexecJoinFilter));
 		s->jfilter->attno = s->jf_attno;
+		/* VC3: and its source, which the table is then built for first */
+		s->jf_source = vexec_scan_takes_join_keys(s->side[0].ps, s->jf_attno);
 	}
+}
+
+static int
+int64_cmp(const void *a, const void *b)
+{
+	int64		x = *(const int64 *) a;
+	int64		y = *(const int64 *) b;
+
+	return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/*
+ * VC3: the inner keys' distinct values, ascending, where there are at most
+ * VEXEC_JOIN_KEYS_VALUES of them -- the range's bits set, else the table's
+ * keys, where it holds few rows -- for the outer scan's source to pass its
+ * units over by; none else, the range alone given.
+ */
+static void
+join_filter_values(HjState *s, VexecJoinFilter *f)
+{
+	int			n = 0;
+
+	f->nvalues = 0;
+	if (f->values == NULL)
+		f->values = MemoryContextAlloc(s->node.mcxt, sizeof(int64) * VEXEC_JOIN_KEYS_VALUES);
+	if (f->bits != NULL)
+	{
+		uint64		nwords = VEXEC_WORDS((uint64) f->max - (uint64) f->min + 1);
+
+		for (uint64 w = 0; w < nwords; w++)
+		{
+			uint64		word = f->bits[w];
+
+			while (word != 0)
+			{
+				if (n >= VEXEC_JOIN_KEYS_VALUES)
+					return;
+				f->values[n++] = (int64) ((uint64) f->min + w * 64 + pg_rightmost_one_pos64(word));
+				word &= word - 1;
+			}
+		}
+	}
+	else
+	{
+		int64	   *keys;
+		int64		nrows = 0;
+		int			m = 0;
+
+		for (int c = 0; c < s->nchunks; c++)
+			nrows += s->chunks[c]->nrows;
+		if (nrows > 4 * VEXEC_JOIN_KEYS_VALUES)
+			return;
+		keys = palloc(sizeof(int64) * Max(nrows, 1));
+		for (int c = 0; c < s->nchunks; c++)
+			for (int r = 0; r < s->chunks[c]->nrows; r++)
+				keys[m++] = s->chunks[c]->keys[r * s->nkeys + s->jf_key].u.i;
+		qsort(keys, m, sizeof(int64), int64_cmp);
+		for (int i = 0; i < m; i++)
+			if (i == 0 || keys[i] != keys[i - 1])
+			{
+				if (n >= VEXEC_JOIN_KEYS_VALUES)
+				{
+					pfree(keys);
+					return;
+				}
+				f->values[n++] = keys[i];
+			}
+		pfree(keys);
+	}
+	f->nvalues = n;
 }
 
 /*
@@ -2901,6 +2974,9 @@ join_filter_lend(HjState *s)
 			}
 		}
 	}
+	if (s->jf_source)
+		join_filter_values(s, f);
+	f->version++;
 	f->off = 0;
 	f->active = true;
 	if (!s->jf_lent)
@@ -2973,7 +3049,11 @@ build_phase(HjState *s)
 		shared_build(s);
 	else
 	{
-		if (!s->fill_inner &&
+		/*
+		 * VC3: not where the outer scan's source takes the table's keys,
+		 * which its first unit would be read without
+		 */
+		if (!s->fill_inner && !s->jf_source &&
 			(s->fill_outer ||
 			 (outer->startup_cost < inner->total_cost && !s->outer_not_empty)))
 		{

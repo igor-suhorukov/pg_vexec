@@ -27,9 +27,12 @@
 #   sink          VecInsert's batches into ClickHouse's columns directly, the
 #                 pages store's parts into memory: buffered rows fetched by
 #                 TID, signs, savepoints, aborts (chte_sink.sh; VC18)
+#   joinkeys      a hash join's inner keys lent to the source on its outer
+#                 side, which passes over the parts and granules no inner
+#                 row meets (chte_joinkeys.sh; VC3)
 #
 #   CHTE_PARTS    the parts run: "suite chte differential loads orders steps
-#                 sink"
+#                 sink joinkeys"
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$here/build.sh" > "${RESULTS_DIR:-/tmp}/vexec-build.log" 2>&1 || { tail -30 "${RESULTS_DIR:-/tmp}/vexec-build.log"; exit 1; }
@@ -39,7 +42,7 @@ CHTE_SRC=/chte /chte/test/build.sh > "${RESULTS_DIR:-/tmp}/chte-build.log" 2>&1 
 echo "vexec and ch_table_engines $(git -C /chte rev-parse --short HEAD 2> /dev/null || echo '?') on $("$BINDIR/pg_config" --version)"
 
 rc=0
-for part in ${CHTE_PARTS:-suite chte differential loads orders steps sink}; do
+for part in ${CHTE_PARTS:-suite chte differential loads orders steps sink joinkeys}; do
 	case "$part" in
 		suite)
 			echo "== vexec's suite, ch_table_engines preloaded beside vexec"
@@ -72,6 +75,10 @@ for part in ${CHTE_PARTS:-suite chte differential loads orders steps sink}; do
 		sink)
 			echo "== vexec's sink into mergetree tables"
 			"$here/chte_sink.sh" || rc=1
+			;;
+		joinkeys)
+			echo "== a hash join's keys lent to the source over mergetree tables"
+			"$here/chte_joinkeys.sh" || rc=1
 			;;
 		*)
 			echo "no part $part"; rc=1 ;;

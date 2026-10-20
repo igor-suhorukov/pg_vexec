@@ -198,8 +198,14 @@ typedef struct VexecSortBound
  * none may raise, else after them, as H6's bound.  Off for
  * VEXEC_JOIN_FILTER_OFF batches where it kept more than 70% of a batch's
  * rows, as ClickHouse turns its join's runtime filter off.
+ *
+ * VC3: a scan whose source takes a join's keys (vexec_source.h,
+ * set_join_keys) gives it the range, and the distinct values where there
+ * are at most VEXEC_JOIN_KEYS_VALUES of them, for the source to pass over
+ * its units by; the version says which build they are of.
  */
 #define VEXEC_JOIN_FILTER_OFF	30
+#define VEXEC_JOIN_KEYS_VALUES	1024
 
 typedef struct VexecJoinFilter
 {
@@ -211,6 +217,9 @@ typedef struct VexecJoinFilter
 	uint64	   *bits;			/* a bit a value of the range, or NULL */
 	uint64	   *bloom;			/* else a Bloom filter's bits */
 	uint32		bloom_mask;		/* its bits less one */
+	uint64		version;		/* bumped at each build lent: 1 the first */
+	int			nvalues;		/* VC3: the distinct values, ascending, or 0 */
+	int64	   *values;
 	int			off;			/* batches left with the filter off */
 	int64		removed;		/* rows dropped, EXPLAIN ANALYZE's */
 	int64		off_batches;	/* batches the filter was off for */
@@ -594,6 +603,7 @@ extern bool vexec_sort_plan_running_bound(CustomScan *cscan);
 extern bool vexec_scan_set_bound(PlanState *ps, VexecSortBound *bound);
 extern pg_atomic_uint64 *vexec_scan_shared_bound(PlanState *ps);
 extern bool vexec_scan_set_join_filter(PlanState *ps, VexecJoinFilter *filter);
+extern bool vexec_scan_takes_join_keys(PlanState *ps, AttrNumber attno);
 
 /* vecrepart.c */
 extern Node *vexec_create_repart_state(CustomScan *cscan);

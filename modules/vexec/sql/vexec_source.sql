@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: Apache-2.0
 --
--- The batch-source and batch-sink contracts (vexec_source.h at minor 5,
+-- The batch-source and batch-sink contracts (vexec_source.h at minor 6,
 -- vexec_sink.h) on vanilla PostgreSQL, through vexec_test's access method,
 -- heap's with a source and a sink of every member
 -- (modules/vexec_test/source_test.c): each query run with vexec.mode off,
@@ -25,7 +25,9 @@
 -- method's fetch by TID leaves the columns fetch_columns() did not name
 -- NULL, and vexec_test.source_fetch_cost prices a fetch (VC16).  It hands
 -- a scan's columns in the steps vexec asks for, a later step's through
--- next_rest() at the rows vexec selects, every other row NULL (VC2).
+-- next_rest() at the rows vexec selects, every other row NULL (VC2).  It
+-- passes over the units none of whose rows a hash join's inner keys meet,
+-- by their least and greatest values (VC3).
 
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS vexec;
@@ -326,6 +328,77 @@ RESET vexec.mode;
 SELECT source_check('SELECT a, b, d, u FROM src WHERE a % 100 = 7 AND c LIKE ''v%7'' AND g > 0');
 RESET vexec.enable_source_steps;
 
+-- a hash join's keys lent to the source (VC3; set_join_keys(), minor 6):
+-- once the join has built its table -- before it reads an outer row -- the
+-- scan on the outer side of an inner, semi or right join gives the source
+-- the inner keys' range, and their values where there are at most 1,024,
+-- and the source passes over the units none of whose rows a key meets; the
+-- scan still checks every row it reads.  The keys in the outer column's
+-- type, clamped to its range, none where no value of it is within; none to
+-- a left or anti join's outer side, nor where the scan's quals may raise;
+-- given again for each table a rescanned join builds; none with
+-- vexec.enable_source_join_keys off.  srcj_dim's keys are 3001 to 3050,
+-- src's unit four of ten; the inner side a source too, which is lent none
+CREATE TABLE srcj_dim (k int4, n int8, s int2, tag text) USING vexec_test_am;
+INSERT INTO srcj_dim
+SELECT i, i * 7, (i - 3000)::int2, CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END
+FROM generate_series(3001, 3050) i;
+INSERT INTO srcj_dim VALUES (NULL, NULL, NULL, 'null'), (20000, 140000, 9999, 'far'),
+	(40000, 40000, NULL, 'huge'), (50000, 50000, NULL, 'huge');
+ANALYZE srcj_dim;
+SET vexec.mode = force;
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT s.a, s.c, d.tag FROM src s JOIN srcj_dim d ON s.a = d.k WHERE d.tag = 'even';
+RESET vexec.mode;
+SELECT calls AS jk_before FROM vexec_test.source_calls() WHERE member = 'units passed by join keys' \gset
+SELECT source_check('SELECT s.a, s.c, d.tag FROM src s JOIN srcj_dim d ON s.a = d.k WHERE d.tag = ''even''');
+-- nine units passed in each format's run
+SELECT calls - :jk_before AS units_passed FROM vexec_test.source_calls() WHERE member = 'units passed by join keys';
+-- an int8 column; an int2 column joined to an expression of the inner
+-- side's, whose keys the type's range clamps; keys none of its range holds;
+-- a semi join, a right join, the inner keys' NULL
+SELECT calls AS jk_before FROM vexec_test.source_calls() WHERE member = 'units passed by join keys' \gset
+SELECT source_check('SELECT s.a, s.b FROM src s JOIN srcj_dim d ON s.b = d.n WHERE d.tag IN (''odd'', ''far'')');
+SELECT source_check('SELECT s.a, s.g FROM src s JOIN srcj_dim d ON s.g = d.k - 3000 WHERE d.tag <> ''null''');
+SELECT source_check('SELECT count(*) FROM src s JOIN srcj_dim d ON s.g = d.n WHERE d.tag = ''huge''');
+SELECT source_check('SELECT a, c FROM src WHERE a IN (SELECT k FROM srcj_dim WHERE tag = ''odd'')');
+SELECT source_check('SELECT s.a, d.k, d.tag FROM src s RIGHT JOIN srcj_dim d ON s.a = d.k WHERE d.tag IN (''even'', ''null'', ''far'')');
+SELECT calls - :jk_before AS units_passed FROM vexec_test.source_calls() WHERE member = 'units passed by join keys';
+SELECT calls AS jk_before FROM vexec_test.source_calls() WHERE member = 'units passed by join keys' \gset
+-- none passed: a left and an anti join, a qual that may raise, the setting off
+SELECT source_check('SELECT s.a, d.tag FROM src s LEFT JOIN srcj_dim d ON s.a = d.k WHERE s.a % 1000 = 7');
+SELECT source_check('SELECT count(*) FROM src s WHERE NOT EXISTS (SELECT 1 FROM srcj_dim d WHERE d.k = s.a)');
+SELECT source_check('SELECT s.a, d.tag FROM src s JOIN srcj_dim d ON s.a = d.k WHERE s.b / (s.g + 1000) > 0');
+SET vexec.enable_source_join_keys = off;
+SELECT source_check('SELECT s.a, s.c, d.tag FROM src s JOIN srcj_dim d ON s.a = d.k WHERE d.tag = ''even''');
+RESET vexec.enable_source_join_keys;
+SELECT calls - :jk_before AS units_passed FROM vexec_test.source_calls() WHERE member = 'units passed by join keys';
+-- a join rescanned for each outer row, its table built anew of other keys,
+-- given each time
+SET vexec.mode = force;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+  SELECT o.lim, (SELECT count(*) FROM src s JOIN srcj_dim d ON s.a = d.k WHERE d.k < o.lim)
+  FROM (VALUES (3010), (3040), (2000)) o(lim);
+RESET vexec.mode;
+SELECT source_check('SELECT o.lim, (SELECT count(*) FROM src s JOIN srcj_dim d ON s.a = d.k WHERE d.k < o.lim) FROM (VALUES (3010), (3040), (2000)) o(lim)');
+-- a table that spills lends none
+SET work_mem = '64kB';
+SELECT source_check('SELECT count(*), sum(s.b) FROM src s JOIN (SELECT a + 20 AS k FROM src WHERE a % 2 = 0) d ON s.a = d.k');
+RESET work_mem;
+-- in parallel, each participant's units
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET vexec.scan_rows_per_worker = 1000;
+SELECT source_check('SELECT s.a, s.c, d.tag FROM src s JOIN srcj_dim d ON s.a = d.k WHERE d.tag = ''odd''');
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET vexec.scan_rows_per_worker;
+
 -- rescans: a subquery's scan, for each outer row
 CREATE TABLE src_outer (k int4);
 INSERT INTO src_outer VALUES (3), (5000), (9999);
@@ -351,5 +424,5 @@ SELECT count(*) FROM src_xml;
 -- and estimate, which estimate_ex replaces (minor 3)
 SELECT member, calls > 0 AS called FROM vexec_test.source_calls();
 
-DROP TABLE src, src_outer, src_copy, src_xml, so_rows;
+DROP TABLE src, src_outer, src_copy, src_xml, so_rows, srcj_dim;
 DROP FUNCTION source_check(text), source_run(text, text, text);
