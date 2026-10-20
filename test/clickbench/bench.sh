@@ -52,7 +52,10 @@
 #                about 35 of 10M rows, which a timed run's restarts, one
 #                before each query's cold run, leave too little time to merge
 #   CB_SETTINGS  more server settings, one "name = value" a line, for every
-#                node's postgresql.auto.conf
+#                node's postgresql.auto.conf.  vexec.exchange_memory, where
+#                they do not give it and a CB_VEXEC session runs parallel
+#                workers: what one parallel aggregation's participants can
+#                take of the area, within an eighth of the memory
 #   CB_VEXEC     vexec's sessions, each one more configuration of each
 #                planner, "<planner>+<session>": force-postgres, force-arrow
 #                (vexec.mode = force in that format), auto-postgres,
@@ -218,6 +221,42 @@ if [ "$ROUTE" = port ]; then
 		echo "$((n + 1)) $((n - 1)) p $(sockdir "$n") $(port "$n") $(datadir "$n")"
 	done > "$CONF"
 fi
+
+# vexec's exchange area (vexec.exchange_memory, pg_vector_executor.md §3.21's
+# M1), where CB_SETTINGS gives none and a vexec session aggregates in
+# parallel: as much as one parallel aggregation's participants can take of it
+# -- each 48 of its 4 MB blocks at most, and no more than its shared memory,
+# vexec.repartition_shared_memory (hash_mem where -1) -- within an eighth of
+# the memory, beside shared_buffers' quarter, shared among the nodes.  The
+# node's settings as written, CB_SETTINGS' too, read with postgres -C, vexec's
+# as their text: the postmaster does not load it for them.
+PARALLEL_VEXEC=""
+for p in $PLANNERS; do
+	case "$p" in *+*-serial) ;; *+*) PARALLEL_VEXEC=1 ;; esac
+done
+setting() { "$BINDIR/postgres" -D "$1" -C "$2" 2> /dev/null; }
+exchange_mb() {				# exchange_mb <datadir>: the area's MB; none where it is given
+	local d="$1" workers kb blocks mb cap
+	setting "$d" vexec.exchange_memory > /dev/null && return
+	[ -n "$VEXEC" ] && [ -n "$PARALLEL_VEXEC" ] || { echo 0; return; }
+	# the participants: the workers a Gather takes, and its leader
+	if [ "$ROUTE" = port ]; then workers=$WORKERS
+	else workers=$(setting "$d" max_parallel_workers_per_gather) || workers=0; fi
+	[ "$workers" -gt 0 ] || { echo 0; return; }
+	kb=$(setting "$d" vexec.repartition_shared_memory | awk '{
+		v = $0; gsub(/[ \047]/, "", v); u = v; sub(/^-?[0-9]+/, "", u); n = substr(v, 1, length(v) - length(u))
+		f = (u == "" || u == "kB") ? 1 : u == "MB" ? 1024 : u == "GB" ? 1048576 : u == "TB" ? 1073741824 : 0
+		if (n != "" && f > 0) printf "%d", (n < 0 ? -1 : n * f) }')
+	[ -n "$kb" ] || kb=-1
+	[ "$kb" -lt 0 ] && kb=$(awk -v m="$(setting "$d" work_mem)" -v f="$(setting "$d" hash_mem_multiplier)" \
+		'BEGIN { printf "%d", m * f }')
+	blocks=$((kb / 4096))
+	[ "$blocks" -gt 48 ] && blocks=48
+	mb=$(((workers + 1) * blocks * 4))
+	cap=$((MEM_KB / 8 / 1024 / $(echo $NODES | wc -w) / 4 * 4))
+	[ "$mb" -gt "$cap" ] && mb=$cap
+	echo "$mb"
+}
 for n in $NODES; do
 	mkdir -p "$(sockdir "$n")"
 	"$BINDIR/initdb" -D "$(datadir "$n")" -N --locale=C --encoding=UTF8 > "$WORK/initdb$n.log" 2>&1 \
@@ -266,6 +305,15 @@ for n in $NODES; do
 		fi
 		[ -n "${CB_SETTINGS:-}" ] && printf '%s\n' "$CB_SETTINGS"
 	} >> "$(datadir "$n")/postgresql.auto.conf"
+	mb=$(exchange_mb "$(datadir "$n")")
+	[ "${mb:-0}" -gt 0 ] && echo "vexec.exchange_memory = ${mb}MB" >> "$(datadir "$n")/postgresql.auto.conf"
+	if [ "$n" -eq 0 ]; then
+		case "$mb" in
+			'') EXCHANGE="$(setting "$(datadir 0)" vexec.exchange_memory), CB_SETTINGS'" ;;
+			0) EXCHANGE=none ;;
+			*) EXCHANGE="$mb MB" ;;
+		esac
+	fi
 done
 start_all || exit 1
 if [ "$ROUTE" = port ]; then
@@ -329,6 +377,7 @@ step() {					# step <name> <psql args...>: timed
 }
 echo "ClickBench, $MODE mode: $ROUTE, $STORAGE, $SUBSET rows ($ROWS)$([ "$ROUTE" = port ] && echo ", $SEGMENTS segments"), planners: $PLANNERS"
 echo "  bindir $BINDIR, data in $WORK"
+[ -n "$VEXEC" ] && echo "  vexec.exchange_memory: $EXCHANGE"
 t0=$(now_ms)
 step create -f "$WORK/create.sql"
 if [ "$ROUTE" != port ]; then
