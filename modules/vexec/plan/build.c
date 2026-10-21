@@ -21,7 +21,9 @@
  *
  * VecResult's is a Result's: no scanrelid, its child in lefttree, its quals
  * and target list reading the child's output as OUTER_VAR.  Children stay in
- * lefttree and righttree, never custom_plans (§3.6).
+ * lefttree and righttree, never custom_plans (§3.6) -- but a Vec Append's,
+ * a VecResult's with its first child in lefttree and the others in
+ * custom_plans (§3.22's T6).
  *
  * The builders set the flags; core copies costs, not flags
  * ([R:route_b pg19_customscan §2.1]).
@@ -32,6 +34,7 @@
 
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/restrictinfo.h"
 
@@ -216,6 +219,34 @@ plan_vecbitmapscan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 }
 
 /*
+ * A list of quals ORCA's translator built, as PostgreSQL's planner hands
+ * them: each conjunct a qual of its own (§3.22's T2).  The translator makes
+ * a filter one qual, its whole condition one AND
+ * (pg19/orca/translate/CTranslatorDXLToPlStmt.cpp, TranslateDXLScCondToQual),
+ * which heap's prefilter, the split of quals between kernels and
+ * PostgreSQL's evaluator, and EXPLAIN's counts would each take as one.  The
+ * order is the AND's, and a NULL conjunct fails the list as it fails the
+ * AND.
+ */
+List *
+vexec_flat_quals(List *quals)
+{
+	List	   *flat = NIL;
+	ListCell   *lc;
+
+	foreach(lc, quals)
+	{
+		Node	   *qual = lfirst(lc);
+
+		if (is_andclause(qual))
+			flat = list_concat(flat, vexec_flat_quals(((BoolExpr *) qual)->args));
+		else
+			flat = lappend(flat, qual);
+	}
+	return flat;
+}
+
+/*
  * VecBitmapHeapScan in place of a BitmapHeapScan ORCA's translator built:
  * the same bitmap and conditions, its plan node id, costs and parameters
  * kept.
@@ -227,8 +258,9 @@ vexec_build_bitmapscan_from_bitmapscan(BitmapHeapScan *bhs)
 
 	cscan->scan = bhs->scan;
 	cscan->scan.plan.type = T_CustomScan;
+	cscan->scan.plan.qual = vexec_flat_quals(bhs->scan.plan.qual);
 	cscan->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-	cscan->custom_exprs = bhs->bitmapqualorig;
+	cscan->custom_exprs = vexec_flat_quals(bhs->bitmapqualorig);
 	cscan->custom_relids = bms_make_singleton(bhs->scan.scanrelid);
 	cscan->methods = vexec_bitmapscan_methods();
 	return &cscan->scan.plan;
@@ -245,6 +277,7 @@ vexec_build_scan_from_seqscan(SeqScan *seqscan)
 
 	cscan->scan = seqscan->scan;
 	cscan->scan.plan.type = T_CustomScan;
+	cscan->scan.plan.qual = vexec_flat_quals(seqscan->scan.plan.qual);
 	cscan->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cscan->methods = vexec_scan_methods();
 	/*
@@ -254,6 +287,27 @@ vexec_build_scan_from_seqscan(SeqScan *seqscan)
 	 * partition's RTE among several aliased t1.
 	 */
 	cscan->custom_relids = bms_make_singleton(seqscan->scan.scanrelid);
+	return &cscan->scan.plan;
+}
+
+/*
+ * Vec Append in place of an Append ORCA's translator built (§3.22's T6): a
+ * VecResult of the same target list, its first child in lefttree and the
+ * others in custom_plans, its plan node id, costs and parameters kept.
+ */
+Plan *
+vexec_build_append_from_append(Append *append)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+
+	cscan->scan.plan = append->plan;
+	cscan->scan.plan.type = T_CustomScan;
+	cscan->scan.plan.lefttree = linitial(append->appendplans);
+	cscan->scan.plan.righttree = NULL;
+	cscan->scan.scanrelid = 0;
+	cscan->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+	cscan->custom_plans = list_delete_first(list_copy(append->appendplans));
+	cscan->methods = vexec_result_methods();
 	return &cscan->scan.plan;
 }
 
@@ -268,6 +322,7 @@ vexec_build_result_from_result(Result *result)
 
 	cscan->scan.plan = result->plan;
 	cscan->scan.plan.type = T_CustomScan;
+	cscan->scan.plan.qual = vexec_flat_quals(result->plan.qual);
 	cscan->scan.scanrelid = 0;
 	cscan->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cscan->methods = vexec_result_methods();

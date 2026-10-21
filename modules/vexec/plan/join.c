@@ -1167,7 +1167,7 @@ vexec_build_hashjoin_from_hashjoin(HashJoin *hj)
 	cscan->scan.plan.type = T_CustomScan;
 	cscan->scan.plan.targetlist = (List *) orca_join_expr((Node *) hj->join.plan.targetlist,
 														  nouter, false);
-	cscan->scan.plan.qual = (List *) orca_join_expr((Node *) hj->join.plan.qual, nouter, false);
+	cscan->scan.plan.qual = vexec_flat_quals((List *) orca_join_expr((Node *) hj->join.plan.qual, nouter, false));
 	cscan->scan.plan.lefttree = outer;
 	cscan->scan.plan.righttree = inner;
 	cscan->scan.scanrelid = 0;
@@ -1175,7 +1175,7 @@ vexec_build_hashjoin_from_hashjoin(HashJoin *hj)
 	cscan->custom_plans = NIL;
 	cscan->custom_scan_tlist = scan_tlist;
 	cscan->custom_exprs = list_make4(orca_join_expr((Node *) hj->hashclauses, nouter, false),
-									 orca_join_expr((Node *) hj->join.joinqual, nouter, false),
+									 vexec_flat_quals((List *) orca_join_expr((Node *) hj->join.joinqual, nouter, false)),
 									 orca_join_expr((Node *) hj->hashkeys, nouter, false),
 									 orca_join_expr((Node *) hash->hashkeys, nouter, true));
 	cscan->custom_private = vexec_join_plan_encode(&plan);

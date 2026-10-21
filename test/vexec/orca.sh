@@ -119,6 +119,8 @@ QUERIES=(
 	"SELECT b.id, a.id FROM %t a RIGHT JOIN %t b ON a.s = b.s AND a.id = b.k WHERE b.id < 120"
 	"SELECT d, sum(v) OVER (PARTITION BY k ORDER BY id) FROM %t WHERE id % 1000 = 7"
 	"SELECT id, v FROM %t WHERE v > 99990 ORDER BY v, id LIMIT 20"
+	"SELECT k, count(*), sum(v) FROM (SELECT k, v FROM %t UNION ALL SELECT k, v FROM %t WHERE b) u GROUP BY k"
+	"SELECT k % 7, count(*), sum(CASE WHEN s = 'name 7' THEN n END), sum(coalesce(nullif(k, 5), -1)) FROM %t WHERE v > 100 AND k < 60 AND d >= DATE '2020-02-01' GROUP BY 1"
 )
 SESSIONS=("off" "explain" "force-postgres" "force-arrow" "force-random")
 session_sets() {
@@ -251,7 +253,7 @@ section_module() {
 		is "every query of the workload, in each session, answers as PostgreSQL's planner does" "$nsame of $nq" "$nq of $nq"
 		is "ORCA plans each in force mode, every plan with the vector nodes it could have (vexec.debug_require_vector)" \
 			"$norca of ${#QUERIES[@]}" "${#QUERIES[@]} of ${#QUERIES[@]}"
-		for k in "Vec Seq Scan" "Vec Hash Join" "Vec Hash Left Join" "Vec Hash Semi Join" "Vec Hash Anti Join" "Vec HashAggregate" "Vec Aggregate"; do
+		for k in "Vec Seq Scan" "Vec Hash Join" "Vec Hash Left Join" "Vec Hash Semi Join" "Vec Hash Anti Join" "Vec HashAggregate" "Vec Aggregate" "Vec Append"; do
 			echo "$kinds" | grep -q -x "$k" && ok "ORCA's plans hold a $k" \
 				|| notok "ORCA's plans hold a $k" "$(echo "$kinds" | sort | uniq -c | sort -rn | head -12)"
 		done
@@ -262,6 +264,27 @@ section_module() {
 		else
 			notok "EXPLAIN ANALYZE shows ORCA's vector scan run, with its rows" "$plan"
 		fi
+		# pg_vector_executor.md §3.22's T2: the conditions ORCA makes one AND,
+		# a VecScan's quals one by one, which heap's reader checks before it
+		# deforms a row
+		plan=$(q "$D" postgres "SET gp.optimizer = on; SET vexec.mode = force; EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*) FROM t_heap WHERE k > 3 AND v < 90000 AND d >= DATE '2020-03-01'")
+		has "under ORCA, a scan's conditions are its quals one by one" "$plan" "Vector Quals: 3 of 3"
+		has "which heap's reader checks before it deforms a row" "$plan" "Prefilter: 3 of 3 quals"
+		# §3.22's T6: a UNION ALL of vector nodes one Vec Append, which EXPLAIN
+		# VERBOSE shows with its columns; an Append under vexec.enable_append
+		# off; rescanned with its parameters, as a correlated subquery's
+		sql="SELECT k, count(*), sum(v) FROM (SELECT k, v FROM t_heap UNION ALL SELECT k, v + 1 FROM t_heap WHERE b) u GROUP BY k"
+		plan=$(q "$D" postgres "SET gp.optimizer = on; SET vexec.mode = force; EXPLAIN (VERBOSE, COSTS OFF) $sql")
+		[[ "$plan" == *"Vec Append"*"Output:"*"Vec Seq Scan on public.t_heap"*"Vec Seq Scan on public.t_heap"* ]] \
+			&& ok "under ORCA, a UNION ALL of vector nodes is a Vec Append, its columns shown" \
+			|| notok "a Vec Append under ORCA" "$plan"
+		plan=$(q "$D" postgres "SET gp.optimizer = on; SET vexec.mode = force; SET vexec.enable_append = off; EXPLAIN (COSTS OFF) $sql")
+		[[ "$plan" == *"Append"* && "$plan" != *"Vec Append"* ]] \
+			&& ok "and an Append under vexec.enable_append off" || notok "an Append under vexec.enable_append off" "$plan"
+		sql="SELECT a.id, (SELECT count(*) || '/' || coalesce(sum(u.v), 0) FROM (SELECT v FROM t_heap WHERE k = a.k AND id < 400 UNION ALL SELECT v FROM t_heap WHERE k = a.k + 1 AND id < 400) u) FROM t_heap a WHERE a.id < 40"
+		is "a Vec Append run again for each outer row answers as the planner" \
+			"$(q "$D" postgres "SET gp.optimizer = on; SET vexec.mode = force; $sql" | sort | md5sum)" \
+			"$(q "$D" postgres "SET gp.optimizer = off; SET vexec.mode = off; $sql" | sort | md5sum)"
 		server_stop "$D"
 		log_clean "vexec under ORCA ($order)" "$D"
 	done
@@ -310,6 +333,7 @@ PAR_QUERIES=(
 	"SELECT count(*), count(b.id), sum(b.v) FROM %t a LEFT JOIN %t b ON a.id = b.id * 3"
 	"SELECT id, sum(v), count(*) FROM %t GROUP BY id HAVING sum(v) > 99000"
 	"SELECT count(*), sum(b.n) FROM %t a JOIN (SELECT id, sum(n) AS n FROM %t GROUP BY id) b ON a.id = b.id + 5"
+	"SELECT count(*), sum(u.k) FROM (SELECT a.k FROM t_small a JOIN %t b ON b.id = a.id WHERE b.v < 50 UNION ALL SELECT k FROM %t WHERE b) u"
 )
 section_parallel() {
 	local D sql ref got nq=0 nsame=0 before after plan s
@@ -438,6 +462,24 @@ section_parallel() {
 	par_plan "with vexec, a grouping's" force \
 		"SELECT k, count(*), sum(n), avg(v) FROM t_heap WHERE b GROUP BY k" \
 		"*Vec Finalize HashAggregate*Gather*Vec Partial HashAggregate*Parallel Vec Seq Scan on t_heap*"
+	# §3.22's T6: a Vec Append below the Gather, each branch split by its own
+	# scan, every participant reading both (gp_orca_vec.h's APPEND); its
+	# rows each once, as PAR_QUERIES's UNION ALL checks
+	par_plan "with vexec, a UNION ALL's Vec Append below the Gather, each branch's scan shared" force \
+		"SELECT k, count(*), sum(v) FROM (SELECT k, v FROM t_heap UNION ALL SELECT k, v FROM t_heap WHERE b) u GROUP BY k" \
+		"*Gather*Vec Append*Parallel Vec Seq Scan on t_heap*Parallel Vec Seq Scan on t_heap*"
+	# and none over one whose branch a small table's scan drives, a larger
+	# table's on its inner side, which each participant would read whole --
+	# whole under enable_parallel_hash off (TPC-DS 76's, by its join's
+	# shape): a Gather of its own below it in each branch, its rows the
+	# planner's
+	sql="SELECT count(*), sum(u.k) FROM (SELECT a.k FROM t_small a JOIN t_heap b ON b.id = a.id WHERE b.v < 50 UNION ALL SELECT k FROM t_heap WHERE b) u"
+	plan=$(q "$D" postgres "$PAR SET enable_parallel_hash = off; SET vexec.mode = force; EXPLAIN (COSTS OFF) $sql")
+	got=$(q "$D" postgres "$PAR SET enable_parallel_hash = off; SET vexec.mode = force; $sql")
+	[[ "$plan" == *"Vec Append"*"Gather"*"Parallel Vec Seq Scan on t_small"*"Gather"*"Parallel Vec Seq Scan on t_heap"* ]] &&
+		[ "$got" = "$(q "$D" postgres "SET gp.optimizer = off; SET vexec.mode = off; $sql")" ] \
+		&& ok "with vexec, no Gather over a Vec Append whose branch would read more whole in each participant than it splits" \
+		|| notok "no Gather over a Vec Append whose branch reads more whole than it splits" "$plan $got"
 	# a bounded VecSort right over its scan fetches the columns past its keys
 	# by TID from the scan's relation (vexec's late columns): no Gather
 	# between them, which vexec.debug_check_plans would refuse

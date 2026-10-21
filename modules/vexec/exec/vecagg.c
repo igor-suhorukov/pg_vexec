@@ -170,6 +170,7 @@
 #include "exec/keyhash.h"
 #include "expr/expr.h"
 #include "expr/kernel.h"
+#include "plan/plan.h"
 
 /* How a key column is hashed and compared. */
 typedef enum VexecAggKeyKind
@@ -3873,6 +3874,73 @@ vexec_agg_last_hash(VexecNode *node)
 }
 
 /*
+ * Whether a VecAgg's groups may be read a batch ahead of its parent's
+ * asking (pg_vector_executor.md §3.22's T4; vechashjoin.c's
+ * vexec_state_read_ahead_safe()): it reads its input whole before its first
+ * group -- plain or hashed, not grouped in its input's order -- each of its
+ * transitions is one of vexec's own that raises nothing, so that a spilled
+ * partition's rows advanced past the first group raise nothing either --
+ * not a float's sum or accumulation, which may overflow, nor PostgreSQL's
+ * transition function -- and what its output runs is none or one of the
+ * built-in functions below, which raise nothing over a state these
+ * transitions made: a partial stage's serialization functions, as ORCA
+ * pushes one below a join (TPC-H q03), and a final stage's or a whole
+ * aggregate's final functions.  Its HAVING and target list are the caller's
+ * to check.
+ */
+bool
+vexec_agg_read_ahead_safe(PlanState *ps)
+{
+	VexecAggState *s = (VexecAggState *) ps;
+
+	if (s->strategy != AGG_PLAIN && s->strategy != AGG_HASHED)
+		return false;
+	for (int i = 0; i < s->ntrans; i++)
+	{
+		switch (s->trans[i].kind)
+		{
+			case VEXEC_AGG_FMGR:
+			case VEXEC_AGG_SUM_FLOAT:
+			case VEXEC_AGG_ACCUM_FLOAT:
+				return false;
+			default:
+				break;
+		}
+		if (DO_AGGSPLIT_SERIALIZE(s->trans[i].aggref->aggsplit))
+			switch (s->trans[i].pertrans->serialfn_oid)
+			{
+				case InvalidOid:
+				case F_NUMERIC_AVG_SERIALIZE:
+				case F_INT8_AVG_SERIALIZE:
+				case F_NUMERIC_POLY_SERIALIZE:
+					break;
+				default:
+					return false;
+			}
+	}
+	for (int i = 0; i < s->naggs; i++)
+	{
+		AggStatePerAgg peragg = &s->aggstate->peragg[i];
+
+		if (peragg->aggref == NULL)
+			return false;		/* not set up: nothing known of it */
+		switch (peragg->finalfn_oid)
+		{
+			case InvalidOid:	/* none, as a partial stage's (SKIPFINAL) */
+			case F_NUMERIC_SUM:
+			case F_NUMERIC_AVG:
+			case F_NUMERIC_POLY_SUM:
+			case F_NUMERIC_POLY_AVG:
+			case F_INT8_AVG:
+				break;
+			default:
+				return false;
+		}
+	}
+	return true;
+}
+
+/*
  * X9: the hashes of the groups of the batch the node last handed up, a
  * row's each; NULL where it keeps none, its n best (C3).
  */
@@ -3882,6 +3950,46 @@ vexec_agg_batch_hashes(VexecNode *node)
 	VexecAggState *s = (VexecAggState *) node;
 
 	return s->topn > 0 ? NULL : s->outhash;
+}
+
+/*
+ * pg_vector_executor.md §3.22's T5, option A: agg(CASE WHEN c THEN x [ELSE
+ * NULL] END) taken as agg(x) FILTER (WHERE c), where the transition skips
+ * a NULL input -- strict, or one of vexec's sums and averages, which skip
+ * it as PostgreSQL's do -- and x can raise nothing, so that it may be
+ * computed for the rows c turns down (target_inexact, below).  The CASE's
+ * kernels would make each row's value a register's and sum it; the FILTER
+ * sums x where c holds, as a pivot's sums of one column by a key's values
+ * want (TPC-DS 02, 43, 59): the measurement after the kernels found them
+ * still a third slower than this.
+ */
+static bool
+case_filter(VexecAggTrans *t, Expr **xp, Expr **cp)
+{
+	Aggref	   *aggref = t->aggref;
+	CaseExpr   *c;
+	CaseWhen   *w;
+	Oid			fn = t->pertrans->transfn_oid;
+
+	if (DO_AGGSPLIT_COMBINE(aggref->aggsplit) || aggref->aggfilter != NULL ||
+		aggref->aggdistinct != NIL || aggref->aggorder != NIL || list_length(aggref->args) != 1)
+		return false;
+	c = (CaseExpr *) linitial_node(TargetEntry, aggref->args)->expr;
+	if (!IsA(c, CaseExpr) || c->arg != NULL || list_length(c->args) != 1)
+		return false;
+	if (c->defresult != NULL &&
+		!(IsA(c->defresult, Const) && ((Const *) c->defresult)->constisnull))
+		return false;
+	if (!t->pertrans->transfn.fn_strict &&
+		fn != F_NUMERIC_AVG_ACCUM && fn != F_INT8_AVG_ACCUM && fn != F_INT4_SUM &&
+		fn != F_INT2_SUM && fn != F_NUMERIC_ACCUM && fn != F_INT8_ACCUM)
+		return false;
+	w = linitial_node(CaseWhen, c->args);
+	if (vexec_expr_may_raise((Node *) w->result))
+		return false;
+	*xp = w->result;
+	*cp = w->expr;
+	return true;
 }
 
 /*
@@ -4125,6 +4233,7 @@ agg_begin(CustomScanState *css, EState *estate, int eflags)
 		Aggref	   *aggref = t->aggref;
 		int			k = 0;
 		Expr	   *x;
+		Expr	   *cond;
 		int64		offset;
 
 		if (aggref == NULL)
@@ -4149,6 +4258,13 @@ agg_begin(CustomScanState *css, EState *estate, int eflags)
 			continue;
 		}
 		t->firstarg = list_length(inputs);
+		if (case_filter(t, &x, &cond))
+		{
+			inputs = lappend(inputs, makeTargetEntry(x, list_length(inputs) + 1, NULL, false));
+			t->filter = list_length(inputs);
+			inputs = lappend(inputs, makeTargetEntry(cond, list_length(inputs) + 1, NULL, false));
+			continue;
+		}
 		foreach(lc, aggref->args)
 		{
 			TargetEntry *tle = lfirst_node(TargetEntry, lc);

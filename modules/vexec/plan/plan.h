@@ -234,9 +234,11 @@ extern Path *vexec_scan_path(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 							 const VexecCost *cost);
 extern Path *vexec_bitmapscan_path(PlannerInfo *root, RelOptInfo *rel, BitmapHeapPath *bp,
 								   const VexecSteps *quals, const VexecSteps *target);
+extern List *vexec_flat_quals(List *quals);
 extern Plan *vexec_build_bitmapscan_from_bitmapscan(BitmapHeapScan *bhs);
 extern Plan *vexec_build_scan_from_seqscan(SeqScan *seqscan);
 extern Plan *vexec_build_result_from_result(Result *result);
+extern Plan *vexec_build_append_from_append(Append *append);
 
 /* explain.c */
 extern bool vexec_explain_requested(void *es);

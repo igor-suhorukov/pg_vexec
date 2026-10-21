@@ -111,6 +111,19 @@
  *	build_repartition	that node, between the partial stage the pass made
  *						and the final stage it puts over it
  *
+ * and, from minor version 6, one more kind describe_node may give:
+ *
+ *	APPEND				an append of the engine's, its children read in
+ *						turn, the first in lefttree and the others in
+ *						custom_plans -- an Append of vector nodes made one,
+ *						so that their batches reach a vector parent with no
+ *						row between -- whose branches a pass splits each
+ *						with a driver of its own under one Gather above it,
+ *						every participant reading every branch, or walks
+ *						one by one as an Append's.  An older gp_orca takes
+ *						it for none of its kinds, as OTHER, and leaves it
+ *						alone
+ *
  * A node built so is the engine's CustomScan, found by name where the
  * plan is read back, a segment's fragment among them.  Without a
  * registration gp_orca calls nothing, and its plans are as they were.
@@ -141,10 +154,11 @@
 #define GP_ORCA_VEC_RENDEZVOUS	"Cloudberry/gp_orca_vec_v1"	/* the major
 															 * version is in
 															 * the name */
-#define GP_ORCA_VEC_MINOR		5	/* 1: describe_node; 2: set_options,
+#define GP_ORCA_VEC_MINOR		6	/* 1: describe_node; 2: set_options,
 									 * the cost oracle, build_window; 3:
 									 * scan_workers; 4: shares_table; 5:
-									 * repartitions, build_repartition */
+									 * repartitions, build_repartition; 6:
+									 * describe_node's APPEND */
 #define GP_ORCA_VEC_MAGIC		0x47564331	/* "GVC1" */
 
 struct ExplainState;
@@ -154,7 +168,8 @@ struct ExplainState;
  * version 1), and what a pass needs of it to treat it as that node: its
  * children are where PostgreSQL's node has them -- lefttree, and a hash
  * join's inner side in righttree, which the join reads whole and hashes
- * itself, with no Hash node -- its qual and target list are the node's own.
+ * itself, with no Hash node; an append's first child in lefttree and the
+ * others in custom_plans -- its qual and target list are the node's own.
  */
 typedef enum GpOrcaVecKind
 {
@@ -169,11 +184,14 @@ typedef enum GpOrcaVecKind
 								 * and righttree, the inner side */
 	GP_ORCA_VEC_AGG,			/* an aggregation of lefttree */
 	GP_ORCA_VEC_SORT,			/* a sort of lefttree */
-	GP_ORCA_VEC_WINDOW			/* from minor version 2, in
+	GP_ORCA_VEC_WINDOW,			/* from minor version 2, in
 								 * GpOrcaVecCosts.kinds alone: a hashed
 								 * window's partitions, brought together
 								 * under its WindowAgg (build_window), which
 								 * describe_node reports as OTHER */
+	GP_ORCA_VEC_APPEND			/* from minor version 6: an append of
+								 * lefttree and custom_plans, read in turn,
+								 * which passes their rows on as they come */
 } GpOrcaVecKind;
 
 typedef struct GpOrcaVecNode

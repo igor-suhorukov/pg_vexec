@@ -349,9 +349,38 @@ SELECT vexec_check('SELECT b % 7, sum(tp_mix(a) % 1000), count(tp_div(a, b)) FRO
  (0,206059,407) | (1,193024,408) | (2,206477,411) | (3,210011,410) | (4,191819,407) | (5,189823,407) | (6,217609,410)
 (1 row)
 
--- a call that never raises may run in PostgreSQL's evaluator ahead of its
--- order too, in a fallback step; one with a check may not
+-- in a CASE, a kernel (pg_vector_executor.md §3.22's T5), each call runs
+-- as declared over the rows its branch takes, a call with a check too --
+-- the query ending in OFFSET 0, so that vexec_run()'s subquery is not
+-- pulled up into the ROW() it reads the rows as, which has no vector form
 SELECT * FROM vexec_how('SELECT CASE WHEN a > 0 THEN tp_mix(a) ELSE 0 END FROM tp');
+                           vexec_how                           
+---------------------------------------------------------------
+ Vec Seq Scan on public.tp
+ Kernel Steps: 2
+ Fallback Steps: 0
+ Declared Calls: tp_mix(bigint) [vexec_testpack: never raises]
+(4 rows)
+
+SELECT * FROM vexec_how('SELECT CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END FROM tp');
+                           vexec_how                           
+---------------------------------------------------------------
+ Vec Seq Scan on public.tp
+ Kernel Steps: 2
+ Fallback Steps: 0
+ Declared Calls: tp_div(bigint,bigint) [vexec_testpack: check]
+(4 rows)
+
+SELECT vexec_check('SELECT CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END FROM tp OFFSET 0');
+                   vexec_check                   
+-------------------------------------------------
+ 3000 rows, md5 0ffd095dcfbc56e00a034b371fe10aa0
+(1 row)
+
+-- a call that never raises may run in PostgreSQL's evaluator ahead of its
+-- order too, in a fallback step -- a ROW's, which has no vector form; one
+-- with a check may not
+SELECT * FROM vexec_how('SELECT ROW(CASE WHEN a > 0 THEN tp_mix(a) ELSE 0 END) FROM tp');
          vexec_how         
 ---------------------------
  Vec Seq Scan on public.tp
@@ -359,7 +388,7 @@ SELECT * FROM vexec_how('SELECT CASE WHEN a > 0 THEN tp_mix(a) ELSE 0 END FROM t
  Fallback Steps: 1
 (3 rows)
 
-SELECT * FROM vexec_how('SELECT CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END FROM tp');
+SELECT * FROM vexec_how('SELECT ROW(CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END) FROM tp');
          vexec_how         
 ---------------------------
  Vec Seq Scan on public.tp
@@ -368,10 +397,10 @@ SELECT * FROM vexec_how('SELECT CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END FRO
  Row-by-Row Targets: 1
 (4 rows)
 
-SELECT vexec_check('SELECT CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END FROM tp');
+SELECT vexec_check('SELECT ROW(CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END) FROM tp OFFSET 0');
                    vexec_check                   
 -------------------------------------------------
- 3000 rows, md5 0ffd095dcfbc56e00a034b371fe10aa0
+ 3000 rows, md5 880793f30c6a65bd01d21bf5fabaf60f
 (1 row)
 
 -- what binds to nothing stays row by row: a function declared nowhere, a

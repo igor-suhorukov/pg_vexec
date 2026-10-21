@@ -73,6 +73,14 @@ typedef enum VexecExprKind
 	VE_SAOP,					/* x op ANY / ALL (an array constant) */
 	VE_DISTINCT,				/* IS [NOT] DISTINCT FROM, through an
 								 * equality kernel */
+	VE_CASE,					/* CASE: each WHEN's condition, then its
+								 * result, over the rows it decides (T5) */
+	VE_CASETEST,				/* a simple CASE's argument, in its
+								 * conditions */
+	VE_COALESCE,				/* COALESCE: each argument over the rows
+								 * still NULL */
+	VE_NULLIF,					/* NULLIF: its first argument, NULL where
+								 * the equality holds */
 	VE_FALLBACK					/* PostgreSQL's evaluator, a row at a time:
 								 * a pure subtree without a kernel */
 } VexecExprKind;
@@ -115,6 +123,12 @@ typedef struct VexecExpr
 	VexecSaop  *saop;			/* VE_SAOP: the array's elements */
 	/* VE_NULLTEST, VE_BOOLTEST */
 	int			testtype;
+	/*
+	 * VE_CASE: args[0] its argument where it has one, then each WHEN's
+	 * condition and result, then its ELSE; VE_NULLIF: its first argument,
+	 * then the equality
+	 */
+	bool		case_arg;
 	/* VE_FALLBACK */
 	ExprState  *state;
 
@@ -167,6 +181,10 @@ typedef struct VexecCompileContext
 	List	   *declared;		/* compiled: the declared calls' steps,
 								 * VexecExpr *, for EXPLAIN */
 	const char *why;			/* why the last top-level one is lazy */
+	int			case_depth;		/* the simple CASEs whose conditions are
+								 * being compiled, 0 in a searched CASE's:
+								 * a CaseTestExpr reads the innermost's
+								 * argument */
 } VexecCompileContext;
 
 /* What a batch's evaluation shares. */
@@ -182,6 +200,8 @@ typedef struct VexecEval
 	ExprContext *econtext;		/* for fallback steps and parameters */
 	bool		over_dict;		/* VC5: a subtree over a dictionary's values,
 								 * not the batch's rows: no X10 memo */
+	struct VexecVec *case_value;	/* the argument of the simple CASE whose
+									 * conditions are being evaluated */
 } VexecEval;
 
 /* compile.c */

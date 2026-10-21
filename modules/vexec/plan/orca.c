@@ -69,6 +69,12 @@
  *			which the pass makes, each participant finalizing the
  *			groups it is dealt (exec/vecrepart.c).
  *
+ * And through its minor version 6 (pg_vector_executor.md §3.22's T6):
+ *
+ *	describe_node	a Vec Append, ORCA's Append of vector children made
+ *			one (exec/vecresult.c): APPEND, each child a branch the
+ *			pass may split.
+ *
  * Force mode builds a vector node wherever the oracle accepts one.  Auto
  * mode, where ORCA's search priced vexec's nodes, builds one wherever it
  * priced one: where the oracle accepts it, of vexec.min_rows rows at least.
@@ -126,6 +132,7 @@ static int	orca_cost_aggregate(void *state, Oid aggfnoid, int nargs,
 static int	orca_cost_relation(void *state, Oid relid);
 static bool orca_cost_hash_key(void *state, Oid eqop, Oid collation);
 static Plan *orca_build_window(void *state, WindowAgg *window, List *rtable);
+static Plan *orca_append(VexecPlanState *ps, Append *append);
 static int	orca_scan_workers(Plan *scan, Relation rel, double pages, double tuples,
 							  int workers);
 static bool orca_shares_table(Plan *join);
@@ -298,6 +305,34 @@ orca_scan(VexecPlanState *ps, SeqScan *seq, List *rtable)
 	if (!chosen(ps, &cost))
 		return NULL;
 	return vexec_build_scan_from_seqscan(seq);
+}
+
+/*
+ * An Append ORCA's translator built, and its Vec Append (§3.22's T6): where
+ * every child is a vector node, a VecResult reading them in turn
+ * (exec/vecresult.c), so that their batches reach a vector parent with no
+ * row between.  A serial Append alone, its target list its children's
+ * columns -- as a UNION ALL's is -- with no run-time pruning; its first child
+ * in lefttree, through which EXPLAIN finds its columns as it finds an
+ * Append's through its first child, the others in custom_plans.  No price of
+ * its own: it costs less than the Append it replaces wherever its children
+ * hand up batches, and what that Append costs where they do not.
+ */
+static Plan *
+orca_append(VexecPlanState *ps, Append *append)
+{
+	if (!vexec_enable_append || list_length(append->appendplans) < 2 ||
+		append->plan.qual != NIL || append->part_prune_index >= 0 ||
+		append->plan.parallel_aware || !chosen(ps, NULL))
+		return NULL;
+	foreach_ptr(Plan, child, append->appendplans)
+		if (!vexec_is_vector_node(child))
+			return NULL;
+	foreach_node(TargetEntry, tle, append->plan.targetlist)
+		if (!IsA(tle->expr, Var) || ((Var *) tle->expr)->varno != OUTER_VAR)
+			return NULL;
+	ps->npossible++;
+	return vexec_build_append_from_append(append);
 }
 
 /*
@@ -718,6 +753,8 @@ orca_build(void *state, Plan *plan, List *rtable)
 			return orca_scan(ps, (SeqScan *) plan, rtable);
 		case T_Result:
 			return orca_result(ps, (Result *) plan);
+		case T_Append:
+			return orca_append(ps, (Append *) plan);
 		case T_Agg:
 			return orca_agg(ps, (Agg *) plan);
 		case T_HashJoin:
@@ -758,7 +795,9 @@ orca_build(void *state, Plan *plan, List *rtable)
  * once parallel-aware (exec/vecscan.c); a VecResult a projection; a
  * VecHashJoin a hash join, its inner side read whole by each participant;
  * a VecAgg the Agg it was made of; a VecSort the Sort of its keys over its
- * child.
+ * child; a Vec Append an append of its children, each a branch the pass may
+ * split, from the API's minor version 6 (§3.22's T6) -- which an older
+ * gp_orca takes for none of its kinds, as it takes OTHER.
  */
 static bool
 orca_describe(Plan *plan, GpOrcaVecNode *vn)
@@ -774,7 +813,7 @@ orca_describe(Plan *plan, GpOrcaVecNode *vn)
 	else if (cscan->methods == vexec_bitmapscan_methods())
 		vn->kind = GP_ORCA_VEC_OTHER;	/* a scan of its bitmap's pages */
 	else if (cscan->methods == vexec_result_methods())
-		vn->kind = GP_ORCA_VEC_RESULT;
+		vn->kind = cscan->custom_plans != NIL ? GP_ORCA_VEC_APPEND : GP_ORCA_VEC_RESULT;
 	else if (cscan->methods == vexec_motion_send_methods())
 	{
 		/*

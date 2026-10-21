@@ -240,6 +240,22 @@ SELECT join_check('SELECT g, ji.id FROM generate_series(-5, 3000) g LEFT JOIN ji
 SELECT join_explain('SELECT g, ji.id FROM generate_series(1, 3000) g JOIN ji ON g = ji.id', 'Input|One at a Time');
 SELECT join_error('SELECT g FROM (SELECT g, 100 / (3000 - g) AS z FROM generate_series(1, 3000) g) q JOIN ji ON q.g = ji.id LIMIT 3');
 
+-- an outer side of row nodes read a batch ahead where reading early changes
+-- nothing but time (pg_vector_executor.md §3.22): an Append of two scans,
+-- which a target list's entry taken for one that may raise left a row at a
+-- time (T1); a CTE's scan, through the CTE's own plan (T3); a VecAgg that
+-- projects, which reads its input whole before its first group and finishes
+-- it by functions that raise nothing (T4) -- and one whose float's average
+-- may raise, still a row at a time
+SELECT join_check('SELECT u.k, ji.id FROM (SELECT k FROM jo UNION ALL SELECT nk FROM jo) u JOIN ji ON u.k = ji.k');
+SELECT join_explain('SELECT u.k, ji.id FROM (SELECT k FROM jo UNION ALL SELECT nk FROM jo) u JOIN ji ON u.k = ji.k', 'Outer Input|One at a Time');
+SELECT join_check('WITH c AS MATERIALIZED (SELECT id, k FROM jo) SELECT c.id, ji.id FROM c JOIN ji ON c.k = ji.k');
+SELECT join_explain('WITH c AS MATERIALIZED (SELECT id, k FROM jo) SELECT c.id, ji.id FROM c JOIN ji ON c.k = ji.k', 'Outer Input|One at a Time');
+SELECT join_check('SELECT a.c, a.sn, ji.k FROM (SELECT count(*) > 0 AS c, sum(n) AS sn, id FROM jo GROUP BY id) a JOIN ji ON a.id = ji.id WHERE ji.k = 7');
+SELECT join_explain('SELECT a.c, a.sn, ji.k FROM (SELECT count(*) > 0 AS c, sum(n) AS sn, id FROM jo GROUP BY id) a JOIN ji ON a.id = ji.id WHERE ji.k = 7', 'Outer Input|One at a Time');
+SELECT join_check('SELECT a.af, ji.k FROM (SELECT avg(f) > 0 AS af, id FROM jo GROUP BY id) a JOIN ji ON a.id = ji.id WHERE ji.k = 7');
+SELECT join_explain('SELECT a.af, ji.k FROM (SELECT avg(f) > 0 AS af, id FROM jo GROUP BY id) a JOIN ji ON a.id = ji.id WHERE ji.k = 7', 'Outer Input|One at a Time');
+
 -- volatile functions, row by row in PostgreSQL's order: once a pair the
 -- hash clauses pass, and once a row that comes out
 CREATE SEQUENCE jseq;

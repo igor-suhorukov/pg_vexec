@@ -725,6 +725,181 @@ eval_fallback(VexecEval *ev, VexecExpr *e, const uint64 *active)
 	return v;
 }
 
+/* ---- CASE, COALESCE and NULLIF (pg_vector_executor.md §3.22's T5) ---- */
+
+/* A word of a register's validity: a constant's spread over the batch. */
+static inline uint64
+valid_word(const VexecVec *v, int w)
+{
+	if (v->validity == NULL)
+		return ~UINT64CONST(0);
+	if (v->encoding == VEXEC_CONST)
+		return vexec_bit(v->validity, 0) ? ~UINT64CONST(0) : 0;
+	return v->validity[w];
+}
+
+/*
+ * Rows of a register into a result in its type's build shape, a Datum a
+ * row, whatever the register's layout and encoding.  A Datum by reference
+ * is kept as it lies, in the input's or the work batch's memory, which
+ * outlive the batch's registers.
+ */
+static void
+copy_rows(VexecEval *ev, VexecVec *out, const VexecVec *src, const uint64 *rows)
+{
+	int			r;
+
+	for (r = vexec_bits_next(rows, ev->nrows, 0); r >= 0; r = vexec_bits_next(rows, ev->nrows, r + 1))
+	{
+		bool		isnull;
+		Datum		value = vexec_vec_datum(ev->work, src, r, &isnull);
+
+		if (isnull)
+			register_set_null(ev, out, r);
+		else if (out->shape.layout == VEXEC_DATUM)
+		{
+			if (out->validity)
+				vexec_bit_set(out->validity, r);
+			((Datum *) out->values)[r] = value;
+		}
+		else
+			register_store(ev, out, r, value, false);
+	}
+}
+
+/* The rows of a mask NULL in a result. */
+static void
+null_rows(VexecEval *ev, VexecVec *out, const uint64 *rows)
+{
+	int			r;
+
+	for (r = vexec_bits_next(rows, ev->nrows, 0); r >= 0; r = vexec_bits_next(rows, ev->nrows, r + 1))
+		register_set_null(ev, out, r);
+}
+
+/*
+ * CASE: each WHEN's condition over the rows no condition before it decided,
+ * each result over the rows its condition took, and the ELSE over the rows
+ * left -- the rows PostgreSQL evaluates each for, so that a result that
+ * would raise on a row its condition does not take is never computed
+ * there.  A row a step sent to redo is decided by PostgreSQL's evaluator,
+ * the whole expression again (vexec_resolve_row()).  A simple CASE's
+ * argument is computed once, and read by its conditions alone, as
+ * PostgreSQL gives it to them (execExpr.c's innermost_caseval); a searched
+ * CASE's conditions have none.
+ */
+static VexecVec *
+eval_case(VexecEval *ev, VexecExpr *e, const uint64 *active)
+{
+	uint64	   *undecided = live_rows(ev, active);
+	VexecVec   *out = new_register(ev, e->type, NULL);
+	VexecVec   *outer_value = ev->case_value;
+	VexecVec   *value = NULL;
+	int			first = e->case_arg ? 1 : 0;
+	int			nwhen = (e->nargs - first - 1) / 2;
+	int			i,
+				w;
+
+	if (e->case_arg)
+		value = vexec_eval(ev, e->args[0], undecided);
+	for (i = 0; i < nwhen; i++)
+	{
+		VexecExpr  *cond = e->args[first + 2 * i];
+		VexecExpr  *result = e->args[first + 2 * i + 1];
+		uint64	   *take;
+		uint64	   *t;
+		uint64	   *va;
+		VexecVec   *c;
+
+		for (w = 0; w < VEXEC_WORDS(ev->nrows); w++)
+			undecided[w] &= ~ev->redo[w];
+		if (!vexec_bits_any(undecided, ev->nrows))
+			break;
+		ev->case_value = value;
+		c = vexec_eval(ev, cond, undecided);
+		ev->case_value = outer_value;
+		bool_bits(ev, c, &t, &va);
+		take = vexec_bitmap_alloc(ev->work, ev->nrows, false);
+		for (w = 0; w < VEXEC_WORDS(ev->nrows); w++)
+		{
+			uint64		u = undecided[w] & ~ev->redo[w];
+
+			take[w] = u & t[w] & (va ? va[w] : ~UINT64CONST(0));
+			undecided[w] = u & ~take[w];
+		}
+		if (vexec_bits_any(take, ev->nrows))
+			copy_rows(ev, out, vexec_eval(ev, result, take), take);
+	}
+	for (w = 0; w < VEXEC_WORDS(ev->nrows); w++)
+		undecided[w] &= ~ev->redo[w];
+	if (vexec_bits_any(undecided, ev->nrows))
+		copy_rows(ev, out, vexec_eval(ev, e->args[e->nargs - 1], undecided), undecided);
+	vexec_node_count_kernel(ev->node);
+	return out;
+}
+
+/*
+ * COALESCE: each argument over the rows every argument before it left NULL,
+ * as PostgreSQL computes them; NULL where all of them are.
+ */
+static VexecVec *
+eval_coalesce(VexecEval *ev, VexecExpr *e, const uint64 *active)
+{
+	uint64	   *undecided = live_rows(ev, active);
+	VexecVec   *out = new_register(ev, e->type, NULL);
+	int			i,
+				w;
+
+	for (i = 0; i < e->nargs && vexec_bits_any(undecided, ev->nrows); i++)
+	{
+		VexecVec   *a = vexec_eval(ev, e->args[i], undecided);
+		uint64	   *take = vexec_bitmap_alloc(ev->work, ev->nrows, false);
+
+		for (w = 0; w < VEXEC_WORDS(ev->nrows); w++)
+		{
+			uint64		u = undecided[w] & ~ev->redo[w];
+
+			take[w] = u & valid_word(a, w);
+			undecided[w] = u & ~take[w];
+		}
+		if (vexec_bits_any(take, ev->nrows))
+			copy_rows(ev, out, a, take);
+	}
+	for (w = 0; w < VEXEC_WORDS(ev->nrows); w++)
+		undecided[w] &= ~ev->redo[w];
+	null_rows(ev, out, undecided);
+	vexec_node_count_kernel(ev->node);
+	return out;
+}
+
+/* NULLIF(a, b): a, NULL where a = b holds. */
+static VexecVec *
+eval_nullif(VexecEval *ev, VexecExpr *e, const uint64 *active)
+{
+	uint64	   *live = live_rows(ev, active);
+	VexecVec   *a = vexec_eval(ev, e->args[0], live);
+	VexecVec   *eq = vexec_eval(ev, e->args[1], live);
+	VexecVec   *out = new_register(ev, e->type, NULL);
+	uint64	   *keep = vexec_bitmap_alloc(ev->work, ev->nrows, false);
+	uint64	   *equal = vexec_bitmap_alloc(ev->work, ev->nrows, false);
+	uint64	   *t;
+	uint64	   *va;
+	int			w;
+
+	bool_bits(ev, eq, &t, &va);
+	for (w = 0; w < VEXEC_WORDS(ev->nrows); w++)
+	{
+		uint64		l = live[w] & ~ev->redo[w];
+
+		equal[w] = l & t[w] & (va ? va[w] : ~UINT64CONST(0));
+		keep[w] = l & ~equal[w];
+	}
+	copy_rows(ev, out, a, keep);
+	null_rows(ev, out, equal);
+	vexec_node_count_kernel(ev->node);
+	return out;
+}
+
 static VexecVec *
 eval_and_or(VexecEval *ev, VexecExpr *e, const uint64 *active)
 {
@@ -1402,6 +1577,16 @@ eval_step(VexecEval *ev, VexecExpr *e, const uint64 *active)
 			return eval_distinct(ev, e, active);
 		case VE_SAOP:
 			return eval_saop(ev, e, active);
+		case VE_CASE:
+			return eval_case(ev, e, active);
+		case VE_CASETEST:
+			if (ev->case_value == NULL)
+				elog(ERROR, "vexec: a CASE's argument read outside its conditions");
+			return ev->case_value;
+		case VE_COALESCE:
+			return eval_coalesce(ev, e, active);
+		case VE_NULLIF:
+			return eval_nullif(ev, e, active);
 		case VE_FALLBACK:
 			return eval_fallback(ev, e, active);
 	}

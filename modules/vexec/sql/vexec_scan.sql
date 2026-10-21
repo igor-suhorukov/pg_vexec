@@ -355,6 +355,68 @@ SELECT vexec_check('SELECT id, i2 + 32700::int2 FROM vs WHERE i2 < 50 AND id < 4
 SELECT vexec_sent('SELECT id, i2 + 32700::int2 FROM vs WHERE i2 < 50 AND id < 400');
 SELECT vexec_sent('SELECT id FROM vs WHERE i2 < 50 AND 1000 / (i2 - 70) > -100 AND id < 400');
 
+-- CASE, COALESCE and NULLIF as kernels (pg_vector_executor.md §3.22's
+-- T5): each WHEN's condition over the rows no condition before it took,
+-- each result and the ELSE over the rows that take it, so that what would
+-- raise on another row raises only where PostgreSQL computes it; a simple
+-- CASE's argument computed once; COALESCE's arguments over the rows still
+-- NULL; NULLIF's equality by its kernel.  Every type's result -- fixed,
+-- varlena, numeric, bool -- NULLs, nested CASEs, a CASE in a qual, and the
+-- aggregate of a CASE a pivot sums.  A projection ends in OFFSET 0:
+-- vexec_run() reads the query as a subquery, which PostgreSQL would
+-- otherwise pull up into the ROW() it reads the rows as -- a target with
+-- no vector form, which PostgreSQL's evaluator computes whole, row by row
+SELECT vexec_check('SELECT id, CASE WHEN i4 < 0 THEN -1 WHEN i4 > 0 THEN 1 WHEN i4 = 0 THEN 0 END FROM vs WHERE id < 300 OFFSET 0');
+SELECT vexec_check('SELECT CASE WHEN id % 3 = 0 THEN t WHEN id % 3 = 1 THEN v ELSE NULL END FROM vs WHERE id < 300 OFFSET 0');
+SELECT vexec_check('SELECT CASE WHEN b THEN n ELSE n * 2 END, CASE WHEN b IS NULL THEN f8 END FROM vs WHERE id < 300 OFFSET 0');
+SELECT vexec_check('SELECT id FROM vs WHERE CASE WHEN i2 > 0 THEN b ELSE NOT b END AND id < 500');
+SELECT vexec_check('SELECT CASE i2 % 3 WHEN 0 THEN ''zero'' WHEN 1 THEN ''one'' WHEN -1 THEN ''minus'' ELSE ''other'' END AS c, count(*) FROM vs GROUP BY 1');
+SELECT vexec_check('SELECT CASE t WHEN ''text 1'' THEN 1 WHEN ''text 2'' THEN 2 END FROM vs WHERE id < 400 OFFSET 0');
+SELECT vexec_check('SELECT CASE iv WHEN interval ''5 minutes'' THEN 1 ELSE 0 END FROM vs WHERE id < 10 OFFSET 0');
+SELECT vexec_check('SELECT CASE WHEN id < 100 THEN CASE id % 2 WHEN 0 THEN ''e'' ELSE ''o'' END ELSE CASE WHEN b THEN ''big'' END END FROM vs WHERE id < 150 OFFSET 0');
+SELECT vexec_check('SELECT CASE i2 % 3 WHEN CASE id % 2 WHEN 0 THEN 1 ELSE 0 END THEN ''same'' WHEN CASE WHEN b THEN -1 END THEN ''minus'' END FROM vs WHERE id < 300 OFFSET 0');
+SELECT vexec_check('SELECT CASE id % 4 WHEN 0 THEN CASE i2 % 2 WHEN 0 THEN ''e'' WHEN 1 THEN ''o'' END WHEN 1 THEN coalesce(t, ''none'') END FROM vs WHERE id < 300 OFFSET 0');
+SELECT vexec_check('SELECT CASE WHEN i2 = 0 THEN 0 ELSE 1000 / i2 END FROM vs WHERE id < 300 OFFSET 0');
+SELECT vexec_check('SELECT CASE WHEN i2 = 5 THEN 1000 / (i2 - 5) ELSE 0 END FROM vs WHERE id < 300 OFFSET 0');
+SELECT vexec_check('SELECT coalesce(i2, i4, -1), coalesce(t, v, ''none''), coalesce(n, 0) FROM vs WHERE id < 200 OFFSET 0');
+SELECT vexec_check('SELECT coalesce(i4, 1000 / (i4 - i4)) FROM vs WHERE i4 IS NOT NULL AND id < 300 OFFSET 0');
+SELECT vexec_check('SELECT coalesce(i4, 1000 / (id - id)) FROM vs WHERE id < 1100 OFFSET 0');
+SELECT vexec_check('SELECT nullif(i2, 0), nullif(t, ''text 5''), nullif(n, 1.000) FROM vs WHERE id < 300 OFFSET 0');
+SELECT vexec_check('SELECT i2 % 7, sum(CASE WHEN t = ''text 3'' THEN n ELSE NULL END), count(CASE WHEN b THEN 1 END), sum(CASE WHEN i4 > 0 THEN i8 ELSE 0 END) FROM vs GROUP BY 1');
+-- their steps kernels' where their arguments' are, PostgreSQL's evaluator
+-- none; a simple CASE whose condition has no kernel PostgreSQL's whole
+CREATE FUNCTION vexec_steps(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	PERFORM set_config('vexec.mode', 'force', true);
+	FOR l IN EXECUTE 'EXPLAIN (VERBOSE, COSTS OFF) ' || q LOOP
+		IF l ~ 'Vec Seq Scan|Fallback Steps' THEN
+			RETURN NEXT regexp_replace(btrim(l), ' on .*', '');
+		END IF;
+	END LOOP;
+END
+$$;
+SELECT vexec_steps('SELECT CASE WHEN i4 < 0 THEN -1 ELSE i4 END, coalesce(i2, 0), nullif(i8, 0), CASE t WHEN ''text 1'' THEN 1 END FROM vs');
+SELECT vexec_steps('SELECT CASE iv WHEN interval ''5 minutes'' THEN 1 ELSE 0 END FROM vs');
+-- NULLIF over an equality that is not strict, found ahead of pg_catalog's:
+-- PostgreSQL calls it on two non-NULL arguments alone, so its evaluator
+-- takes the NULLIF whole -- with a kernel's form, a row whose second
+-- argument is NULL would be NULL, where PostgreSQL gives the first
+CREATE SCHEMA vexec_ops;
+CREATE FUNCTION vexec_ops.eq_or_null(int4, int4) RETURNS bool
+LANGUAGE sql IMMUTABLE LEAKPROOF CALLED ON NULL INPUT
+AS 'SELECT $1 IS NULL OR $2 IS NULL OR $1 OPERATOR(pg_catalog.=) $2';
+CREATE OPERATOR vexec_ops.= (LEFTARG = int4, RIGHTARG = int4, FUNCTION = vexec_ops.eq_or_null);
+SET search_path = vexec_ops, pg_catalog, public;
+SELECT vexec_check('SELECT id, nullif(id, i4) FROM vs WHERE id BETWEEN 1000 AND 1100 OFFSET 0');
+SELECT vexec_steps('SELECT nullif(id, i4) FROM vs');
+RESET search_path;
+DROP OPERATOR vexec_ops.= (int4, int4);
+DROP FUNCTION vexec_ops.eq_or_null(int4, int4);
+DROP SCHEMA vexec_ops;
+
 DROP POLICY vsec_p ON vsec;
 REVOKE ALL ON vsec FROM regress_vexec_rls;
 REVOKE ALL ON FUNCTION vexec_check(text), vexec_run(text, text, text), vexec_leak(int4) FROM regress_vexec_rls;
@@ -367,5 +429,6 @@ DROP SEQUENCE vseq;
 DROP FUNCTION vexec_leak(int4);
 DROP FUNCTION vexec_dear(int4);
 DROP FUNCTION vexec_sent(text);
+DROP FUNCTION vexec_steps(text);
 DROP FUNCTION vexec_check(text);
 DROP FUNCTION vexec_run(text, text, text);

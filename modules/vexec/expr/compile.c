@@ -135,7 +135,11 @@ usable_kernel(Expr *expr, Oid funcid, List *args, Oid inputcollid, void **extra)
 	return ke;
 }
 
-/* Why a subtree cannot run ahead through PostgreSQL's evaluator. */
+/*
+ * Why a subtree cannot run ahead through PostgreSQL's evaluator.  A target
+ * list's entry computes nothing itself (pg_vector_executor.md §3.22's T1):
+ * without it, a plan's every target list read as one that may raise.
+ */
 static bool
 impurity_walker(Node *node, const char **why)
 {
@@ -144,6 +148,7 @@ impurity_walker(Node *node, const char **why)
 
 	switch (nodeTag(node))
 	{
+		case T_TargetEntry:
 		case T_Var:
 		case T_Const:
 		case T_RelabelType:
@@ -437,6 +442,108 @@ compile_fallback(VexecCompileContext *cc, Expr *expr)
 	return e;
 }
 
+/* Whether a subtree reads a CASE's argument: a CaseTestExpr in it. */
+static bool
+casetest_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, CaseTestExpr))
+		return true;
+	return expression_tree_walker(node, casetest_walker, context);
+}
+
+/*
+ * Whether a compiled condition has a fallback step that reads its CASE's
+ * argument: PostgreSQL's evaluator, given the step alone, would not find
+ * the argument where the CASE it is not part of sets it.
+ */
+static bool
+fallback_reads_case(const VexecExpr *e)
+{
+	if (e->kind == VE_FALLBACK)
+		return casetest_walker((Node *) e->expr, NULL);
+	for (int i = 0; i < e->nargs; i++)
+		if (fallback_reads_case(e->args[i]))
+			return true;
+	return false;
+}
+
+/*
+ * CASE (pg_vector_executor.md §3.22's T5): args[0] its argument where it has
+ * one (case_arg), then each WHEN's condition and result, then its ELSE, a
+ * NULL constant of its type where it has none.  A simple CASE's conditions
+ * read its argument through CaseTestExpr (VE_CASETEST); a searched CASE's
+ * read none, as execExpr.c's innermost_caseval gives them none.  Where a
+ * condition has no vector form and its fallback reads the argument, the
+ * CASE has no vector form either: PostgreSQL's evaluator takes it whole,
+ * and sets the argument for its conditions itself.
+ */
+static VexecExpr *
+compile_case(VexecCompileContext *cc, CaseExpr *c)
+{
+	VexecExpr  *e;
+	Expr	   *defresult = c->defresult;
+	int			first = c->arg != NULL ? 1 : 0;
+	int			depth = cc->case_depth;
+	int			i = first;
+	ListCell   *lc;
+
+	e = new_expr(cc, VE_CASE, (Expr *) c, first + 2 * list_length(c->args) + 1);
+	e->case_arg = c->arg != NULL;
+	if (c->arg != NULL && (e->args[0] = vexec_compile_expr(cc, c->arg)) == NULL)
+		return NULL;
+	foreach(lc, c->args)
+	{
+		CaseWhen   *w = lfirst_node(CaseWhen, lc);
+
+		cc->case_depth = c->arg != NULL ? depth + 1 : 0;
+		e->args[i] = vexec_compile_expr(cc, w->expr);
+		cc->case_depth = depth;
+		if (e->args[i] == NULL || (c->arg != NULL && fallback_reads_case(e->args[i])))
+			return NULL;
+		if ((e->args[i + 1] = vexec_compile_expr(cc, w->result)) == NULL)
+			return NULL;
+		i += 2;
+	}
+	if (defresult == NULL)
+		defresult = (Expr *) makeNullConst(c->casetype, exprTypmod((Node *) c), c->casecollid);
+	if ((e->args[i] = vexec_compile_expr(cc, defresult)) == NULL)
+		return NULL;
+	cc->nkernels++;
+	return e;
+}
+
+/*
+ * NULLIF (§3.22's T5): its first argument, and the equality of the two as
+ * an operator's call, which a kernel computes where one is bound.  A strict
+ * equality's alone: PostgreSQL calls it on two non-NULL arguments only.
+ */
+static VexecExpr *
+compile_nullif(VexecCompileContext *cc, NullIfExpr *n)
+{
+	OpExpr	   *eq = makeNode(OpExpr);
+	VexecExpr  *e;
+
+	set_opfuncid((OpExpr *) n);
+	if (list_length(n->args) != 2 || !func_strict(n->opfuncid))
+		return NULL;
+	eq->opno = n->opno;
+	eq->opfuncid = n->opfuncid;
+	eq->opresulttype = BOOLOID;
+	eq->opretset = false;
+	eq->opcollid = InvalidOid;
+	eq->inputcollid = n->inputcollid;
+	eq->args = n->args;
+	eq->location = n->location;
+	e = new_expr(cc, VE_NULLIF, (Expr *) n, 2);
+	if ((e->args[0] = vexec_compile_expr(cc, linitial(n->args))) == NULL ||
+		(e->args[1] = vexec_compile_expr(cc, (Expr *) eq)) == NULL)
+		return NULL;
+	cc->nkernels++;
+	return e;
+}
+
 /* The vector forms; NULL for an expression that has none. */
 static VexecExpr *
 compile_vector(VexecCompileContext *cc, Expr *expr)
@@ -550,6 +657,30 @@ compile_vector(VexecCompileContext *cc, Expr *expr)
 				return compile_call(cc, expr, VE_SAOP, saop->opfuncid, saop->args,
 									saop->inputcollid);
 			}
+		case T_CaseExpr:
+			return compile_case(cc, (CaseExpr *) expr);
+		case T_CaseTestExpr:
+			/* a simple CASE's argument, only in that CASE's conditions */
+			if (cc->case_depth == 0)
+				return NULL;
+			return new_expr(cc, VE_CASETEST, expr, 0);
+		case T_CoalesceExpr:
+			{
+				CoalesceExpr *c = (CoalesceExpr *) expr;
+				ListCell   *lc;
+				int			i = 0;
+
+				e = new_expr(cc, VE_COALESCE, expr, list_length(c->args));
+				foreach(lc, c->args)
+				{
+					if ((e->args[i++] = vexec_compile_expr(cc, lfirst(lc))) == NULL)
+						return NULL;
+				}
+				cc->nkernels++;
+				return e;
+			}
+		case T_NullIfExpr:
+			return compile_nullif(cc, (NullIfExpr *) expr);
 		default:
 			return NULL;
 	}
@@ -568,7 +699,8 @@ dict_input(VexecExpr *e)
 	if (e == NULL)
 		return NULL;
 	e->dict_col = e->kind == VE_VAR ? e->col : -1;
-	e->dict_pure = e->kind != VE_PARAM && e->kind != VE_FALLBACK;
+	/* a CASE's argument is a register of the batch's rows, not the column's values */
+	e->dict_pure = e->kind != VE_PARAM && e->kind != VE_FALLBACK && e->kind != VE_CASETEST;
 	for (i = 0; i < e->nargs; i++)
 	{
 		const VexecExpr *a = e->args[i];

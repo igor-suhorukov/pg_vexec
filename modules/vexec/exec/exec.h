@@ -563,6 +563,7 @@ extern uint32 vexec_key_hash_slot(VexecKeyHash *kh, TupleTableSlot *slot);
 extern bool vexec_agg_hashes_keys(VexecNode *node, List *keycols, List *eqops,
 								  List *collations);
 extern uint32 vexec_agg_last_hash(VexecNode *node);
+extern bool vexec_agg_read_ahead_safe(PlanState *ps);
 extern const uint32 *vexec_agg_batch_hashes(VexecNode *node);
 extern void vexec_agg_set_topk_shared(VexecNode *node, pg_atomic_uint32 *shared);
 extern uint32 vexec_agg_topk_bound(VexecNode *node);
@@ -685,6 +686,6 @@ extern void vexec_motion_send_plan_decode(CustomScan *cscan, VexecMotionSendPlan
 extern Node *vexec_create_hashjoin_state(CustomScan *cscan);
 extern List *vexec_join_plan_encode(const VexecJoinPlan *plan);
 extern void vexec_join_plan_decode(CustomScan *cscan, VexecJoinPlan *plan);
-extern bool vexec_plan_read_ahead_safe(Plan *plan);
+extern bool vexec_state_read_ahead_safe(PlanState *ps);
 
 #endif							/* VEXEC_EXEC_H */

@@ -2325,7 +2325,7 @@ vexec_build_agg_from_agg(Agg *agg)
 	cscan->scan.plan = agg->plan;
 	cscan->scan.plan.type = T_CustomScan;
 	cscan->scan.plan.targetlist = (List *) orca_index_mutator((Node *) agg->plan.targetlist, &ctx);
-	cscan->scan.plan.qual = (List *) orca_index_mutator((Node *) agg->plan.qual, &ctx);
+	cscan->scan.plan.qual = vexec_flat_quals((List *) orca_index_mutator((Node *) agg->plan.qual, &ctx));
 	cscan->scan.scanrelid = 0;
 	cscan->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 

@@ -124,6 +124,7 @@ extern PGDLLIMPORT bool vexec_prefer_vector_sort;
 extern PGDLLIMPORT bool vexec_enable_late_exchange;
 extern PGDLLIMPORT bool vexec_enable_running_bound;
 extern PGDLLIMPORT bool vexec_enable_window;
+extern PGDLLIMPORT bool vexec_enable_append;
 extern PGDLLIMPORT bool vexec_enable_insert;
 extern PGDLLIMPORT bool vexec_enable_motion_frames;
 extern PGDLLIMPORT bool vexec_orca;

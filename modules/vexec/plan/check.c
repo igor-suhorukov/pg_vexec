@@ -49,7 +49,9 @@ node_name(Plan *plan)
  * its canonical form (build.c, agg.c): a VecScan scans a relation with no
  * custom_scan_tlist, a VecBitmapHeapScan too with its bitmap's tree in
  * lefttree; a VecResult has its child in lefttree and no
- * relation; a VecAgg too, with a scan tuple of its plan's columns; a
+ * relation; a VecAgg too, with a scan tuple of its plan's columns; a Vec
+ * Append, a VecResult, its first child in lefttree and the others in
+ * custom_plans (§3.22's T6); a
  * VecHashJoin its sides in lefttree and righttree, its scan tuple their
  * columns, and its keys its operators'; a VecSort its child in lefttree,
  * its scan tuple the child's row, and its keys the child's columns; a

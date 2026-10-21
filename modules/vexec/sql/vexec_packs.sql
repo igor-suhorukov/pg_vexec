@@ -164,11 +164,19 @@ SELECT vexec_check('SELECT id FROM tp WHERE b > 0 ORDER BY tp_div(a, b), id LIMI
 SELECT * FROM vexec_how('SELECT b % 7, sum(tp_mix(a) % 1000), count(tp_div(a, b)) FROM tp WHERE b > 0 GROUP BY 1');
 SELECT vexec_check('SELECT b % 7, sum(tp_mix(a) % 1000), count(tp_div(a, b)) FROM tp WHERE b > 0 GROUP BY 1');
 
--- a call that never raises may run in PostgreSQL's evaluator ahead of its
--- order too, in a fallback step; one with a check may not
+-- in a CASE, a kernel (pg_vector_executor.md §3.22's T5), each call runs
+-- as declared over the rows its branch takes, a call with a check too --
+-- the query ending in OFFSET 0, so that vexec_run()'s subquery is not
+-- pulled up into the ROW() it reads the rows as, which has no vector form
 SELECT * FROM vexec_how('SELECT CASE WHEN a > 0 THEN tp_mix(a) ELSE 0 END FROM tp');
 SELECT * FROM vexec_how('SELECT CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END FROM tp');
-SELECT vexec_check('SELECT CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END FROM tp');
+SELECT vexec_check('SELECT CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END FROM tp OFFSET 0');
+-- a call that never raises may run in PostgreSQL's evaluator ahead of its
+-- order too, in a fallback step -- a ROW's, which has no vector form; one
+-- with a check may not
+SELECT * FROM vexec_how('SELECT ROW(CASE WHEN a > 0 THEN tp_mix(a) ELSE 0 END) FROM tp');
+SELECT * FROM vexec_how('SELECT ROW(CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END) FROM tp');
+SELECT vexec_check('SELECT ROW(CASE WHEN b > 0 THEN tp_div(a, b) ELSE 0 END) FROM tp OFFSET 0');
 
 -- what binds to nothing stays row by row: a function declared nowhere, a
 -- declaration whose C symbol is another, an overload no declaration has

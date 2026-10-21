@@ -31,6 +31,7 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.drop_implied_keys         | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_agg                | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_agg_split          | on                        |      | user       | bool    |         |              |                             | t
+ vexec.enable_append             | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_bitmapscan         | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_exchange_area      | on                        |      | user       | bool    |         |              |                             | t
  vexec.enable_group_topk         | on                        |      | user       | bool    |         |              |                             | t
@@ -74,7 +75,7 @@ FROM pg_settings WHERE name LIKE 'vexec.%' ORDER BY name;
  vexec.repartition_min_rows      | 500000                    |      | user       | integer | 0       | 2147483647   |                             | t
  vexec.repartition_shared_memory | -1                        | kB   | user       | integer | -1      | 2147483647   |                             | f
  vexec.scan_rows_per_worker      | 163840                    |      | user       | integer | 0       | 2147483647   |                             | t
-(61 rows)
+(62 rows)
 
 -- the modes
 SET vexec.mode = explain;

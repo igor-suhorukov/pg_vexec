@@ -52,7 +52,7 @@
  * evaluator computes, is taken only once every row before it has been
  * consumed: a batch of join rows never reaches past it.  A row child is read
  * a batch ahead only where reading early costs nothing but time
- * (vexec_plan_read_ahead_safe()), else a row at a time.
+ * (vexec_state_read_ahead_safe()), else a row at a time.
  *
  * The table is held to get_hash_memory_limit().  Past it the join is a
  * grace hash join: the inner rows go to partitions on disk by bits of their
@@ -569,30 +569,38 @@ exprs_pure(Node *node)
 }
 
 static bool
-plans_read_ahead_safe(List *plans)
+states_read_ahead_safe(PlanState **states, int n)
 {
-	ListCell   *lc;
-
-	foreach(lc, plans)
-		if (!vexec_plan_read_ahead_safe(lfirst(lc)))
+	for (int i = 0; i < n; i++)
+		if (!vexec_state_read_ahead_safe(states[i]))
 			return false;
 	return true;
 }
 
 /*
- * Whether a plan's rows may be read a batch ahead of its parent's asking:
+ * Whether a child's rows may be read a batch ahead of its parent's asking:
  * reading them early can raise no error and have no side effect that
  * reading them as asked would not, so that nothing but time tells.  Scans,
  * sorts, joins and appends whose every expression is pure (expr/compile.c),
  * and gp_core's Motions, which compute nothing here; vexec's own nodes read
  * as rows by the same rule.  Anything else is read a row at a time.
+ *
+ * Over the child's plan states, which hold what its plan does not
+ * (pg_vector_executor.md §3.22's T3 and T4): a CTE's scan, whose CTE's plan
+ * is a subplan of the statement's, read ahead where that plan may be; and a
+ * VecAgg, whose output runs its final functions, where it has read its
+ * input whole before its first group and its transitions and final
+ * functions raise nothing (vexec_agg_read_ahead_safe()).
  */
 bool
-vexec_plan_read_ahead_safe(Plan *plan)
+vexec_state_read_ahead_safe(PlanState *ps)
 {
-	if (plan == NULL)
+	Plan	   *plan;
+
+	if (ps == NULL)
 		return true;
 	check_stack_depth();
+	plan = ps->plan;
 	if (!exprs_pure((Node *) plan->targetlist) || !exprs_pure((Node *) plan->qual))
 		return false;
 
@@ -627,11 +635,13 @@ vexec_plan_read_ahead_safe(Plan *plan)
 				return false;
 			break;
 		case T_BitmapAnd:
-			if (!plans_read_ahead_safe(((BitmapAnd *) plan)->bitmapplans))
+			if (!states_read_ahead_safe(((BitmapAndState *) ps)->bitmapplans,
+										((BitmapAndState *) ps)->nplans))
 				return false;
 			break;
 		case T_BitmapOr:
-			if (!plans_read_ahead_safe(((BitmapOr *) plan)->bitmapplans))
+			if (!states_read_ahead_safe(((BitmapOrState *) ps)->bitmapplans,
+										((BitmapOrState *) ps)->nplans))
 				return false;
 			break;
 		case T_Result:
@@ -639,15 +649,22 @@ vexec_plan_read_ahead_safe(Plan *plan)
 				return false;
 			break;
 		case T_Append:
-			if (!plans_read_ahead_safe(((Append *) plan)->appendplans))
+			if (!states_read_ahead_safe(((AppendState *) ps)->appendplans,
+										((AppendState *) ps)->as_nplans))
 				return false;
 			break;
 		case T_MergeAppend:
-			if (!plans_read_ahead_safe(((MergeAppend *) plan)->mergeplans))
+			if (!states_read_ahead_safe(((MergeAppendState *) ps)->mergeplans,
+										((MergeAppendState *) ps)->ms_nplans))
 				return false;
 			break;
 		case T_SubqueryScan:
-			if (!vexec_plan_read_ahead_safe(((SubqueryScan *) plan)->subplan))
+			if (!vexec_state_read_ahead_safe(((SubqueryScanState *) ps)->subplan))
+				return false;
+			break;
+		case T_CteScan:
+			/* the CTE's own rows then read early too */
+			if (!vexec_state_read_ahead_safe(((CteScanState *) ps)->cteplanstate))
 				return false;
 			break;
 		case T_NestLoop:
@@ -673,21 +690,27 @@ vexec_plan_read_ahead_safe(Plan *plan)
 		case T_CustomScan:
 			{
 				CustomScan *cscan = (CustomScan *) plan;
+				ListCell   *lc;
 
 				if (strcmp(cscan->methods->CustomName, HJ_MOTION_NAME) == 0)
 					return true;	/* a receiving Motion computes nothing here */
-				if (!vexec_is_vector_node(plan) ||
-					cscan->methods == vexec_agg_methods())
-					return false;	/* VecAgg's output runs final functions */
+				if (!vexec_is_vector_node(plan))
+					return false;
+				if (cscan->methods == vexec_agg_methods() && !vexec_agg_read_ahead_safe(ps))
+					return false;
 				if (!exprs_pure((Node *) cscan->custom_exprs))
 					return false;
+				/* a Vec Append's children past its first (§3.22's T6) */
+				foreach(lc, ((CustomScanState *) ps)->custom_ps)
+					if (!vexec_state_read_ahead_safe(lfirst(lc)))
+						return false;
 				break;
 			}
 		default:
 			return false;
 	}
-	return vexec_plan_read_ahead_safe(plan->lefttree) &&
-		vexec_plan_read_ahead_safe(plan->righttree);
+	return vexec_state_read_ahead_safe(outerPlanState(ps)) &&
+		vexec_state_read_ahead_safe(innerPlanState(ps));
 }
 
 /* ---------------------------------------------------------------------
@@ -3889,7 +3912,7 @@ side_init(HjState *s, HjSide *side, PlanState *ps, int sidx, int first_attno, in
 		attnos[i] = first_attno + i;
 	}
 	side->batches = vexec_is_vector_state(ps) && vexec_node_batchable((VexecNode *) ps);
-	side->read_ahead = side->inner || side->batches || vexec_plan_read_ahead_safe(ps->plan);
+	side->read_ahead = side->inner || side->batches || vexec_state_read_ahead_safe(ps);
 	side->rowbatch = vexec_batch_create(mcxt, ncols, side->types);
 	side->onebatch = vexec_batch_create(mcxt, ncols, side->types);
 

@@ -81,6 +81,7 @@ bool		vexec_prefer_vector_sort = true;
 bool		vexec_enable_late_exchange = true;
 bool		vexec_enable_running_bound = true;
 bool		vexec_enable_window = true;
+bool		vexec_enable_append = true;
 bool		vexec_enable_insert = true;
 bool		vexec_enable_motion_frames = true;
 bool		vexec_orca = true;
@@ -488,6 +489,12 @@ define_settings(void)
 	DefineCustomBoolVariable("vexec.enable_window",
 							 "Enables vector hashed window aggregation, which only ORCA plans.",
 							 NULL, &vexec_enable_window, true,
+							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
+	DefineCustomBoolVariable("vexec.enable_append",
+							 "Enables vector appends, which only ORCA plans.",
+							 "An Append whose children are vector nodes reads their batches in turn, "
+							 "with no row between them and a vector parent.",
+							 &vexec_enable_append, true,
 							 PGC_USERSET, GUC_EXPLAIN, NULL, NULL, NULL);
 	DefineCustomBoolVariable("vexec.enable_insert",
 							 "Enables vector inserts.",

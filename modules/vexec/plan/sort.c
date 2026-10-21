@@ -1295,6 +1295,7 @@ vexec_orca_limit_bound(Limit *limit)
 			below = below->lefttree;
 		else if (IsA(below, CustomScan) &&
 				 ((CustomScan *) below)->methods == vexec_result_methods() &&
+				 ((CustomScan *) below)->custom_plans == NIL &&	/* no Vec Append */
 				 below->qual == NIL &&
 				 !expression_returns_set((Node *) below->targetlist))
 			below = below->lefttree;
