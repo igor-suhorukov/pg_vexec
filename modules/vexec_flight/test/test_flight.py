@@ -9,8 +9,9 @@
 #               semantics corpus, its values against adbc_driver_postgresql's
 #               and psql's; pyarrow.flight listing catalogs, schemas and
 #               tables; prepared statements with DoPut parameters; a Flight
-#               transaction that rolls back
-#   ingest      adbc_ingest's modes through CommandStatementIngest, as
+#               transaction that rolls back; an update answered while its
+#               client's stream is open, DDL counting 0 rows
+#   ingest     adbc_ingest's modes through CommandStatementIngest, as
 #               adbc_driver_postgresql's COPY loads the same table; in a
 #               transaction; the access method and storage parameters of the
 #               table it makes, from its options, ch_table_engines' tables
@@ -123,13 +124,13 @@ def any_cmd(name, body=b''):
     return fstr(1, 'type.googleapis.com/arrow.flight.protocol.sql.' + name) + fbytes(2, body)
 
 
-def flight_client(user='flight', password=PASSWORD, tls=False, database=DB, appname=None):
+def flight_client(user='flight', password=PASSWORD, tls=False, database=DB, appname=None, timeout=None):
     client = fl.FlightClient(TLS if tls else PLAIN, tls_root_certs=CA if tls else None)
     headers = [(b'database', database.encode())]
     if appname:
         headers.append((b'application_name', appname.encode()))
     token = client.authenticate_basic_token(user, password, fl.FlightCallOptions(headers=headers))
-    return client, fl.FlightCallOptions(headers=[token])
+    return client, fl.FlightCallOptions(headers=[token], timeout=timeout)
 
 
 def raw_command(client, opts, cmd):
@@ -455,7 +456,8 @@ def ingest_into_tables():
 
 
 def pb_fields(b):
-    """a protobuf message's length-delimited fields, {number: bytes}"""
+    """a protobuf message's length-delimited fields as bytes, and its varints
+    as ints, {number: value}"""
     def rd(i):
         n = shift = 0
         while True:
@@ -473,7 +475,7 @@ def pb_fields(b):
             out[key >> 3] = b[i:i + n]
             i += n
         elif key & 7 == 0:
-            _, i = rd(i)
+            out[key >> 3], i = rd(i)
         else:
             raise ValueError('wire type %d' % (key & 7))
     return out
@@ -704,6 +706,39 @@ def flight_transaction_rolls_back():
     conn.commit()
     conn.close()
     assert psql('SELECT string_agg(i::text, \',\') FROM tx') == '3'
+
+
+@test
+def updates_answered_on_their_descriptor():
+    """a CommandStatementUpdate answered while the client's stream is open, as
+    Arrow Java's FlightSqlClient.executeUpdate() reads its PutResult before it
+    ends its DoPut; DDL and SET counting 0 rows, which the Flight SQL JDBC
+    driver needs, where -1 reads as a query's"""
+    psql('DROP TABLE IF EXISTS upd; CREATE TABLE upd (i int4); GRANT ALL ON upd TO flight')
+    client, opts = flight_client(timeout=30)
+
+    def update(sql):
+        desc = fl.FlightDescriptor.for_command(any_cmd('CommandStatementUpdate', fstr(1, sql)))
+        writer, reader = client.do_put(desc, pa.schema([]), opts)
+        # a batch of nothing: the descriptor goes out, and the stream stays open
+        writer.write_batch(pa.RecordBatch.from_arrays([], schema=pa.schema([])))
+        meta = reader.read()
+        assert meta is not None, 'no PutResult for %s before the client ended its stream' % sql
+        writer.close()
+        n = pb_fields(meta.to_pybytes()).get(1, 0)      # DoPutUpdateResult's record_count
+        return n - (1 << 64) if n >= 1 << 63 else n
+    got = update('INSERT INTO upd VALUES (1), (2), (3)')
+    assert got == 3, got
+    got = update('CREATE TEMP TABLE upd_temp (i int4)')
+    assert got == 0, got
+    got = update("SET work_mem = '8MB'")
+    assert got == 0, got
+    # the session goes on: its temporary table, and its setting
+    _, t = raw_command(client, opts, any_cmd('CommandStatementQuery', fstr(
+        1, "SELECT count(*) AS n, current_setting('work_mem') AS w FROM upd_temp")))
+    assert t.to_pylist() == [{'n': 0, 'w': '8MB'}], t.to_pylist()
+    client.close()
+    assert psql('SELECT count(*) FROM upd') == '3'
 
 
 def login(user, password, tls=False, database=DB):

@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // The Flight SQL JDBC driver against vexec_flight (pg_vector_executor.md §5,
-// V10): catalogs, schemas and tables listed through DatabaseMetaData, and a
-// query read through a ResultSet.  Run by run.sh, its arguments the Flight
-// port, the user, the password and the database.
+// V10): catalogs, schemas and tables listed through DatabaseMetaData, a
+// query read through a ResultSet, and DDL and an INSERT through a Statement
+// and a PreparedStatement, each run once.  Run by run.sh, its arguments the
+// Flight port, the user, the password and the database.
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverManager;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
@@ -21,6 +24,19 @@ public class FlightJdbcTest {
 		System.out.println("  " + (ok ? "ok" : "FAILED") + " jdbc " + what + (ok ? "" : ": " + got));
 		if (!ok)
 			failed++;
+	}
+
+	interface Update {
+		Object run() throws SQLException;
+	}
+
+	// An update's count, or its error: a check of it fails rather than ending the test.
+	static Object update(Update u) {
+		try {
+			return u.run();
+		} catch (SQLException | RuntimeException e) {
+			return e.toString();
+		}
 	}
 
 	static List<String> column(ResultSet rs, String name) throws Exception {
@@ -55,6 +71,23 @@ public class FlightJdbcTest {
 					ids += rs.getInt("id");
 				}
 				check("reads a query's rows", rows == 100 && ids == 5050, rows + " rows, ids " + ids);
+			}
+			// DDL counts 0 rows: the driver takes an update count of -1 for a query's,
+			// and asks for its result by GetFlightInfo, which would run it again
+			try (Statement st = conn.createStatement()) {
+				Object got = update(() -> st.execute("CREATE TEMP TABLE jdbc_ddl (i int4)") ? "a result set" : st.getUpdateCount());
+				check("runs DDL once, counting 0 rows", Integer.valueOf(0).equals(got), got);
+				got = update(() -> st.executeUpdate("INSERT INTO jdbc_ddl VALUES (1), (2), (3)"));
+				check("counts an INSERT's rows", Integer.valueOf(3).equals(got), got);
+			}
+			try (PreparedStatement ps = conn.prepareStatement("CREATE TEMP TABLE jdbc_ddl_prepared (i int4)")) {
+				Object got = update(ps::executeUpdate);
+				check("runs a prepared DDL once, counting 0 rows", Integer.valueOf(0).equals(got), got);
+			}
+			try (Statement st = conn.createStatement();
+				 ResultSet rs = st.executeQuery("SELECT (SELECT count(*) FROM jdbc_ddl) + (SELECT count(*) FROM jdbc_ddl_prepared) AS n")) {
+				rs.next();
+				check("reads what the updates made", rs.getLong("n") == 3, rs.getLong("n"));
 			}
 		}
 		System.out.println(failed == 0 ? "jdbc: every check passed" : "jdbc: " + failed + " checks FAILED");

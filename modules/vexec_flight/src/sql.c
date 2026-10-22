@@ -440,14 +440,17 @@ flight_statement_run(FlightCall *call, FlightStatement *stmt)
 
 /*
  * A statement for its row count: once for each bound set of parameters,
- * all in one transaction.  -1 when the statement counts no rows, as Flight
- * SQL has it (DoPutUpdateResult).
+ * all in one transaction.  A statement whose command tag counts no rows --
+ * DDL, SET, CALL -- counts 0, as PostgreSQL's JDBC driver reports it, and
+ * not Flight SQL's -1 for an unknown count (DoPutUpdateResult): the Flight
+ * SQL JDBC driver takes an update count of -1 for a query's, and asks for
+ * its result by GetFlightInfo, which runs the statement a second time
+ * (rpc.c, command_info).
  */
 int64
 flight_statement_update(FlightStatement *stmt)
 {
 	uint64		total = 0;
-	bool		counted = false;
 	ListCell   *lc;
 
 	if (stmt->nparams > 0 && stmt->paramsets == NIL)
@@ -459,8 +462,8 @@ flight_statement_update(FlightStatement *stmt)
 	{
 		uint64		n = run_once(stmt, NULL, None_Receiver);
 
-		counted = n != PG_UINT64_MAX;
-		total = counted ? n : 0;
+		if (n != PG_UINT64_MAX)
+			total = n;
 	}
 	else
 		foreach(lc, stmt->paramsets)
@@ -468,14 +471,11 @@ flight_statement_update(FlightStatement *stmt)
 			uint64		n = run_once(stmt, lfirst(lc), None_Receiver);
 
 			if (n != PG_UINT64_MAX)
-			{
-				counted = true;
 				total += n;
-			}
 			CommandCounterIncrement();
 		}
 	flight_statement_ends();
-	return counted ? (int64) total : -1;
+	return (int64) total;
 }
 
 /* A transaction command -- BEGIN, COMMIT, SAVEPOINT ... -- as a statement of its own. */

@@ -541,7 +541,7 @@ read_descriptor(FlightCall *call, char **type, ProtobufCBinaryData *value)
  * send every statement as a query read (adbc_driver_flightsql's
  * ExecuteQuery: a DoGet it starts and may cancel unread when its cursor
  * closes, which would leave the statement never run).  *ran is its row
- * count, -1 when it counts none; -2 when nothing ran.
+ * count (flight_statement_update); -2 when nothing ran.
  */
 static void
 command_info(char *type, ProtobufCBinaryData *value, const ProtobufCBinaryData *cmd,
@@ -762,8 +762,15 @@ do_put(FlightCall *call)
 		FlightStatement *stmt;
 
 		flight_check_transaction(u->_transaction_id_case != 0, &u->transaction_id);
-		while (h2_call_read(call, &msg))
-			;					/* an update has no batches */
+
+		/*
+		 * An update has no batches: it runs on its descriptor, without waiting
+		 * for the client to end its stream.  Arrow Java's FlightSqlClient
+		 * .executeUpdate() reads the PutResult before it ends its DoPut, and
+		 * the two would wait on each other; the C++ and Go clients end their
+		 * stream first.  What a client sends after the descriptor is let go
+		 * when the call finishes (h2_call_finish).
+		 */
 		stmt = flight_statement_create(u->query, false);
 		r.record_count = flight_statement_update(stmt);
 		flight_statement_drop(stmt);
