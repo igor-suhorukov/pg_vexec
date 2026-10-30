@@ -1,0 +1,481 @@
+-- A file's nested columns read as PostgreSQL's arrays, hstore and jsonb
+-- (pg_vector_executor.md §3.40's PQ19 and PQ20): a list of flat elements as
+-- an array of the elements' type, a map of strings to strings as hstore, any
+-- map as a jsonb object.  The files are pyarrow's (test/data/make_files.py,
+-- written into VPQ_TEST_DATA/nested before the test).
+CREATE EXTENSION IF NOT EXISTS hstore;
+\getenv data VPQ_TEST_DATA
+SELECT :'data' || '/nested' AS nested \gset
+\set f_lists :nested '/lists.parquet'
+\set f_maps :nested '/maps.parquet'
+\set f_shapes :nested '/shapes.parquet'
+-- the types a table declares them as
+SELECT name, type, arrow_type FROM vexec_parquet.columns(:'f_lists');
+ name  |        type        |           arrow_type            
+-------+--------------------+---------------------------------
+ id    | bigint             | int64
+ l64   | bigint[]           | list<element: int64>
+ l32   | integer[]          | list<element: int32>
+ l16   | smallint[]         | list<element: int16>
+ l8    | smallint[]         | list<element: int8>
+ ls    | text[]             | list<element: string>
+ lf    | real[]             | list<element: float>
+ ld    | double precision[] | list<element: double>
+ lb    | boolean[]          | list<element: bool>
+ ldate | date[]             | list<element: date32[day]>
+ lts   | timestamp[]        | list<element: timestamp[us]>
+ ldec  | numeric(9,2)[]     | list<element: decimal128(9, 2)>
+ lbin  | bytea[]            | list<element: binary>
+ large | bigint[]           | large_list<element: int64>
+(14 rows)
+
+SELECT name, type, arrow_type FROM vexec_parquet.columns(:'f_maps');
+  name  |  type  |             arrow_type             
+--------+--------+------------------------------------
+ id     | bigint | int64
+ tags   | hstore | map<string, string ('tags')>
+ counts | jsonb  | map<string, int64 ('counts')>
+ scores | jsonb  | map<int64, double ('scores')>
+ flags  | jsonb  | map<string, bool ('flags')>
+ dates  | jsonb  | map<string, date32[day] ('dates')>
+(6 rows)
+
+SELECT name, type, arrow_type FROM vexec_parquet.columns(:'f_shapes');
+ name |  type  |                arrow_type                
+------+--------+------------------------------------------
+ id   | bigint | int64
+ ll   |        | list<element: list<element: int64>>
+ lst  |        | list<element: struct<a: int64>>
+ ml   |        | map<string, list<element: int64> ('ml')>
+(4 rows)
+
+SELECT vexec_parquet.column_list(:'f_lists') AS lists \gset
+SELECT vexec_parquet.column_list(:'f_maps') AS maps \gset
+CREATE TABLE n_lists (:lists) USING vexec_parquet WITH (location = :'f_lists');
+CREATE TABLE n_maps (:maps) USING vexec_parquet WITH (location = :'f_maps');
+-- every list: NULL lists and elements, empty lists, of every element type
+SELECT id, l64, l32, l16, l8, ls, lf, ld FROM n_lists ORDER BY id;
+ id |       l64       |     l32      |   l16    |     l8     |                 ls                 |     lf      |          ld          
+----+-----------------+--------------+----------+------------+------------------------------------+-------------+----------------------
+  0 | {1,2,3}         | {10,20}      | {1}      | {78,87,82} | {a,ü,""}                           | {1.5,-2.25} | {0.3333333333333333}
+  1 |                 | {NULL}       | {2,3}    | {87}       |                                    | {NaN}       | 
+  2 | {}              |              | {}       | {}         | {}                                 | {}          | {}
+  3 | {NULL,5}        | {}           |          |            | {NULL,x}                           |             | {NULL}
+  4 | {1099511627776} | {2147483647} | {32767}  | {NULL}     | {"long text long text long text "} | {Infinity}  | {1e+300}
+  5 | {7,7,7,7}       | {-1}         | {-32768} | {82,82}    | {outer,inner}                      | {0}         | {-0.5}
+(6 rows)
+
+SELECT id, lb, ldate, lts, ldec, lbin, large FROM n_lists ORDER BY id;
+ id |   lb   |       ldate       |             lts              |     ldec     |    lbin     |  large  
+----+--------+-------------------+------------------------------+--------------+-------------+---------
+  0 | {t,f}  | {01-01-2024}      | {"Mon Jan 01 12:00:00 2024"} | {1.25}       | {"\\x0001"} | {1,2}
+  1 | {NULL} | {01-02-2024,NULL} | {}                           | {}           | {"\\x"}     | {}
+  2 | {}     | {}                |                              |              |             | 
+  3 |        |                   | {"Mon Jan 01 12:00:01 2024"} | {-3.50,NULL} | {}          | {3}
+  4 | {t}    | {01-01-2024}      | {"Mon Jan 01 12:00:00 2024"} | {0.01}       | {NULL}      | {4}
+  5 | {f}    | {01-01-2024}      | {"Mon Jan 01 12:00:00 2024"} | {}           | {"\\x7a"}   | {5,6,7}
+(6 rows)
+
+SELECT id, pg_typeof(l64), array_lower(l64, 1), array_upper(l64, 1), cardinality(l64), l64[1] FROM n_lists ORDER BY id;
+ id | pg_typeof | array_lower | array_upper | cardinality |      l64      
+----+-----------+-------------+-------------+-------------+---------------
+  0 | bigint[]  |           1 |           3 |           3 |             1
+  1 | bigint[]  |             |             |             |              
+  2 | bigint[]  |             |             |           0 |              
+  3 | bigint[]  |           1 |           2 |           2 |              
+  4 | bigint[]  |           1 |           1 |           1 | 1099511627776
+  5 | bigint[]  |           1 |           4 |           4 |             7
+(6 rows)
+
+-- other declarations of the same lists: the elements' types read as a column of them is, typmods applied
+CREATE TABLE n_other (id int8, l8 "char"[], l32 int8[], l64 numeric[], ls varchar(40)[], lf float8[])
+	USING vexec_parquet WITH (location = :'f_lists');
+SELECT * FROM n_other ORDER BY id;
+ id |   l8    |     l32      |       l64       |                 ls                 |     lf      
+----+---------+--------------+-----------------+------------------------------------+-------------
+  0 | {N,W,R} | {10,20}      | {1,2,3}         | {a,ü,""}                           | {1.5,-2.25}
+  1 | {W}     | {NULL}       |                 |                                    | {NaN}
+  2 | {}      |              | {}              | {}                                 | {}
+  3 |         | {}           | {NULL,5}        | {NULL,x}                           | 
+  4 | {NULL}  | {2147483647} | {1099511627776} | {"long text long text long text "} | {Infinity}
+  5 | {R,R}   | {-1}         | {7,7,7,7}       | {outer,inner}                      | {0}
+(6 rows)
+
+CREATE TABLE n_short (id int8, ls varchar(3)[]) USING vexec_parquet WITH (location = :'f_lists');
+SELECT * FROM n_short ORDER BY id;
+ERROR:  value too long for type character varying(3)
+-- every map: hstore of strings, jsonb of any keys and values -- NULL and empty maps,
+-- NULL values, a key twice (hstore keeps one, jsonb its last), a float's NaN and infinity as text
+SELECT id, tags, counts, scores, flags, dates FROM n_maps ORDER BY id;
+ id |                   tags                    |          counts           |         scores         |           flags            |        dates        
+----+-------------------------------------------+---------------------------+------------------------+----------------------------+---------------------
+  0 | "name"=>"ซอย 5", "highway"=>"residential" | {"a": 1, "b": null}       | {"1": 0.5, "2": "NaN"} | {"on": true, "off": false} | {"d": "2024-01-01"}
+  1 |                                           | {}                        | {"3": "Infinity"}      |                            | 
+  2 |                                           |                           |                        | {}                         | {}
+  3 | "building"=>NULL                          | {"big": 1125899906842624} | {}                     | {"x": null}                | {"e": null}
+  4 | "k"=>"first"                              | {"z": -1}                 | {"4": -1.25}           | {"y": true}                | {"f": "2024-01-01"}
+  5 | "a"=>"1", "b"=>"2", "c"=>"3"              | {"k": 3}                  | {"5": 0.001}           | {"z": false}               | {"g": "2024-01-01"}
+(6 rows)
+
+SELECT id, tags -> 'highway' AS highway, tags ? 'building' AS building, tags ?| ARRAY['a', 'name'] AS any_of,
+	akeys(tags), hstore_to_jsonb(tags) FROM n_maps ORDER BY id;
+ id |   highway   | building | any_of |     akeys      |               hstore_to_jsonb               
+----+-------------+----------+--------+----------------+---------------------------------------------
+  0 | residential | f        | t      | {name,highway} | {"name": "ซอย 5", "highway": "residential"}
+  1 |             |          |        |                | 
+  2 |             | f        | f      | {}             | {}
+  3 |             | t        | f      | {building}     | {"building": null}
+  4 |             | f        | f      | {k}            | {"k": "first"}
+  5 |             | f        | t      | {a,b,c}        | {"a": "1", "b": "2", "c": "3"}
+(6 rows)
+
+SELECT id, jsonb_typeof(counts -> 'a') AS a, counts ->> 'big' AS big, jsonb_typeof(scores -> '2') AS nan,
+	scores ->> '3' AS inf, flags -> 'on' AS on_flag FROM n_maps ORDER BY id;
+ id |   a    |       big        |  nan   |   inf    | on_flag 
+----+--------+------------------+--------+----------+---------
+  0 | number |                  | string |          | true
+  1 |        |                  |        | Infinity | 
+  2 |        |                  |        |          | 
+  3 |        | 1125899906842624 |        |          | 
+  4 |        |                  |        |          | 
+  5 |        |                  |        |          | 
+(6 rows)
+
+CREATE TABLE n_json (id int8, tags jsonb) USING vexec_parquet WITH (location = :'f_maps');
+SELECT * FROM n_json ORDER BY id;
+ id |                    tags                     
+----+---------------------------------------------
+  0 | {"name": "ซอย 5", "highway": "residential"}
+  1 | 
+  2 | {}
+  3 | {"building": null}
+  4 | {"k": "second"}
+  5 | {"a": "1", "b": "2", "c": "3"}
+(6 rows)
+
+-- what no declaration reads; a string element of another type through that type's input, as a string column's is
+SELECT vpq_error(format('CREATE TABLE n_bad1 (id int8, l64 text[]) USING vexec_parquet WITH (location = %L)', :'f_lists'));
+                                                                       vpq_error                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+ column "l64" of type text[] of a vexec_parquet table cannot be read from the file's column "l64" of type list<element: int64> / The file is "<path>".
+(1 row)
+
+SELECT vpq_error(format('CREATE TABLE n_bad2 (id int8, lb int8[]) USING vexec_parquet WITH (location = %L)', :'f_lists'));
+                                                                      vpq_error                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------
+ column "lb" of type bigint[] of a vexec_parquet table cannot be read from the file's column "lb" of type list<element: bool> / The file is "<path>".
+(1 row)
+
+SELECT vpq_error(format('CREATE TABLE n_bad3 (id int8, l64 jsonb) USING vexec_parquet WITH (location = %L)', :'f_lists'));
+                                                                      vpq_error                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------
+ column "l64" of type jsonb of a vexec_parquet table cannot be read from the file's column "l64" of type list<element: int64> / The file is "<path>".
+(1 row)
+
+SELECT vpq_error(format('CREATE TABLE n_bad4 (id int8, counts hstore) USING vexec_parquet WITH (location = %L)', :'f_maps'));
+                                                                              vpq_error                                                                               
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ column "counts" of type hstore of a vexec_parquet table cannot be read from the file's column "counts" of type map<string, int64 ('counts')> / The file is "<path>".
+(1 row)
+
+SELECT vpq_error(format('CREATE TABLE n_bad5 (id int8, tags text[]) USING vexec_parquet WITH (location = %L)', :'f_maps'));
+                                                                            vpq_error                                                                            
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ column "tags" of type text[] of a vexec_parquet table cannot be read from the file's column "tags" of type map<string, string ('tags')> / The file is "<path>".
+(1 row)
+
+SELECT vpq_error(format('CREATE TABLE n_bad6 (id int8, ll int8[]) USING vexec_parquet WITH (location = %L)', :'f_shapes'));
+                                                                              vpq_error                                                                               
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ column "ll" of type bigint[] of a vexec_parquet table cannot be read from the file's column "ll" of type list<element: list<element: int64>> / The file is "<path>".
+(1 row)
+
+SELECT vpq_error(format('CREATE TABLE n_bad7 (id int8, lst text) USING vexec_parquet WITH (location = %L)', :'f_shapes'));
+                                                                           vpq_error                                                                            
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+ column "lst" of type text of a vexec_parquet table cannot be read from the file's column "lst" of type list<element: struct<a: int64>> / The file is "<path>".
+(1 row)
+
+SELECT vpq_error(format('CREATE TABLE n_bad8 (id int8, ml jsonb) USING vexec_parquet WITH (location = %L)', :'f_shapes'));
+                                                                               vpq_error                                                                                
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ column "ml" of type jsonb of a vexec_parquet table cannot be read from the file's column "ml" of type map<string, list<element: int64> ('ml')> / The file is "<path>".
+(1 row)
+
+CREATE TABLE n_input (id int8, ls int8[]) USING vexec_parquet WITH (location = :'f_lists');
+SELECT vpq_error('SELECT * FROM n_input');
+                 vpq_error                 
+-------------------------------------------
+ invalid input syntax for type bigint: "a"
+(1 row)
+
+-- the arrays' and maps' operators, row by row
+SELECT id FROM n_lists WHERE 5 = ANY(l64) OR 'inner' = ANY(ls) ORDER BY id;
+ id 
+----
+  3
+  5
+(2 rows)
+
+SELECT id, u, o FROM n_lists, unnest(l64) WITH ORDINALITY AS x(u, o) ORDER BY id, o;
+ id |       u       | o 
+----+---------------+---
+  0 |             1 | 1
+  0 |             2 | 2
+  0 |             3 | 3
+  3 |               | 1
+  3 |             5 | 2
+  4 | 1099511627776 | 1
+  5 |             7 | 1
+  5 |             7 | 2
+  5 |             7 | 3
+  5 |             7 | 4
+(10 rows)
+
+SELECT id FROM n_lists WHERE l16 && ARRAY[3, 32767]::int2[] ORDER BY id;
+ id 
+----
+  1
+  4
+(2 rows)
+
+SELECT id FROM n_maps WHERE tags @> 'highway=>residential' ORDER BY id;
+ id 
+----
+  0
+(1 row)
+
+SELECT id, k, v FROM n_maps, each(tags) AS e(k, v) ORDER BY id, k;
+ id |    k     |      v      
+----+----------+-------------
+  0 | highway  | residential
+  0 | name     | ซอย 5
+  3 | building | 
+  4 | k        | first
+  5 | a        | 1
+  5 | b        | 2
+  5 | c        | 3
+(7 rows)
+
+-- through vexec's source, in both formats: the same rows as the plain scan's
+CREATE TEMP TABLE off_rows AS SELECT l::text AS r FROM n_lists l UNION ALL SELECT m::text FROM n_maps m;
+SET vexec.mode = force;
+SELECT count(*) AS differ FROM ((SELECT l::text FROM n_lists l UNION ALL SELECT m::text FROM n_maps m
+	EXCEPT ALL TABLE off_rows) UNION ALL (TABLE off_rows EXCEPT ALL
+	(SELECT l::text FROM n_lists l UNION ALL SELECT m::text FROM n_maps m))) x;
+ differ 
+--------
+      0
+(1 row)
+
+SELECT id, cardinality(l64), ls[2], tags -> 'highway', counts -> 'a', scores ->> '1' FROM n_lists JOIN n_maps USING (id)
+	ORDER BY id;
+ id | cardinality |  ls   |  ?column?   | ?column? | ?column? 
+----+-------------+-------+-------------+----------+----------
+  0 |           3 | ü     | residential | 1        | 0.5
+  1 |             |       |             |          | 
+  2 |           0 |       |             |          | 
+  3 |           2 | x     |             |          | 
+  4 |           1 |       |             |          | 
+  5 |           4 | inner |             |          | 
+(6 rows)
+
+SET vexec.batch_format = arrow;
+SELECT count(*) AS differ FROM ((SELECT l::text FROM n_lists l UNION ALL SELECT m::text FROM n_maps m
+	EXCEPT ALL TABLE off_rows) UNION ALL (TABLE off_rows EXCEPT ALL
+	(SELECT l::text FROM n_lists l UNION ALL SELECT m::text FROM n_maps m))) x;
+ differ 
+--------
+      0
+(1 row)
+
+RESET vexec.batch_format;
+RESET vexec.mode;
+-- PQ21: the kernels over the nested layouts -- hstore's ->, ? and ?|, cardinality() and x = ANY
+-- of a list -- in the scan and in an aggregation above it: the same answers as the plain scan's,
+-- no row sent to PostgreSQL but a map's key given twice (hstore keeps one, its sort's)
+CREATE FUNCTION nested_scan(q text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	FOR l IN EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF l ~ 'Kernel Steps|Rows Sent|Rows Evaluated|Kept as Handed' THEN
+			RETURN NEXT regexp_replace(l, '^\s*(->\s*)?', '');
+		END IF;
+	END LOOP;
+END
+$$;
+CREATE TEMP TABLE nested_q (q text);
+INSERT INTO nested_q VALUES
+	('SELECT id, tags -> ''highway'' FROM n_maps WHERE tags -> ''highway'' = ''residential'''),
+	('SELECT id FROM n_maps WHERE tags -> ''k'' IS NOT NULL'),
+	('SELECT id FROM n_maps WHERE tags -> ''a'' IN (''1'', ''x'')'),
+	('SELECT id FROM n_maps WHERE tags ? ''building'''),
+	('SELECT id FROM n_maps WHERE NOT tags ? ''name'''),
+	('SELECT id FROM n_maps WHERE tags ?| ARRAY[''c'', ''building'', NULL]'),
+	('SELECT id FROM n_maps WHERE tags ?| ARRAY[]::text[]'),
+	('SELECT id, cardinality(l64), cardinality(ls), cardinality(large) FROM n_lists'),
+	('SELECT id FROM n_lists WHERE cardinality(l64) > 1'),
+	('SELECT id FROM n_lists WHERE 7 = ANY(l64)'),
+	('SELECT id FROM n_lists WHERE 5::int8 = ANY(l64)'),
+	('SELECT id FROM n_lists WHERE 3 = ANY(l16)'),
+	('SELECT id FROM n_lists WHERE NULL::int8 = ANY(l64)'),
+	('SELECT id, 5 = ANY(l64) AS any5 FROM n_lists'),
+	('SELECT id FROM n_lists WHERE ''x'' = ANY(ls)'),
+	('SELECT id, ''zz'' = ANY(ls) AS anyzz FROM n_lists'),
+	('SELECT sum(cardinality(l64)), count(*) FILTER (WHERE 7 = ANY(l64)) FROM n_lists'),
+	('SELECT id % 2 AS g, sum(cardinality(l32)) FROM n_lists GROUP BY 1');
+SET vexec.mode = off;
+CREATE TEMP TABLE nested_off (q text, x text);
+DO $$
+DECLARE
+	r record;
+	res text;
+BEGIN
+	FOR r IN SELECT q FROM nested_q LOOP
+		EXECUTE format('SELECT string_agg(t::text, '' '' ORDER BY t::text) FROM (%s) t', r.q) INTO res;
+		INSERT INTO nested_off VALUES (r.q, res);
+	END LOOP;
+END
+$$;
+SET vexec.mode = force;
+SET max_parallel_workers_per_gather = 0;
+SELECT q, (SELECT string_agg(t, E'\n') FROM nested_scan(q) t) AS plan FROM nested_q ORDER BY q;
+                                        q                                         |              plan              
+----------------------------------------------------------------------------------+--------------------------------
+ SELECT id % 2 AS g, sum(cardinality(l32)) FROM n_lists GROUP BY 1                | Kernel Steps: 1               +
+                                                                                  | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_lists WHERE 'x' = ANY(ls)                                       | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_lists WHERE 3 = ANY(l16)                                        | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_lists WHERE 5::int8 = ANY(l64)                                  | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_lists WHERE 7 = ANY(l64)                                        | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_lists WHERE NULL::int8 = ANY(l64)                               | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_lists WHERE cardinality(l64) > 1                                | Kernel Steps: 2               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_maps WHERE NOT tags ? 'name'                                    | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_maps WHERE tags -> 'a' IN ('1', 'x')                            | Kernel Steps: 2               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_maps WHERE tags -> 'k' IS NOT NULL                              | Kernel Steps: 1               +
+                                                                                  | Rows Sent to PostgreSQL: 1    +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_maps WHERE tags ? 'building'                                    | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_maps WHERE tags ?| ARRAY['c', 'building', NULL]                 | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id FROM n_maps WHERE tags ?| ARRAY[]::text[]                              | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id, 'zz' = ANY(ls) AS anyzz FROM n_lists                                  | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id, 5 = ANY(l64) AS any5 FROM n_lists                                     | Kernel Steps: 1               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT id, cardinality(l64), cardinality(ls), cardinality(large) FROM n_lists    | Kernel Steps: 3               +
+                                                                                  | Text Columns Kept as Handed: 2
+ SELECT id, tags -> 'highway' FROM n_maps WHERE tags -> 'highway' = 'residential' | Kernel Steps: 3               +
+                                                                                  | Text Columns Kept as Handed: 1
+ SELECT sum(cardinality(l64)), count(*) FILTER (WHERE 7 = ANY(l64)) FROM n_lists  | Kernel Steps: 2               +
+                                                                                  | Kernel Steps: 0               +
+                                                                                  | Text Columns Kept as Handed: 1
+(18 rows)
+
+DO $$
+DECLARE
+	r record;
+	res text;
+	bad int := 0;
+BEGIN
+	FOR r IN SELECT q, x FROM nested_off LOOP
+		EXECUTE format('SELECT string_agg(t::text, '' '' ORDER BY t::text) FROM (%s) t', r.q) INTO res;
+		IF res IS DISTINCT FROM r.x THEN
+			RAISE NOTICE 'differs: % -- % against %', r.q, res, r.x;
+			bad := bad + 1;
+		END IF;
+	END LOOP;
+	RAISE NOTICE '% of % queries answer as the plain scan does', (SELECT count(*) FROM nested_q) - bad,
+		(SELECT count(*) FROM nested_q);
+END
+$$;
+NOTICE:  18 of 18 queries answer as the plain scan does
+SELECT id, tags -> 'k' AS k FROM n_maps ORDER BY id;
+ id |   k   
+----+-------
+  0 | 
+  1 | 
+  2 | 
+  3 | 
+  4 | first
+  5 | 
+(6 rows)
+
+SET vexec.batch_format = arrow;
+SELECT id FROM n_maps WHERE tags ? 'building' OR tags -> 'a' = '1' ORDER BY id;
+ id 
+----
+  3
+  5
+(2 rows)
+
+SELECT id, cardinality(l64) FROM n_lists WHERE 7 = ANY(l64) OR 2147483647 = ANY(l32) ORDER BY id;
+ id | cardinality 
+----+-------------
+  4 |           1
+  5 |           4
+(2 rows)
+
+RESET vexec.batch_format;
+-- x = ANY of a heap's array column: each row's array, as ScalarArrayOpExpr's evaluation reads it
+CREATE TABLE n_heap AS SELECT id, l64, ls, l16 FROM n_lists;
+SELECT nested_scan('SELECT id FROM n_heap WHERE 7 = ANY(l64)');
+   nested_scan   
+-----------------
+ Kernel Steps: 1
+(1 row)
+
+SELECT id, 5 = ANY(l64) AS any5, 'x' = ANY(ls) AS anyx, 3 = ANY(l16) AS any3, NULL::int8 = ANY(l64) AS anynull
+FROM n_heap ORDER BY id;
+ id | any5 | anyx | any3 | anynull 
+----+------+------+------+---------
+  0 | f    | f    | f    | 
+  1 |      |      | t    | 
+  2 | f    | f    | f    | f
+  3 | t    | t    |      | 
+  4 | f    | f    | f    | 
+  5 | f    | f    | f    | 
+(6 rows)
+
+RESET vexec.mode;
+SELECT id, 5 = ANY(l64) AS any5, 'x' = ANY(ls) AS anyx, 3 = ANY(l16) AS any3, NULL::int8 = ANY(l64) AS anynull
+FROM n_heap ORDER BY id;
+ id | any5 | anyx | any3 | anynull 
+----+------+------+------+---------
+  0 | f    | f    | f    | 
+  1 |      |      | t    | 
+  2 | f    | f    | f    | f
+  3 | t    | t    |      | 
+  4 | f    | f    | f    | 
+  5 | f    | f    | f    | 
+(6 rows)
+
+RESET max_parallel_workers_per_gather;
+DROP TABLE n_heap;
+DROP FUNCTION nested_scan(text);
+-- another process: the children's types from the files' facts in shared memory
+\c
+SELECT id, l64, tags, scores FROM n_lists JOIN n_maps USING (id) ORDER BY id;
+ id |       l64       |                   tags                    |         scores         
+----+-----------------+-------------------------------------------+------------------------
+  0 | {1,2,3}         | "name"=>"ซอย 5", "highway"=>"residential" | {"1": 0.5, "2": "NaN"}
+  1 |                 |                                           | {"3": "Infinity"}
+  2 | {}              |                                           | 
+  3 | {NULL,5}        | "building"=>NULL                          | {}
+  4 | {1099511627776} | "k"=>"first"                              | {"4": -1.25}
+  5 | {7,7,7,7}       | "a"=>"1", "b"=>"2", "c"=>"3"              | {"5": 0.001}
+(6 rows)
+
+DROP TABLE n_lists, n_maps, n_other, n_short, n_json, n_input;

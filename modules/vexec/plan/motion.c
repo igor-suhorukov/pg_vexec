@@ -152,7 +152,7 @@ make_send(Plan *fragment, int motion, List *hashexprs, List *hashfuncs, bool leg
 	send->scan.plan.lefttree = fragment;
 	send->scan.plan.startup_cost = fragment->startup_cost;
 	send->scan.plan.total_cost = fragment->total_cost;
-	send->scan.plan.plan_rows = Max(1.0, ceil(fragment->plan_rows / VEXEC_BATCH_ROWS));
+	send->scan.plan.plan_rows = Max(1.0, ceil(fragment->plan_rows / vexec_batch_rows));
 	send->scan.plan.plan_width = fragment->plan_width;
 	send->scan.plan.parallel_safe = fragment->parallel_safe;
 	send->scan.plan.plan_node_id = VEXEC_NODE_ID_UNSET;

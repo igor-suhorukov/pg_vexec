@@ -74,6 +74,14 @@ The plan's phases land here in order, each on a branch of its own:
   only while the vector executor is active -- a statement's result as IPC
   messages, from a vector node's batches where one is at the top of the
   plan, and a client's parameter batches read as values.
+- **V8's device contract** (`v8`; the plan's §3.11, §3.25 and §5): the device
+  contract, `vexec/device_v1`, and its headers; VecAgg's, VecHashJoin's and
+  VecSort's device strategies, each falling back to its CPU's; and the source
+  contract's units, which a device reads itself from Parquet and Arrow files.
+  The provider that runs them on a GPU, `vexec_gpu`, is on the branch `vpqc`
+  and not on this one: without a provider no node takes a device, and nothing
+  here needs CUDA or libcudf.  V8's change to the port -- gp_core's settings --
+  is in a worktree of the port, under `pg19/` only.
 
 ## Layout
 
@@ -82,10 +90,11 @@ The plan's phases land here in order, each on a branch of its own:
 | `include/vexec_source.h` | the batch-source contract (§3.5.1): storage modules register batch readers by a rendezvous variable; installed with `vexec` |
 | `include/vexec_kernels.h` | the kernel packs' registry (§3.17): a pack declares which of an extension's functions never raise, checks the rows on which the others may, or prefilters them, by a rendezvous variable, with no kernel ABI -- only fmgr's functions; installed with `vexec` |
 | `include/vexec_egress.h` | the egress API (§3.15): a statement's result as Arrow IPC messages, and a client's parameter batches as values, for an extension that serves Arrow to clients; installed with `vexec` |
+| `include/vexec_device.h`, `include/vexec_device_format.h` | the device contract (§3.11): a device provider's routine, by a rendezvous variable, and what a request and an answer say, in plain C99 that the provider's executor reads; installed with `vexec` |
 | `modules/vexec/` | the module, built by PGXS against vanilla PostgreSQL 19 or the port's server |
 | `modules/vexec/batch/` | the logical batch, its layouts, the PostgreSQL and Arrow formats, the conversions, rows in and out, scaled numerics, export through Arrow's C Data Interface |
 | `modules/vexec/plan/` | the vectorized planner: the oracle, the cost model, the path hooks, the node builders, ORCA's front end through gp_orca's API, the reasons, EXPLAIN's option, the plan check |
-| `modules/vexec/exec/` | the vector nodes, `VecScan` and `VecBitmapHeapScan`, `VecResult`, `VecAgg`, `VecHashJoin`, `VecSort` and `VecRepartition`, with their row and batch interfaces, and the aggregates' transitions |
+| `modules/vexec/exec/` | the vector nodes, `VecScan` and `VecBitmapHeapScan`, `VecResult`, `VecAgg`, `VecHashJoin`, `VecSort` and `VecRepartition`, with their row and batch interfaces, the aggregates' transitions, and the device strategies' tasks and chunks (`device.c`, V8) |
 | `modules/vexec/expr/` | the expression compiler and evaluator: kernels bound by function OID, the fallback, PostgreSQL's evaluator for what may raise; calls bound to kernel packs' declarations (`packs.c`), kept per backend and dropped by syscache callbacks |
 | `modules/vexec/source/` | `vexec`'s side of the source registry, and heap's page reader |
 | `modules/vexec/ipc/` | Arrow IPC messages, written and read by `vexec`'s own code (V7_0) |
@@ -108,9 +117,10 @@ The plan's phases land here in order, each on a branch of its own:
 
 pg_vexec is four PGXS extensions: `vexec`, and beside it in `modules/` the
 kernel packs `vexec_pgvector` and `vexec_postgis` and the Flight SQL endpoint
-`vexec_flight`.  They build against an installed PostgreSQL 19.  The tests
-build and run them in containers, from images made of two checkouts from
-GitHub ([the development environment](#the-development-environment)).
+`vexec_flight`.  They build against an installed
+PostgreSQL 19.  The tests build and run them in containers, from images made
+of two checkouts from GitHub ([the development
+environment](#the-development-environment)).
 
 ### The extensions
 
@@ -123,7 +133,7 @@ They need:
 - a C compiler and GNU make;
 - for `vexec_flight` alone: nghttp2, protobuf-c and its compiler `protoc-c`,
   protobuf's well-known `.proto` files, and OpenSSL; on Debian and Ubuntu,
-  `libnghttp2-dev libprotobuf-c-dev protobuf-c-compiler libprotobuf-dev libssl-dev`.
+  `libnghttp2-dev libprotobuf-c-dev protobuf-c-compiler libprotobuf-dev libssl-dev`;
 
 ```sh
 make PG_CONFIG=/usr/local/pgsql/bin/pg_config      # vexec, vexec_pgvector, vexec_postgis, vexec_flight
@@ -131,12 +141,12 @@ make PG_CONFIG=/usr/local/pgsql/bin/pg_config install
 make PG_CONFIG=... EXTENSIONS="vexec vexec_pgvector vexec_postgis"   # without vexec_flight's dependencies
 ```
 
-The packs and `vexec_flight` compile against `include/` here, not against
-`vexec`'s installed headers, so that a commit builds as one.  Each of them
-also builds alone from its directory (`make -C modules/vexec_pgvector
-PG_CONFIG=...`), against the headers `vexec` installs under
-`$(pg_config --includedir-server)/extension/vexec`, where storage modules
-and packs built elsewhere find them too.
+The packs and `vexec_flight` compile against `include/` here,
+not against `vexec`'s installed headers, so that a commit builds as one.
+Each of them also builds alone from its directory (`make -C
+modules/vexec_pgvector PG_CONFIG=...`), against the headers `vexec` installs
+under `$(pg_config --includedir-server)/extension/vexec`, where storage
+modules and packs built elsewhere find them too.
 
 ### Loading them
 

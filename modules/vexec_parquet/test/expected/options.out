@@ -1,0 +1,257 @@
+-- A table's options: its codec, its row groups, its storage; who may name
+-- files; tables moved between access methods; what COPY TO does with a
+-- table that reads files
+CREATE TABLE opt (a int4, b text) USING vexec_parquet
+	WITH (codec = 'lz4', compression_level = 1, row_group_rows = 2048);
+SELECT reloptions FROM pg_class WHERE relname = 'opt';
+                     reloptions                      
+-----------------------------------------------------
+ {codec=lz4,compression_level=1,row_group_rows=2048}
+(1 row)
+
+INSERT INTO opt SELECT i, md5(i::text) FROM generate_series(1, 5000) i;
+SELECT g.row_group, g.rows FROM vexec_parquet.files('opt') f, vexec_parquet.file_row_groups(f.path) g ORDER BY 1;
+ row_group | rows 
+-----------+------
+         0 | 2048
+         1 | 2048
+         2 |  904
+(3 rows)
+
+ALTER TABLE opt SET (row_group_rows = 10000, codec = 'snappy');
+INSERT INTO opt SELECT i, md5(i::text) FROM generate_series(5001, 8000) i;
+SELECT f.file_id, g.row_group, g.rows FROM vexec_parquet.files('opt') f, vexec_parquet.file_row_groups(f.path) g ORDER BY 1, 2;
+ file_id | row_group | rows 
+---------+-----------+------
+       1 |         0 | 2048
+       1 |         1 | 2048
+       1 |         2 |  904
+       2 |         0 | 3000
+(4 rows)
+
+ALTER TABLE opt RESET (codec, compression_level);
+SELECT reloptions FROM pg_class WHERE relname = 'opt';
+       reloptions       
+------------------------
+ {row_group_rows=10000}
+(1 row)
+
+-- options refused
+CREATE TABLE bad (a int4) USING vexec_parquet WITH (codec = 'lz5');
+ERROR:  unknown codec "lz5" of a vexec_parquet table
+HINT:  The codecs are zstd, lz4, snappy, gzip, brotli and none.
+CREATE TABLE bad (a int4) USING vexec_parquet WITH (row_group_rows = 0);
+ERROR:  option "row_group_rows" of a vexec_parquet table is an integer from 1024 to 67108864: "0"
+CREATE TABLE bad (a int4) USING vexec_parquet WITH (no_such_option = 1);
+ERROR:  unrecognized parameter "no_such_option"
+CREATE TABLE bad (a int4) USING vexec_parquet WITH (location = '/nonexistent/vpq', storage = '/tmp');
+ERROR:  a vexec_parquet table with a location reads its files and writes none
+DETAIL:  storage, codec, compression_level, row_group_rows and page_bytes are options of a table of its own files, made without location.
+-- heap's options in heap's tables, as before
+CREATE TABLE heapopt (a int4) USING heap WITH (fillfactor = 50);
+SELECT reloptions FROM pg_class WHERE relname = 'heapopt';
+   reloptions    
+-----------------
+ {fillfactor=50}
+(1 row)
+
+CREATE TABLE heapbad (a int4) USING heap WITH (codec = 'zstd');
+ERROR:  unrecognized parameter "codec"
+-- the default access method's tables take the options too
+SET default_table_access_method = vexec_parquet;
+CREATE TABLE dflt (a int4) WITH (codec = 'gzip');
+SELECT a.amname, c.reloptions FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname = 'dflt';
+    amname     |  reloptions  
+---------------+--------------
+ vexec_parquet | {codec=gzip}
+(1 row)
+
+RESET default_table_access_method;
+-- a storage of the table's own: a root of its own, a directory under it per table
+SELECT current_setting('data_directory') || '/vpq_root' AS root \gset
+CREATE TABLE stored (a int4) USING vexec_parquet WITH (storage = :'root');
+INSERT INTO stored SELECT generate_series(1, 10);
+SELECT count(*), sum(a) FROM stored;
+ count | sum 
+-------+-----
+    10 |  55
+(1 row)
+
+SELECT regexp_replace(path, '^.*/vpq_root/[0-9]+/[0-9]+/[0-9]+_[0-9]+/([0-9]+)_[0-9]+[.]parquet$',
+	'<root>/<system>/<db>/<spc>_<relnumber>/\1_<fxid>.parquet') AS path
+FROM vexec_parquet.files('stored');
+                          path                           
+---------------------------------------------------------
+ <root>/<system>/<db>/<spc>_<relnumber>/1_<fxid>.parquet
+(1 row)
+
+-- a storage changes only while the table has no file
+ALTER TABLE stored SET (storage = '/tmp');
+ERROR:  cannot change the storage of "stored" while it has files
+HINT:  TRUNCATE the table first, or make a new table with CREATE TABLE AS.
+TRUNCATE stored;
+ALTER TABLE opt RESET (storage);
+ERROR:  cannot change the storage of "opt" while it has files
+HINT:  TRUNCATE the table first, or make a new table with CREATE TABLE AS.
+-- naming files is for those who may read the server's files
+SET ROLE regress_vpq_user;
+CREATE TABLE mine (a int4) USING vexec_parquet;
+INSERT INTO mine VALUES (1);
+SELECT * FROM mine;
+ a 
+---
+ 1
+(1 row)
+
+-- its files, without their paths
+SELECT file_id, path, rows FROM vexec_parquet.files('mine');
+ file_id | path | rows 
+---------+------+------
+       1 |      |    1
+(1 row)
+
+SELECT file_id FROM vexec_parquet.files('opt');
+ERROR:  permission denied for table opt
+CREATE TABLE theirs (a int4) USING vexec_parquet WITH (location = '/etc');
+ERROR:  permission denied to set the location of a vexec_parquet table
+DETAIL:  Only roles with privileges of the "pg_read_server_files" role may read files of the server.
+CREATE TABLE theirs (a int4) USING vexec_parquet WITH (storage = '/tmp');
+ERROR:  permission denied to set the storage of a vexec_parquet table
+DETAIL:  Only roles with privileges of the "pg_write_server_files" role may write files of the server.
+SELECT * FROM vexec_parquet.columns('/etc');
+ERROR:  permission denied for function columns
+SELECT * FROM vexec_parquet.file_schema('/etc/passwd');
+ERROR:  permission denied for function file_schema
+-- the catalogs are the access method's
+SELECT count(*) FROM vexec_parquet.files;
+ERROR:  permission denied for table files
+RESET ROLE;
+DROP TABLE mine;
+-- tables moved between access methods keep their rows
+CREATE TABLE moved (a int4, b text) USING heap;
+INSERT INTO moved SELECT i, 'm' || i FROM generate_series(1, 100) i;
+ALTER TABLE moved SET ACCESS METHOD vexec_parquet;
+SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname = 'moved';
+    amname     
+---------------
+ vexec_parquet
+(1 row)
+
+SELECT count(*), sum(a), min(b) FROM moved;
+ count | sum  | min 
+-------+------+-----
+   100 | 5050 | m1
+(1 row)
+
+ALTER TABLE moved SET (codec = 'none');
+ALTER TABLE moved SET ACCESS METHOD heap;
+SELECT a.amname, c.reloptions FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.relname = 'moved';
+ amname | reloptions 
+--------+------------
+ heap   | 
+(1 row)
+
+SELECT count(*), sum(a), min(b) FROM moved;
+ count | sum  | min 
+-------+------+-----
+   100 | 5050 | m1
+(1 row)
+
+-- a table that reads files: none to write, COPY TO answers with no rows
+CREATE TABLE src (a int4, b text) USING vexec_parquet;
+INSERT INTO src VALUES (1, 'x'), (2, 'y');
+SELECT regexp_replace(path, '/[^/]+$', '') AS dir FROM vexec_parquet.files('src') LIMIT 1 \gset
+CREATE TABLE ext (a int4, b text) USING vexec_parquet WITH (location = :'dir');
+SELECT * FROM ext ORDER BY a;
+ a | b 
+---+---
+ 1 | x
+ 2 | y
+(2 rows)
+
+COPY ext TO stdout;
+NOTICE:  COPY of ext returns no rows: its rows are those of the files at its location
+HINT:  COPY (SELECT * FROM ext) TO ... reads them.
+COPY (SELECT * FROM ext ORDER BY a) TO stdout;
+1	x
+2	y
+INSERT INTO ext VALUES (3, 'z');
+ERROR:  a vexec_parquet table that reads files is read-only: "ext"
+HINT:  Make a table of its own files, without location, to write into.
+UPDATE ext SET b = 'q';
+ERROR:  a vexec_parquet table that reads files is read-only: "ext"
+DELETE FROM ext;
+ERROR:  a vexec_parquet table that reads files is read-only: "ext"
+TRUNCATE ext;
+NOTICE:  TRUNCATE leaves the files of "ext", which it reads from its location
+SELECT count(*) FROM ext;
+ count 
+-------
+     2
+(1 row)
+
+-- its location is set again, its files checked as CREATE TABLE checks
+-- them, never reset
+ALTER TABLE ext SET (location = '/nonexistent/vpq');
+ERROR:  no file or directory at the location "/nonexistent/vpq" of vexec_parquet table "ext"
+SELECT vpq_error(format('ALTER TABLE ext SET (location = %L)', :'dir' || '/../..'));
+                            vpq_error                            
+-----------------------------------------------------------------
+ column "a" of a vexec_parquet table is not in the file "<path>"
+(1 row)
+
+ALTER TABLE ext SET (location = :'dir');
+SELECT count(*) FROM ext;
+ count 
+-------
+     2
+(1 row)
+
+ALTER TABLE ext RESET (location);
+ERROR:  the location of a vexec_parquet table is set again, never reset
+-- nor is it made with rows, or made a partition
+CREATE TABLE ext2 USING vexec_parquet WITH (location = :'dir') AS SELECT 1 AS a;
+ERROR:  a vexec_parquet table that reads files takes no rows
+HINT:  Use WITH NO DATA.
+CREATE TABLE ext2 USING vexec_parquet WITH (location = :'dir') AS SELECT 1::int4 AS a, 'x'::text AS b WITH NO DATA;
+SELECT count(*) FROM ext2;
+ count 
+-------
+     2
+(1 row)
+
+CREATE INDEX ON ext (a);
+ERROR:  a vexec_parquet table that reads files cannot be indexed
+DETAIL:  Its row identifiers last as long as a listing of its files.
+CREATE TABLE p (a int4, b text) PARTITION BY LIST (a);
+ALTER TABLE p ATTACH PARTITION ext FOR VALUES IN (1);
+ERROR:  a vexec_parquet table that reads files cannot be a partition
+-- a location's files' columns, as CREATE TABLE would name them
+SELECT * FROM vexec_parquet.columns(:'dir');
+ name |  type   | nullable | arrow_type 
+------+---------+----------+------------
+ a    | integer | t        | int32
+ b    | text    | t        | string
+(2 rows)
+
+SELECT vexec_parquet.column_list(:'dir');
+    column_list    
+-------------------
+ a integer, b text
+(1 row)
+
+-- a location of no file, and a column the files have not
+CREATE TABLE ext3 (a int4) USING vexec_parquet WITH (location = '/nonexistent/vpq');
+ERROR:  no file or directory at the location "/nonexistent/vpq" of vexec_parquet table "ext3"
+SELECT vpq_error(format('CREATE TABLE ext3 (a int4, c int4) USING vexec_parquet WITH (location = %L)', :'dir'));
+                            vpq_error                            
+-----------------------------------------------------------------
+ column "c" of a vexec_parquet table is not in the file "<path>"
+(1 row)
+
+SELECT vpq_error(format('CREATE TABLE ext3 (a text, b text) USING vexec_parquet WITH (location = %L)', :'dir'));
+                                                            vpq_error                                                             
+----------------------------------------------------------------------------------------------------------------------------------
+ column "a" of type text of a vexec_parquet table cannot be read from the file's column "a" of type int32 / The file is "<path>".
+(1 row)
+

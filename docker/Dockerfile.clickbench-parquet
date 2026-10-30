@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# ClickBench's vanilla image with Apache Arrow C++'s runtime libraries -- its
+# own, Parquet's and S3's, and OpenTelemetry's, which Arrow's Debian builds
+# link and only its -dev packages ask for -- which vexec_parquet
+# (modules/vexec_parquet, pg_vector_executor.md §3.34) links: the loads
+# vanilla-vpq_none and vanilla-vpq_lz4 of test/clickbench run on it, the
+# module built in vexec's -parquet images (Dockerfile.parquet) against the
+# same servers.
+ARG BASE_IMAGE=pg_accel/clickbench-vanilla:latest
+FROM ${BASE_IMAGE}
+USER root
+ARG ARROW_VERSION=26.0.0-1
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates lsb-release wget \
+    && wget -q -O /tmp/apache-arrow-apt-source.deb \
+        https://packages.apache.org/artifactory/arrow/debian/apache-arrow-apt-source-latest-trixie.deb \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /tmp/apache-arrow-apt-source.deb \
+    && rm /tmp/apache-arrow-apt-source.deb \
+    && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libarrow2600=${ARROW_VERSION} libparquet2600=${ARROW_VERSION} libarrow-s3-2600=${ARROW_VERSION} \
+        opentelemetry-cpp \
+    && rm -rf /var/lib/apt/lists/* \
+    && ! ldd /usr/lib/x86_64-linux-gnu/libarrow*.so.2600 /usr/lib/x86_64-linux-gnu/libparquet.so.2600 | grep 'not found'
+USER postgres

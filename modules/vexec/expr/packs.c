@@ -81,6 +81,9 @@ static HTAB *decl_table = NULL;
 static uint64 decl_generation = 0;
 static bool callbacks_registered = false;
 
+/* PQ21 (pg_vector_executor.md §3.40): the functions bound to vexec's own kernels, by funcid; def NULL none */
+static HTAB *ext_table = NULL;
+
 /*
  * The registry, made when vexec loads so that a pack loaded after it finds
  * it, and a pack loaded before it has made it.
@@ -103,6 +106,11 @@ decl_invalidate(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 	{
 		hash_destroy(decl_table);
 		decl_table = NULL;
+	}
+	if (ext_table != NULL)
+	{
+		hash_destroy(ext_table);
+		ext_table = NULL;
 	}
 }
 
@@ -159,6 +167,77 @@ type_named(Oid typid, const char *name, Oid extoid)
 	return nsp == PG_CATALOG_NAMESPACE || getExtensionOfObject(TypeRelationId, typid) == extoid;
 }
 
+/* What a function is of: its C function's name, arguments, symbol and library, its extension and version */
+typedef struct ProcFacts
+{
+	char	   *proname;
+	int			nargs;
+	Oid		   *argtypes;
+	char	   *prosrc;
+	char	   *probin;
+	Oid			extoid;
+	char	   *extname;
+	char	   *extversion;
+} ProcFacts;
+
+/* A function's facts, from the catalogs; false where it is no extension's C function */
+static bool
+proc_facts(Oid funcid, ProcFacts *f)
+{
+	HeapTuple	tup;
+	Form_pg_proc proc;
+	Datum		d;
+	bool		isnull;
+
+	memset(f, 0, sizeof(*f));
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	proc = (Form_pg_proc) GETSTRUCT(tup);
+	if (proc->prolang != ClanguageId || proc->prokind != PROKIND_FUNCTION || proc->proretset)
+	{
+		ReleaseSysCache(tup);
+		return false;
+	}
+	f->proname = pstrdup(NameStr(proc->proname));
+	f->nargs = proc->pronargs;
+	f->argtypes = palloc(sizeof(Oid) * Max(f->nargs, 1));
+	memcpy(f->argtypes, proc->proargtypes.values, sizeof(Oid) * f->nargs);
+	f->prosrc = TextDatumGetCString(SysCacheGetAttrNotNull(PROCOID, tup, Anum_pg_proc_prosrc));
+	d = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_probin, &isnull);
+	if (!isnull)
+		f->probin = TextDatumGetCString(d);
+	ReleaseSysCache(tup);
+	if (f->probin == NULL)
+		return false;
+
+	f->extoid = getExtensionOfObject(ProcedureRelationId, funcid);
+	if (!OidIsValid(f->extoid))
+		return false;
+	tup = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(f->extoid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	f->extname = pstrdup(NameStr(((Form_pg_extension) GETSTRUCT(tup))->extname));
+	f->extversion = TextDatumGetCString(SysCacheGetAttrNotNull(EXTENSIONOID, tup,
+															   Anum_pg_extension_extversion));
+	ReleaseSysCache(tup);
+	return true;
+}
+
+/* Whether a function's facts are those of a name, argument types' names, symbol and library */
+static bool
+facts_match(const ProcFacts *f, const char *name, int nargs, const char *const *argtypes, const char *symbol,
+			const char *library)
+{
+	if (nargs != f->nargs || strcmp(name, f->proname) != 0 || strcmp(symbol, f->prosrc) != 0 ||
+		strcmp(library, f->probin) != 0)
+		return false;
+	for (int a = 0; a < nargs; a++)
+		if (!type_named(f->argtypes[a], argtypes[a], f->extoid))
+			return false;
+	return true;
+}
+
 /*
  * The declaration a function binds to (above), from the catalogs; *pack and
  * *decl NULL when none.
@@ -167,82 +246,97 @@ static void
 bind_function(Oid funcid, const VexecKernelPack **pack, const VexecKernelDecl **decl)
 {
 	const VexecKernelRegistry *reg = vexec_find_kernel_registry();
-	HeapTuple	tup;
-	Form_pg_proc proc;
-	char	   *proname;
-	int			nargs;
-	Oid		   *argtypes;
-	char	   *prosrc;
-	char	   *probin = NULL;
-	Datum		d;
-	bool		isnull;
-	Oid			extoid;
-	char	   *extname;
-	char	   *extversion;
-	int			p,
-				i,
-				a;
+	ProcFacts	f;
 
 	*pack = NULL;
 	*decl = NULL;
-	if (reg == NULL || reg->npacks == 0)
+	if (reg == NULL || reg->npacks == 0 || !proc_facts(funcid, &f))
 		return;
-
-	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
-	if (!HeapTupleIsValid(tup))
-		return;
-	proc = (Form_pg_proc) GETSTRUCT(tup);
-	if (proc->prolang != ClanguageId || proc->prokind != PROKIND_FUNCTION || proc->proretset)
-	{
-		ReleaseSysCache(tup);
-		return;
-	}
-	proname = pstrdup(NameStr(proc->proname));
-	nargs = proc->pronargs;
-	argtypes = palloc(sizeof(Oid) * Max(nargs, 1));
-	memcpy(argtypes, proc->proargtypes.values, sizeof(Oid) * nargs);
-	prosrc = TextDatumGetCString(SysCacheGetAttrNotNull(PROCOID, tup, Anum_pg_proc_prosrc));
-	d = SysCacheGetAttr(PROCOID, tup, Anum_pg_proc_probin, &isnull);
-	if (!isnull)
-		probin = TextDatumGetCString(d);
-	ReleaseSysCache(tup);
-	if (probin == NULL)
-		return;
-
-	extoid = getExtensionOfObject(ProcedureRelationId, funcid);
-	if (!OidIsValid(extoid))
-		return;
-	tup = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(extoid));
-	if (!HeapTupleIsValid(tup))
-		return;
-	extname = pstrdup(NameStr(((Form_pg_extension) GETSTRUCT(tup))->extname));
-	extversion = TextDatumGetCString(SysCacheGetAttrNotNull(EXTENSIONOID, tup,
-															Anum_pg_extension_extversion));
-	ReleaseSysCache(tup);
-
-	for (p = 0; p < reg->npacks; p++)
+	for (int p = 0; p < reg->npacks; p++)
 	{
 		const VexecKernelPack *pk = reg->packs[p];
 
-		if (strcmp(pk->extension, extname) != 0 || !version_named(pk, extversion))
+		if (strcmp(pk->extension, f.extname) != 0 || !version_named(pk, f.extversion))
 			continue;
-		for (i = 0; i < pk->ndecls; i++)
+		for (int i = 0; i < pk->ndecls; i++)
 		{
 			const VexecKernelDecl *dc = &pk->decls[i];
 
-			if (dc->nargs != nargs || strcmp(dc->name, proname) != 0 ||
-				strcmp(dc->symbol, prosrc) != 0 || strcmp(dc->library, probin) != 0)
-				continue;
-			for (a = 0; a < nargs; a++)
-				if (!type_named(argtypes[a], dc->argtypes[a], extoid))
-					break;
-			if (a < nargs)
+			if (!facts_match(&f, dc->name, dc->nargs, dc->argtypes, dc->symbol, dc->library))
 				continue;
 			*pack = pk;
 			*decl = dc;
 			return;
 		}
 	}
+}
+
+/*
+ * PQ21 (pg_vector_executor.md §3.40): another extension's function bound to
+ * one of vexec's own kernels (vexec_extension_kernels(), k_nested.c) by the
+ * packs' rule -- its extension and a version the entry names, its name,
+ * arguments' types, symbol and library -- kept per backend as the
+ * declarations are; NULL where none binds it here, or it may not run but
+ * through fmgr (vexec_kernel_permitted()).
+ */
+const VexecKernelEntry *
+vexec_extension_kernel_find(Oid funcid)
+{
+	VexecKernelEntry *e;
+	bool		found;
+	uint64		generation;
+	const VexecKernelDef *def;
+	const void *info;
+
+	if (ext_table == NULL)
+	{
+		HASHCTL		ctl;
+
+		if (decl_table == NULL)
+			decl_table_make();	/* the callbacks */
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(VexecKernelEntry);
+		ctl.hcxt = CacheMemoryContext;
+		ext_table = hash_create("vexec extension kernels", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	e = hash_search(ext_table, &funcid, HASH_FIND, NULL);
+	if (e == NULL)
+	{
+		do
+		{
+			ProcFacts	f;
+			int			n;
+			const VexecExtensionKernel *k = vexec_extension_kernels(&n);
+
+			generation = decl_generation;
+			def = NULL;
+			info = NULL;
+			if (proc_facts(funcid, &f))
+				for (int i = 0; i < n && def == NULL; i++)
+				{
+					bool		version = false;
+
+					if (strcmp(k[i].extension, f.extname) != 0)
+						continue;
+					for (const char *const *v = k[i].versions; *v != NULL; v++)
+						if (strcmp(*v, f.extversion) == 0)
+							version = true;
+					if (version && facts_match(&f, k[i].name, k[i].nargs, k[i].argtypes, k[i].symbol, k[i].library))
+					{
+						def = k[i].def;
+						info = k[i].info;
+					}
+				}
+		} while (generation != decl_generation);
+		if (ext_table == NULL)
+			return NULL;		/* invalidated meanwhile, and dropped: asked again next time */
+		e = hash_search(ext_table, &funcid, HASH_ENTER, &found);
+		e->def = def;
+		e->info = info;
+	}
+	if (e->def == NULL || !vexec_kernel_permitted(funcid))
+		return NULL;
+	return e;
 }
 
 /*

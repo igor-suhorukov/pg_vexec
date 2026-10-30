@@ -61,6 +61,7 @@ x-run: &run
     VEXEC_WORK: /work
     CHTE_ENGINE: /engine/libchte_engine.so
     CHTE_PARTS: ${CHTE_PARTS:-}
+    PARQUET_PARTS: ${PARQUET_PARTS:-}
     CB_SRC_MOUNT: ${CB_SRC_MOUNT:-}
     VEXEC_ORCA_SECTIONS: ${VEXEC_ORCA_SECTIONS:-}
     # the legs' own settings, passed through when the host sets them
@@ -109,6 +110,17 @@ services:
       dockerfile: Dockerfile.arrow
       args:
         BASE_IMAGE: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}
+    profiles: ["build"]
+
+  # vexec_parquet's (modules/vexec_parquet): the -arrow image with Apache
+  # Arrow C++ and moto's S3 server (Dockerfile.parquet).
+  vexec-dev-vanillaparquet:
+    image: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-parquet
+    build:
+      context: .
+      dockerfile: Dockerfile.parquet
+      args:
+        BASE_IMAGE: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-arrow
     profiles: ["build"]
 
   vexec-dev-portarrow:
@@ -222,6 +234,14 @@ services:
   chte:
     <<: *run
     image: pg_chte/dev:${CHTE_VANILLA_FLAVOR:-vanilla}
+    profiles: ["run"]
+
+  # vexec_parquet's leg (modules/vexec_parquet; test/vexec/parquet.sh): the
+  # vanilla leg's image with Arrow C++, pyarrow and moto's S3 server, which
+  # listens on the container's loopback.
+  parquet:
+    <<: *run
+    image: pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-parquet
     profiles: ["run"]
 
   # The two legs with pyarrow (V7_0, V10).

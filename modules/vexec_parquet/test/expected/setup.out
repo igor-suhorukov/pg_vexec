@@ -1,0 +1,91 @@
+-- vexec_parquet's suite: the extension, its access method, its settings
+CREATE EXTENSION vexec_parquet;
+SELECT amname, amtype, amhandler FROM pg_am WHERE amname = 'vexec_parquet';
+    amname     | amtype |        amhandler         
+---------------+--------+--------------------------
+ vexec_parquet | t      | vexec_parquet.am_handler
+(1 row)
+
+SELECT name, setting, unit, context, vartype FROM pg_settings
+WHERE name LIKE 'vexec_parquet.%' ORDER BY name;
+                  name                  | setting | unit |  context   | vartype 
+----------------------------------------+---------+------+------------+---------
+ vexec_parquet.buffer_mb                | 256     | MB   | user       | integer
+ vexec_parquet.buffer_rows              | 1048576 |      | user       | integer
+ vexec_parquet.codec                    | zstd    |      | user       | string
+ vexec_parquet.enable_device_units      | on      |      | user       | bool
+ vexec_parquet.enable_fetch_columns     | on      |      | user       | bool
+ vexec_parquet.enable_footer_cache      | on      |      | user       | bool
+ vexec_parquet.enable_point_reads       | on      |      | user       | bool
+ vexec_parquet.enable_projected_footers | on      |      | user       | bool
+ vexec_parquet.enable_pruning           | on      |      | user       | bool
+ vexec_parquet.enable_row_ranges        | on      |      | user       | bool
+ vexec_parquet.enable_step_pages        | on      |      | user       | bool
+ vexec_parquet.enable_text_marks        | on      |      | user       | bool
+ vexec_parquet.fetch_threads            | 16      |      | user       | integer
+ vexec_parquet.footer_cache_size        | 65536   | kB   | postmaster | integer
+ vexec_parquet.read_memory_mb           | 256     | MB   | user       | integer
+ vexec_parquet.row_group_rows           | 131072  |      | user       | integer
+ vexec_parquet.s3_access_key_id         |         |      | superuser  | string
+ vexec_parquet.s3_anonymous             | off     |      | superuser  | bool
+ vexec_parquet.s3_connect_timeout       | 0       |      | superuser  | real
+ vexec_parquet.s3_endpoint              |         |      | superuser  | string
+ vexec_parquet.s3_io_threads            | 8       |      | superuser  | integer
+ vexec_parquet.s3_prefetch              | on      |      | user       | bool
+ vexec_parquet.s3_region                |         |      | superuser  | string
+ vexec_parquet.s3_request_timeout       | 0       |      | superuser  | real
+ vexec_parquet.s3_scheme                | https   |      | superuser  | string
+ vexec_parquet.s3_virtual_addressing    | off     |      | superuser  | bool
+ vexec_parquet.storage                  |         |      | superuser  | string
+ vexec_parquet.sync                     | off     |      | superuser  | bool
+(28 rows)
+
+-- the secrets are not shown to anyone
+SHOW vexec_parquet.s3_secret_access_key;
+ vexec_parquet.s3_secret_access_key 
+------------------------------------
+ 
+(1 row)
+
+-- the catalogs are the access method's alone
+SELECT c.relname, c.relpersistence, a.amname
+FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+WHERE c.relnamespace = 'vexec_parquet'::regnamespace AND c.relkind = 'r' ORDER BY 1;
+       relname       | relpersistence | amname 
+---------------------+----------------+--------
+ files               | p              | heap
+ files_unlogged      | u              | heap
+ storages            | p              | heap
+ storages_unlogged   | u              | heap
+ tombstones          | p              | heap
+ tombstones_unlogged | u              | heap
+(6 rows)
+
+SELECT has_table_privilege('public', 'vexec_parquet.files', 'SELECT') AS public_reads_files,
+       has_function_privilege('public', 'vexec_parquet.file_schema(text)', 'EXECUTE') AS public_reads_schemas;
+ public_reads_files | public_reads_schemas 
+--------------------+----------------------
+ f                  | f
+(1 row)
+
+-- a statement's error, the paths it names masked: the tests' files are in
+-- an instance's directory, their names hold their writers' transactions
+CREATE FUNCTION vpq_error(stmt text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	detail text;
+BEGIN
+	EXECUTE stmt;
+	RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+	GET STACKED DIAGNOSTICS detail = PG_EXCEPTION_DETAIL;
+	RETURN regexp_replace(SQLERRM || CASE WHEN detail <> '' THEN ' / ' || detail ELSE '' END,
+		'"(/|s3://)[^"]*"', '"<path>"', 'g');
+END $$;
+-- a role without superuser's rights, for the tests of privileges
+CREATE ROLE regress_vpq_user;
+GRANT CREATE ON SCHEMA public TO regress_vpq_user;
+-- the codecs a setting takes
+SET vexec_parquet.codec = 'lz5';
+ERROR:  invalid value for parameter "vexec_parquet.codec": "lz5"
+DETAIL:  The codecs are zstd, lz4, snappy, gzip, brotli and none.
+RESET vexec_parquet.codec;

@@ -45,6 +45,103 @@ vexec_batch_create(MemoryContext parent, int ncols, VexecType *const *types)
 	return batch;
 }
 
+static void *
+copy_bytes(VexecBatch *dst, const void *src, Size len)
+{
+	void	   *p = vexec_batch_alloc(dst, len);
+
+	memcpy(p, src, len);
+	return p;
+}
+
+/*
+ * A column copied into dst's memory, with what its values point at: a
+ * Datum's value at the rows of `defined` alone, every row where it is NULL.
+ */
+static void
+vec_clone(VexecBatch *dst, VexecVec *d, const VexecVec *s, const uint64 *defined)
+{
+	int			n = s->nvalues;
+
+	*d = *s;
+	d->datums = NULL;
+	if (s->validity != NULL)
+		d->validity = copy_bytes(dst, s->validity, sizeof(uint64) * VEXEC_WORDS(Max(n, 1)));
+	if (s->encoding == VEXEC_DICT)
+	{
+		d->codes = copy_bytes(dst, s->codes, sizeof(int32) * Max(n, 1));
+		d->dictionary = vexec_batch_alloc0(dst, sizeof(VexecVec));
+		/* a dictionary's values are all defined */
+		vec_clone(dst, d->dictionary, s->dictionary, NULL);
+		return;
+	}
+	switch (s->shape.layout)
+	{
+		case VEXEC_FIXED:
+		case VEXEC_SCALED:
+			d->values = copy_bytes(dst, s->values, (Size) Max(n, 1) * s->shape.stride);
+			break;
+		case VEXEC_BYTE_BOOL:
+			d->values = copy_bytes(dst, s->values, Max(n, 1));
+			break;
+		case VEXEC_BIT_BOOL:
+			d->values = copy_bytes(dst, s->values, sizeof(uint64) * VEXEC_WORDS(Max(n, 1)));
+			break;
+		case VEXEC_DATUM:
+			{
+				Datum	   *v = vexec_batch_alloc(dst, sizeof(Datum) * Max(n, 1));
+
+				for (int i = 0; i < n; i++)
+					v[i] = (s->validity != NULL && !vexec_bit(s->validity, i)) ||
+						(defined != NULL && s->encoding == VEXEC_FLAT && !vexec_bit(defined, i)) ?
+						(Datum) 0 :
+						vexec_varlena_copy(dst, s->type, ((const Datum *) s->values)[i]);
+				d->values = v;
+			}
+			break;
+		case VEXEC_VIEW:
+		case VEXEC_OFFSETS:
+			d->values = copy_bytes(dst, s->values,
+								   s->shape.layout == VEXEC_VIEW ? sizeof(VexecView) * Max(n, 1) :
+								   sizeof(int32) * (n + 1));
+			if (s->nbuffers > 0)
+			{
+				d->buffers = vexec_batch_alloc(dst, sizeof(char *) * s->nbuffers);
+				d->buffer_sizes = copy_bytes(dst, s->buffer_sizes, sizeof(int64) * s->nbuffers);
+				for (int b = 0; b < s->nbuffers; b++)
+					d->buffers[b] = s->buffer_sizes[b] > 0 ?
+						copy_bytes(dst, s->buffers[b], s->buffer_sizes[b]) : NULL;
+			}
+			break;
+	}
+}
+
+/*
+ * A copy of a batch that outlives it: its columns, and what their values
+ * point at -- a Datum column's values one by one, a view column's data
+ * buffers and an offsets column's bytes whole -- in a batch of its own in
+ * mcxt, its selection too.  A Datum column's values are read at the rows of
+ * `defined` alone -- the batch's selection where it is NULL, every row
+ * where the batch has none -- and are NULL elsewhere: a row a filter left
+ * out, or one a kernel left to PostgreSQL's evaluator, holds no value to
+ * read (§3.7).  For a node that keeps a child's batches past the child's
+ * next one: VecHashJoin's device probes (V8c), VecSort's device order (V8d).
+ */
+VexecBatch *
+vexec_batch_clone(MemoryContext mcxt, const VexecBatch *src, const uint64 *defined)
+{
+	VexecBatch *dst = vexec_batch_create(mcxt, src->ncols, src->types);
+
+	dst->nrows = src->nrows;
+	if (src->selection != NULL)
+		dst->selection = copy_bytes(dst, src->selection, sizeof(uint64) * VEXEC_WORDS(Max(src->nrows, 1)));
+	if (defined == NULL)
+		defined = src->selection;
+	for (int c = 0; c < src->ncols; c++)
+		vec_clone(dst, &dst->cols[c], &src->cols[c], defined);
+	return dst;
+}
+
 /* Forget the batch's rows and free their memory, keeping its columns' types. */
 void
 vexec_batch_reset(VexecBatch *batch)
@@ -466,6 +563,8 @@ vexec_vec_flatten(VexecBatch *batch, VexecVec *v)
 		from = v->encoding == VEXEC_DICT ? v->codes[i] : 0;
 		vexec_vec_copy_value(batch, &flat, i, values, from);
 	}
+	/* F5: the same values, their source's word kept */
+	flat.flags = v->flags;
 	*v = flat;
 }
 

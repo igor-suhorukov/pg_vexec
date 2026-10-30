@@ -24,13 +24,15 @@
 # more values than an IN list takes; a mergetree
 # table on the inner side; a qual beside the keys; a rescanned join;
 # parallel scans.  Every answer the same as with vexec off, and as with
-# the keys off.
+# the keys off.  The condition cache off (pg_vector_executor.md §3.28, F7):
+# a second scan of the same quals would pass over the granules the first
+# found none true of, and hand fewer rows for it.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/lib.sh"
 D="$(mktemp -d "${TMPDIR:-/tmp}/chte-joinkeys-XXXXXX")"
 server_init "$D" "shared_preload_libraries = 'vexec,ch_table_engines'" "vexec.min_rows = 0" \
-	"max_parallel_workers_per_gather = 0" "ch.max_merge_workers = 0" || exit 1
+	"max_parallel_workers_per_gather = 0" "ch.max_merge_workers = 0" "vexec.enable_condition_cache = off" || exit 1
 server_start "$D" || { echo "the server did not start"; tail -20 "$D/log"; exit 1; }
 trap 'server_stop "$D"; [ -n "${RESULTS_DIR:-}" ] && cp "$D/log" "$RESULTS_DIR/joinkeys-server.log"' EXIT
 

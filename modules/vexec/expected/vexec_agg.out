@@ -291,6 +291,78 @@ SELECT agg_explain('SELECT k, k - 1, k - 2, count(*) FROM at GROUP BY 1, 2, 3', 
 (1 row)
 
 RESET vexec.drop_implied_keys;
+-- F22 (§3.38): the keys M3 leaves out of the hash's, out of the vector
+-- scan below too, which then computes none of them -- the aggregation's
+-- output computes them from k; with vexec.drop_implied_key_inputs off, and
+-- where M3 keeps the keys, the scan computes them as before
+SELECT agg_explain('SELECT k, k - 1, k - 2, count(*) FROM at GROUP BY 1, 2, 3', 'Vec Seq Scan|Output');
+                        agg_explain                        
+-----------------------------------------------------------
+   Output: k, (k - N), (k - N), (count(*))
+   ->  Vec Seq Scan on public.at (actual rows=N.N loops=N)
+         Output: k
+(3 rows)
+
+SELECT agg_check('SELECT k - 2, k, sum(k - 1), count(*) FROM at GROUP BY 1, 2 HAVING max(k - 2) >= 0');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SET vexec.drop_implied_key_inputs = off;
+SELECT agg_explain('SELECT k, k - 1, k - 2, count(*) FROM at GROUP BY 1, 2, 3', 'Vec Seq Scan|Output');
+                        agg_explain                        
+-----------------------------------------------------------
+   Output: k, (k - N), (k - N), (count(*))
+   ->  Vec Seq Scan on public.at (actual rows=N.N loops=N)
+         Output: k, (k - N), (k - N)
+(3 rows)
+
+RESET vexec.drop_implied_key_inputs;
+SET vexec.drop_implied_keys = off;
+SELECT agg_explain('SELECT k, k - 1, k - 2, count(*) FROM at GROUP BY 1, 2, 3', 'Vec Seq Scan|Output');
+                        agg_explain                        
+-----------------------------------------------------------
+   Output: k, ((k - N)), ((k - N)), (count(*))
+   ->  Vec Seq Scan on public.at (actual rows=N.N loops=N)
+         Output: k, (k - N), (k - N)
+(3 rows)
+
+RESET vexec.drop_implied_keys;
+-- F20 (§3.38): in auto mode, a grouping of fewer input rows than
+-- vexec.min_rows by the estimate is VecAgg's where it reads a vector
+-- scan's batches; over rows -- a function's here -- PostgreSQL's as before,
+-- and with vexec.enable_agg_below_min_rows off
+SET vexec.mode = auto;
+EXPLAIN (COSTS OFF) SELECT k, count(*), sum(id) FROM at WHERE b < 300000 GROUP BY k;
+          QUERY PLAN          
+------------------------------
+ Vec HashAggregate
+   Group Key: k
+   ->  Vec Seq Scan on at
+         Filter: (b < 300000)
+(4 rows)
+
+SET vexec.enable_agg_below_min_rows = off;
+EXPLAIN (COSTS OFF) SELECT k, count(*), sum(id) FROM at WHERE b < 300000 GROUP BY k;
+          QUERY PLAN          
+------------------------------
+ HashAggregate
+   Group Key: k
+   ->  Vec Seq Scan on at
+         Filter: (b < 300000)
+(4 rows)
+
+RESET vexec.enable_agg_below_min_rows;
+EXPLAIN (COSTS OFF) SELECT x % 3, count(*) FROM generate_series(1, 300) x GROUP BY 1;
+                QUERY PLAN                
+------------------------------------------
+ HashAggregate
+   Group Key: (x % 3)
+   ->  Function Scan on generate_series x
+(3 rows)
+
+SET vexec.mode = force;
 -- no rows: a plain aggregation's one row, a hashed one's none
 SELECT agg_check('SELECT count(*), sum(id), avg(n), min(t), bool_and(bo), sum(f), variance(r) FROM ae');
   agg_check   
@@ -493,6 +565,71 @@ SELECT agg_check($$SELECT x, length(x), char_length(x), character_length(x), oct
  same, no VecAgg
 (1 row)
 
+-- W43 (pg_vector_executor.md §3.35): to_timestamp() of a float8 -- an
+-- integer's seconds through its cast -- and a timestamptz's fields and
+-- truncation under UTC, as kernels: the same rows, an infinity the
+-- timestamp's, its errors PostgreSQL's; under another time zone the
+-- timestamptz's bind no kernel
+CREATE TABLE au (s int8, f float8);
+INSERT INTO au VALUES (0, 0), (1373811234, 1373811234.5), (-1, -0.0000005), (NULL, NULL),
+  (946684800, 'infinity'), (9007199254, '-infinity'), (2147483647, 1e10), (-62135596800, 253402300799.999999);
+CREATE TABLE au_bad (f float8);
+INSERT INTO au_bad VALUES (1), ('NaN');
+SET TimeZone = 'UTC';
+EXPLAIN (COSTS OFF, VERBOSE) SELECT date_trunc('minute', to_timestamp(s)), extract(hour FROM to_timestamp(s)) FROM au;
+                                                            QUERY PLAN                                                             
+-----------------------------------------------------------------------------------------------------------------------------------
+ Vec Seq Scan on public.au
+   Output: date_trunc('minute'::text, to_timestamp((s)::double precision)), EXTRACT(hour FROM to_timestamp((s)::double precision))
+   Batch Format: postgres
+   Kernel Steps: 6
+   Fallback Steps: 0
+   Shared Steps: 1
+   Source: heap's pages
+(7 rows)
+
+SELECT agg_check($$SELECT to_timestamp(s), to_timestamp(f), date_trunc('minute', to_timestamp(s)),
+       date_trunc('day', to_timestamp(f)), extract(hour FROM to_timestamp(s)), extract(epoch FROM to_timestamp(s)),
+       extract(dow FROM to_timestamp(f)), count(*) FROM au GROUP BY 1, 2, 3, 4, 5, 6, 7$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_error('SELECT max(to_timestamp(f)) FROM au_bad');
+                 agg_error                 
+-------------------------------------------
+ both ERROR 22008: timestamp cannot be NaN
+(1 row)
+
+SELECT agg_error('SELECT max(to_timestamp(f * 1e300)) FROM au_bad WHERE f = 1');
+                     agg_error                      
+----------------------------------------------------
+ both ERROR 22008: timestamp out of range: "1e+300"
+(1 row)
+
+SET TimeZone = 'Europe/Moscow';
+EXPLAIN (COSTS OFF, VERBOSE) SELECT date_trunc('minute', to_timestamp(s)), extract(hour FROM to_timestamp(s)) FROM au;
+                                                            QUERY PLAN                                                             
+-----------------------------------------------------------------------------------------------------------------------------------
+ Vec Seq Scan on public.au
+   Output: date_trunc('minute'::text, to_timestamp((s)::double precision)), EXTRACT(hour FROM to_timestamp((s)::double precision))
+   Batch Format: postgres
+   Kernel Steps: 0
+   Fallback Steps: 0
+   Row-by-Row Targets: 2
+   Source: heap's pages
+(7 rows)
+
+SELECT agg_check($$SELECT date_trunc('hour', to_timestamp(s)), extract(hour FROM to_timestamp(s)), count(*)
+       FROM au GROUP BY 1, 2$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET TimeZone;
+DROP TABLE au, au_bad;
 -- int8 sums past int64, as int128 holds them
 SELECT agg_check($$SELECT sum(x), avg(x) FROM (VALUES (9223372036854775807::int8),
        (9223372036854775807), (9223372036854775807), (-1)) v(x)$$);
@@ -1039,7 +1176,9 @@ SELECT agg_check('SELECT k % 50, count(DISTINCT t), sum(id) FROM ah GROUP BY 1')
  same, VecAgg
 (1 row)
 
-SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'Partial|Frozen|Handed On');
+-- (whether a participant's table thaws and is frozen again, F16, is the
+-- participants' share of the rows: not shown)
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'Partial|Frozen At|Handed On');
                               agg_explain                              
 -----------------------------------------------------------------------
                ->  Vec Partial HashAggregate (actual rows=N.N loops=N)
@@ -1058,7 +1197,8 @@ SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', 'Frozen|Hand
                      Table Frozen At: N groups
                      Groups Handed On: N
                      Table Thawed After: N groups handed on
-(3 rows)
+                     Table Frozen Again At: N groups
+(4 rows)
 
 SELECT agg_check('SELECT k, count(*), sum(id), sum(n), max(t), min(d) FROM ah GROUP BY k');
   agg_check   
@@ -1089,6 +1229,40 @@ SELECT agg_check('SELECT c, count(*), sum(id) FROM af GROUP BY c');
 (1 row)
 
 DROP TABLE af;
+-- F16 (pg_vector_executor.md §3.37): the thawed table freezes again, for
+-- good, at 8 times the bounds it froze at -- 800 groups here -- and a first
+-- stage spills nothing: one that fills its memory freezes then, for good
+-- (the first stage's lines alone, by their indent)
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', '^ {20}(Table|Spill|Groups Handed)');
+                        agg_explain                         
+------------------------------------------------------------
+                     Table Frozen At: N groups
+                     Groups Handed On: N
+                     Table Thawed After: N groups handed on
+                     Table Frozen Again At: N groups
+(4 rows)
+
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+-- four workers planned, none launched: at 64 kB two make the parallel plan
+-- cheaper by 2% only, four by 40%
+SET max_parallel_workers_per_gather = 4;
+SELECT agg_explain('SELECT k, count(*), sum(n) FROM ah GROUP BY k', '^ {20}(Table|Spill|Groups Handed)');
+                  agg_explain                  
+-----------------------------------------------
+                     Table Frozen At: N groups
+                     Groups Handed On: N
+(2 rows)
+
+SELECT agg_check('SELECT k, count(*), sum(id), sum(n), max(t), min(d) FROM ah GROUP BY k');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SET max_parallel_workers_per_gather = 2;
+RESET hash_mem_multiplier;
+RESET work_mem;
 RESET max_parallel_workers;
 RESET vexec.partial_agg_limit;
 -- D2: a first stage whose every state is one of vexec's own without a
@@ -1099,8 +1273,11 @@ RESET vexec.partial_agg_limit;
 -- among them; in shared memory, or past vexec.repartition_shared_memory in
 -- files; a frozen table's batch groups made packed, or, where its rows are
 -- groups of their own, each row one with no lookup (the bypass); either
--- stage spilling; no worker; rescanned.  Not where a state holds a pointer:
--- sum(n), min(t)
+-- stage spilling; no worker; rescanned.  Not where a state holds a pointer
+-- the group cannot take: sum(n).  A text's minimum and maximum (F5 of
+-- §3.28) are packed by their values' bytes, each group by a copy, never
+-- made where it is handed on: a frozen table's batch groups packed as the
+-- batch ends, and no bypass
 CREATE TABLE ap (id int PRIMARY KEY, k int, t text, big text, n numeric, d date);
 INSERT INTO ap
   SELECT g, (g::int8 * 7919 % 30000)::int, CASE WHEN g % 7 = 0 THEN NULL ELSE 'v' || (g % 9000) END,
@@ -1131,9 +1308,16 @@ SELECT agg_explain('SELECT k, count(*), sum(n) FROM ap GROUP BY k', 'Partition F
 (1 row)
 
 SELECT agg_explain('SELECT k, count(*), min(t) FROM ap GROUP BY k', 'Partition Format');
-              agg_explain               
-----------------------------------------
-               Partition Format: frames
+                  agg_explain                  
+-----------------------------------------------
+               Partition Format: packed groups
+(1 row)
+
+-- F14 (§3.32): a numeric key packed as its scaled integer
+SELECT agg_explain('SELECT n, k % 50, count(*), sum(id) FROM ap GROUP BY 1, 2', 'Partition Format');
+                  agg_explain                  
+-----------------------------------------------
+               Partition Format: packed groups
 (1 row)
 
 SELECT agg_explain($$SELECT s.id, s.big, s.t, count(*), sum(a.k) FROM ap a JOIN apk s ON s.id = a.id % 5000
@@ -1160,6 +1344,20 @@ UNION ALL
 SELECT agg_check('SELECT k % 100, count(DISTINCT t), count(*), sum(id) FROM ap GROUP BY 1')
 UNION ALL
 SELECT agg_check('SELECT k, d, count(*), sum(id), max(id) FROM ap GROUP BY k, d')
+UNION ALL
+SELECT agg_check('SELECT k % 3000, count(*), min(t), max(t), max(big), min(id) FROM ap GROUP BY 1')
+UNION ALL
+SELECT agg_check('SELECT k, min(t COLLATE "C"), max(t), count(*) FROM ap GROUP BY k')
+UNION ALL
+-- F14 (§3.32): a numeric key's groups packed and kept as its scaled
+-- integers, the numeric made as a group is projected; one value at two
+-- scales, numeric(10,2)'s and numeric(10,4)'s, one group -- shown at one
+-- scale, a group's display scale its first row's, which a plan's order
+-- chooses
+SELECT agg_check('SELECT n, k % 50, count(*), sum(id) FROM ap GROUP BY 1, 2')
+UNION ALL
+SELECT agg_check($$SELECT (x * 10000)::int8, count(*), sum(id) FROM (SELECT (k % 97)::numeric(10,2) AS x, id FROM ap
+       UNION ALL SELECT (k % 97)::numeric(10,4), id FROM ap) v GROUP BY x$$)
 $f$;
 SELECT agg_packed();
   agg_packed  
@@ -1171,7 +1369,11 @@ SELECT agg_packed();
  same, VecAgg
  same, VecAgg
  same, VecAgg
-(7 rows)
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(11 rows)
 
 SET vexec.repartition_shared_memory = 0;
 SELECT agg_packed();
@@ -1184,7 +1386,11 @@ SELECT agg_packed();
  same, VecAgg
  same, VecAgg
  same, VecAgg
-(7 rows)
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(11 rows)
 
 SET vexec.repartition_shared_memory = '64kB';
 SELECT agg_packed();
@@ -1197,7 +1403,11 @@ SELECT agg_packed();
  same, VecAgg
  same, VecAgg
  same, VecAgg
-(7 rows)
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(11 rows)
 
 RESET vexec.repartition_shared_memory;
 -- a frozen table whose rows are groups of their own, (k, d)'s, bypassed
@@ -1212,7 +1422,11 @@ SELECT agg_packed();
  same, VecAgg
  same, VecAgg
  same, VecAgg
-(7 rows)
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(11 rows)
 
 SET vexec.partial_agg_bypass = off;
 SELECT agg_check('SELECT k, d, count(*), sum(id), max(id) FROM ap GROUP BY k, d');
@@ -1234,7 +1448,11 @@ SELECT agg_packed();
  same, VecAgg
  same, VecAgg
  same, VecAgg
-(7 rows)
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(11 rows)
 
 RESET work_mem;
 SET max_parallel_workers = 0;
@@ -1248,9 +1466,738 @@ SELECT agg_packed();
  same, VecAgg
  same, VecAgg
  same, VecAgg
-(7 rows)
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(11 rows)
 
 RESET max_parallel_workers;
+-- F23 (§3.38): the final stage's packed groups scattered into sub-buffers by
+-- their hash and merged a run of them at a time, each run's groups handed on
+-- before the next -- every query above so, by default -- or, past the
+-- memory, merged into one table a window at a time; off, one table of every
+-- group as before.  The counts the leader's, alone here
+SET vexec.enable_final_subpartitions = off;
+SELECT agg_packed();
+  agg_packed  
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(11 rows)
+
+RESET vexec.enable_final_subpartitions;
+SET max_parallel_workers = 0;
+SELECT agg_explain('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Sub-buffer');
+          agg_explain          
+-------------------------------
+         Sub-buffer Runs: N
+         Sub-buffer Windows: N
+         Sub-buffer Records: N
+(3 rows)
+
+SET work_mem = '64kB';
+SELECT agg_explain('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Sub-buffer');
+          agg_explain          
+-------------------------------
+         Sub-buffer Runs: N
+         Sub-buffer Windows: N
+         Sub-buffer Records: N
+(3 rows)
+
+RESET work_mem;
+SET vexec.enable_final_subpartitions = off;
+SELECT agg_explain('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Sub-buffer');
+ agg_explain 
+-------------
+(0 rows)
+
+RESET vexec.enable_final_subpartitions;
+RESET max_parallel_workers;
+-- F29 (§3.38): the final stage's sub-buffers hold references to the packed
+-- groups where the exchange keeps them -- its chunks, which it gives back
+-- once the groups are out -- a file's records copied; a group of keys and
+-- states by value, where its run first meets it, the packed group itself --
+-- every query above so, by default; off, F23's copies.  The counts the
+-- leader's, alone here: integer and text keys' groups the records, a text
+-- minimum's groups made; in windows past the memory; the chunks in files
+CREATE FUNCTION agg_figure(q text, label text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+	r record;
+	v bigint := 0;
+BEGIN
+	PERFORM set_config('vexec.mode', 'force', true);
+	FOR r IN EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF r."QUERY PLAN" ~ ('^ *' || label || ': ') THEN
+			v := v + substring(r."QUERY PLAN" FROM ': ([0-9]+)')::bigint;
+		END IF;
+	END LOOP;
+	RETURN v;
+END $$;
+SET vexec.enable_final_references = off;
+SELECT agg_packed();
+  agg_packed  
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(11 rows)
+
+RESET vexec.enable_final_references;
+SET max_parallel_workers = 0;
+SELECT q, agg_figure(q, 'Records Referenced') > 0 AS referenced,
+       agg_figure(q, 'Records Made Groups') > 0 AS made_groups,
+       agg_figure(q, 'Chunks Kept for References') > 0 AS kept
+  FROM (VALUES ('SELECT k, count(*), sum(id), avg((id % 1000)::int2), sum(id::int8), min(id), bool_or(id > 9) FROM ap GROUP BY k'),
+               ('SELECT k, d, count(*), max(id) FROM ap GROUP BY k, d'),
+               ('SELECT t, count(*), sum(id) FROM ap GROUP BY t'),
+               ('SELECT k % 3000, count(*), min(t), max(id) FROM ap GROUP BY 1')) v(q);
+                                                        q                                                        | referenced | made_groups | kept 
+-----------------------------------------------------------------------------------------------------------------+------------+-------------+------
+ SELECT k, count(*), sum(id), avg((id % 1000)::int2), sum(id::int8), min(id), bool_or(id > 9) FROM ap GROUP BY k | t          | t           | t
+ SELECT k, d, count(*), max(id) FROM ap GROUP BY k, d                                                            | t          | t           | t
+ SELECT t, count(*), sum(id) FROM ap GROUP BY t                                                                  | t          | t           | t
+ SELECT k % 3000, count(*), min(t), max(id) FROM ap GROUP BY 1                                                   | t          | f           | t
+(4 rows)
+
+SET vexec.enable_final_references = off;
+SELECT agg_figure('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Records Referenced') AS referenced;
+ referenced 
+------------
+          0
+(1 row)
+
+RESET vexec.enable_final_references;
+SET work_mem = '64kB';
+SELECT agg_explain('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Sub-buffer Windows');
+          agg_explain          
+-------------------------------
+         Sub-buffer Windows: N
+(1 row)
+
+SELECT agg_figure('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Records Made Groups') > 0 AS made_groups;
+ made_groups 
+-------------
+ t
+(1 row)
+
+SELECT agg_check('SELECT k, count(*), sum(id), max(d) FROM ap GROUP BY k');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT t, k % 5, count(*), sum(id) FROM ap GROUP BY 1, 2');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET work_mem;
+SET vexec.repartition_shared_memory = 0;
+SELECT agg_figure('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Records Referenced') AS referenced,
+       agg_figure('SELECT k, count(*), sum(id) FROM ap GROUP BY k', 'Records Copied') > 0 AS copied;
+ referenced | copied 
+------------+--------
+          0 | t
+(1 row)
+
+SELECT agg_check('SELECT k, count(*), sum(id), max(d) FROM ap GROUP BY k');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.repartition_shared_memory;
+RESET max_parallel_workers;
+SELECT agg_check('SELECT k, d, count(*), sum(id), max(id), bool_and(id > 5) FROM ap GROUP BY k, d');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT k, count(*), sum(id) FROM ap GROUP BY k ORDER BY sum(id) DESC, k LIMIT 9');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT k, count(*), max(d) FROM ap GROUP BY k ORDER BY count(*) DESC, k LIMIT 7');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT k, count(*) FROM ap GROUP BY k HAVING count(*) > 6');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+-- F26 (§3.38): a row whose keys -- compared by their bits or bytes -- are
+-- the row before's takes that row's group with no lookup: rows in their
+-- keys' order, integer, text and NULL keys; a frozen table's batch groups;
+-- off, each row looked up.  The counts the leader's, alone
+CREATE TABLE ac AS
+  SELECT g / 4 AS u, CASE WHEN g % 50 < 8 THEN NULL ELSE 's' || (g / 8) END AS s, g AS x
+  FROM generate_series(1, 100000) g;
+ANALYZE ac;
+SELECT agg_check('SELECT u, count(*), sum(x) FROM ac GROUP BY u');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT u, s, count(*), min(x) FROM ac GROUP BY u, s');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT s, count(*), max(x) FROM ac GROUP BY s');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SET vexec.partial_agg_limit = 100;
+SELECT agg_check('SELECT u, s, count(*), min(x) FROM ac GROUP BY u, s');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.partial_agg_limit;
+SET max_parallel_workers = 0;
+SELECT agg_explain('SELECT u, s, count(*), min(x) FROM ac GROUP BY u, s', 'Row Before');
+                        agg_explain                        
+-----------------------------------------------------------
+                     Rows Taking the Row Before's Group: N
+(1 row)
+
+SET vexec.enable_consecutive_keys = off;
+SELECT agg_explain('SELECT u, s, count(*), min(x) FROM ac GROUP BY u, s', 'Row Before');
+ agg_explain 
+-------------
+(0 rows)
+
+SELECT agg_check('SELECT u, s, count(*), min(x) FROM ac GROUP BY u, s');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.enable_consecutive_keys;
+RESET max_parallel_workers;
+DROP TABLE ac;
+-- F31 (§3.38): a batch whose rows are of one key -- its key columns' values
+-- the first row's, by their bits, bytes or dictionary codes, NULLs alike --
+-- takes its group once and its transitions as a plain aggregation's, over
+-- the batch at once: integer, text and NULL keys, two keys, a frozen table's
+-- batch groups -- a text's bytes where its batch holds them, offsets or
+-- views; batches of two keys a row at a time; off, as F26.  The counts the
+-- leader's, alone
+CREATE TABLE aok AS
+  SELECT g / 5000 AS u, 'k' || (g / 7000) AS s, CASE WHEN g / 6000 % 3 = 0 THEN NULL ELSE g / 6000 END AS n,
+         g AS x, (g % 1000)::int2 AS y, 'v' || (g / 5000) AS v
+  FROM generate_series(1, 100000) g;
+ANALYZE aok;
+SELECT agg_check('SELECT u, count(*), sum(x), avg(y), min(x), max(y), count(n) FROM aok GROUP BY u');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT s, count(*), sum(x), bool_and(x > 9) FROM aok GROUP BY s');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT n, count(*), sum(x), count(n) FROM aok GROUP BY n');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT u, s, count(*), max(x) FROM aok GROUP BY u, s');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT u % 2, count(*), sum(y) FROM aok GROUP BY 1');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SET max_parallel_workers = 0;
+SELECT agg_explain('SELECT u, count(*), sum(x) FROM aok GROUP BY u', 'One Key');
+                agg_explain                
+-------------------------------------------
+                     Batches of One Key: N
+(1 row)
+
+SET vexec.batch_varlena_layout = offsets;
+SELECT agg_explain('SELECT u, v, count(*), max(x) FROM aok GROUP BY u, v', 'One Key');
+                agg_explain                
+-------------------------------------------
+                     Batches of One Key: N
+(1 row)
+
+SELECT agg_explain('SELECT v, count(*), sum(x) FROM aok GROUP BY v', 'One Key');
+                agg_explain                
+-------------------------------------------
+                     Batches of One Key: N
+(1 row)
+
+SELECT agg_check('SELECT u, v, count(*), max(x) FROM aok GROUP BY u, v');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT v, s, count(*), sum(x) FROM aok GROUP BY v, s');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.batch_varlena_layout;
+SET vexec.enable_one_key_batches = off;
+SELECT agg_explain('SELECT u, count(*), sum(x) FROM aok GROUP BY u', 'One Key|Row Before');
+                        agg_explain                        
+-----------------------------------------------------------
+                     Rows Taking the Row Before's Group: N
+(1 row)
+
+SELECT agg_check('SELECT u, count(*), sum(x), avg(y), min(x), max(y), count(n) FROM aok GROUP BY u');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.enable_one_key_batches;
+-- F30 (§3.38): a batch's integer keys with no NULL read from their columns --
+-- their hashes made over them, a row's keys compared with the row before's
+-- by their values, a probe made only for a row looked up; off, a probe a row.
+-- F32's runs off, which take these batches where they are on
+SET vexec.enable_key_runs = off;
+SELECT agg_figure('SELECT x % 1000, count(*), sum(y) FROM aok GROUP BY 1', 'Batches Keyed by Columns') > 0 AS keyed;
+ keyed 
+-------
+ t
+(1 row)
+
+SELECT agg_figure('SELECT x % 100, y, count(*), max(x) FROM aok GROUP BY 1, 2', 'Batches Keyed by Columns') > 0 AS keyed;
+ keyed 
+-------
+ t
+(1 row)
+
+SET vexec.enable_vector_keys = off;
+SELECT agg_figure('SELECT x % 1000, count(*), sum(y) FROM aok GROUP BY 1', 'Batches Keyed by Columns') AS keyed;
+ keyed 
+-------
+     0
+(1 row)
+
+RESET vexec.enable_vector_keys;
+RESET max_parallel_workers;
+SELECT agg_check('SELECT x % 1000, count(*), sum(y), avg(y), min(x) FROM aok GROUP BY 1');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT x % 100, y, count(*), max(x) FROM aok GROUP BY 1, 2');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT (x % 50)::int8, (x % 7)::int2, count(*) FROM aok GROUP BY 1, 2');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT n, x % 3, count(*) FROM aok GROUP BY 1, 2');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SET vexec.enable_vector_keys = off;
+SELECT agg_check('SELECT x % 1000, count(*), sum(y), avg(y), min(x) FROM aok GROUP BY 1');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.enable_vector_keys;
+RESET vexec.enable_key_runs;
+DROP TABLE aok;
+-- F32 (§3.38): a batch's rows cut into runs of one key before any row is
+-- hashed -- integers of each width, F10's scaled numerics, text as offsets and
+-- as views, short and past a view's inlined bytes, NULLs, two keys -- each run's
+-- first row alone hashed and looked up, a count(*) added by the run's length;
+-- rows a qual filtered, C5's bound, a table spilling; off, as F30 and F26.  The
+-- counts the leader's, alone: a run's first row and its repeats are the rows
+CREATE TABLE ar AS
+  SELECT g / 4 AS u, (g / 4)::int8 AS b, (g / 4 % 30000)::int2 AS h,
+         CASE WHEN g % 50 < 8 THEN NULL ELSE 's' || (g / 8) END AS s,
+         'a key past a view''s inlined bytes ' || (g / 16) AS l,
+         timestamp '2020-01-01' + (g / 400) * interval '1 minute' AS ts,
+         g AS x, (g % 1000)::int2 AS y
+  FROM generate_series(1, 100000) g;
+ANALYZE ar;
+SET max_parallel_workers = 0;
+-- (the first batch's rows the array's decision's, X5's: 1,025 looked up by no run)
+SELECT agg_figure('SELECT u, count(*) FROM ar GROUP BY u', 'Key Runs') + 1025 +
+       agg_figure('SELECT u, count(*) FROM ar GROUP BY u', 'Rows Taking the Row Before''s Group') AS every_row,
+       agg_figure('SELECT u, count(*) FROM ar GROUP BY u', 'Key Runs') + 1025 AS one_run_a_key;
+ every_row | one_run_a_key 
+-----------+---------------
+    100000 |         25025
+(1 row)
+
+SELECT agg_figure('SELECT u, count(*), sum(x) FROM ar WHERE x % 3 <> 0 GROUP BY u', 'Key Runs') + 1025 +
+       agg_figure('SELECT u, count(*), sum(x) FROM ar WHERE x % 3 <> 0 GROUP BY u', 'Rows Taking the Row Before''s Group')
+       AS every_row_left;
+ every_row_left 
+----------------
+          66667
+(1 row)
+
+SELECT agg_figure('SELECT u, count(*), sum(x) FROM ar GROUP BY u', 'Batches Keyed by Runs') > 0 AS by_runs;
+ by_runs 
+---------
+ t
+(1 row)
+
+SET vexec.batch_varlena_layout = offsets;
+SELECT agg_figure('SELECT s, l, count(*) FROM ar GROUP BY s, l', 'Batches Keyed by Runs') > 0 AS by_runs;
+ by_runs 
+---------
+ t
+(1 row)
+
+SET vexec.batch_varlena_layout = view;
+SELECT agg_figure('SELECT s, l, count(*) FROM ar GROUP BY s, l', 'Batches Keyed by Runs') > 0 AS by_runs;
+ by_runs 
+---------
+ t
+(1 row)
+
+SELECT agg_figure('SELECT s, count(*) FROM ar GROUP BY s', 'Key Runs') +
+       agg_figure('SELECT s, count(*) FROM ar GROUP BY s', 'Rows Taking the Row Before''s Group') AS every_text_row;
+ every_text_row 
+----------------
+         100000
+(1 row)
+
+RESET vexec.batch_varlena_layout;
+SELECT agg_figure('SELECT extract(minute FROM ts), u, count(*) FROM ar GROUP BY 1, 2', 'Batches Keyed by Runs') > 0 AS by_runs;
+ by_runs 
+---------
+ t
+(1 row)
+
+SELECT agg_figure('SELECT u, count(*) FROM ar GROUP BY u LIMIT 7', 'Groups Kept by Hash') AS kept,
+       agg_figure('SELECT u, count(*) FROM ar GROUP BY u LIMIT 7', 'Batches Keyed by Runs') > 0 AS by_runs;
+ kept | by_runs 
+------+---------
+    7 | t
+(1 row)
+
+SET vexec.enable_key_runs = off;
+SELECT agg_figure('SELECT u, count(*), sum(x) FROM ar GROUP BY u', 'Batches Keyed by Runs') AS by_runs,
+       agg_figure('SELECT u, count(*), sum(x) FROM ar GROUP BY u', 'Batches Keyed by Columns') > 0 AS by_columns;
+ by_runs | by_columns 
+---------+------------
+       0 | t
+(1 row)
+
+RESET vexec.enable_key_runs;
+-- F38 (§3.38): C5's table sized by the groups its LIMIT keeps, not the
+-- planner's estimate of all of them; off, by the estimate
+SELECT agg_figure('SELECT u, count(*) FROM ar GROUP BY u LIMIT 7', 'Buckets') <= 2048 AS few_buckets;
+ few_buckets 
+-------------
+ t
+(1 row)
+
+SET vexec.enable_topk_table_bound = off;
+SELECT agg_figure('SELECT u, count(*) FROM ar GROUP BY u LIMIT 7', 'Buckets') > 2048 AS many_buckets;
+ many_buckets 
+--------------
+ t
+(1 row)
+
+RESET vexec.enable_topk_table_bound;
+RESET max_parallel_workers;
+CREATE FUNCTION agg_runs() RETURNS SETOF text LANGUAGE sql AS $f$
+SELECT agg_check('SELECT u, count(*) FROM ar GROUP BY u')
+UNION ALL
+SELECT agg_check('SELECT u, count(*), sum(x), avg(y), min(x), max(y), count(s) FROM ar GROUP BY u')
+UNION ALL
+SELECT agg_check('SELECT b, count(*), sum(y) FROM ar GROUP BY b')
+UNION ALL
+SELECT agg_check('SELECT h, count(*), sum(y) FROM ar GROUP BY h')
+UNION ALL
+SELECT agg_check('SELECT u, s, count(*), min(x) FROM ar GROUP BY u, s')
+UNION ALL
+SELECT agg_check('SELECT s, count(*), max(x) FROM ar GROUP BY s')
+UNION ALL
+SELECT agg_check('SELECT l, count(*), max(x) FROM ar GROUP BY l')
+UNION ALL
+SELECT agg_check('SELECT l, s, b, count(*) FROM ar GROUP BY l, s, b')
+UNION ALL
+SELECT agg_check('SELECT extract(minute FROM ts), u, count(*), sum(y) FROM ar GROUP BY 1, 2')
+UNION ALL
+SELECT agg_check('SELECT u, count(*), sum(x) FROM ar WHERE x % 3 <> 0 GROUP BY u')
+UNION ALL
+SELECT agg_check('SELECT s, l, count(*) FROM ar WHERE x % 3 <> 0 GROUP BY s, l')
+UNION ALL
+SELECT agg_check('SELECT count(*), min(c), max(c) FROM (SELECT u, count(*) AS c FROM ar WHERE u BETWEEN 1 AND 1000 GROUP BY u LIMIT 7) q')
+UNION ALL
+SELECT agg_check('SELECT count(*), min(c), max(c), sum(z) > 0 FROM (SELECT l, count(*) AS c, sum(x) AS z FROM ar WHERE x BETWEEN 16 AND 16015 GROUP BY l LIMIT 7) q')
+$f$;
+SELECT agg_runs();
+   agg_runs   
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(13 rows)
+
+SET vexec.batch_varlena_layout = offsets;
+SELECT agg_runs();
+   agg_runs   
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(13 rows)
+
+SET vexec.batch_varlena_layout = view;
+SELECT agg_runs();
+   agg_runs   
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(13 rows)
+
+RESET vexec.batch_varlena_layout;
+SET vexec.partial_agg_limit = 100;
+SELECT agg_runs();
+   agg_runs   
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(13 rows)
+
+RESET vexec.partial_agg_limit;
+SET work_mem = '64kB';
+SELECT agg_runs();
+   agg_runs   
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(13 rows)
+
+RESET work_mem;
+SET max_parallel_workers = 0;
+SELECT agg_runs();
+   agg_runs   
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(13 rows)
+
+SET work_mem = '64kB';
+SELECT agg_runs();
+   agg_runs   
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(13 rows)
+
+RESET work_mem;
+RESET max_parallel_workers;
+SET vexec.enable_key_runs = off;
+SELECT agg_runs();
+   agg_runs   
+--------------
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(13 rows)
+
+RESET vexec.enable_key_runs;
+-- F33 (§3.38): a frozen table's bypass measured over the rows it looks up, a
+-- run's repeats out of them: keys of five rows each, every run a group of its
+-- own, bypassed; off, the repeats among the rows measured, no bypass.  F34's
+-- prefetch off, the same answers
+CREATE TABLE abr AS SELECT g / 5 AS u, 'k' || (g / 5) AS s, g AS x FROM generate_series(1, 400000) g;
+ANALYZE abr;
+SET vexec.partial_agg_limit = 100;
+SELECT agg_figure('SELECT u, count(*), sum(x) FROM abr GROUP BY u', 'Rows Bypassing the Table') > 0 AS bypassed;
+ bypassed 
+----------
+ t
+(1 row)
+
+SET vexec.batch_varlena_layout = offsets;
+SELECT agg_figure('SELECT s, count(*), max(x) FROM abr GROUP BY s', 'Rows Bypassing the Table') > 0 AS bypassed_text;
+ bypassed_text 
+---------------
+ t
+(1 row)
+
+SELECT agg_check('SELECT s, count(*), max(x) FROM abr GROUP BY s');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.batch_varlena_layout;
+SELECT agg_check('SELECT u, count(*), sum(x) FROM abr GROUP BY u');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SET vexec.enable_bypass_over_runs = off;
+SELECT agg_figure('SELECT u, count(*), sum(x) FROM abr GROUP BY u', 'Rows Bypassing the Table') AS not_bypassed;
+ not_bypassed 
+--------------
+            0
+(1 row)
+
+SELECT agg_check('SELECT u, count(*), sum(x) FROM abr GROUP BY u');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.enable_bypass_over_runs;
+SET vexec.enable_pack_prefetch = off;
+SELECT agg_check('SELECT u, count(*), sum(x) FROM abr GROUP BY u');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.enable_pack_prefetch;
+RESET vexec.partial_agg_limit;
+DROP FUNCTION agg_runs();
+DROP FUNCTION agg_figure(text, text);
+DROP TABLE ar, abr;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 SET enable_material = off;
@@ -1303,6 +2250,20 @@ SELECT agg_explain('SELECT k, k - 1, k - 2, count(*), sum(id) FROM ap GROUP BY 1
                Partition Format: packed groups
                      Group Key: ap.k
 (4 rows)
+
+-- F22: the parallel scan under the partial stage computes no implied key
+SELECT agg_explain('SELECT k, k - 1, k - 2, count(*), sum(id) FROM ap GROUP BY 1, 2, 3',
+                   'Parallel Vec Seq Scan|Output:');
+                                     agg_explain                                      
+--------------------------------------------------------------------------------------
+   Output: k, ((k - N)), ((k - N)), (count(*)), (sum(id))
+         Output: k, (k - N), (k - N), (count(*)), (sum(id))
+               Output: k, (PARTIAL count(*)), (PARTIAL sum(id))
+                     Output: k, (PARTIAL count(*)), (PARTIAL sum(id))
+                     Output: packed groups
+                     ->  Parallel Vec Seq Scan on public.ap (actual rows=N.N loops=N)
+                           Output: k, id
+(7 rows)
 
 -- M1 (§3.21): the suite's server has an exchange area of two blocks
 -- (test/vexec/suite.sh), which the partitions above took: a participant's
@@ -1360,7 +2321,11 @@ SELECT agg_packed();
  same, VecAgg
  same, VecAgg
  same, VecAgg
-(7 rows)
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(11 rows)
 
 RESET vexec.enable_exchange_area;
 SELECT free = blocks AS all_free FROM vexec.exchange_area();
@@ -1389,7 +2354,11 @@ SELECT agg_packed();
  same, VecAgg
  same, VecAgg
  same, VecAgg
-(7 rows)
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+ same, VecAgg
+(11 rows)
 
 RESET vexec.enable_packed_groups;
 RESET cpu_operator_cost;
@@ -1892,6 +2861,22 @@ SELECT agg_check('SELECT d, count(DISTINCT k), count(DISTINCT k) * 2 FROM ah GRO
  same, VecAgg
 (1 row)
 
+-- F10 (§3.31): a numeric key of a batch's scaled integers -- a numeric(10,2)
+-- column's, extract()'s -- in X1's stages: the partial groups' hashes, which
+-- VecRepartition deals them by, hash_numeric()'s, as the stages above
+-- compute them from the numerics
+SELECT agg_check('SELECT n, count(DISTINCT t), count(*), sum(id) FROM ah GROUP BY n');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT extract(dow FROM d) AS w, n, count(DISTINCT t), sum(n) FROM ah GROUP BY 1, 2');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
 -- NULL arguments and keys, and an empty input
 SELECT agg_check('SELECT t, count(DISTINCT u), count(*), sum(b) FROM at GROUP BY t');
   agg_check   
@@ -2101,6 +3086,129 @@ RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 RESET max_parallel_workers_per_gather;
+-- F10 (§3.31): extract()'s fields within the day from the time of day --
+-- before 2000 and after, an infinity's NULL, date_part()'s floats -- and a
+-- numeric key of a batch's scaled integers hashed and compared by them, a
+-- group's numeric made once: extract()'s, a numeric(10,3) column's; one value
+-- at two display scales, 5 and 5.000000, one group, as numeric_eq() makes it
+CREATE TABLE af AS
+  SELECT g AS id, timestamp '1999-12-31 22:00' + g * interval '7.123457 seconds' AS ts,
+         (g % 37)::numeric(10,3) / 8 AS n3
+  FROM generate_series(1, 30000) g
+  UNION ALL SELECT 0, 'infinity', NULL
+  UNION ALL SELECT -1, '-infinity', 0;
+ANALYZE af;
+EXPLAIN (COSTS OFF, VERBOSE) SELECT extract(minute FROM ts), count(*) FROM af GROUP BY 1;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Vec HashAggregate
+   Output: (EXTRACT(minute FROM ts)), (count(*))
+   Group Key: (EXTRACT(minute FROM af.ts))
+   Batch Format: postgres
+   Vector Transitions: 1 of 1
+   Transitions: count(*)
+   Kernel Steps: 0
+   Fallback Steps: 0
+   Input: batches
+   ->  Vec Seq Scan on public.af
+         Output: EXTRACT(minute FROM ts)
+         Batch Format: postgres
+         Kernel Steps: 1
+         Fallback Steps: 0
+         Source: heap's pages
+(15 rows)
+
+SELECT agg_check($$SELECT extract(hour FROM ts), extract(minute FROM ts), count(*), sum(id) FROM af GROUP BY 1, 2$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check($$SELECT extract(second FROM ts), extract(milliseconds FROM ts), extract(microseconds FROM ts),
+       count(*), min(id) FROM af GROUP BY 1, 2, 3$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check($$SELECT date_part('hour', ts), date_part('second', ts), date_part('milliseconds', ts),
+       count(*) FROM af GROUP BY 1, 2, 3$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check('SELECT n3, count(*), sum(id) FROM af GROUP BY n3');
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check($$SELECT (x * 1000000)::int8, count(*) FROM (SELECT extract(second FROM ts) AS x FROM af
+       UNION ALL SELECT extract(minute FROM ts) FROM af) v GROUP BY x$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check($$SELECT (x * 1000)::int8, count(*) FROM (SELECT n3 AS x FROM af
+       UNION ALL SELECT (id % 5)::numeric FROM af) v GROUP BY x$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS vexec_test;
+RESET client_min_messages;
+SELECT count(*) AS keys, count(*) FILTER (WHERE r = 'none') AS none,
+       count(*) FILTER (WHERE r NOT IN ('ok', 'none')) AS differ
+FROM (SELECT vexec_test.scaled_key(round(v, s), s, o) AS r
+      FROM generate_series(0, 18) s,
+           (VALUES (0::numeric), (1), (-1), (5), (9999), (10000), (100000000), (123456789.123456789),
+                   (-0.0001), (0.5), (12.25), (99999999.99999), (1e-18), (9.223372036854775807),
+                   (9223372036854775807), (-9223372036854775808), (1234567890123.4567)) x(v),
+           LATERAL (VALUES (round(v, s)), (round(v, s) * 1.000), (round(v, s) + 1), (-round(v, s)),
+                           (round(v, s) + 0.000000000000000001), (0), ('NaN'), ('Infinity')) y(o)) z;
+ keys | none | differ 
+------+------+--------
+ 2584 |  736 |      0
+(1 row)
+
+-- F14 (§3.32): Q18's shape -- extract()'s minute and another key, nearly
+-- every row a group of its own -- in parallel, the first stage frozen and
+-- its rows bypassed, each a group packed with its key's scaled integer, the
+-- final stage's groups so too, C3's ten projected; a key of scale 6
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+SET vexec.partial_agg_limit = 100;
+SELECT agg_check($$SELECT id % 7000, extract(minute FROM ts), count(*) FROM af GROUP BY 1, 2
+       ORDER BY 3 DESC, 1, 2 LIMIT 10$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check($$SELECT extract(second FROM ts), count(*), sum(id) FROM af GROUP BY 1$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+SELECT agg_check($$SELECT extract(minute FROM ts) AS m, count(*) FROM af GROUP BY 1 HAVING count(*) > 400$$);
+  agg_check   
+--------------
+ same, VecAgg
+(1 row)
+
+RESET vexec.partial_agg_limit;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+DROP TABLE af;
 -- explain mode: costed, recorded, never built
 SET vexec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM at GROUP BY k;

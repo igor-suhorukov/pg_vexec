@@ -176,6 +176,18 @@ typedef struct PackChunk
 } PackChunk;
 
 #define PACK_CHUNK_HEADER	MAXALIGN(sizeof(PackChunk))
+
+/*
+ * F34 (§3.38): the lines of a partition's chunk fetched ahead for writing.
+ * prefetchw is a no-op on an x86-64 without it; two lines take Q15's stall, the
+ * wide records of Q18 and Q32 want four, eight gain no more.
+ */
+#define PACK_PREFETCH_LINES	4
+#if defined(__x86_64__)
+#define PACK_PREFETCH_WRITE(p) __asm__ __volatile__("prefetchw %0" : : "m" (*(const char *) (p)))
+#else
+#define PACK_PREFETCH_WRITE(p) __builtin_prefetch((p), 1)
+#endif
 #define PACK_PAGE			((Size) 4096)	/* a shared chunk's alignment */
 #define PACK_CHUNK_FIRST	((Size) 16 * 1024)	/* a partition's first chunk */
 #define PACK_CHUNK_MAX		((Size) 256 * 1024)	/* and its largest */
@@ -274,6 +286,11 @@ typedef struct VexecRepartState
 	int			pk_nmaps;
 	PackPointer pk_next;		/* the claimed partition's next shared chunk */
 	PackChunk  *pk_done;		/* the one read last: its pages to give back */
+	bool		pk_keep;		/* F29: the shared chunks read kept, until the reader lets them go */
+	PackChunk **pk_kept;
+	int			pk_nkept;
+	int			pk_kept_size;
+	int64		pk_chunks_kept;
 
 	/*
 	 * D2: read while others write (above): the partitions claimed then, how
@@ -314,6 +331,7 @@ struct VexecPackSink
 	Size		seg_used;
 	Size		seg_size;
 	bool		no_segments;	/* none to be had: local chunks from now */
+	bool		prefetch;		/* F34: vexec.enable_pack_prefetch, as it began */
 };
 
 static bool repart_fetch(VexecNode *node);
@@ -758,6 +776,15 @@ vexec_pack_alloc(VexecPackSink *k, int p, Size len)
 	g = (char *) c + PACK_CHUNK_HEADER + c->used;
 	c->used += (uint32) len;
 	k->s->pk_groups++;
+
+	/*
+	 * F34 (§3.38): as the partition's next record crosses into a new line,
+	 * the lines ahead fetched for writing -- past the chunk's end or in a page
+	 * not yet mapped, it does nothing
+	 */
+	if (k->prefetch && ((uintptr_t) g ^ (uintptr_t) (g + len)) >= PG_CACHE_LINE_SIZE)
+		for (int i = 0; i < PACK_PREFETCH_LINES; i++)
+			PACK_PREFETCH_WRITE(g + len + i * PG_CACHE_LINE_SIZE);
 	return g;
 }
 
@@ -804,6 +831,7 @@ write_packed(VexecRepartState *s)
 	k->budget = vexec_repartition_shared_memory < 0 ? get_hash_memory_limit() :
 		(Size) vexec_repartition_shared_memory * 1024;
 	k->npartitions = sh->npartitions;
+	k->prefetch = vexec_enable_pack_prefetch;
 	k->cur = MemoryContextAllocZero(mcxt, sizeof(PackChunk *) * sh->npartitions);
 	k->cur_ptr = MemoryContextAlloc(mcxt, sizeof(PackPointer) * sh->npartitions);
 	k->next_size = MemoryContextAlloc(mcxt, sizeof(Size) * sh->npartitions);
@@ -1229,7 +1257,7 @@ repart_fetch(VexecNode *node)
 	if (s->shared == NULL)
 	{
 		/* one participant: the child's groups as they come */
-		while (in->nrows < VEXEC_BATCH_ROWS)
+		while (in->nrows < in->room)
 		{
 			TupleTableSlot *slot = ExecProcNode(s->child);
 
@@ -1243,7 +1271,7 @@ repart_fetch(VexecNode *node)
 	{
 		if (!s->written)
 			write_groups(s);
-		while (in->nrows < VEXEC_BATCH_ROWS)
+		while (in->nrows < in->room)
 		{
 			MinimalTuple tuple;
 			uint32		hash;
@@ -1370,14 +1398,61 @@ vexec_repart_packed(VexecNode *node)
 }
 
 /*
+ * F29 (pg_vector_executor.md §3.38): a shared chunk read, kept where it lies
+ * -- its groups the reader's references, its pages given back once it lets
+ * them go (vexec_repart_release_kept())
+ */
+static void
+keep_chunk(VexecRepartState *s, PackChunk *c)
+{
+	if (s->pk_nkept == s->pk_kept_size)
+	{
+		s->pk_kept_size = Max(s->pk_kept_size * 2, 64);
+		s->pk_kept = s->pk_kept == NULL ?
+			MemoryContextAlloc(s->node.mcxt, sizeof(PackChunk *) * s->pk_kept_size) :
+			repalloc(s->pk_kept, sizeof(PackChunk *) * s->pk_kept_size);
+	}
+	s->pk_kept[s->pk_nkept++] = c;
+	s->pk_chunks_kept++;
+}
+
+/*
+ * F29: the shared chunks the next ones read are kept where they lie, for
+ * the final VecAgg's references into them, until it lets them go
+ */
+void
+vexec_repart_keep_chunks(VexecNode *node, bool keep)
+{
+	VexecRepartState *s = (VexecRepartState *) node;
+
+	Assert(node->kind == VEXEC_NODE_REPART);
+	s->pk_keep = keep;
+}
+
+/* F29: the shared chunks kept given back, their groups merged and handed on */
+void
+vexec_repart_release_kept(VexecNode *node)
+{
+	VexecRepartState *s = (VexecRepartState *) node;
+
+	Assert(node->kind == VEXEC_NODE_REPART);
+	for (int i = 0; i < s->pk_nkept; i++)
+		pack_release(s->pk_kept[i]);
+	s->pk_nkept = 0;
+}
+
+/*
  * D2: the next chunk of packed groups of the partitions this participant
  * claims, once its own are written: its groups, *len bytes of them, where
  * they lie -- in shared memory, or the record of a file -- until the next
  * call, which frees a shared one; false once none is left.  The groups'
- * count is the parent's to add to the node's rows.
+ * count is the parent's to add to the node's rows.  F29: where the reader
+ * keeps the chunks (vexec_repart_keep_chunks()), a shared one stays where it
+ * lies until it lets them go, and *kept, where given, says so; a file's
+ * record goes at the next call still.
  */
 bool
-vexec_repart_next_chunk(VexecNode *node, const char **groups, Size *len)
+vexec_repart_next_chunk(VexecNode *node, const char **groups, Size *len, bool *kept)
 {
 	VexecRepartState *s = (VexecRepartState *) node;
 	PlanState  *ps = &node->css.ss.ps;
@@ -1404,7 +1479,12 @@ vexec_repart_next_chunk(VexecNode *node, const char **groups, Size *len)
 
 			if (c != NULL)
 			{
-				s->pk_done = c;
+				if (s->pk_keep)
+					keep_chunk(s, c);
+				else
+					s->pk_done = c;
+				if (kept)
+					*kept = s->pk_keep;
 				s->pk_chunks_early++;
 				*groups = (const char *) c + PACK_CHUNK_HEADER;
 				*len = c->used;
@@ -1429,7 +1509,12 @@ vexec_repart_next_chunk(VexecNode *node, const char **groups, Size *len)
 			PackChunk  *c = pack_chunk(s, s->pk_next);
 
 			s->pk_next = c->next;
-			s->pk_done = c;
+			if (s->pk_keep)
+				keep_chunk(s, c);
+			else
+				s->pk_done = c;
+			if (kept)
+				*kept = s->pk_keep;
 			*groups = (const char *) c + PACK_CHUNK_HEADER;
 			*len = c->used;
 			break;
@@ -1449,6 +1534,8 @@ vexec_repart_next_chunk(VexecNode *node, const char **groups, Size *len)
 				elog(ERROR, "vexec: a parallel aggregation's partition holds a record that is no chunk of groups");
 			*groups = (const char *) rec + PACK_CHUNK_HEADER;
 			*len = ((PackChunk *) rec)->used;
+			if (kept)
+				*kept = false;
 			break;
 		}
 	}
@@ -1565,6 +1652,8 @@ repart_initialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordin
 	VexecRepartState *s = (VexecRepartState *) css;
 	RepartShared *sh = (RepartShared *) coordinate;
 
+	vexec_pool_reserve(pcxt, &css->ss.ps);	/* F3: the pool's workers for the Gather's, where it may */
+
 	sh->nparticipants = pcxt->nworkers + 1;
 	sh->npartitions = repart_partitions(sh->nparticipants);
 	sh->frames = s->frames;
@@ -1613,6 +1702,8 @@ repart_reinitialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coord
 {
 	VexecRepartState *s = (VexecRepartState *) css;
 	RepartShared *sh = (RepartShared *) coordinate;
+
+	vexec_pool_reserve(pcxt, &css->ss.ps);	/* F3: the pool's workers for the Gather's, where it may */
 
 	(void) pcxt;
 	end_reading(s);
@@ -1681,6 +1772,8 @@ repart_rescan(CustomScanState *css)
 {
 	VexecRepartState *s = (VexecRepartState *) css;
 
+	vexec_repart_release_kept(&s->node);
+	s->pk_keep = false;
 	end_reading(s);
 	if (s->child->chgParam == NULL)
 		ExecReScan(s->child);
@@ -1699,6 +1792,7 @@ repart_shutdown(CustomScanState *css)
 {
 	VexecRepartState *s = (VexecRepartState *) css;
 
+	vexec_repart_release_kept(&s->node);
 	end_reading(s);
 	pack_unmap_all(s);
 	s->shared = NULL;
@@ -1710,6 +1804,8 @@ repart_end(CustomScanState *css)
 {
 	VexecRepartState *s = (VexecRepartState *) css;
 
+	if (s->shared != NULL)
+		vexec_repart_release_kept(&s->node);
 	end_reading(s);
 	vexec_node_end(&s->node);
 	ExecEndNode(s->child);
@@ -1755,5 +1851,7 @@ repart_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		ExplainPropertyInteger("Chunks Read", NULL, s->pk_chunks_read, es);
 		if (s->pk_chunks_early > 0)
 			ExplainPropertyInteger("Chunks Read Beside Writers", NULL, s->pk_chunks_early, es);
+		if (s->pk_chunks_kept > 0)
+			ExplainPropertyInteger("Chunks Kept for References", NULL, s->pk_chunks_kept, es);
 	}
 }

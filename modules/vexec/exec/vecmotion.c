@@ -307,7 +307,7 @@ send_fetch(VexecNode *node)
 	in = s->rowbatch;
 	vexec_batch_reset(in);
 	vexec_batch_begin_rows(in);
-	while (!s->child_done && in->nrows < VEXEC_BATCH_ROWS)
+	while (!s->child_done && in->nrows < in->room)
 	{
 		TupleTableSlot *slot = ExecProcNode(s->child);
 

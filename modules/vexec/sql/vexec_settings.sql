@@ -43,15 +43,29 @@ SET vexec.cpu_operator_factor = -1;
 SET vexec.compact_threshold = 1.5;
 RESET ALL;
 
+-- the rows a batch is filled with (F24, §3.38): a power of two, 1,024 to
+-- the 4,096 a batch holds
+SHOW vexec.batch_rows;
+SET vexec.batch_rows = 2048;
+SHOW vexec.batch_rows;
+SET vexec.batch_rows = 3000;
+SET vexec.batch_rows = 512;
+SET vexec.batch_rows = 8192;
+RESET vexec.batch_rows;
+
 -- the prefix is vexec's: a name it does not define is refused
 SET vexec.no_such_setting = 1;
 
--- the GPU: off by default; a server's devices are its own
+-- the GPU: off by default, and precise; a server's devices are vexec_gpu's,
+-- an extension of its own, not vexec's
 SHOW vexec.gpu;
-SHOW vexec.gpu_devices;
+SHOW vexec.precision;
 SET vexec.gpu = auto;
+SET vexec.precision = fast;
+SET vexec.gpu_chunk_rows = 100;
 RESET vexec.gpu;
-SET vexec.gpu_devices = '0';
+RESET vexec.precision;
+SHOW vexec.gpu_devices;
 SET vexec.gpu_segments = on;
 
 -- the debug settings are a superuser's

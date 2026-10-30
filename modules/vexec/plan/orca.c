@@ -184,6 +184,7 @@ orca_begin(Query *parse, int cursorOptions, struct ExplainState *es)
 	ps->layout = vexec_layout_config();
 	ps->parse = parse;
 	ps->cursor_options = cursorOptions;
+	vexec_planning_mark(ps);
 	return ps;
 }
 
@@ -1305,6 +1306,9 @@ orca_end(void *state, PlannedStmt *stmt)
 	if (ps->record)
 		stmt->extension_state = lappend(stmt->extension_state,
 										makeDefElem("vexec", vexec_reasons_node(ps), -1));
+	/* OT6: the planning's summary, for pg_otel_probe's span, in every mode */
+	stmt->extension_state = lappend(stmt->extension_state,
+									makeDefElem("vexec_summary", vexec_summary_node(ps), -1));
 	if (vexec_debug_require_vector && ps->gate_open &&
 		(ps->mode == VEXEC_MODE_AUTO || ps->mode == VEXEC_MODE_FORCE) &&
 		ps->npossible > 0 && nodes == 0)

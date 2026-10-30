@@ -126,6 +126,9 @@ SELECT g,
 		 ELSE 'short ' || g END
 FROM generate_series(1, 2600) g;
 ANALYZE corpus;
+-- batches of 1,024 rows, as before F24 (§3.38) made their rows a setting:
+-- the corpus's 2,600 rows in three batches, the batches' edges between them
+SET vexec.batch_rows = 1024;
 -- every column of three batches through every shape and back
 SELECT * FROM vexec_test.roundtrip('SELECT * FROM corpus ORDER BY id');
  col |            type             | layouts | pairs | kept | dictionaries | constants | rows | batches 
@@ -341,6 +344,22 @@ FROM unnest(ARRAY[1, 63, 64, 65, 1023, 1024, 1025, 2048, 2049]) n;
  2049 | 3 batches of 2049 rows
 (9 rows)
 
+-- and at 4,095, 4,096 and 4,097 rows: the most a batch holds, and
+-- vexec.batch_rows' default
+SET vexec.batch_rows = 4096;
+SELECT n, (SELECT string_agg(DISTINCT batches::text || ' batches of ' || rows::text || ' rows', '; ')
+           FROM vexec_test.roundtrip(format('SELECT g, g::int8 * 3, md5(g::text) FROM generate_series(1, %s) g', n)))
+FROM unnest(ARRAY[4095, 4096, 4097, 8192, 8193]) n;
+  n   |       string_agg       
+------+------------------------
+ 4095 | 1 batches of 4095 rows
+ 4096 | 1 batches of 4096 rows
+ 4097 | 2 batches of 4097 rows
+ 8192 | 2 batches of 8192 rows
+ 8193 | 3 batches of 8193 rows
+(5 rows)
+
+SET vexec.batch_rows = 1024;
 SELECT * FROM vexec_test.roundtrip('SELECT * FROM corpus WHERE false');
  col |            type             | layouts | pairs | kept | dictionaries | constants | rows | batches 
 -----+-----------------------------+---------+-------+------+--------------+-----------+------+---------

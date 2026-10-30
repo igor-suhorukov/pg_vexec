@@ -53,6 +53,7 @@ vexec_batch_begin_rows(VexecBatch *batch)
 
 	if (batch->nrows != 0)
 		elog(ERROR, "vexec batch begins its rows with %d rows in it", batch->nrows);
+	batch->room = vexec_batch_rows;
 	for (i = 0; i < batch->ncols; i++)
 	{
 		VexecVec   *v = &batch->cols[i];
@@ -60,17 +61,17 @@ vexec_batch_begin_rows(VexecBatch *batch)
 
 		vexec_type_build_shape(v->type, &shape);
 		vexec_vec_init(batch, v, &shape, 0);
-		/* room for VEXEC_BATCH_ROWS: vec_init allocated for none */
+		/* room for the batch's rows: vec_init allocated for none */
 		switch (shape.layout)
 		{
 			case VEXEC_FIXED:
-				v->values = vexec_batch_alloc0(batch, (Size) shape.stride * VEXEC_BATCH_ROWS);
+				v->values = vexec_batch_alloc0(batch, (Size) shape.stride * batch->room);
 				break;
 			case VEXEC_BYTE_BOOL:
-				v->values = vexec_batch_alloc0(batch, VEXEC_BATCH_ROWS);
+				v->values = vexec_batch_alloc0(batch, batch->room);
 				break;
 			case VEXEC_DATUM:
-				v->values = vexec_batch_alloc0(batch, sizeof(Datum) * VEXEC_BATCH_ROWS);
+				v->values = vexec_batch_alloc0(batch, sizeof(Datum) * batch->room);
 				break;
 			default:
 				elog(ERROR, "unexpected build layout %d", shape.layout);
@@ -166,7 +167,7 @@ vexec_vec_set_null(VexecBatch *batch, VexecVec *v, int row)
 	{
 		int			i;
 
-		v->validity = vexec_bitmap_alloc(batch, VEXEC_BATCH_ROWS, false);
+		v->validity = vexec_bitmap_alloc(batch, batch->filling ? batch->room : VEXEC_BATCH_ROWS, false);
 		for (i = 0; i < row / 64; i++)
 			v->validity[i] = ~UINT64CONST(0);
 		if (row % 64)
@@ -182,10 +183,10 @@ vexec_batch_add_values(VexecBatch *batch, const Datum *values, const bool *isnul
 	int			row = batch->nrows;
 	int			i;
 
-	if (row >= VEXEC_BATCH_ROWS)
-		elog(ERROR, "vexec batch is full");
 	if (!batch->filling)
 		elog(ERROR, "vexec batch takes no rows once its columns are converted, encoded or compacted");
+	if (row >= batch->room)
+		elog(ERROR, "vexec batch is full");
 
 	for (i = 0; i < batch->ncols; i++)
 	{
@@ -415,6 +416,16 @@ vexec_vec_datum(VexecBatch *batch, const VexecVec *v, int row, bool *isnull)
 					return v->datums[row];
 				vexec_vec_value_bytes(v, row, &p, &len);
 				return bytes_as_datum(batch, v->type, p, len);
+			}
+		case VEXEC_LIST:
+		case VEXEC_MAP:
+			{
+				/* PQ21 (§3.40): its source's Datum, in the batch's memory */
+				MemoryContext old = MemoryContextSwitchTo(batch->mcxt);
+				Datum		d = v->nested->datum(v->nested->owner, v->nested->column, row, isnull);
+
+				MemoryContextSwitchTo(old);
+				return d;
 			}
 	}
 	elog(ERROR, "unexpected layout %d", v->shape.layout);

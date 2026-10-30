@@ -54,6 +54,7 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
+#include "access/transam.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_proc.h"
@@ -84,6 +85,7 @@
 #include "vexec.h"
 #include "batch/batch.h"
 #include "exec/aggtrans.h"
+#include "exec/device.h"
 #include "expr/expr.h"
 #include "expr/kernel.h"
 
@@ -410,6 +412,8 @@ vexec_aggtrans_setup(AggState *aggstate, List *aggs, EState *estate, int *ntrans
 			else
 				transfn_oid = aggform->aggtransfn;
 			check_execute(transfn_oid, aggOwner);
+			t->user_combine = OidIsValid(aggform->aggcombinefn) &&
+				aggform->aggcombinefn >= FirstNormalObjectId;
 
 			textInitVal = SysCacheGetAttr(AGGFNOID, aggTuple, Anum_pg_aggregate_agginitval,
 										  &initValueIsNull);
@@ -733,6 +737,96 @@ vexec_agg_vectorized(Oid aggfnoid, AggSplit split, Oid argtype, const char **nam
 	if (name)
 		*name = t.kindname;
 	return t.kind != VEXEC_AGG_FMGR;
+}
+
+/*
+ * V8b, for the planners: whether an aggregate of this split over an
+ * argument of this type has a state the device keeps (as
+ * vexec_aggtrans_device_aggs() maps the transition the node would choose).
+ */
+bool
+vexec_agg_device_ok(Oid aggfnoid, AggSplit split, Oid argtype, int32 argtypmod, Oid collation, bool fast)
+{
+	VexecAggTrans t;
+	HeapTuple	tup;
+	Form_pg_aggregate aggform;
+	VexecDevAgg aggs[VEXEC_AGGTRANS_DEVICE_MAX];
+	int			devtype = VEXEC_DEV_NONE;
+
+	if (DO_AGGSPLIT_COMBINE(split))
+		return false;
+	memset(&t, 0, sizeof(t));
+	t.kind = VEXEC_AGG_FMGR;
+	t.kindname = "fmgr";
+	t.share = -1;
+	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	aggform = (Form_pg_aggregate) GETSTRUCT(tup);
+	choose_kind(&t, aggform->aggtransfn, aggform->aggtranstype, collation, split, argtype);
+	t.user_combine = OidIsValid(aggform->aggcombinefn) && aggform->aggcombinefn >= FirstNormalObjectId;
+	ReleaseSysCache(tup);
+	if (OidIsValid(argtype))
+	{
+		int16		scale;
+
+		devtype = vexec_dev_type_of(vexec_type_make(argtype, argtypmod, InvalidOid), &scale);
+	}
+	return t.kind != VEXEC_AGG_FMGR && vexec_aggtrans_device_aggs(&t, devtype, fast, aggs) >= 0;
+}
+
+/*
+ * W17 (§3.28), for the planners: whether an aggregate of this split over an
+ * argument of this type has its result in one device aggregate's value, as
+ * vexec_aggtrans_device_rank() has it of the transition the node would
+ * choose -- a count, an integer's sum, a minimum or maximum, bool_and or
+ * bool_or, with no final function -- so that a HAVING over it is the
+ * device's to apply to its answer's groups.
+ */
+bool
+vexec_agg_device_result(Oid aggfnoid, AggSplit split, Oid argtype, int32 argtypmod, Oid collation, bool fast)
+{
+	VexecAggTrans t;
+	HeapTuple	tup;
+	Form_pg_aggregate aggform;
+	VexecDevAgg aggs[VEXEC_AGGTRANS_DEVICE_MAX];
+	int			devtype = VEXEC_DEV_NONE;
+	bool		final;
+
+	if (DO_AGGSPLIT_COMBINE(split))
+		return false;
+	memset(&t, 0, sizeof(t));
+	t.kind = VEXEC_AGG_FMGR;
+	t.kindname = "fmgr";
+	t.share = -1;
+	tup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	aggform = (Form_pg_aggregate) GETSTRUCT(tup);
+	choose_kind(&t, aggform->aggtransfn, aggform->aggtranstype, collation, split, argtype);
+	t.user_combine = OidIsValid(aggform->aggcombinefn) && aggform->aggcombinefn >= FirstNormalObjectId;
+	final = OidIsValid(aggform->aggfinalfn);
+	ReleaseSysCache(tup);
+	if (OidIsValid(argtype))
+	{
+		int16		scale;
+
+		devtype = vexec_dev_type_of(vexec_type_make(argtype, argtypmod, InvalidOid), &scale);
+	}
+	if (t.kind == VEXEC_AGG_FMGR || vexec_aggtrans_device_aggs(&t, devtype, fast, aggs) != 1)
+		return false;
+	switch (t.kind)
+	{
+		case VEXEC_AGG_COUNT_STAR:
+		case VEXEC_AGG_COUNT:
+		case VEXEC_AGG_SUM_INT:
+		case VEXEC_AGG_MINMAX:
+		case VEXEC_AGG_MINMAX_TEXT:
+		case VEXEC_AGG_BOOL:
+			return !final;
+		default:
+			return false;
+	}
 }
 
 /*
@@ -1472,6 +1566,14 @@ batch_by_datum(VexecAggTrans *t, AggState *aggstate, VexecBatch *work, char **gr
 	}
 }
 
+void
+vexec_aggtrans_count_overflow(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			 errmsg("bigint out of range")));
+}
+
 static void
 batch_count(char **groups, Size off, char *plain, const uint64 *rows, int nrows)
 {
@@ -2048,6 +2150,18 @@ vexec_aggtrans_stats_requests(const VexecAggTrans *t, Oid argtype, AttrNumber at
 				return -1;
 			STATS_REQUEST(t->larger ? VEXEC_SRC_AGG_MAX : VEXEC_SRC_AGG_MIN, argtype);
 			break;
+		case VEXEC_AGG_MINMAX_TEXT:
+
+			/*
+			 * A text's, under C's collation, which orders it as a source's
+			 * statistics of its bytes do (§3.36, "Universal?": the planner
+			 * priced such a minimum answered, the node read every unit)
+			 */
+			if (!t->c_collation)
+				return -1;
+			STATS_REQUEST(t->larger ? VEXEC_SRC_AGG_MAX : VEXEC_SRC_AGG_MIN, argtype);
+			reqs[n - 1].collation = t->collation;
+			break;
 		case VEXEC_AGG_SUM_INT:
 			STATS_REQUEST(VEXEC_SRC_AGG_SUM, INT8OID);
 			break;
@@ -2102,6 +2216,14 @@ vexec_aggtrans_stats_apply(VexecAggTrans *t, AggState *aggstate, void *state,
 				bool		isnull = false;
 
 				vexec_aggtrans_advance(t, aggstate, state, &d, &isnull);
+			}
+			break;
+		case VEXEC_AGG_MINMAX_TEXT:
+			if (!answers[0].isnull)
+			{
+				text	   *v = DatumGetTextPP(answers[0].value);
+
+				minmax_text(t, aggstate, (MinMaxState *) state, VARDATA_ANY(v), (int) VARSIZE_ANY_EXHDR(v));
 			}
 			break;
 		case VEXEC_AGG_SUM_INT:
@@ -2476,6 +2598,44 @@ vexec_aggtrans_int64_result(const VexecAggTrans *t, AggState *aggstate, int aggn
 		offsetof(CountState, n) == 0;
 }
 
+/*
+ * W2 (§3.26): which of the transition's device aggregates -- its place among
+ * vexec_aggtrans_device_aggs()'s -- holds the aggregate's result as a final
+ * stage gives it, its NULL where the result is NULL, so that the device may
+ * rank its groups by it: a count's; sum(int2)'s and sum(int4)'s, an int8;
+ * sum(int8)'s and a scaled numeric's, a DECIMAL128 that numeric_poly_sum()
+ * and numeric_sum() make a numeric of the same order; a min's or a max's;
+ * bool_and's and bool_or's.  -1 for any other: an average's, which
+ * divides; H8's sum of x + k; a stage that hands on its states.
+ */
+int
+vexec_aggtrans_device_rank(const VexecAggTrans *t, AggState *aggstate, int aggno)
+{
+	AggStatePerAgg peragg = &aggstate->peragg[aggno];
+	Oid			finalfn = peragg->finalfn_oid;
+
+	if (DO_AGGSPLIT_SKIPFINAL(peragg->aggref->aggsplit) || t->share >= 0)
+		return -1;
+	switch (t->kind)
+	{
+		case VEXEC_AGG_COUNT_STAR:
+		case VEXEC_AGG_COUNT:
+		case VEXEC_AGG_SUM_INT:
+		case VEXEC_AGG_MINMAX:
+		case VEXEC_AGG_MINMAX_TEXT:	/* W17: its value the text, under C's collation (W12) */
+		case VEXEC_AGG_BOOL:
+		case VEXEC_AGG_COMBINE_COUNT:	/* W19: the whole stages' combining transitions */
+		case VEXEC_AGG_COMBINE_SUM_INT:
+			return OidIsValid(finalfn) ? -1 : 0;
+		case VEXEC_AGG_SUM_INT128:
+			return finalfn == F_NUMERIC_POLY_SUM ? 2 : -1;
+		case VEXEC_AGG_SUM_NUMERIC:
+			return finalfn == F_NUMERIC_SUM ? 2 : -1;
+		default:
+			return -1;
+	}
+}
+
 bool
 vexec_aggtrans_packable(const VexecAggTrans *t)
 {
@@ -2494,9 +2654,62 @@ vexec_aggtrans_packable(const VexecAggTrans *t)
 		case VEXEC_AGG_COMBINE_AVG_INT:
 		case VEXEC_AGG_COMBINE_INT128:
 			return true;
+		case VEXEC_AGG_MINMAX_TEXT:
+		case VEXEC_AGG_SUM_NUMERIC:
+			/*
+			 * F5: by its value's bytes, in a copy of its group
+			 * (vexec_aggtrans_packs_value()) -- a text's minimum or maximum,
+			 * or a numeric sum's numeric of what its int128 could not take
+			 */
+			return true;
 		default:
 			return false;
 	}
+}
+
+/*
+ * F5 (§3.28): whether a packed group holds the transition's state by a
+ * value's bytes after the group's own -- a text's minimum or maximum, or a
+ * numeric sum's numeric of what its int128 could not take, whose states hold
+ * a pointer: its group packed by a copy, never made where it is handed on
+ * and advanced there (vecagg.c's pack_group()), the value's bytes at the
+ * offset from the state that its Datum then holds.
+ */
+bool
+vexec_aggtrans_packs_value(const VexecAggTrans *t)
+{
+	return t->kind == VEXEC_AGG_MINMAX_TEXT || t->kind == VEXEC_AGG_SUM_NUMERIC;
+}
+
+/* F5: such a state's value in a group's state, or NULL where it has none */
+const varlena *
+vexec_aggtrans_state_value(const VexecAggTrans *t, const void *state)
+{
+	if (t->kind == VEXEC_AGG_SUM_NUMERIC)
+	{
+		const NumericState *s = state;
+
+		return s->overflow != (Datum) 0 ? (const varlena *) DatumGetPointer(s->overflow) : NULL;
+	}
+	Assert(t->kind == VEXEC_AGG_MINMAX_TEXT);
+	return ((const MinMaxState *) state)->any ? (const varlena *) DatumGetPointer(((const MinMaxState *) state)->value) :
+		NULL;
+}
+
+/* F5: the state of it in a packed group, its value's bytes `offset` bytes past the state */
+void
+vexec_aggtrans_state_value_at(const VexecAggTrans *t, void *state, uint32 offset)
+{
+	if (t->kind == VEXEC_AGG_SUM_NUMERIC)
+	{
+		NumericState *s = state;
+
+		Assert(s->overflow != (Datum) 0);
+		s->overflow = UInt32GetDatum(offset);
+		return;
+	}
+	Assert(t->kind == VEXEC_AGG_MINMAX_TEXT && ((MinMaxState *) state)->any);
+	((MinMaxState *) state)->value = UInt32GetDatum(offset);
 }
 
 bool
@@ -2504,6 +2717,22 @@ vexec_aggtrans_merges(const VexecAggTrans *t, const VexecAggTrans *producer)
 {
 	switch (t->kind)
 	{
+		/*
+		 * A first stage's own groups, packed and spilled by its device
+		 * strategy (§3.11): merged as the transition would have advanced
+		 * them, a sum wrapping as int4_sum's does
+		 */
+		case VEXEC_AGG_COUNT_STAR:
+		case VEXEC_AGG_COUNT:
+		case VEXEC_AGG_SUM_INT128:
+		case VEXEC_AGG_SUM_NUMERIC:
+			return producer->kind == t->kind;
+		case VEXEC_AGG_SUM_INT:
+		case VEXEC_AGG_AVG_INT:
+			return producer->kind == t->kind && producer->width == t->width;
+		case VEXEC_AGG_SUM_OFFSET:
+			return producer->kind == t->kind && producer->offset == t->offset &&
+				producer->share == t->share;
 		case VEXEC_AGG_COMBINE_COUNT:
 			return producer->kind == VEXEC_AGG_COUNT_STAR ||
 				producer->kind == VEXEC_AGG_COUNT ||
@@ -2524,6 +2753,43 @@ vexec_aggtrans_merges(const VexecAggTrans *t, const VexecAggTrans *producer)
 				producer->larger == t->larger && producer->width == t->width;
 		case VEXEC_AGG_BOOL:
 			return producer->kind == VEXEC_AGG_BOOL && producer->is_and == t->is_and;
+		case VEXEC_AGG_MINMAX_TEXT:
+			/* F5: the combine function is the transition, under the same collation */
+			return producer->kind == VEXEC_AGG_MINMAX_TEXT && producer->larger == t->larger &&
+				producer->collation == t->collation;
+		default:
+			return false;
+	}
+}
+
+/*
+ * F29 (pg_vector_executor.md §3.38): whether a producer's state, as it lies,
+ * is the state this transition would make of it merged into its initial
+ * one (vexec_aggtrans_init(), zeroes) -- the same layout, by value: a
+ * count's, a sum's, an average's, an int128 sum's, a by-value minimum's or
+ * maximum's, a bool_and's or bool_or's.  Not a numeric sum, nor a text's
+ * minimum or maximum, whose values lie after the state.
+ */
+bool
+vexec_aggtrans_state_as_is(const VexecAggTrans *t, const VexecAggTrans *producer)
+{
+	if (t->statesize != producer->statesize || t->share >= 0 || producer->share >= 0 ||
+		!vexec_aggtrans_merges(t, producer))
+		return false;
+	switch (t->kind)
+	{
+		case VEXEC_AGG_COMBINE_COUNT:
+			return producer->kind == VEXEC_AGG_COUNT_STAR || producer->kind == VEXEC_AGG_COUNT ||
+				producer->kind == VEXEC_AGG_COMBINE_COUNT;
+		case VEXEC_AGG_COMBINE_SUM_INT:
+			return producer->kind == VEXEC_AGG_SUM_INT || producer->kind == VEXEC_AGG_COMBINE_SUM_INT;
+		case VEXEC_AGG_COMBINE_AVG_INT:
+			return producer->kind == VEXEC_AGG_AVG_INT || producer->kind == VEXEC_AGG_COMBINE_AVG_INT;
+		case VEXEC_AGG_COMBINE_INT128:
+			return producer->kind == VEXEC_AGG_SUM_INT128 || producer->kind == VEXEC_AGG_COMBINE_INT128;
+		case VEXEC_AGG_MINMAX:
+		case VEXEC_AGG_BOOL:
+			return producer->kind == t->kind;
 		default:
 			return false;
 	}
@@ -2541,6 +2807,86 @@ vexec_aggtrans_merge(VexecAggTrans *t, AggState *aggstate, void *state,
 {
 	switch (t->kind)
 	{
+		case VEXEC_AGG_COUNT_STAR:
+		case VEXEC_AGG_COUNT:
+			count_add((CountState *) state, ((const CountState *) pstate)->n);
+			break;
+		case VEXEC_AGG_SUM_INT:
+			{
+				SumIntState *s = state;
+				const SumIntState *p = pstate;
+
+				if (!p->any)
+					return;
+				s->sum = s->any ? wrap_add64(s->sum, p->sum) : p->sum;
+				s->any = true;
+			}
+			break;
+		case VEXEC_AGG_AVG_INT:
+			{
+				AvgIntState *s = state;
+				const AvgIntState *p = pstate;
+
+				s->count = wrap_add64(s->count, p->count);
+				s->sum = wrap_add64(s->sum, p->sum);
+			}
+			break;
+		case VEXEC_AGG_SUM_INT128:
+			{
+				Int128State *s = state;
+				const Int128State *p = pstate;
+
+				if (!p->called)
+					return;
+				s->called = true;
+				s->n += p->n;
+				s->sum += p->sum;
+			}
+			break;
+		case VEXEC_AGG_SUM_OFFSET:
+			{
+				OffsetState *s = state;
+				const OffsetState *p = pstate;
+
+				s->sum = wrap_add64(s->sum, p->sum);
+				s->count += p->count;
+			}
+			break;
+		case VEXEC_AGG_SUM_NUMERIC:
+			{
+				/*
+				 * as numeric_avg_combine() adds two states (numeric.c): the
+				 * counts, the larger display scale and its count, the sums --
+				 * at the larger of their scales, into the int128 or its
+				 * overflow numeric -- the packed group's overflow numeric at
+				 * the offset from its state its Datum holds (F5).  TPC-H's
+				 * Q18 at SF10 spilled the device's groups of numeric sums,
+				 * which no merge took (§3.36, "Universal?")
+				 */
+				NumericState *s = state;
+				const NumericState *p = pstate;
+
+				if (!p->called)
+					return;
+				s->called = true;
+				s->nan += p->nan;
+				s->pinf += p->pinf;
+				s->ninf += p->ninf;
+				if (p->maxscale > s->maxscale)
+				{
+					s->maxscale = p->maxscale;
+					s->maxscalecount = p->maxscalecount;
+				}
+				else if (p->maxscale == s->maxscale)
+					s->maxscalecount += p->maxscalecount;
+				s->n += p->n;
+				if (p->sum != 0)
+					numeric_add_scaled(aggstate, s, p->sum, p->accscale);
+				if (p->overflow != (Datum) 0)
+					numeric_overflow_add(aggstate, s,
+										 PointerGetDatum((const char *) pstate + DatumGetUInt32(p->overflow)));
+			}
+			break;
 		case VEXEC_AGG_COMBINE_COUNT:
 			count_add((CountState *) state, ((const CountState *) pstate)->n);
 			break;
@@ -2617,7 +2963,296 @@ vexec_aggtrans_merge(VexecAggTrans *t, AggState *aggstate, void *state,
 				vexec_aggtrans_advance(t, aggstate, state, &v, &isnull);
 			}
 			break;
+		case VEXEC_AGG_MINMAX_TEXT:
+			{
+				const MinMaxState *mp = pstate;
+				const varlena *vl;
+
+				/* F5: the packed group's text, at the offset from its state that its Datum holds */
+				if (!mp->any)
+					return;
+				vl = (const varlena *) ((const char *) pstate + DatumGetUInt32(mp->value));
+				minmax_text(t, aggstate, (MinMaxState *) state, VARDATA_ANY(vl), (int) VARSIZE_ANY_EXHDR(vl));
+			}
+			break;
 		default:
 			elog(ERROR, "vexec: a %s state merged into a %s one", producer->kindname, t->kindname);
+	}
+}
+
+/* ---------------------------------------------------------------------
+ * The device strategy (§3.11, "The operators on the device", V8b)
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * The device's aggregates for a transition over an argument of the device
+ * type argtype (VEXEC_DEV_NONE for count(*)): how many, their kinds and
+ * result types into aggs -- the argument's and the filter's chunk columns
+ * are the node's to set -- or -1 where the device keeps none of this kind's
+ * state.  A state with no pointer in it alone, D2's packable kinds, so that
+ * a group the table cannot take spills as it lies.
+ *
+ *	count(*)			COUNT_ALL
+ *	count(x)			COUNT
+ *	sum(int2, int4)		SUM into INT64, wrapping as int4_sum() does
+ *	avg(int2, int4)		COUNT, and SUM into INT64
+ *	sum, avg(int8)		COUNT_ALL -- int8_avg_accum()'s state is made by the
+ *						first row the transition is called for -- COUNT,
+ *						and SUM into DECIMAL128, exact as its int128 is
+ *	min, max			MIN, MAX of the by-value type; a float's only with
+ *						fast: float8larger() keeps the newer of two values
+ *						that compare equal, a -0 and a 0, so the row order
+ *						shows in the result's bits, and the device's is not
+ *						the rows'
+ *	bool_and, bool_or	ALL, ANY over BOOL8
+ *	SUM(x + k), H8's	SUM into INT64, and COUNT
+ *	min, max of text	MIN, MAX of the STRING under C's collation, its
+ *						bytes compared (W12, §3.27): the device's answer
+ *						carries the value, made the group's state as the
+ *						group is handed up
+ *
+ * A float's sum and average stay on the CPU in both modes: float8pl()'s
+ * overflow error depends on the order the values are added in.
+ */
+int
+vexec_aggtrans_device_aggs(const VexecAggTrans *t, int argtype, bool fast, VexecDevAgg *aggs)
+{
+	memset(aggs, 0, sizeof(VexecDevAgg) * VEXEC_AGGTRANS_DEVICE_MAX);
+	for (int i = 0; i < VEXEC_AGGTRANS_DEVICE_MAX; i++)
+	{
+		aggs[i].arg = -1;
+		aggs[i].filter = -1;
+	}
+	/*
+	 * W9: an aggregate whose combine function is a user's: the device merges
+	 * its chunks' groups by its kind, where PostgreSQL's parallel plan would
+	 * call that function -- the regression suite's balk(), its combine
+	 * function's NULL -- and a whole aggregation on the device would stand in
+	 * for its parallel plan
+	 */
+	if (t->user_combine)
+		return -1;
+	switch (t->kind)
+	{
+		case VEXEC_AGG_COUNT_STAR:
+			aggs[0].kind = VEXEC_DEV_AGG_COUNT_ALL;
+			aggs[0].result = VEXEC_DEV_INT64;
+			return 1;
+		case VEXEC_AGG_COUNT:
+			if (argtype == VEXEC_DEV_NONE)
+				return -1;
+			aggs[0].kind = VEXEC_DEV_AGG_COUNT;
+			aggs[0].result = VEXEC_DEV_INT64;
+			return 1;
+		case VEXEC_AGG_SUM_INT:
+			if (argtype != VEXEC_DEV_INT16 && argtype != VEXEC_DEV_INT32)
+				return -1;
+			aggs[0].kind = VEXEC_DEV_AGG_SUM;
+			aggs[0].result = VEXEC_DEV_INT64;
+			return 1;
+		case VEXEC_AGG_AVG_INT:
+			if (argtype != VEXEC_DEV_INT16 && argtype != VEXEC_DEV_INT32)
+				return -1;
+			aggs[0].kind = VEXEC_DEV_AGG_COUNT;
+			aggs[0].result = VEXEC_DEV_INT64;
+			aggs[1].kind = VEXEC_DEV_AGG_SUM;
+			aggs[1].result = VEXEC_DEV_INT64;
+			return 2;
+		case VEXEC_AGG_SUM_INT128:
+			if (argtype != VEXEC_DEV_INT64)
+				return -1;
+			aggs[0].kind = VEXEC_DEV_AGG_COUNT_ALL;
+			aggs[0].result = VEXEC_DEV_INT64;
+			aggs[1].kind = VEXEC_DEV_AGG_COUNT;
+			aggs[1].result = VEXEC_DEV_INT64;
+			aggs[2].kind = VEXEC_DEV_AGG_SUM;
+			aggs[2].result = VEXEC_DEV_DECIMAL128;
+			return 3;
+		case VEXEC_AGG_MINMAX:
+			if ((t->cmp == VEXEC_CMP_FLOAT4 || t->cmp == VEXEC_CMP_FLOAT8) && !fast)
+				return -1;
+			if (argtype == VEXEC_DEV_NONE || argtype == VEXEC_DEV_STRING ||
+				argtype == VEXEC_DEV_BOOL8 || argtype == VEXEC_DEV_DECIMAL64 ||
+				argtype == VEXEC_DEV_DECIMAL128)
+				return -1;
+			aggs[0].kind = t->larger ? VEXEC_DEV_AGG_MAX : VEXEC_DEV_AGG_MIN;
+			aggs[0].result = argtype;
+			return 1;
+		case VEXEC_AGG_BOOL:
+			if (argtype != VEXEC_DEV_BOOL8)
+				return -1;
+			aggs[0].kind = t->is_and ? VEXEC_DEV_AGG_ALL : VEXEC_DEV_AGG_ANY;
+			aggs[0].result = VEXEC_DEV_BOOL8;
+			return 1;
+		case VEXEC_AGG_MINMAX_TEXT:
+			if (argtype != VEXEC_DEV_STRING || !t->c_collation)
+				return -1;
+			aggs[0].kind = t->larger ? VEXEC_DEV_AGG_MAX : VEXEC_DEV_AGG_MIN;
+			aggs[0].result = VEXEC_DEV_STRING;
+			return 1;
+		case VEXEC_AGG_SUM_NUMERIC:
+			/*
+			 * a scaled numeric of 18 digits or fewer: its sum, at its scale,
+			 * a DECIMAL128 no chunk's rows overflow; the state's own adds
+			 * take it, as a batch's sum
+			 */
+			if (argtype != VEXEC_DEV_DECIMAL64)
+				return -1;
+			aggs[0].kind = VEXEC_DEV_AGG_COUNT_ALL;
+			aggs[0].result = VEXEC_DEV_INT64;
+			aggs[1].kind = VEXEC_DEV_AGG_COUNT;
+			aggs[1].result = VEXEC_DEV_INT64;
+			aggs[2].kind = VEXEC_DEV_AGG_SUM;
+			aggs[2].result = VEXEC_DEV_DECIMAL128;
+			return 3;
+		case VEXEC_AGG_SUM_OFFSET:
+			if (t->share >= 0)
+				return 0;		/* it reads another transition's state */
+			if (argtype != VEXEC_DEV_INT16)
+				return -1;
+			aggs[0].kind = VEXEC_DEV_AGG_SUM;
+			aggs[0].result = VEXEC_DEV_INT64;
+			aggs[1].kind = VEXEC_DEV_AGG_COUNT;
+			aggs[1].result = VEXEC_DEV_INT64;
+			return 2;
+			/*
+			 * W19 (§3.28): a combining transition of the X1 stages' upper one, where
+			 * the device's whole grouping takes both stages with the other
+			 * aggregates beside the distinct count: the first stage's aggregates
+			 * over the scan's column, whose results merge into the combining
+			 * state as the partial states would (vexec_aggtrans_device_merge())
+			 */
+		case VEXEC_AGG_COMBINE_COUNT:
+			if (aggregate_transfn(t->aggref->aggfnoid) == F_INT8INC)
+			{
+				aggs[0].kind = VEXEC_DEV_AGG_COUNT_ALL;
+				aggs[0].result = VEXEC_DEV_INT64;
+				return 1;
+			}
+			if (argtype == VEXEC_DEV_NONE)
+				return -1;
+			aggs[0].kind = VEXEC_DEV_AGG_COUNT;
+			aggs[0].result = VEXEC_DEV_INT64;
+			return 1;
+		case VEXEC_AGG_COMBINE_SUM_INT:
+			if (argtype != VEXEC_DEV_INT16 && argtype != VEXEC_DEV_INT32)
+				return -1;
+			aggs[0].kind = VEXEC_DEV_AGG_SUM;
+			aggs[0].result = VEXEC_DEV_INT64;
+			return 1;
+		case VEXEC_AGG_COMBINE_AVG_INT:
+			if (argtype != VEXEC_DEV_INT16 && argtype != VEXEC_DEV_INT32)
+				return -1;
+			aggs[0].kind = VEXEC_DEV_AGG_COUNT;
+			aggs[0].result = VEXEC_DEV_INT64;
+			aggs[1].kind = VEXEC_DEV_AGG_SUM;
+			aggs[1].result = VEXEC_DEV_INT64;
+			return 2;
+		case VEXEC_AGG_COMBINE_INT128:
+			if (argtype != VEXEC_DEV_INT64)
+				return -1;
+			aggs[0].kind = VEXEC_DEV_AGG_COUNT_ALL;
+			aggs[0].result = VEXEC_DEV_INT64;
+			aggs[1].kind = VEXEC_DEV_AGG_COUNT;
+			aggs[1].result = VEXEC_DEV_INT64;
+			aggs[2].kind = VEXEC_DEV_AGG_SUM;
+			aggs[2].result = VEXEC_DEV_DECIMAL128;
+			return 3;
+		default:
+			return -1;
+	}
+}
+
+/*
+ * A group's device results, v[] in vexec_aggtrans_device_aggs()'s order,
+ * merged into its state as the transition would have advanced it over the
+ * group's rows: a count added, a sum wrapping as the first stage's does,
+ * a minimum compared.
+ */
+void
+vexec_aggtrans_device_merge(VexecAggTrans *t, AggState *aggstate, void *state,
+							const VexecAggDevValue *v)
+{
+	switch (t->kind)
+	{
+		case VEXEC_AGG_COUNT_STAR:
+		case VEXEC_AGG_COUNT:
+		case VEXEC_AGG_COMBINE_COUNT:	/* W19: the combining kinds' states the first stage's */
+			count_add((CountState *) state, v[0].i64);
+			break;
+		case VEXEC_AGG_SUM_INT:
+		case VEXEC_AGG_COMBINE_SUM_INT:
+			if (!v[0].isnull)
+			{
+				SumIntState *s = state;
+
+				s->sum = s->any ? wrap_add64(s->sum, v[0].i64) : v[0].i64;
+				s->any = true;
+			}
+			break;
+		case VEXEC_AGG_AVG_INT:
+		case VEXEC_AGG_COMBINE_AVG_INT:
+			{
+				AvgIntState *s = state;
+
+				s->count = wrap_add64(s->count, v[0].i64);
+				if (!v[1].isnull)
+					s->sum = wrap_add64(s->sum, v[1].i64);
+			}
+			break;
+		case VEXEC_AGG_SUM_INT128:
+		case VEXEC_AGG_COMBINE_INT128:
+			{
+				Int128State *s = state;
+
+				if (v[0].i64 > 0)
+					s->called = true;
+				if (v[1].i64 > 0 && !v[2].isnull)
+				{
+					s->n += v[1].i64;
+					s->sum += v[2].i128;
+				}
+			}
+			break;
+		case VEXEC_AGG_SUM_NUMERIC:
+			{
+				NumericState *s = state;
+
+				if (v[0].i64 > 0)
+					s->called = true;
+				if (v[1].i64 > 0 && !v[2].isnull)
+				{
+					numeric_count(s, v[2].scale, v[1].i64);
+					numeric_add_scaled(aggstate, s, v[2].i128, v[2].scale);
+				}
+			}
+			break;
+		case VEXEC_AGG_MINMAX:
+		case VEXEC_AGG_BOOL:
+			if (!v[0].isnull)
+			{
+				bool		isnull = false;
+
+				vexec_aggtrans_advance(t, aggstate, state, &v[0].d, &isnull);
+			}
+			break;
+		case VEXEC_AGG_MINMAX_TEXT:
+			/* W12: the device's value's bytes, compared and kept as the CPU's are */
+			if (!v[0].isnull)
+				minmax_text(t, aggstate, (MinMaxState *) state, v[0].bytes, v[0].len);
+			break;
+		case VEXEC_AGG_SUM_OFFSET:
+			if (t->share < 0)
+			{
+				OffsetState *s = state;
+
+				if (!v[0].isnull)
+					s->sum = wrap_add64(s->sum, v[0].i64);
+				s->count += v[1].i64;
+			}
+			break;
+		default:
+			elog(ERROR, "vexec: a device's %s state", t->kindname);
 	}
 }

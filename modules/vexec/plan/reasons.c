@@ -22,12 +22,16 @@
 
 #include <math.h>
 
+#include "mb/pg_wchar.h"
 #include "nodes/makefuncs.h"
 #include "nodes/value.h"
 #include "parser/parsetree.h"
 
 #include "vexec.h"
 #include "plan/plan.h"
+
+/* The first refusal's reason a statement's summary keeps, at most (OT6) */
+#define SUMMARY_REASON_MAX	200
 
 /*
  * A record for an alternative of a node kind over some relations, in the
@@ -72,10 +76,17 @@ vexec_alt_record(VexecPlanState *ps, const char *node, const char *target,
 	return alt;
 }
 
-/* The oracle refused it: the first reason stays, unless one was possible. */
+/*
+ * The oracle refused it: the first reason stays, unless one was possible.
+ * Counted in every mode, record or none, and the statement's first reason
+ * kept, for its summary (OT6, vexec_summary_node()).
+ */
 void
 vexec_alt_refuse(VexecPlanState *ps, VexecAlt *alt, const char *reason)
 {
+	ps->nrefused++;
+	if (ps->first_refusal == NULL && reason != NULL)
+		ps->first_refusal = MemoryContextStrdup(ps->mcxt, reason);
 	if (alt == NULL || alt->possible || alt->reason != NULL)
 		return;
 	alt->reason = MemoryContextStrdup(ps->mcxt, reason);
@@ -254,5 +265,98 @@ vexec_reasons_node(VexecPlanState *ps)
 	items = lappend(items, makeDefElem(pstrdup("alternatives"), (Node *) alts, -1));
 	if (ps->dropped > 0)
 		items = lappend(items, makeDefElem(pstrdup("dropped"), (Node *) makeInteger(ps->dropped), -1));
+	return (Node *) items;
+}
+
+/* The registry of batch sources, as the postmaster left it; NULL without one */
+static const VexecSourceRegistry *
+source_registry(void)
+{
+	VexecSourceRegistry **rv;
+
+	rv = (VexecSourceRegistry **) find_rendezvous_variable(VEXEC_SOURCE_RENDEZVOUS);
+	return (*rv != NULL && (*rv)->magic == VEXEC_SOURCE_MAGIC) ? *rv : NULL;
+}
+
+/*
+ * OT5 (pg_vector_executor.md §3.41): each source's planning figures as the
+ * statement's planning begins, where it gives them (vexec_source.h's minor
+ * 16): what grew by its end is the statement's.
+ */
+void
+vexec_planning_mark(VexecPlanState *ps)
+{
+	const VexecSourceRegistry *reg = source_registry();
+
+	ps->nmarks = 0;
+	ps->marks = NULL;
+	if (reg == NULL)
+		return;
+	for (int i = 0; i < reg->nsources; i++)
+	{
+		const VexecSourceRoutine *src = reg->sources[i];
+		VexecPlanningMark *m;
+
+		if (!VEXEC_SOURCE_HAS(src, planning_figures))
+			continue;
+		if (ps->marks == NULL)
+			ps->marks = MemoryContextAllocZero(ps->mcxt, sizeof(VexecPlanningMark) * reg->nsources);
+		m = &ps->marks[ps->nmarks++];
+		m->src = src;
+		m->n = Max(0, Min(src->planning_figures(m->figures), VEXEC_SOURCE_FIGURES_MAX));
+	}
+}
+
+/*
+ * OT6 (pg_vector_executor.md §3.41): what pg_otel_probe's span of the
+ * statement carries of its planning in every mode -- PlannedStmt's
+ * "vexec_summary", beside the record explain mode keeps -- the mode and
+ * the format it was planned in; a closed gate's reason; the alternatives the
+ * oracle accepted, built or added as paths, and those it refused, as the
+ * planner met them, with the first refusal's reason; and what the sources'
+ * planning read (OT5), the figures that grew.  Integers and strings, which
+ * copy, print and read back as the record does.
+ */
+Node *
+vexec_summary_node(VexecPlanState *ps)
+{
+	List	   *items = NIL;
+	List	   *reads = NIL;
+
+	items = lappend(items, item_string("mode", vexec_mode_name(ps->mode)));
+	items = lappend(items, item_string("format",
+									   ps->layout.format == VEXEC_FORMAT_ARROW ? "arrow" : "postgres"));
+	if (!ps->gate_open)
+		items = lappend(items, item_string("gate", ps->gate_reason));
+	items = lappend(items, makeDefElem(pstrdup("possible"), (Node *) makeInteger(ps->npossible), -1));
+	items = lappend(items, makeDefElem(pstrdup("refused"), (Node *) makeInteger(ps->nrefused), -1));
+	if (ps->first_refusal != NULL)
+		items = lappend(items, makeDefElem(pstrdup("refusal"),
+										   (Node *) makeString(pnstrdup(ps->first_refusal,
+																		pg_mbcliplen(ps->first_refusal,
+																					 strlen(ps->first_refusal),
+																					 SUMMARY_REASON_MAX))),
+										   -1));
+	for (int i = 0; i < ps->nmarks; i++)
+	{
+		const VexecPlanningMark *m = &ps->marks[i];
+		VexecSourceFigure now[VEXEC_SOURCE_FIGURES_MAX];
+		int			n = Max(0, Min(m->src->planning_figures(now), VEXEC_SOURCE_FIGURES_MAX));
+
+		for (int j = 0; j < n && j < m->n; j++)
+		{
+			int64		grew;
+
+			if (now[j].key == NULL || m->figures[j].key == NULL ||
+				strcmp(now[j].key, m->figures[j].key) != 0)
+				continue;
+			grew = now[j].value - m->figures[j].value;
+			if (grew > 0)
+				reads = lappend(reads, makeDefElem(pstrdup(now[j].key),
+												   (Node *) makeInteger((int) Min(grew, PG_INT32_MAX)), -1));
+		}
+	}
+	if (reads != NIL)
+		items = lappend(items, makeDefElem(pstrdup("planning"), (Node *) reads, -1));
 	return (Node *) items;
 }

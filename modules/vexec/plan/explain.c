@@ -314,25 +314,84 @@ count_vector_nodes(Plan *plan)
 	return n;
 }
 
+/* OT7: what the statement's vector nodes with a device strategy did */
+typedef struct DeviceSums
+{
+	bool		on_error;
+	int			device_nodes;	/* ran on the device, all or in part */
+	int			cpu_nodes;		/* a device strategy, run on the CPU: none, or
+								 * given up */
+	double		device_ms;
+	double		gpu_ms;			/* of it, the GPU's, by CUDA events (OT10) */
+} DeviceSums;
+
+static bool
+sum_device(PlanState *ps, void *context)
+{
+	DeviceSums *sums = (DeviceSums *) context;
+
+	if (ps == NULL)
+		return false;
+	if (vexec_is_vector_state(ps) && ((VexecNode *) ps)->ran)
+	{
+		VexecNodeFigures f;
+
+		vexec_node_figures((VexecNode *) ps, &f, sums->on_error);
+		if (f.device != NULL && strcmp(f.device, "none") != 0)
+			sums->device_nodes++;
+		if (f.device != NULL && (strcmp(f.device, "none") == 0 || f.device_why != NULL))
+			sums->cpu_nodes++;
+		if (f.device != NULL && f.device_ms > 0)
+			sums->device_ms += f.device_ms;
+		if (f.device != NULL && f.device_gpu_ms > 0)
+			sums->gpu_ms += f.device_gpu_ms;
+	}
+	return planstate_tree_walker(ps, sum_device, context);
+}
+
+static const char *
+gpu_name(int gpu)
+{
+	switch (gpu)
+	{
+		case VEXEC_GPU_AUTO:
+			return "auto";
+		case VEXEC_GPU_FORCE:
+			return "force";
+		default:
+			return "off";
+	}
+}
+
 /*
  * What a statement's span carries in pg_otel_probe's traces (its PLAN.md
  * §4.7.4, pg_otel_probe_api.h): the mode and the batch format it was
  * planned in, whether the gate let the vectorized planner in and why not,
- * the vector nodes its plan has, and the alternatives the planners priced
- * and did not take -- the record EXPLAIN (VEXEC) prints.  A segment's
- * fragment, a part of a plan made on the coordinator, carries no record:
- * its span has its vector nodes alone.  It reads the plan, and so is safe on
- * a failed statement's error path.
+ * and the vector nodes its plan has.  In every mode, its planning's summary
+ * (pg_vector_executor.md §3.41, OT6, plan/reasons.c): the alternatives the
+ * oracle accepted and those it refused, with the first refusal's reason, and
+ * what the sources' planning read (OT5); in explain mode, the number of
+ * alternatives the planners priced and did not take -- the record EXPLAIN
+ * (VEXEC) prints.  And what the device did (OT7): vexec.gpu, the nodes the
+ * device took, those whose device strategy ran on the CPU, and the device's
+ * time.  A segment's fragment, a part of a plan made on the coordinator,
+ * carries no record: its span has its vector nodes and its device alone.  It
+ * reads the plan and the nodes' states, and so is safe on a failed
+ * statement's error path.
  */
 static void
 vexec_statement_report(QueryDesc *queryDesc, PgOtelProbeAttrs *attrs, int when)
 {
 	PlannedStmt *pstmt = queryDesc->plannedstmt;
 	List	   *items = NIL;
+	List	   *summary = NIL;
 	ListCell   *lc;
 	int			nodes = 0;
 	const char *gate;
+	const char *refusal;
 	Node	   *dropped;
+	Node	   *n;
+	DeviceSums	sums;
 
 	if (pstmt == NULL || pstmt->commandType == CMD_UTILITY)
 		return;
@@ -342,26 +401,71 @@ vexec_statement_report(QueryDesc *queryDesc, PgOtelProbeAttrs *attrs, int when)
 
 		if (strcmp(d->defname, "vexec") == 0)
 			items = (List *) d->arg;
+		else if (strcmp(d->defname, "vexec_summary") == 0)
+			summary = (List *) d->arg;
 	}
 	nodes = count_vector_nodes(pstmt->planTree);
 	foreach(lc, pstmt->subplans)
 		nodes += count_vector_nodes(lfirst(lc));
-	if (items == NIL && nodes == 0 && vexec_mode == VEXEC_MODE_OFF)
+	if (items == NIL && summary == NIL && nodes == 0 && vexec_mode == VEXEC_MODE_OFF)
 		return;
-	/* the record is kept in explain mode; else the mode the session runs in */
-	if (items == NIL)
-		attrs->add_string(attrs, "vexec.mode", vexec_mode_name(vexec_mode));
-	if (items != NIL)
+	/* the mode and format it was planned in; else the mode the session runs in */
+	if (summary != NIL || items != NIL)
 	{
-		attrs->add_string(attrs, "vexec.mode", item_str(items, "mode"));
-		attrs->add_string(attrs, "vexec.batch_format", item_str(items, "format"));
-		gate = item_str(items, "gate");
+		List	   *planned = summary != NIL ? summary : items;
+
+		attrs->add_string(attrs, "vexec.mode", item_str(planned, "mode"));
+		attrs->add_string(attrs, "vexec.batch_format", item_str(planned, "format"));
+		gate = item_str(planned, "gate");
 		if (gate != NULL && strcmp(gate, "open") != 0)
 			attrs->add_string(attrs, "vexec.gate", gate);
+	}
+	else
+		attrs->add_string(attrs, "vexec.mode", vexec_mode_name(vexec_mode));
+	if (summary != NIL)
+	{
+		n = item(summary, "possible");
+		if (n != NULL && IsA(n, Integer))
+			attrs->add_int(attrs, "vexec.alternatives.possible", intVal(n));
+		n = item(summary, "refused");
+		if (n != NULL && IsA(n, Integer))
+			attrs->add_int(attrs, "vexec.alternatives.refused", intVal(n));
+		refusal = item_str(summary, "refusal");
+		if (refusal != NULL)
+			attrs->add_string(attrs, "vexec.refusal", refusal);
+		n = item(summary, "planning");
+		if (n != NULL && IsA(n, List))
+		{
+			foreach(lc, (List *) n)
+			{
+				DefElem    *p = lfirst_node(DefElem, lc);
+
+				if (p->arg != NULL && IsA(p->arg, Integer))
+					attrs->add_int(attrs, p->defname, intVal(p->arg));
+			}
+		}
+	}
+	if (items != NIL)
+	{
 		dropped = item(items, "dropped");
 		attrs->add_int(attrs, "vexec.alternatives_not_taken",
 					   list_length((List *) item(items, "alternatives")) +
 					   (dropped != NULL && IsA(dropped, Integer) ? intVal(dropped) : 0));
 	}
 	attrs->add_int(attrs, "vexec.vector_nodes", nodes);
+
+	/* OT7: the device, where a node had its strategy or vexec.gpu is on */
+	memset(&sums, 0, sizeof(sums));
+	sums.on_error = when == PG_OTEL_PROBE_REPORT_ABORT;
+	if (queryDesc->planstate != NULL)
+		(void) sum_device(queryDesc->planstate, &sums);
+	if (vexec_gpu != VEXEC_GPU_OFF || sums.device_nodes > 0 || sums.cpu_nodes > 0)
+		attrs->add_string(attrs, "vexec.gpu", gpu_name(vexec_gpu));
+	if (sums.device_nodes > 0 || sums.cpu_nodes > 0)
+	{
+		attrs->add_int(attrs, "vexec.device_nodes", sums.device_nodes);
+		attrs->add_int(attrs, "vexec.device_nodes_cpu", sums.cpu_nodes);
+		attrs->add_double(attrs, "vexec.device.ms", sums.device_ms);
+		attrs->add_double(attrs, "vexec.device.gpu_ms", sums.gpu_ms);
+	}
 }

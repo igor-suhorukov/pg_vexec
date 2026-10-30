@@ -12,8 +12,9 @@
 #     the port's storage modules compile against in pg19/include (V1), and
 #     its batch-sink contract, include/vexec_sink.h, the same way (VI);
 #   - pg_otel_probe's API, pg_otel_probe_api.h, whose copy in the port's
-#     pg19/include vexec's (in pgxs/include, above) and vexec_flight's
-#     (modules/vexec_flight/src) equal;
+#     pg19/include vexec's (in pgxs/include, above), vexec_flight's
+#     (modules/vexec_flight/src) and vexec_parquet's (its src/)
+#     equal -- the modules' vexec's without the port too;
 #   - the two contracts' copies in ch_table_engines' include/vexec, which
 #     its source and sink compile against (ch_table_engines.md §3, VC10),
 #     where its tree is: CHTE_SRC, pg_ch_table_engines beside this checkout.
@@ -34,6 +35,14 @@ COPIES="$ROOT/modules/vexec/pgxs/include"
 
 CHTE_SRC="${CHTE_SRC:-$(cd "$ROOT/.." && pwd)/pg_ch_table_engines}"
 fail=0
+
+# the modules' copies of pg_otel_probe's API, vexec's own, here
+for module in vexec_flight vexec_parquet; do
+	if ! cmp -s "$ROOT/modules/$module/src/pg_otel_probe_api.h" "$COPIES/pg_otel_probe_api.h"; then
+		echo "  DIFFERS pg_otel_probe_api.h: refresh modules/$module/src's copy from modules/vexec/pgxs/include's"
+		fail=1
+	fi
+done
 
 # ch_table_engines' copies of the contracts
 if [ -d "$CHTE_SRC/include/vexec" ]; then
@@ -64,12 +73,14 @@ for copy in "$COPIES"/*.h; do
 	fi
 done
 if [ -f "$CB_SRC/pg19/include/pg_otel_probe_api.h" ]; then
-	if cmp -s "$ROOT/modules/vexec_flight/src/pg_otel_probe_api.h" "$CB_SRC/pg19/include/pg_otel_probe_api.h"; then
-		echo "  ok pg_otel_probe_api.h, vexec_flight's copy"
-	else
-		echo "  DIFFERS pg_otel_probe_api.h: refresh modules/vexec_flight/src's copy from pg19/include/pg_otel_probe_api.h"
-		fail=1
-	fi
+	for module in vexec_flight vexec_parquet; do
+		if cmp -s "$ROOT/modules/$module/src/pg_otel_probe_api.h" "$CB_SRC/pg19/include/pg_otel_probe_api.h"; then
+			echo "  ok pg_otel_probe_api.h, $module's copy"
+		else
+			echo "  DIFFERS pg_otel_probe_api.h: refresh modules/$module/src's copy from pg19/include/pg_otel_probe_api.h"
+			fail=1
+		fi
+	done
 fi
 for contract in vexec_source.h vexec_sink.h; do
 	[ -f "$CB_SRC/pg19/include/$contract" ] || continue

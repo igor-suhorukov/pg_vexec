@@ -1,0 +1,98 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1u s2u s1c s2s s2c
+step s1u: UPDATE accounts SET balance = balance + 10 WHERE id = 1;
+step s2u: UPDATE accounts SET balance = balance * 2 WHERE id = 1 RETURNING balance; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+balance
+-------
+    220
+(1 row)
+
+step s2s: SELECT * FROM accounts ORDER BY id;
+id|balance
+--+-------
+ 1|    220
+ 2|    200
+(2 rows)
+
+step s2c: COMMIT;
+
+starting permutation: s1u s2u s1a s2s s2c
+step s1u: UPDATE accounts SET balance = balance + 10 WHERE id = 1;
+step s2u: UPDATE accounts SET balance = balance * 2 WHERE id = 1 RETURNING balance; <waiting ...>
+step s1a: ROLLBACK;
+step s2u: <... completed>
+balance
+-------
+    200
+(1 row)
+
+step s2s: SELECT * FROM accounts ORDER BY id;
+id|balance
+--+-------
+ 1|    200
+ 2|    200
+(2 rows)
+
+step s2c: COMMIT;
+
+starting permutation: s1d s2u s1c s2s s2c
+step s1d: DELETE FROM accounts WHERE id = 1;
+step s2u: UPDATE accounts SET balance = balance * 2 WHERE id = 1 RETURNING balance; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+balance
+-------
+(0 rows)
+
+step s2s: SELECT * FROM accounts ORDER BY id;
+id|balance
+--+-------
+ 2|    200
+(1 row)
+
+step s2c: COMMIT;
+
+starting permutation: s2rr s2s s1u s1c s2u s2c
+step s2rr: SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+step s2s: SELECT * FROM accounts ORDER BY id;
+id|balance
+--+-------
+ 1|    100
+ 2|    200
+(2 rows)
+
+step s1u: UPDATE accounts SET balance = balance + 10 WHERE id = 1;
+step s1c: COMMIT;
+step s2u: UPDATE accounts SET balance = balance * 2 WHERE id = 1 RETURNING balance;
+ERROR:  could not serialize access due to concurrent update
+step s2c: COMMIT;
+
+starting permutation: s2rr s2s s1u s2u s1a s2s s2c
+step s2rr: SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+step s2s: SELECT * FROM accounts ORDER BY id;
+id|balance
+--+-------
+ 1|    100
+ 2|    200
+(2 rows)
+
+step s1u: UPDATE accounts SET balance = balance + 10 WHERE id = 1;
+step s2u: UPDATE accounts SET balance = balance * 2 WHERE id = 1 RETURNING balance; <waiting ...>
+step s1a: ROLLBACK;
+step s2u: <... completed>
+balance
+-------
+    200
+(1 row)
+
+step s2s: SELECT * FROM accounts ORDER BY id;
+id|balance
+--+-------
+ 1|    200
+ 2|    200
+(2 rows)
+
+step s2c: COMMIT;

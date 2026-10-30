@@ -11,6 +11,10 @@
 
 \i sql/vexec_corpus_setup.sql
 
+-- batches of 1,024 rows, as before F24 (§3.38) made their rows a setting:
+-- the corpus's 2,600 rows in three batches, the batches' edges between them
+SET vexec.batch_rows = 1024;
+
 -- columns of each kind of Arrow type, of the rows whose values Arrow holds
 -- (vexec_egress's), sent and read back
 CREATE TEMP VIEW ing_corpus AS

@@ -84,6 +84,14 @@ typedef struct VexecKernelDef
 	 * the row-by-row variant runs.
 	 */
 	bool		(*variant) (VexecKernelCall *kc, VexecVec **args, VexecVariant *v);
+
+	/*
+	 * PQ21 (§3.40): the argument it reads of a nested layout as the source
+	 * handed it -- nested_arg, of the layout nested_layout -- where it is
+	 * one; 0 layout: none, every argument made a Datum first (eval.c)
+	 */
+	int			nested_arg;
+	uint8		nested_layout;
 } VexecKernelDef;
 
 /* An entry of the binding table. */
@@ -126,7 +134,35 @@ extern void vexec_kernels_arith(void (*add) (Oid, const VexecKernelDef *, const 
 extern void vexec_kernels_text(void (*add) (Oid, const VexecKernelDef *, const void *));
 extern void vexec_kernels_numeric(void (*add) (Oid, const VexecKernelDef *, const void *));
 extern void vexec_kernels_datetime(void (*add) (Oid, const VexecKernelDef *, const void *));
+/* W43 (pg_vector_executor.md §3.35): whether the session's time zone is UTC's fixed offset (k_datetime.c) */
+extern bool vexec_session_utc(void);
 extern void vexec_kernels_regex(void (*add) (Oid, const VexecKernelDef *, const void *));
+
+/*
+ * k_nested.c (PQ21, §3.40): kernels over the nested layouts -- cardinality()
+ * of a list, x = ANY of a list column, and hstore's ->, ? and ?| of a map,
+ * hstore's functions bound by name as the kernel packs bind theirs
+ * (packs.c, vexec_extension_kernel_find())
+ */
+extern void vexec_kernels_nested(void (*add) (Oid, const VexecKernelDef *, const void *));
+extern const VexecKernelEntry *vexec_any_list_kernel(Oid opfuncid, Oid scalar_type, Oid array_type,
+													 Oid collation);
+
+typedef struct VexecExtensionKernel
+{
+	const char *extension;
+	const char *const *versions;	/* NULL-terminated */
+	const char *name;
+	int			nargs;
+	const char *argtypes[VEXEC_KERNEL_MAXARGS]; /* pg_type.typname */
+	const char *symbol;			/* prosrc */
+	const char *library;		/* probin */
+	const VexecKernelDef *def;
+	const void *info;
+} VexecExtensionKernel;
+
+extern const VexecExtensionKernel *vexec_extension_kernels(int *n);
+extern const VexecKernelEntry *vexec_extension_kernel_find(Oid funcid);
 
 /*
  * k_text.c: a varlena argument whose active values can be read as bytes,
@@ -139,6 +175,13 @@ extern VexecVec *vexec_text_plain(VexecKernelCall *kc, VexecVec *v);
  * encoding's whole, checked at once, and whether every byte is ASCII
  */
 extern bool vexec_text_batch_whole(const VexecVec *s, int nrows, int encoding, bool *ascii);
+
+/*
+ * k_regex.c, W17 (§3.28): regexp_replace()'s constant pattern and replacement as
+ * the device's matcher takes them (vexec_device_format.h, VexecDevRegex), palloc'd,
+ * or NULL where the pattern is not of H10's class
+ */
+extern char *vexec_regex_device_program(Datum pattern, Datum replacement, Size *len);
 
 /* Iterating a bitmap's set bits, a word at a time. */
 #define VEXEC_FOREACH_ROW(bits, nrows, i) \

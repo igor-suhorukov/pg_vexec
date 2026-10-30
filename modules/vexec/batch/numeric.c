@@ -36,6 +36,7 @@
 #include "postgres.h"
 
 #include "access/detoast.h"
+#include "common/hashfn.h"
 #include "utils/numeric.h"
 #include "varatt.h"
 
@@ -459,4 +460,118 @@ vexec_scaled_to_numeric(VexecBatch *batch, int128 value, int scale)
 		memcpy(p + VARHDRSZ + 2 * sizeof(uint16), digits + first, ndigits * sizeof(int16));
 	}
 	return PointerGetDatum(p);
+}
+
+/*
+ * F10 (pg_vector_executor.md §3.31): an int64 at a scale as the digits
+ * vexec_scaled_to_numeric() makes of it -- base-NBASE digits aligned on the
+ * decimal point, leading and trailing zeros stripped, the first of weight
+ * *weight -- their count, 0 for zero, and its sign.  At a scale of 18 at
+ * most, an int64's, in 64-bit arithmetic: an int64 has five base-NBASE
+ * digits at most in its integer part, and five in its fraction.
+ */
+static int
+scaled_digits(int64 value, int scale, int16 *digits, int *weight, bool *neg)
+{
+	uint64		u = value < 0 ? (uint64) -(value + 1) + 1 : (uint64) value;
+	uint64		ip = u / (uint64) pow10_128[scale];
+	uint64		fp = u % (uint64) pow10_128[scale];
+	int			nfrac = (scale + DEC_DIGITS - 1) / DEC_DIGITS;
+	int			pad = nfrac * DEC_DIGITS - scale;
+	int16		rev[5];
+	int			nint = 0;
+	int			n = 0;
+	int			first;
+	int			k;
+
+	Assert(scale >= 0 && scale <= 18);
+	*neg = value < 0;
+	for (; ip != 0; ip /= NBASE)
+		rev[nint++] = (int16) (ip % NBASE);
+	while (n < nint)
+	{
+		digits[n] = rev[nint - 1 - n];
+		n++;
+	}
+	/* the fraction's, the last padded with zeros on its right */
+	for (k = nfrac - 1; k >= 0; k--)
+	{
+		int			take = k == nfrac - 1 ? DEC_DIGITS - pad : DEC_DIGITS;
+
+		digits[n + k] = (int16) (fp % (uint64) pow10_128[take] *
+								 (uint64) pow10_128[k == nfrac - 1 ? pad : 0]);
+		fp /= (uint64) pow10_128[take];
+	}
+	n += nfrac;
+	*weight = nint - 1;
+	first = 0;
+	while (first < n && digits[first] == 0)
+	{
+		first++;
+		(*weight)--;
+	}
+	while (n > first && digits[n - 1] == 0)
+		n--;
+	if (first > 0)
+		memmove(digits, digits + first, (n - first) * sizeof(int16));
+	return n - first;
+}
+
+/*
+ * F10: hash_numeric()'s hash of an int64 at a scale, its numeric not made:
+ * the hash of its digits, stripped of zeros, xor their weight; zero's -1
+ * (numeric.c's hash_numeric(), which hashes neither scale nor sign).
+ */
+uint32
+vexec_scaled_hash_numeric(int64 value, int scale)
+{
+	int16		digits[10];
+	int			weight;
+	bool		neg;
+	int			n = scaled_digits(value, scale, digits, &weight, &neg);
+
+	if (n == 0)
+		return (uint32) -1;
+	return hash_bytes((const unsigned char *) digits, n * (int) sizeof(int16)) ^ (uint32) weight;
+}
+
+/*
+ * F10: whether a numeric Datum equals an int64 at a scale as numeric_eq()
+ * judges -- by their values, whatever their display scales: their digits
+ * stripped of zeros, their weights and signs the same; NaN and the
+ * infinities equal no such integer.
+ */
+bool
+vexec_scaled_numeric_eq(int64 value, int scale, Datum num)
+{
+	VexecNumericParts parts;
+	int16		digits[10];
+	int			weight;
+	bool		neg;
+	int			n = scaled_digits(value, scale, digits, &weight, &neg);
+	int			first = 0;
+	int			last;
+	int16		d;
+
+	if (!vexec_numeric_parts(num, &parts))
+		return false;
+	for (; first < parts.ndigits; first++)
+	{
+		memcpy(&d, parts.digits + first * sizeof(int16), sizeof(int16));
+		if (d != 0)
+			break;
+		parts.weight--;
+	}
+	for (last = parts.ndigits; last > first; last--)
+	{
+		memcpy(&d, parts.digits + (last - 1) * sizeof(int16), sizeof(int16));
+		if (d != 0)
+			break;
+	}
+	if (last - first != n)
+		return false;
+	if (n == 0)
+		return true;			/* both zero */
+	return parts.weight == weight && (parts.sign == N_NEG) == neg &&
+		memcmp(parts.digits + first * sizeof(int16), digits, n * sizeof(int16)) == 0;
 }

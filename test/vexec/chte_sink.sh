@@ -20,7 +20,15 @@
 #   - every answer that of a heap table loaded alike, with
 #     ch.enable_sink_columns and ch.enable_memory_parts on and off; no
 #     tmp_insert_ directory left in the data directory, nor made where the
-#     pages store's parts go into memory.
+#     pages store's parts go into memory;
+#   - F5 (pg_vector_executor.md §3.28): a part's text vouched for to vexec
+#     (ch.parts.text_checked) where the extension found each value the
+#     encoding's whole as it wrote the part -- rows, a sink's batches, rows
+#     of a sink's into a table of its own files -- and a merge of such parts
+#     alone; one holding values the encoding does not take whole
+#     (vexec_test.text_of_bytes()), and rows of PostgreSQL's copied from it,
+#     not, and their length(), regexp_replace(), = and min() PostgreSQL's,
+#     in each store and in a table of its own files.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/lib.sh"
@@ -74,7 +82,9 @@ for store in pages files; do
 		sql "$set SET ch.insert_buffer_rows = 7000; INSERT INTO $t SELECT * FROM src;" > /dev/null
 		sql "INSERT INTO ${t}_h SELECT * FROM src;" > /dev/null
 		check "$t: 40000 rows, parts every 7000" "$(rows $t)" "$(rows ${t}_h)"
-		check "$t: its parts" "$(sql "SELECT count(*) > 5 FROM ch.parts(('$t')::regclass)" 2>&1)" "t"
+		# a part where the buffer passed 7,000 rows, at a batch's end: 6 of 1,024-row batches' 7,168,
+		# 5 of 4,096-row batches' 8,192 (vexec.batch_rows, pg_vector_executor.md §3.38's F24)
+		check "$t: its parts" "$(sql "SELECT count(*) >= 5 FROM ch.parts(('$t')::regclass)" 2>&1)" "t"
 
 		# rows of tuple_insert and of the sink in one transaction, a scan between
 		sql "BEGIN; SET LOCAL vexec.mode = off; INSERT INTO $t VALUES (-1, -1, 'row', 1, 1, NULL);
@@ -118,6 +128,56 @@ for store in pages files; do
 	check "$t: a sign out of range" "$(err "SET vexec.mode = force; INSERT INTO $t SELECT k, a, 300 FROM src WHERE k < 5")" \
 		"ERROR:  sign value 300 is out of range"
 done
+
+# F5: the parts' text vouched for or not, as found as it was written; the unvouched checked
+out=$(sql "SET client_min_messages = warning; CREATE EXTENSION IF NOT EXISTS vexec_test;
+	CREATE TABLE bad_h (id int, v text);
+	INSERT INTO bad_h VALUES (1, 'café'), (2, 'caf' || vexec_test.text_of_bytes('\\xc3')),
+		(3, 'café' || vexec_test.text_of_bytes('\\x00') || 'dcba'), (4, vexec_test.text_of_bytes('\\xff') || 'caf'),
+		(5, 'caf' || vexec_test.text_of_bytes('\\xe282')), (6, 'http://ünï.cödé/päth'), (7, '');")
+case "$out" in *ERROR*) echo "F5 setup: $out"; fail=1 ;; esac
+answers() {						# answers <table>: each bad row's length(), regexp_replace() and =, alone, and min()
+	local out="" id
+	for id in 1 2 3 4 5 6 7; do
+		out="$out$id: $(sql "SET vexec.batch_varlena_layout = offsets;
+			SELECT length(v), vexec_test.raw(regexp_replace(v, '^caf(.)\$', '\\1')), v = 'café' FROM $1 WHERE id = $id" 2>&1 |
+			sed 's/^ERROR: *//'); "
+	done
+	echo "$out$(sql "SELECT vexec_test.raw(min(v)), count(*) FROM $1" 2>&1)"
+}
+checked() {						# checked <table>: its parts' text_checked, in their names' order
+	sql "SELECT string_agg(p.text_checked::text, ',' ORDER BY p.name) FROM ch.parts p
+		JOIN pg_class c ON c.relfilenode = p.relfilenumber WHERE c.relname = '$1'"
+}
+for t in t_pages t_files t_own; do
+	case $t in
+		t_pages) using="USING mergetree WITH (order_by = 'id', storage = 'pages')" ;;
+		t_files) using="USING mergetree WITH (order_by = 'id', storage = 'files')" ;;
+		t_own) using="USING parquet" ;;
+	esac
+	echo "== F5, $t"
+	sql "SET client_min_messages = warning; CREATE TABLE $t (id int, v text) $using;
+		SET vexec.mode = off; INSERT INTO $t SELECT g + 100, 'café ' || g FROM generate_series(1, 50) g;" > /dev/null
+	check "$t: rows, each value whole, vouched for" "$(checked $t)" "true"
+	sql "SET vexec.mode = force; INSERT INTO $t SELECT g + 200, 'naïve ' || g FROM generate_series(1, 50) g;" > /dev/null
+	check "$t: the sink's batches, each value whole, vouched for" "$(checked $t)" "true,true"
+	sql "SET vexec.mode = force; INSERT INTO $t SELECT * FROM bad_h;" > /dev/null
+	check "$t: the sink's batch of values not whole, not" "$(checked $t)" "true,true,false"
+	want=$(PGOPTIONS="-c vexec.mode=off" answers $t)
+	check "$t: answers over it, as PostgreSQL's" "$(PGOPTIONS="-c vexec.mode=force" answers $t)" "$want"
+	sql "SELECT ch.optimize('$t', true)" > /dev/null
+	check "$t: merged with it, not" "$(checked $t)" "false"
+	check "$t: answers after the merge, as PostgreSQL's" "$(PGOPTIONS="-c vexec.mode=force" answers $t)" "$want"
+	sql "SET client_min_messages = warning; CREATE TABLE ${t}_c (id int, v text) $using;
+		SET vexec.mode = off; INSERT INTO ${t}_c SELECT * FROM $t;" > /dev/null
+	check "${t}_c: its rows copied as PostgreSQL's, not" "$(checked ${t}_c)" "false"
+	check "${t}_c: answers over them, as PostgreSQL's" "$(PGOPTIONS="-c vexec.mode=force" answers ${t}_c)" "$want"
+done
+sql "SET client_min_messages = warning; CREATE TABLE t_ok (id int, v text) USING mergetree WITH (order_by = 'id');
+	INSERT INTO t_ok SELECT g, 'é' || g FROM generate_series(1, 50) g;
+	INSERT INTO t_ok SELECT g + 50, 'ü' || g FROM generate_series(1, 50) g;" > /dev/null
+sql "SELECT ch.optimize('t_ok', true)" > /dev/null
+check "t_ok: a merge of vouched parts, vouched for" "$(checked t_ok)" "true"
 
 echo
 if grep -qE "TRAP:|PANIC|terminated by signal" "$D/log"; then

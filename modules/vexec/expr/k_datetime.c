@@ -15,11 +15,20 @@
  *	extract(f, timestamp)	timestamp_part_common()'s (timestamp.c): an
  *						integer, or for second, millisecond and epoch the
  *						microseconds at scale 6, 3 and 6, as
- *						int64_div_fast_to_numeric() makes them
+ *						int64_div_fast_to_numeric() makes them; hour to
+ *						microsecond from the time of day alone, the
+ *						calendar's fields by timestamp2tm()
  *	date_part(f, timestamp)	the same fields as float8, in the same
  *						expressions as timestamp_part_common()
  *	date_trunc(f, timestamp)	for a day and less: the timestamp less its
  *						remainder, as timestamp_trunc() zeroes the fields
+ *	to_timestamp(float8)	float8_timestamptz() (timestamp.c): a NaN or
+ *						seconds past the range marked, an infinity the
+ *						timestamp's (W43, pg_vector_executor.md §3.35)
+ *	extract(f, timestamptz), date_trunc(f, timestamptz)	under a session
+ *						time zone of UTC's fixed offset alone -- the
+ *						timestamp's own, its local time its UTC time --
+ *						bound so as the call is (W43)
  *
  * The field is a constant, decoded when the call is bound with
  * DecodeUnits() and DecodeSpecial(), as those functions decode it; a field
@@ -46,6 +55,7 @@
 #include "utils/float.h"
 #include "utils/fmgroids.h"
 #include "utils/timestamp.h"
+#include "pgtime.h"
 #include "varatt.h"
 
 #include "vexec.h"
@@ -58,13 +68,28 @@ typedef enum DtKind
 	DT_EXTRACT_DATE,
 	DT_EXTRACT_TS,
 	DT_DATE_PART_TS,
-	DT_TRUNC_TS
+	DT_TRUNC_TS,
+	DT_FLOAT8_TO_TS				/* W43 */
 } DtKind;
 
 typedef struct DtInfo
 {
 	uint8		kind;
+	bool		utc;			/* W43: a timestamptz's, bound under UTC alone */
 } DtInfo;
+
+/*
+ * W43 (pg_vector_executor.md §3.35): whether the session's time zone is
+ * UTC's -- a fixed offset of none, no daylight saving -- under which a
+ * timestamptz's fields and truncation are its UTC time's, a timestamp's
+ */
+bool
+vexec_session_utc(void)
+{
+	long		gmtoff;
+
+	return session_timezone != NULL && pg_get_timezone_offset(session_timezone, &gmtoff) && gmtoff == 0;
+}
 
 /* A call of extract or date_part: its field, decoded. */
 typedef struct DtField
@@ -122,6 +147,44 @@ date_to_ts(VexecKernelCall *kc)
 
 		out[i] = date2timestamp_safe(d, (Node *) &escontext);
 		if (escontext.error_occurred)
+			vexec_fail(kc, i);
+	}
+}
+
+/* W43: to_timestamp(float8) as float8_timestamptz() makes it, its errors' rows marked */
+static void
+float8_to_ts(VexecKernelCall *kc)
+{
+	const VexecVec *v = kc->args[0];
+	TimestampTz *out = kc->result->values;
+
+	VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+	{
+		float8		s = ((const float8 *) v->values)[vexec_arg_row(v, i)];
+
+		if (isnan(s))
+		{
+			vexec_fail(kc, i);
+			continue;
+		}
+		if (isinf(s))
+		{
+			if (s < 0)
+				TIMESTAMP_NOBEGIN(out[i]);
+			else
+				TIMESTAMP_NOEND(out[i]);
+			continue;
+		}
+		if (s < (float8) SECS_PER_DAY * (DATETIME_MIN_JULIAN - UNIX_EPOCH_JDATE) ||
+			s >= (float8) SECS_PER_DAY * (TIMESTAMP_END_JULIAN - UNIX_EPOCH_JDATE))
+		{
+			vexec_fail(kc, i);
+			continue;
+		}
+		s -= ((POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY);
+		s = rint(s * USECS_PER_SEC);
+		out[i] = (TimestampTz) s;
+		if (!IS_VALID_TIMESTAMP(out[i]))
 			vexec_fail(kc, i);
 	}
 }
@@ -289,46 +352,73 @@ extract_ts(VexecKernelCall *kc)
 			else
 				ir = t - epoch;
 		}
+		else if (f->val == DTK_MICROSEC || f->val == DTK_MILLISEC || f->val == DTK_SECOND ||
+				 f->val == DTK_MINUTE || f->val == DTK_HOUR)
+		{
+			/*
+			 * F10 (§3.31): a field within the day from the time of day, as
+			 * timestamp2tm() takes it -- the remainder modulo a day, taken
+			 * upward -- and dt2time() splits it; a timestamp whose day it
+			 * refuses, PostgreSQL's evaluator
+			 */
+			int64		tod = t % USECS_PER_DAY;
+			int64		day = t / USECS_PER_DAY;
+			int64		sec;
+			int64		us;
+
+			if (tod < 0)
+			{
+				tod += USECS_PER_DAY;
+				day -= 1;
+			}
+			day += POSTGRES_EPOCH_JDATE;
+			if (day < 0 || day > (int64) PG_INT32_MAX)
+			{
+				vexec_fail(kc, i);	/* "timestamp out of range" */
+				continue;
+			}
+			sec = tod % USECS_PER_MINUTE / USECS_PER_SEC;
+			us = tod % USECS_PER_SEC;
+			switch (f->val)
+			{
+				case DTK_HOUR:
+					ir = tod / USECS_PER_HOUR;
+					break;
+				case DTK_MINUTE:
+					ir = tod % USECS_PER_HOUR / USECS_PER_MINUTE;
+					break;
+				case DTK_MILLISEC:
+					if (as_float)
+					{
+						fr = sec * 1000.0 + us / 1000.0;
+						have_float = true;
+					}
+					else
+						ir = tod % USECS_PER_MINUTE;
+					break;
+				case DTK_SECOND:
+					if (as_float)
+					{
+						fr = sec + us / 1000000.0;
+						have_float = true;
+					}
+					else
+						ir = tod % USECS_PER_MINUTE;
+					break;
+				default:		/* DTK_MICROSEC */
+					ir = tod % USECS_PER_MINUTE;
+					break;
+			}
+		}
 		else
 		{
+			/* the calendar's fields */
 			if (timestamp2tm(t, NULL, &tt, &fsec, NULL, NULL) != 0)
 			{
 				vexec_fail(kc, i);	/* "timestamp out of range" */
 				continue;
 			}
-			switch (f->val)
-			{
-				case DTK_MICROSEC:
-					ir = tt.tm_sec * INT64CONST(1000000) + fsec;
-					break;
-				case DTK_MILLISEC:
-					if (as_float)
-					{
-						fr = tt.tm_sec * 1000.0 + fsec / 1000.0;
-						have_float = true;
-					}
-					else
-						ir = tt.tm_sec * INT64CONST(1000000) + fsec;
-					break;
-				case DTK_SECOND:
-					if (as_float)
-					{
-						fr = tt.tm_sec + fsec / 1000000.0;
-						have_float = true;
-					}
-					else
-						ir = tt.tm_sec * INT64CONST(1000000) + fsec;
-					break;
-				case DTK_MINUTE:
-					ir = tt.tm_min;
-					break;
-				case DTK_HOUR:
-					ir = tt.tm_hour;
-					break;
-				default:
-					ir = year_field(f->val, tt.tm_year, tt.tm_mon, tt.tm_mday);
-					break;
-			}
+			ir = year_field(f->val, tt.tm_year, tt.tm_mon, tt.tm_mday);
 		}
 		if (as_float)
 			((float8 *) kc->result->values)[i] = have_float ? fr : (float8) ir;
@@ -356,6 +446,8 @@ field_bind(VexecExpr *call, const void *info)
 	if (call->kind != VE_CALL || !IsA(call->expr, FuncExpr) || list_length(args) != 2)
 		return false;
 	if (!IsA(linitial(args), Const) || ((Const *) linitial(args))->constisnull)
+		return false;
+	if (di->utc && !vexec_session_utc())
 		return false;
 	c = linitial_node(Const, args);
 	units = DatumGetTextPP(c->constvalue);
@@ -436,6 +528,11 @@ dt_variant(VexecKernelCall *kc, VexecVec **args, VexecVariant *v)
 			v->result.width = v->result.stride = 4;
 			v->fn = ts_to_date;
 			return true;
+		case DT_FLOAT8_TO_TS:
+			v->result.layout = VEXEC_FIXED;
+			v->result.width = v->result.stride = 8;
+			v->fn = float8_to_ts;
+			return true;
 		case DT_EXTRACT_DATE:
 		case DT_EXTRACT_TS:
 			pg_epoch(kc, &args[1]);
@@ -509,6 +606,8 @@ trunc_bind(VexecExpr *call, const void *info)
 		return false;
 	if (!IsA(linitial(args), Const) || ((Const *) linitial(args))->constisnull)
 		return false;
+	if (((const DtInfo *) info)->utc && !vexec_session_utc())
+		return false;
 	c = linitial_node(Const, args);
 	units = DatumGetTextPP(c->constvalue);
 	lowunits = downcase_truncate_identifier(VARDATA_ANY(units), VARSIZE_ANY_EXHDR(units), false);
@@ -562,6 +661,9 @@ static const DtInfo info_extract_date = {DT_EXTRACT_DATE};
 static const DtInfo info_extract_ts = {DT_EXTRACT_TS};
 static const DtInfo info_date_part_ts = {DT_DATE_PART_TS};
 static const DtInfo info_trunc_ts = {DT_TRUNC_TS};
+static const DtInfo info_float8_to_ts = {DT_FLOAT8_TO_TS};
+static const DtInfo info_extract_tstz = {DT_EXTRACT_TS, true};
+static const DtInfo info_trunc_tstz = {DT_TRUNC_TS, true};
 
 void
 vexec_kernels_datetime(void (*add) (Oid, const VexecKernelDef *, const void *))
@@ -572,4 +674,8 @@ vexec_kernels_datetime(void (*add) (Oid, const VexecKernelDef *, const void *))
 	add(F_EXTRACT_TEXT_TIMESTAMP, &dt_field_def, &info_extract_ts);
 	add(F_DATE_PART_TEXT_TIMESTAMP, &dt_field_def, &info_date_part_ts);
 	add(F_DATE_TRUNC_TEXT_TIMESTAMP, &dt_trunc_def, &info_trunc_ts);
+	/* W43 (§3.35) */
+	add(F_TO_TIMESTAMP_FLOAT8, &dt_cast_def, &info_float8_to_ts);
+	add(F_EXTRACT_TEXT_TIMESTAMPTZ, &dt_field_def, &info_extract_tstz);
+	add(F_DATE_TRUNC_TEXT_TIMESTAMPTZ, &dt_trunc_def, &info_trunc_tstz);
 }

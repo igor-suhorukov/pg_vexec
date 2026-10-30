@@ -26,6 +26,8 @@
 #include "nodes/plannodes.h"
 #include "utils/relcache.h"
 
+#include "vexec_source.h"
+
 #include "vexec.h"
 #include "batch/batch.h"
 
@@ -80,6 +82,18 @@ typedef struct VexecAlt
 	VexecCost	cost;
 } VexecAlt;
 
+/*
+ * A source's planning figures as a statement's planning began
+ * (pg_vector_executor.md §3.41, OT5): what grew by its end is the
+ * statement's (reasons.c, vexec_summary_node()).
+ */
+typedef struct VexecPlanningMark
+{
+	const VexecSourceRoutine *src;
+	int			n;
+	VexecSourceFigure figures[VEXEC_SOURCE_FIGURES_MAX];
+} VexecPlanningMark;
+
 /* What a statement's planning keeps (PlannerGlobal's extension state). */
 typedef struct VexecPlanState
 {
@@ -101,6 +115,9 @@ typedef struct VexecPlanState
 	List	   *kept_scans;		/* base relations' VecScan paths, kept aside
 								 * for an ORDER BY's late columns
 								 * (plan/sort.c, vexec_sort_keep_scan()) */
+	List	   *kept_aggs;		/* W7: grouped relations' device VecAgg paths,
+								 * kept aside for a bounded VecSort's rank
+								 * (plan/agg.c, keep_device_path()) */
 	Query	   *parse;			/* ORCA's: the statement, while it is planned */
 	bool		orca_costed;	/* ORCA's search priced vexec's nodes
 								 * (CCostModelVec): translation builds them
@@ -113,6 +130,19 @@ typedef struct VexecPlanState
 	int			cursor_options; /* ORCA's: the statement's */
 	int			motions_framed; /* ORCA's Motions given frames (motion.c),
 								 * whose nodes are numbered at its end */
+	uint64		statement;		/* W20: the token its asks of the device
+								 * carry (exec/devasked.c) */
+
+	/*
+	 * pg_vector_executor.md §3.41, OT6: the oracle's refusals, in every
+	 * mode, as the planner met them -- a join relation's each time its hook
+	 * fired -- and the first one's reason; and OT5's sources' planning
+	 * figures as the planning began
+	 */
+	int			nrefused;
+	char	   *first_refusal;
+	int			nmarks;
+	VexecPlanningMark *marks;
 } VexecPlanState;
 
 /* The most alternatives one statement records. */
@@ -129,12 +159,17 @@ extern void vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 							const VexecSteps *quals, const VexecSteps *target,
 							int ncols_in, int ncols_out, double source_rows, double source_bytes,
 							VexecCost *cost);
+extern void vexec_cost_scan_device(PlannerInfo *root, RelOptInfo *rel, double bytes, double rows,
+								   int ncols_out, double width_out, VexecCost *cost);
 extern void vexec_cost_hashjoin(PlannerInfo *root, Path *rowpath,
 								Path *outer, Path *inner, int nclauses,
 								int nclauses_kernel, bool outer_vector,
 								bool inner_vector, VexecCost *cost);
 extern void vexec_cost_plan_hashjoin(Plan *join, Plan *outer, Plan *inner, int nclauses,
 									 int nclauses_kernel, VexecCost *cost);
+extern bool vexec_join_device(JoinType jointype, List *hashclauses, double outer_rows,
+							  double inner_rows);
+extern Cost vexec_cost_agg_device(Cost cpu, double bytes, double group_bytes);
 extern void vexec_cost_agg(PlannerInfo *root, Path *rowpath, Path *input,
 						   bool input_vector, int ngroupcols, int ngroupcols_kernel,
 						   int naggs_kernel, double numgroups, VexecCost *cost);
@@ -160,13 +195,15 @@ extern void vexec_alt_costed(VexecPlanState *ps, VexecAlt *alt, const VexecCost 
 							 const char *detail);
 extern char *vexec_relids_names(PlannerInfo *root, Relids relids);
 extern Node *vexec_reasons_node(VexecPlanState *ps);
+extern void vexec_planning_mark(VexecPlanState *ps);
+extern Node *vexec_summary_node(VexecPlanState *ps);
 
 /* paths.c */
 extern int	vexec_planner_extension_id(void);
 extern VexecPlanState *vexec_plan_state(PlannerInfo *root);
 extern const char *vexec_statement_gate(Query *parse, int cursorOptions);
 extern bool vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost,
-								 Cost *fetch);
+								 Cost *fetch, double *threads);
 extern int	vexec_scan_path_ordering(PlannerInfo *root, Path *path, int max, AttrNumber *attnums);
 
 /* orca.c: ORCA's front end, through gp_orca's API */
@@ -182,6 +219,8 @@ extern Agg *vexec_agg_describe(CustomScan *cscan);
 extern Plan *vexec_build_repart(Plan *child, int nkeys, const AttrNumber *keycols,
 								const Oid *eqops, const Oid *collations);
 extern bool vexec_agg_path_ranks(Path *path);
+extern bool vexec_agg_path_device(Path *path);
+extern Path *vexec_agg_kept_device(VexecPlanState *ps, RelOptInfo *rel);
 
 /* join.c */
 extern bool vexec_is_vector_path(Path *path);
@@ -195,6 +234,7 @@ extern Plan *vexec_build_hashjoin_from_hashjoin(HashJoin *hj);
 
 /* sort.c */
 extern bool vexec_expr_may_raise(Node *node);
+extern int64 vexec_query_bound(PlannerInfo *root);
 extern void vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel,
 								RelOptInfo *output_rel, VexecPlanState *ps,
 								const char *target_name);
@@ -228,7 +268,14 @@ extern Plan *vexec_build_window(VexecPlanState *ps, WindowAgg *window, List *rta
 
 /* build.c */
 extern bool vexec_is_scan_path(Path *path);
-extern void vexec_scan_path_set_answers(Path *path, double units);
+extern Path *vexec_scan_device_path(Path *scan, const VexecCost *cost, double rows);
+extern bool vexec_is_device_scan_path(Path *path);
+extern Path *vexec_scan_device_variant(PlannerInfo *root, Path *scan, Bitmapset *attrs, double rows,
+										 int ncols_out, double width_out);
+extern bool vexec_units_bytes(PlannerInfo *root, RelOptInfo *rel, Bitmapset *attrs, double *bytes,
+							  double *per_byte);
+extern void vexec_scan_path_set_answers(Path *path, double units, bool counts_only);
+extern bool vexec_scan_path_counts_only(Path *path);
 extern bool vexec_scan_path_answers(Path *path, double *units);
 extern Path *vexec_scan_path(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 							 const VexecCost *cost);

@@ -30,9 +30,27 @@
 #   joinkeys      a hash join's inner keys lent to the source on its outer
 #                 side, which passes over the parts and granules no inner
 #                 row meets (chte_joinkeys.sh; VC3)
+#   condcache     the condition cache: a part's granules no row of which is
+#                 true of a scan's immutable quals, passed over by the next
+#                 scan of them (chte_condcache.sh; pg_vector_executor.md
+#                 §3.28's F7, VC30)
+#   bound         a bounded sort's running bound passing over the granules of
+#                 a unit by the parts' min/max skip indexes as it moves
+#                 (chte_bound.sh; pg_vector_executor.md §3.38's F25, VC43)
+#   units         a parallel scan's units cut over the granules its quals
+#                 keep, and its workers by the bytes a row decodes to
+#                 (chte_units.sh; pg_vector_executor.md §3.38's F28, VC44)
+#   sparse        a part's sparse column's rows of the default left out of the
+#                 source's batches where a qual is false of the default
+#                 (chte_sparse.sh; pg_vector_executor.md §3.38, VC45)
+#   pool          vexec's long-lived parallel workers taken for a Gather's
+#                 (chte_pool.sh; pg_vector_executor.md §3.28, F3)
+#   chars         a text column read for its values' characters alone, from the
+#                 column of them a storage keeps beside it (chte_chars.sh;
+#                 pg_vector_executor.md §3.38's F35 and F37, VC47, VC48)
 #
 #   CHTE_PARTS    the parts run: "suite chte differential loads orders steps
-#                 sink joinkeys"
+#                 sink joinkeys condcache bound units sparse pool chars"
 set -u
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 "$here/build.sh" > "${RESULTS_DIR:-/tmp}/vexec-build.log" 2>&1 || { tail -30 "${RESULTS_DIR:-/tmp}/vexec-build.log"; exit 1; }
@@ -42,7 +60,7 @@ CHTE_SRC=/chte /chte/test/build.sh > "${RESULTS_DIR:-/tmp}/chte-build.log" 2>&1 
 echo "vexec and ch_table_engines $(git -C /chte rev-parse --short HEAD 2> /dev/null || echo '?') on $("$BINDIR/pg_config" --version)"
 
 rc=0
-for part in ${CHTE_PARTS:-suite chte differential loads orders steps sink joinkeys}; do
+for part in ${CHTE_PARTS:-suite chte differential loads orders steps sink joinkeys condcache bound units sparse pool chars}; do
 	case "$part" in
 		suite)
 			echo "== vexec's suite, ch_table_engines preloaded beside vexec"
@@ -79,6 +97,30 @@ for part in ${CHTE_PARTS:-suite chte differential loads orders steps sink joinke
 		joinkeys)
 			echo "== a hash join's keys lent to the source over mergetree tables"
 			"$here/chte_joinkeys.sh" || rc=1
+			;;
+		condcache)
+			echo "== the condition cache over mergetree tables"
+			"$here/chte_condcache.sh" || rc=1
+			;;
+		bound)
+			echo "== a running bound passing over granules of mergetree tables"
+			"$here/chte_bound.sh" || rc=1
+			;;
+		units)
+			echo "== a parallel scan's units and workers over mergetree tables"
+			"$here/chte_units.sh" || rc=1
+			;;
+		sparse)
+			echo "== a sparse column's rows of the default left out over mergetree tables"
+			"$here/chte_sparse.sh" || rc=1
+			;;
+		pool)
+			echo "== vexec's long-lived parallel workers over heap and mergetree tables"
+			"$here/chte_pool.sh" || rc=1
+			;;
+		chars)
+			echo "== text columns read for their characters alone over mergetree tables"
+			"$here/chte_chars.sh" || rc=1
 			;;
 		*)
 			echo "no part $part"; rc=1 ;;

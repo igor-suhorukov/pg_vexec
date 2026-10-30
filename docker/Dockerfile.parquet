@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: Apache-2.0
+#
+# vexec_parquet's dev image (modules/vexec_parquet): vexec's vanilla dev
+# image with pyarrow (Dockerfile.arrow), and
+#
+#   - Apache Arrow C++ with Parquet and S3, from Apache's own Debian
+#     packages (packages.apache.org/artifactory/arrow), pinned: the library
+#     vexec_parquet is built against and loads -- S3's filesystem a library
+#     of its own since Arrow 26, libarrow_s3;
+#   - moto's S3 server, in pyarrow's virtual environment, which the S3 parts
+#     of the leg run on the container's loopback (test/vexec/parquet.sh):
+#     the leg's containers have no network;
+#   - stock PostGIS, for the module's tests of geometry read from GeoParquet
+#     files through the type's receive function (test/sql/geo.sql): built by
+#     PGXS against this image's server, from the tag and commit the port's
+#     image pins (pg19/docker/Dockerfile.cbext), without raster (GDAL) and
+#     protobuf, which those tests do not use.
+#
+#   BASE_IMAGE      pg_accel/vexec-dev:vanilla-arrow
+#   ARROW_VERSION   26.0.0-1, the newest on 2026-10-26
+#   MOTO_VERSION    5.2.4
+#   POSTGIS_TAG     3.7.0rc2, its commit checked as POSTGIS_COMMIT
+
+ARG BASE_IMAGE=pg_accel/vexec-dev:vanilla-arrow
+
+FROM ${BASE_IMAGE}
+USER root
+ARG ARROW_VERSION=26.0.0-1
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates lsb-release wget \
+    && wget -q -O /tmp/apache-arrow-apt-source.deb \
+        https://packages.apache.org/artifactory/arrow/debian/apache-arrow-apt-source-latest-trixie.deb \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /tmp/apache-arrow-apt-source.deb \
+    && rm /tmp/apache-arrow-apt-source.deb \
+    && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libarrow-dev=${ARROW_VERSION} libparquet-dev=${ARROW_VERSION} libarrow-s3-dev=${ARROW_VERSION} \
+    && rm -rf /var/lib/apt/lists/* \
+    && grep -q '^#define ARROW_S3$' /usr/include/arrow/util/config.h \
+    && pkg-config --exists arrow parquet arrow-s3
+ARG MOTO_VERSION=5.2.4
+RUN /opt/arrow/bin/pip install --no-cache-dir "moto[server]==${MOTO_VERSION}" \
+    && /opt/arrow/bin/python -c 'import moto, pyarrow; print("moto", moto.__version__, "pyarrow", pyarrow.__version__)'
+ARG POSTGIS_TAG=3.7.0rc2
+ARG POSTGIS_COMMIT=e2ea03ad0bfcf4b15ccb748113be3c5741809a08
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential pkg-config git ca-certificates autoconf automake libtool bison flex \
+        libxml2-dev libgeos-dev libproj-dev libjson-c-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --quiet --depth 1 --branch "$POSTGIS_TAG" https://github.com/postgis/postgis.git /tmp/postgis \
+    && test "$(git -C /tmp/postgis rev-parse HEAD)" = "$POSTGIS_COMMIT" \
+    && cd /tmp/postgis && ./autogen.sh > /dev/null \
+    && ./configure --with-pgconfig=/usr/local/pgsql/bin/pg_config --without-raster --without-protobuf > /tmp/postgis-configure.log \
+    && make -j"$(nproc)" > /tmp/postgis-make.log && make install > /tmp/postgis-install.log \
+    && cd / && rm -rf /tmp/postgis /tmp/postgis-*.log \
+    && test -f /usr/local/pgsql/share/extension/postgis.control
+USER postgres

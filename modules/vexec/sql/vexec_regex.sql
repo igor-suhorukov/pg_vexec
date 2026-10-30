@@ -383,6 +383,21 @@ FROM unnest(ARRAY['rx_bad', 'rx_split', 'rx_ok', 'rx_ascii', 'rx_long']) t;
 -- PostgreSQL's length() of each value rx_bad has, alone: a truncated
 -- character raises, as the walk that leaves it to PostgreSQL's raises
 SELECT id, rx_same(format('SELECT length(v) FROM rx_bad WHERE id = %s', id)) FROM rx_bad ORDER BY id;
+-- F5 (§3.28): length() of a whole batch of offsets that is not all ASCII,
+-- counted over its bytes at once -- a bit a byte where a character begins,
+-- 64 bytes at a time, each value's the bits between its offsets -- values
+-- across the 64 bytes' edges and the batch's last, partial, 64; and with few
+-- rows active, each value's own count
+CREATE TABLE rx_wide (id int, v text);
+INSERT INTO rx_wide
+  SELECT g, CASE WHEN g % 11 = 0 THEN NULL ELSE repeat(substr('aé€😀b', 1 + g % 5, 1 + g % 3), g % 37) END
+  FROM generate_series(1, 3000) g;
+SET vexec.batch_varlena_layout = offsets;
+SELECT rx_same('SELECT id, length(v) FROM rx_wide') AS all_rows,
+       rx_same('SELECT id, length(v) FROM rx_wide WHERE id % 97 = 3') AS few_rows,
+       rx_same('SELECT sum(length(v)), count(v) FROM rx_wide') AS sums;
+RESET vexec.batch_varlena_layout;
+DROP TABLE rx_wide;
 SELECT t, rx_same(format($q$SELECT id FROM %I WHERE v <> ''$q$, t)) AS ne,
        rx_same(format($q$SELECT id FROM %I WHERE '' = v OR v = 'café'$q$, t)) AS eq
 FROM unnest(ARRAY['rx_bad', 'rx_split', 'rx_ok', 'rx_ascii', 'rx_long']) t;

@@ -1,0 +1,131 @@
+-- What scans read of their files' footers (pg_vector_executor.md §3.34,
+-- PQ1 to PQ4): an own file's facts in its catalog row -- the same as its
+-- footer's read again, every data page of version 1 -- so that a plan of an
+-- own table reads no footer, nor a scan before a unit of it is read on the
+-- CPU; an own table's listing kept for its snapshot, its statistics
+-- decoded a column at a time; an external file's facts kept in shared
+-- memory, so that the next process plans without reading its footer.
+SET vexec.mode = force;
+
+-- every type class, in files of every codec, of columns renamed and added
+-- between them, a numeric's NaN kept as its image, infinities
+CREATE TABLE fk (id int8 NOT NULL, i2 int2, i4 int4, f4 float4, f8 float8, b bool, ch "char",
+  d date, ts timestamp, tz timestamptz, tm time, n numeric(12, 3), nn numeric(10, 2), nu numeric,
+  t text, vc varchar(20), bp char(4), by bytea, u uuid, js json, jb jsonb, iv interval, arr int4[])
+  USING vexec_parquet WITH (row_group_rows = 1024);
+INSERT INTO fk
+SELECT i, (i % 30000)::int2, CASE WHEN i % 13 = 0 THEN NULL ELSE i * 7 END, i / 3.0, i / 7.0,
+  i % 3 = 0, chr(65 + i % 26)::"char", DATE '2001-01-01' + i % 3000,
+  TIMESTAMP '2001-01-01' + i * INTERVAL '17 seconds', TIMESTAMPTZ '2001-01-01 00:00+00' + i * INTERVAL '19 seconds',
+  TIME '00:00' + (i % 86400) * INTERVAL '1 second', i * 1.001, i * 0.5, i / 13.0, 'text ' || i,
+  'v' || i % 1000, 'b' || i % 10, decode(lpad(to_hex(i), 8, '0'), 'hex'), md5(i::text)::uuid,
+  json_build_object('i', i), jsonb_build_object('i', i), i * INTERVAL '1 minute', ARRAY[i, i + 1]
+FROM generate_series(1, 2500) i;
+INSERT INTO fk (id, nn, d, ts, tz) VALUES (2501, 'NaN', 'infinity', '-infinity', 'infinity');
+ALTER TABLE fk SET (codec = 'lz4');
+INSERT INTO fk (id, i4, t, d) SELECT i, i, 'lz4 ' || i, DATE '2020-01-01' + i % 10 FROM generate_series(2502, 3700) i;
+ALTER TABLE fk SET (codec = 'snappy');
+INSERT INTO fk (id, i4, t) SELECT i, i, 'snappy ' || i FROM generate_series(3701, 4000) i;
+ALTER TABLE fk SET (codec = 'none');
+ALTER TABLE fk RENAME COLUMN t TO t2;
+ALTER TABLE fk ADD COLUMN extra int4;
+INSERT INTO fk (id, i4, t2, extra) SELECT i, i, 'none ' || i, i FROM generate_series(4001, 4100) i;
+ALTER TABLE fk SET (codec = 'gzip');
+INSERT INTO fk (id, i4, t2, extra) SELECT i, i, 'gzip ' || i, -i FROM generate_series(4101, 4200) i;
+SELECT count(*) AS files, bool_and(facts) AS facts, bool_and(same) AS same, bool_and(pages_v1) AS pages_v1
+FROM vexec_parquet.verify_facts('fk');
+SELECT count(*) AS files FROM vexec_parquet.files('fk') \gset
+
+-- a fresh process: its plan reads no footer; its scan opens each file of its
+-- facts, and reads a footer as Arrow's reader opens on the file -- a CPU unit
+\c
+SET vexec.mode = force;
+SELECT count(*) >= 0 AS reset FROM vexec_parquet.read_stats(true);
+EXPLAIN (COSTS OFF) SELECT count(*), sum(i4), min(t2) FROM fk WHERE id > 100;
+SELECT footers_read, facts_opened, footers_late FROM vexec_parquet.read_stats();
+SELECT count(*), sum(i4), min(t2), max(extra), count(DISTINCT d) FROM fk WHERE id > 100;
+SELECT facts_opened = :files AS each_file_of_facts, footers_read = footers_late AS every_footer_late,
+  footers_read = :files AS each_footer_once
+FROM vexec_parquet.read_stats();
+-- answers from statistics alone open no file
+SELECT count(*) >= 0 AS reset FROM vexec_parquet.read_stats(true);
+SELECT count(*), min(id), max(id) FROM fk;
+SELECT footers_read, facts_opened FROM vexec_parquet.read_stats();
+-- every row as the plain executor reads it
+SET vexec.mode = off;
+CREATE TABLE plain AS SELECT * FROM fk;
+SET vexec.mode = force;
+SELECT count(*) AS differ FROM ((SELECT fk::text FROM fk EXCEPT ALL SELECT plain::text FROM plain)
+  UNION ALL (SELECT plain::text FROM plain EXCEPT ALL SELECT fk::text FROM fk)) x;
+
+-- a listing kept for its snapshot: one for the statements of a repeatable
+-- read transaction while it writes nothing, a column's statistics decoded
+-- as a statement first asks for it -- one column of each file here
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT listings AS l0, stat_columns AS s0 FROM vexec_parquet.read_stats() \gset
+SELECT count(*) FROM fk WHERE i4 > 10;
+SELECT count(*) FROM fk WHERE i4 > 20;
+SELECT listings - :l0 AS listings, stat_columns - :s0 AS stat_columns, :files AS files FROM vexec_parquet.read_stats();
+-- a write of the transaction's: a new listing, which sees it
+INSERT INTO fk (id, i4) VALUES (99999, 5);
+SELECT count(*) FROM fk WHERE id = 99999;
+SELECT listings - :l0 > 1 AS listed_again FROM vexec_parquet.read_stats();
+COMMIT;
+SELECT count(*) FROM fk WHERE id = 99999;
+
+-- a file whose catalog row has no facts -- one written before them, its
+-- statistics' form "VPQ1" -- read by its footer, as before
+CREATE FUNCTION vpq_int32(b bytea, at int) RETURNS int LANGUAGE sql IMMUTABLE AS $$
+  SELECT get_byte(b, at) | (get_byte(b, at + 1) << 8) | (get_byte(b, at + 2) << 16) | (get_byte(b, at + 3) << 24)
+$$;
+CREATE FUNCTION vpq_without_facts(s bytea) RETURNS bytea LANGUAGE sql IMMUTABLE AS $$
+  SELECT '\x56505131'::bytea || substring(s FROM 5 FOR 8 + 8 * nrg + 3 * ncols) ||
+    substring(s FROM 13 + 8 * nrg + 3 * ncols + 4 + vpq_int32(s, 12 + 8 * nrg + 3 * ncols))
+  FROM (SELECT vpq_int32(s, 4) AS nrg, vpq_int32(s, 8) AS ncols) x
+$$;
+UPDATE vexec_parquet.files SET stats = vpq_without_facts(stats)
+WHERE relnumber = pg_relation_filenode('fk')
+  AND file_id = (SELECT min(file_id) FROM vexec_parquet.files('fk'));
+SELECT facts, count(*) FROM vexec_parquet.verify_facts('fk') GROUP BY 1 ORDER BY 1;
+SELECT count(*) AS files FROM vexec_parquet.files('fk') \gset
+\c
+SET vexec.mode = force;
+SELECT count(*) >= 0 AS reset FROM vexec_parquet.read_stats(true);
+SELECT count(*) AS differ FROM ((SELECT fk::text FROM fk WHERE id <> 99999 EXCEPT ALL SELECT plain::text FROM plain)
+  UNION ALL (SELECT plain::text FROM plain EXCEPT ALL SELECT fk::text FROM fk WHERE id <> 99999)) x;
+SELECT facts_opened = :files - 1 AS the_others_of_facts, footers_read - footers_late AS read_by_footer
+FROM vexec_parquet.read_stats();
+
+-- external files' facts in shared memory: the process that reads their
+-- footers keeps them, the next plans and prunes without reading one -- and
+-- beside each its footer's index (pg_vector_executor.md §3.37, PQ11): two
+-- entries a file
+CREATE TABLE fsrc (id int8, name text, day date) USING vexec_parquet WITH (row_group_rows = 1024);
+INSERT INTO fsrc SELECT i, 'name ' || i, DATE '2024-01-01' + i % 100 FROM generate_series(1, 2000) i;
+INSERT INTO fsrc SELECT i, 'name ' || i, DATE '2024-06-01' + i % 100 FROM generate_series(2001, 3000) i;
+SELECT regexp_replace(min(path), '/[^/]+$', '') AS srcdir FROM vexec_parquet.files('fsrc') \gset
+SELECT cache_kept AS k0 FROM vexec_parquet.read_stats() \gset
+CREATE TABLE fext (id int8, name text, day date) USING vexec_parquet WITH (location = :'srcdir');
+SELECT count(*), sum(id), max(day) FROM fext WHERE id > 1500;
+SELECT cache_kept - :k0 AS kept FROM vexec_parquet.read_stats();
+\c
+SET vexec.mode = force;
+SELECT cache_hits AS h0 FROM vexec_parquet.read_stats(true) \gset
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id), max(day) FROM fext WHERE id > 1500;
+SELECT footers_read, facts_opened > 0 AS of_facts, cache_hits - :h0 AS found FROM vexec_parquet.read_stats();
+SELECT count(*), sum(id), max(day) FROM fext WHERE id > 1500;
+-- with the cache off, the footers read again
+\c
+SET vexec.mode = force;
+SET vexec_parquet.enable_footer_cache = off;
+SELECT count(*) >= 0 AS reset FROM vexec_parquet.read_stats(true);
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id), max(day) FROM fext WHERE id > 1500;
+SELECT footers_read, facts_opened FROM vexec_parquet.read_stats();
+SELECT count(*), sum(id), max(day) FROM fext WHERE id > 1500;
+RESET vexec_parquet.enable_footer_cache;
+-- a file of a new size or time is another key
+INSERT INTO fsrc SELECT i, 'name ' || i, DATE '2025-01-01' FROM generate_series(3001, 3100) i;
+SELECT count(*), sum(id), max(day) FROM fext WHERE id > 1500;
+DROP TABLE fext, fsrc, fk, plain;
+
+RESET vexec.mode;

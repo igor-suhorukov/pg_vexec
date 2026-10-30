@@ -82,6 +82,14 @@
 #                                the differential runner's sessions over
 #                                mergetree tables, and loads into them in both
 #                                of its stores (chte.sh; CHTE_PARTS)
+#   run.sh parquet               vexec_parquet's leg (modules/vexec_parquet):
+#                                vexec's suite with it preloaded, its own
+#                                suite -- S3 through moto's server, files of
+#                                pyarrow's, isolation specs -- and the
+#                                differential runner's sessions over its
+#                                tables, on the vanilla leg's -parquet image,
+#                                built first where it is not there
+#                                (parquet.sh; PARQUET_PARTS)
 #   run.sh v0                    V0's "done when": checks; the suite, the
 #                                states, pgregress and differential on both
 #                                legs; the cluster leg
@@ -316,15 +324,15 @@ case "$cmd" in
 		rc=0
 		tpc_leg="${TPC_LEG:-port}"
 		[ "$tpc_leg" = vanilla-orca ] && [ -z "${VEXEC_ORCA_STAGE:-}" ] && die "no gp_orca built alone at $VEXEC_ORCA_BUILD: run.sh orcabuild"
-		for storage in ${*:-$( [ "$tpc_leg" = vanilla-orca ] && echo heap || echo heap ao_column pax pax_porc_vec)}; do
-			run="$(new_run "tpc-$( [ "$tpc_leg" = vanilla-orca ] && echo vanilla-orca- )$storage")"
+		for storage in ${*:-$( [ "$tpc_leg" != port ] && echo heap || echo heap ao_column pax pax_porc_vec)}; do
+			run="$(new_run "tpc-$( [ "$tpc_leg" != port ] && echo "$tpc_leg-" )$storage")"
 			echo "== tpc on $storage: $run"
-			if [ "$tpc_leg" = vanilla-orca ]; then
+			if [ "$tpc_leg" != port ]; then
 				echo "  image pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-orca, gp_orca built alone from $(cat "$VEXEC_ORCA_STAGE/COMMIT" 2> /dev/null || echo '?')"
 			else
 				echo "  image pg_accel/vexec-dev:${VEXEC_PORT_FLAVOR:-port}-$CB_COMMIT, the port's modules from $(cat "${VEXEC_PORT_STAGE:-/nonexistent}/COMMIT" 2> /dev/null || echo 'the image')"
 			fi
-			in_leg "$tpc_leg" "$run" "/src/test/vexec/build.sh > /dev/null && { case $storage in mergetree*) CHTE_SRC=/chte /chte/test/build.sh > /dev/null || exit 1 ;; esac; } && { grep -q '^#define USE_ASSERT_CHECKING' \"\$(pg_config --includedir-server)/pg_config.h\" && echo '  server with assertions' || echo '  server without assertions'; } && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} TPC_VEXEC_NUMERIC=${TPC_VEXEC_NUMERIC:-} TPC_VEXEC_SETTINGS='${TPC_VEXEC_SETTINGS:-}' TPC_PLANNER_ROUTE=${TPC_PLANNER_ROUTE:-1} TPC_SEGMENTS=${TPC_SEGMENTS:-$( [ "$tpc_leg" = vanilla-orca ] && echo 0 || echo 4)} TPC_ROUNDS=${TPC_ROUNDS:-1} TPC_WORKERS='${TPC_WORKERS:-0}' TPC_KINDS='${TPC_KINDS:-h ds}' TPC_QUERIES='${TPC_QUERIES:-}' TPC_SF=${TPC_SF:-1} TPC_TIMEOUT=${TPC_TIMEOUT:-120} TPC_PLANNING=${TPC_PLANNING:-0} TPC_PLANS=${TPC_PLANS:-0} TPC_INTERCONNECT=${TPC_INTERCONNECT:-} /src/test/tpc/run.sh" \
+			in_leg "$tpc_leg" "$run" "/src/test/vexec/build.sh > /dev/null && { case $storage in mergetree*) CHTE_SRC=/chte /chte/test/build.sh > /dev/null || exit 1 ;; esac; } && { grep -q '^#define USE_ASSERT_CHECKING' \"\$(pg_config --includedir-server)/pg_config.h\" && echo '  server with assertions' || echo '  server without assertions'; } && CB_TPC=${CB_TPC:-check} TPC_STORAGE=$storage TPC_VEXEC_MODE=${TPC_VEXEC_MODE:-off} TPC_VEXEC_FORMAT=${TPC_VEXEC_FORMAT:-postgres} TPC_VEXEC_NUMERIC=${TPC_VEXEC_NUMERIC:-} TPC_VEXEC_SETTINGS='${TPC_VEXEC_SETTINGS:-}' TPC_PLANNER_ROUTE=${TPC_PLANNER_ROUTE:-1} TPC_SEGMENTS=${TPC_SEGMENTS:-$( [ "$tpc_leg" != port ] && echo 0 || echo 4)} TPC_ROUNDS=${TPC_ROUNDS:-1} TPC_WORKERS='${TPC_WORKERS:-0}' TPC_KINDS='${TPC_KINDS:-h ds}' TPC_QUERIES='${TPC_QUERIES:-}' TPC_SF=${TPC_SF:-1} TPC_TIMEOUT=${TPC_TIMEOUT:-120} TPC_PLANNING=${TPC_PLANNING:-0} TPC_PLANS=${TPC_PLANS:-0} TPC_INTERCONNECT=${TPC_INTERCONNECT:-} /src/test/tpc/run.sh" \
 				| tee "$run/output" || rc=1
 		done
 		exit $rc
@@ -348,6 +356,17 @@ case "$cmd" in
 		echo "== ch_table_engines' leg: $run"
 		echo "  the extension's tree $CHTE_SRC at $(git -C "$CHTE_SRC" rev-parse --short HEAD 2> /dev/null || echo '?')$( [ -n "$(git -C "$CHTE_SRC" status --porcelain 2> /dev/null)" ] && echo ' +changes')"
 		in_leg chte "$run" "/src/test/vexec/chte.sh" | tee "$run/output"
+		exit "${PIPESTATUS[0]}"
+		;;
+	parquet)
+		if ! docker image inspect "pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-parquet" > /dev/null 2>&1; then
+			docker image inspect "pg_accel/vexec-dev:${VEXEC_VANILLA_FLAVOR:-vanilla}-arrow" > /dev/null 2>&1 ||
+				docker compose -f "$COMPOSE" --profile build build vexec-dev-vanillaarrow || exit 1
+			docker compose -f "$COMPOSE" --profile build build vexec-dev-vanillaparquet || exit 1
+		fi
+		run="$(new_run parquet)"
+		echo "== vexec_parquet's leg: $run"
+		in_leg parquet "$run" "/src/test/vexec/parquet.sh" | tee "$run/output"
 		exit "${PIPESTATUS[0]}"
 		;;
 	v0)

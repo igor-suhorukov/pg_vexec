@@ -1247,3 +1247,23 @@ window_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 			ExplainPropertyInteger("Rows In", NULL, s->rows_in, es);
 	}
 }
+
+/*
+ * pg_otel_probe's span of a VecWindowHashAgg that ran (node.c;
+ * pg_vector_executor.md §3.41, OT2): its peak memory, and its spills -- a
+ * spill file a partition's.  Its fields alone.
+ */
+void
+vexec_window_figures(VexecNode *node, VexecNodeFigures *f, bool on_error)
+{
+	VexecWindowState *s = (VexecWindowState *) node;
+
+	(void) on_error;
+	f->memory_kb = (int64) ((s->peak_memory + 1023) / 1024);
+	if (s->ever_spilled)
+	{
+		f->spilled_partitions = s->spill_files;
+		f->spilled_rows = s->spilled_rows;
+		f->spill_depth = s->max_depth;
+	}
+}

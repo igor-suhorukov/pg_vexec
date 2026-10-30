@@ -20,8 +20,14 @@
 #                key's btree); vanilla also mergetree and mergetree_files,
 #                ch_table_engines' MergeTree in its pages store and its files
 #                store, ordered by the primary key (ch_table_engines.md §4),
+#                and parquet and arrow, its tables of their own Parquet and
+#                Arrow IPC files (its CH8, §2.18), which have no sort key,
 #                the extension preloaded, installed at the container's start
-#                (vexec-entry.sh); port: aoco, porc, porc_vec
+#                (vexec-entry.sh); vanilla also vpq_none and vpq_lz4,
+#                vexec_parquet's tables of their own Parquet files
+#                (pg_vector_executor.md §3.34), uncompressed and LZ4, no sort
+#                key, the module preloaded after vexec; port: aoco, porc,
+#                porc_vec
 #   CB_PLANNERS  vanilla: planner; port and vanilla-orca: "orca planner" --
 #                ORCA, and the planner's route on the same tables
 #   CB_SUBSET    1m, 10m, full: the rows loaded (clickbench.py subsets)
@@ -45,7 +51,9 @@
 #   CB_PAX_WITH  PAX's table options in place of the suite's
 #   CB_MT_WITH   mergetree's table options in place of the suite's, but for
 #                order_by and storage: '' for none, the table's defaults
-#   CB_MT_MERGES mergetree: wait -- the load waits for the merge workers'
+#   CB_OWN_WITH  parquet and arrow: the table's options, '' for none (the
+#                codec's defaults, lz4 for Parquet and none for Arrow)
+#   CB_MT_MERGES mergetree, parquet and arrow: wait -- the load waits for the merge workers'
 #                merges of the parts it wrote, their time its step "merges",
 #                as ClickHouse's own load runs its merges while it loads;
 #                none (the default) -- the queries begin on the load's parts,
@@ -55,7 +63,11 @@
 #                node's postgresql.auto.conf.  vexec.exchange_memory, where
 #                they do not give it and a CB_VEXEC session runs parallel
 #                workers: what one parallel aggregation's participants can
-#                take of the area, within an eighth of the memory
+#                take of the area, within an eighth of the memory.
+#                vexec.pool_workers, where they do not give it and such a
+#                session runs on the vanilla route: as many as
+#                a Gather takes -- the server's default is none, this harness
+#                alone turns the pool on; "vexec.pool_workers = 0" turns it off
 #   CB_VEXEC     vexec's sessions, each one more configuration of each
 #                planner, "<planner>+<session>": force-postgres, force-arrow
 #                (vexec.mode = force in that format), auto-postgres,
@@ -95,10 +107,10 @@ WORKERS="${CB_WORKERS:-0}"
 OUT="${CB_OUT:-}"
 case "$MODE" in check|time) ;; *) die "CB_MODE is check or time" ;; esac
 case "$ROUTE:$STORAGE" in
-	vanilla:heap|vanilla:heap_pk|vanilla:mergetree|vanilla:mergetree_files) PLANNERS="${CB_PLANNERS:-planner}" ;;
+	vanilla:heap|vanilla:heap_pk|vanilla:mergetree|vanilla:mergetree_files|vanilla:parquet|vanilla:arrow|vanilla:vpq_none|vanilla:vpq_lz4) PLANNERS="${CB_PLANNERS:-planner}" ;;
 	port:aoco|port:porc|port:porc_vec) PLANNERS="${CB_PLANNERS:-orca planner}" ;;
 	vanilla-orca:heap|vanilla-orca:heap_pk) PLANNERS="${CB_PLANNERS:-orca planner}" ;;
-	*) die "CB_ROUTE and CB_STORAGE: vanilla or vanilla-orca with heap or heap_pk, vanilla with mergetree or mergetree_files, port with aoco, porc or porc_vec" ;;
+	*) die "CB_ROUTE and CB_STORAGE: vanilla or vanilla-orca with heap or heap_pk, vanilla with mergetree, mergetree_files, parquet, arrow, vpq_none or vpq_lz4, port with aoco, porc or porc_vec" ;;
 esac
 VEXEC="${CB_VEXEC:-}"
 if [ -n "$VEXEC" ]; then
@@ -183,8 +195,7 @@ start_all() {
 			|| { echo "node $n did not start:"; tail -20 "$WORK/node$n.log"; return 1; }
 	done
 	for _ in $(seq 300); do
-		q clickbench "SELECT 1" > /dev/null 2>&1 && return 0
-		q postgres "SELECT 1" > /dev/null 2>&1 && return 0
+		{ q clickbench "SELECT 1" > /dev/null 2>&1 || q postgres "SELECT 1" > /dev/null 2>&1; } && return 0
 		sleep 0.2
 	done
 	echo "the servers do not answer"; return 1
@@ -257,6 +268,18 @@ exchange_mb() {				# exchange_mb <datadir>: the area's MB; none where it is give
 	[ "$mb" -gt "$cap" ] && mb=$cap
 	echo "$mb"
 }
+# vexec's long-lived workers (vexec.pool_workers, pg_vector_executor.md §3.28's
+# F3, §3.38 and §8 item 30), 0 by default in every other server: on in this
+# harness alone, at the user's word, where CB_SETTINGS gives none and a vexec
+# session runs parallel workers -- as many as a Gather takes, and as many worker
+# processes more.  Not on the port's route or ORCA's, where no leg has run
+# them.
+pool_workers() {			# pool_workers <datadir>: the pool's workers; none where it is given
+	local d="$1"
+	setting "$d" vexec.pool_workers > /dev/null && return
+	[ "$ROUTE" = vanilla ] && [ -n "$VEXEC" ] && [ -n "$PARALLEL_VEXEC" ] || { echo 0; return; }
+	setting "$d" max_parallel_workers_per_gather || echo 0
+}
 for n in $NODES; do
 	mkdir -p "$(sockdir "$n")"
 	"$BINDIR/initdb" -D "$(datadir "$n")" -N --locale=C --encoding=UTF8 > "$WORK/initdb$n.log" 2>&1 \
@@ -269,7 +292,8 @@ for n in $NODES; do
 		echo "log_temp_files = 0"
 		if [ "$ROUTE" = vanilla ]; then
 			case "$STORAGE" in
-				mergetree*) echo "shared_preload_libraries = '${VEXEC:+vexec,}ch_table_engines'" ;;
+				mergetree*|parquet|arrow) echo "shared_preload_libraries = '${VEXEC:+vexec,}ch_table_engines'" ;;
+				vpq_*) echo "shared_preload_libraries = '${VEXEC:+vexec,}vexec_parquet'" ;;
 				*) [ -n "$VEXEC" ] && echo "shared_preload_libraries = 'vexec'" ;;
 			esac
 		fi
@@ -314,6 +338,20 @@ for n in $NODES; do
 			*) EXCHANGE="$mb MB" ;;
 		esac
 	fi
+	w=$(pool_workers "$(datadir "$n")")
+	if [ "${w:-0}" -gt 0 ]; then
+		{
+			echo "vexec.pool_workers = $w"
+			echo "max_worker_processes = $(($(setting "$(datadir "$n")" max_worker_processes) + w))"
+		} >> "$(datadir "$n")/postgresql.auto.conf"
+	fi
+	if [ "$n" -eq 0 ]; then
+		case "$w" in
+			'') POOL="$(setting "$(datadir 0)" vexec.pool_workers), CB_SETTINGS'" ;;
+			0) POOL=none ;;
+			*) POOL="$w workers" ;;
+		esac
+	fi
 done
 start_all || exit 1
 if [ "$ROUTE" = port ]; then
@@ -325,9 +363,12 @@ fi
 out=$(q postgres "CREATE DATABASE clickbench")
 [ -n "$out" ] && { echo "CREATE DATABASE: $out"; exit 1; }
 case "$STORAGE" in
-	mergetree*)
+	mergetree*|parquet|arrow)
 		out=$(q clickbench "SET client_min_messages = warning; CREATE EXTENSION ch_table_engines")
 		[ -n "$out" ] && { echo "ch_table_engines: $out"; exit 1; } ;;
+	vpq_*)
+		out=$(q clickbench "SET client_min_messages = warning; CREATE EXTENSION vexec_parquet")
+		[ -n "$out" ] && { echo "vexec_parquet: $out"; exit 1; } ;;
 esac
 if [ "$ROUTE" = port ]; then
 	out=$(q clickbench "SET client_min_messages = warning; CREATE EXTENSION gp_sql; CREATE EXTENSION gp_ao; CREATE EXTENSION pax")
@@ -358,6 +399,13 @@ case "$STORAGE" in
 	# MT_WITH's options
 	mergetree) CLAUSE="USING mergetree WITH (order_by = '$(echo "$PK" | tr 'A-Z' 'a-z')'${MT_WITH:+, $MT_WITH})" ;;
 	mergetree_files) CLAUSE="USING mergetree WITH (order_by = '$(echo "$PK" | tr 'A-Z' 'a-z')', storage = 'files'${MT_WITH:+, $MT_WITH})" ;;
+	# a table of its own files: no sort key (ch_table_engines.md §2.18), its
+	# rows in the load's order, CB_OWN_WITH's options
+	parquet|arrow) CLAUSE="USING $STORAGE${CB_OWN_WITH:+ WITH ($CB_OWN_WITH)}" ;;
+	# vexec_parquet's tables of their own files: no sort key, the rows in the
+	# load's order, the codec the storage's name says and the module's
+	# defaults beside it -- or CB_OWN_WITH's options with it
+	vpq_none|vpq_lz4) CLAUSE="USING vexec_parquet WITH (codec = '${STORAGE#vpq_}'${CB_OWN_WITH:+, $CB_OWN_WITH})" ;;
 	aoco) CLAUSE="USING ao_column WITH (compresstype=zstd) DISTRIBUTED BY (UserID)" ;;
 	porc|porc_vec)
 		CLAUSE="USING pax WITH (${CB_PAX_WITH:-storage_format=$STORAGE, compresstype=zstd, cluster_type='lexical', cluster_columns='counterid,eventdate', minmax_columns='$MINMAX', bloomfilter_columns='userid,urlhash,refererhash'}) DISTRIBUTED BY (UserID)" ;;
@@ -378,6 +426,7 @@ step() {					# step <name> <psql args...>: timed
 echo "ClickBench, $MODE mode: $ROUTE, $STORAGE, $SUBSET rows ($ROWS)$([ "$ROUTE" = port ] && echo ", $SEGMENTS segments"), planners: $PLANNERS"
 echo "  bindir $BINDIR, data in $WORK"
 [ -n "$VEXEC" ] && echo "  vexec.exchange_memory: $EXCHANGE"
+[ -n "$VEXEC" ] && echo "  vexec.pool_workers: $POOL"
 t0=$(now_ms)
 step create -f "$WORK/create.sql"
 if [ "$ROUTE" != port ]; then
@@ -397,7 +446,7 @@ fi
 # (ch.merge_naptime, 10 s) and a few seconds more; the step's time, and the
 # load's, the time to the last change seen
 confirmed=0
-if [ "${CB_MT_MERGES:-none}" = wait ] && [[ "$STORAGE" == mergetree* ]]; then
+if [ "${CB_MT_MERGES:-none}" = wait ] && [[ "$STORAGE" =~ ^(mergetree|parquet$|arrow$) ]]; then
 	s=$(now_ms); last=""; since=$s
 	while :; do
 		parts=$(q clickbench "SELECT count(*) FROM ch.parts('hits')")

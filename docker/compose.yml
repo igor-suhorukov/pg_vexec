@@ -122,11 +122,21 @@ services:
         PG_VANILLA_NOASSERT_IMAGE: ${PG_VANILLA_NOASSERT_IMAGE:-cloudberry/pg19-vanilla-noassert:latest}
     profiles: ["build"]
 
+  # ClickBench's vanilla image with Apache Arrow C++'s runtime libraries, for
+  # vexec_parquet's loads (test/clickbench/run.sh's vanilla-vpq_*).
+  clickbench-vanilla-parquet:
+    image: pg_accel/clickbench-vanilla-parquet:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.clickbench-parquet
+    profiles: ["build"]
+
   # The vanilla route, and DuckDB's side of the suite: the subsets, the
-  # references, and the reports.
+  # references, and the reports.  CB_VANILLA_IMAGE: another image of the
+  # route's servers -- vexec_parquet's loads', with Arrow C++
   vanilla:
     <<: *run
-    image: pg_accel/clickbench-vanilla:latest
+    image: ${CB_VANILLA_IMAGE:-pg_accel/clickbench-vanilla:latest}
     profiles: ["run"]
 
   # The ORCA route: the port, a coordinator and its segments in one container.

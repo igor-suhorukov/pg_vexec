@@ -4,10 +4,11 @@
  * pg_otel_probe_api.h
  *	  What other extensions use of pg_otel_probe (PLAN.md §4.7.4): reporters,
  *	  which add the counters only a node's or a statement's own extension
- *	  knows to its span, and the trace context of a request an extension
- *	  receives or sends on a statement's behalf.
+ *	  knows to its span; metric reporters, whose data points the collector
+ *	  takes at each collection beside its own metrics; and the trace context
+ *	  of a request an extension receives or sends on a statement's behalf.
  *
- * Neither side links the other.  Both rendezvous variables are reached by
+ * Neither side links the other.  The rendezvous variables are reached by
  * name, and everything here is a type, a macro or an inline function, so a
  * module that includes this header needs nothing of pg_otel_probe's at load
  * time, and there is no order between the modules in
@@ -17,6 +18,8 @@
  *		whichever module comes first while the postmaster loads libraries,
  *		as vexec_source.h's is.  A registration without the probe is an
  *		unused entry.
+ *	pg_otel_probe/metric_reporter_v1	a registry of metric reporters, made
+ *		and used the same way.
  *	pg_otel_probe/context_v1	the probe's own functions, published by its
  *		_PG_init and looked up when called: NULL where the probe is not
  *		loaded.
@@ -42,12 +45,14 @@
 
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "datatype/timestamp.h"
 #include "executor/execdesc.h"
 #include "nodes/execnodes.h"
 #include "nodes/extensible.h"
 #include "utils/memutils.h"
 
 #define PG_OTEL_PROBE_REPORTER_RENDEZVOUS	"pg_otel_probe/node_reporter_v1"
+#define PG_OTEL_PROBE_METRICS_RENDEZVOUS	"pg_otel_probe/metric_reporter_v1"
 #define PG_OTEL_PROBE_CONTEXT_RENDEZVOUS	"pg_otel_probe/context_v1"
 
 /* ---- reporters ---- */
@@ -241,6 +246,132 @@ pg_otel_probe_register_statement_reporter(PgOtelProbeStatementReporter reporter,
 	reg->statements[reg->nstatements].reporter = reporter;
 	reg->statements[reg->nstatements].flags = flags;
 	reg->nstatements++;
+}
+
+/* ---- metric reporters ---- */
+
+/*
+ * A metric an extension reports at each of the probe's collections: a name
+ * under the extension's own prefix -- "vexec_gpu.device.utilization" -- a
+ * UCUM unit ("1", "By", "s", "Cel", "W", "MHz", "By/s"), a description, and
+ * a kind: a gauge's value now, or a cumulative sum's since its start,
+ * monotonic or not.  The probe keeps the pointers: a definition stays valid
+ * for the life of the process, as a static one does.
+ */
+#define PG_OTEL_PROBE_GAUGE		0
+#define PG_OTEL_PROBE_COUNTER	1	/* cumulative, monotonic */
+#define PG_OTEL_PROBE_UPDOWN	2	/* cumulative, up and down */
+
+typedef struct PgOtelProbeMetricDef
+{
+	const char *name;
+	const char *unit;
+	const char *description;
+	int			kind;
+} PgOtelProbeMetricDef;
+
+/*
+ * What a metric reporter adds its data points through: a point of a
+ * metric -- a sum's from "start", 0 the server's start -- then its
+ * attributes, each a key and a string, which go with the point until the
+ * next one begins.  At most PG_OTEL_PROBE_METRIC_POINTS_MAX points a
+ * reporter at a collection, and PG_OTEL_PROBE_METRIC_ATTRS_MAX attributes a
+ * point; past them, and a name not under the reporter's prefix, a point is
+ * dropped and counted, and the call returns false.  The calls copy what they
+ * keep, allocate nothing the reporter frees, and never raise.
+ */
+#define PG_OTEL_PROBE_METRIC_POINTS_MAX	1024
+#define PG_OTEL_PROBE_METRIC_ATTRS_MAX	8
+
+typedef struct PgOtelProbeMetrics PgOtelProbeMetrics;
+
+struct PgOtelProbeMetrics
+{
+	bool		(*point_int) (PgOtelProbeMetrics *m, const PgOtelProbeMetricDef *def,
+							  TimestampTz start, int64 value);
+	bool		(*point_double) (PgOtelProbeMetrics *m, const PgOtelProbeMetricDef *def,
+								 TimestampTz start, double value);
+	void		(*attr) (PgOtelProbeMetrics *m, const char *key, const char *value);
+	void	   *state;			/* the probe's */
+};
+
+/*
+ * A metric reporter: called at each of the probe's collections, in its
+ * collector -- a background worker of the server, which from 15 on is
+ * connected to no database -- so it reads shared memory and its own
+ * process's state, and runs no SQL.  An error it raises is caught and
+ * counted, the points it added before it kept.
+ */
+typedef void (*PgOtelProbeMetricReporter) (PgOtelProbeMetrics *m);
+
+#define PG_OTEL_PROBE_METRICS_MAGIC	0x504F4D31	/* "POM1" */
+
+typedef struct PgOtelProbeMetricReporterEntry
+{
+	const char *prefix;			/* the extension's, its metrics' names' */
+	PgOtelProbeMetricReporter reporter;
+	int			flags;
+} PgOtelProbeMetricReporterEntry;
+
+/* The registry, made and inherited as the reporters' is; fixed for the major version */
+typedef struct PgOtelProbeMetricRegistry
+{
+	uint32		magic;
+	int			nreporters;
+	PgOtelProbeMetricReporterEntry reporters[PG_OTEL_PROBE_REPORTERS_MAX];
+} PgOtelProbeMetricRegistry;
+
+/* The metric reporters' registry, made if no module has made it yet. */
+static inline PgOtelProbeMetricRegistry *
+pg_otel_probe_metric_registry(void)
+{
+	PgOtelProbeMetricRegistry **rv;
+
+	rv = (PgOtelProbeMetricRegistry **) find_rendezvous_variable(PG_OTEL_PROBE_METRICS_RENDEZVOUS);
+	if (*rv == NULL)
+	{
+		PgOtelProbeMetricRegistry *reg;
+
+		reg = (PgOtelProbeMetricRegistry *)
+			MemoryContextAllocZero(TopMemoryContext, sizeof(PgOtelProbeMetricRegistry));
+		reg->magic = PG_OTEL_PROBE_METRICS_MAGIC;
+		*rv = reg;
+	}
+	else if ((*rv)->magic != PG_OTEL_PROBE_METRICS_MAGIC)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("the rendezvous variable \"%s\" does not hold pg_otel_probe's metric registry",
+						PG_OTEL_PROBE_METRICS_RENDEZVOUS)));
+	return *rv;
+}
+
+/*
+ * A metric reporter of the extension whose metrics' names begin with
+ * "prefix" and a dot.  From the module's _PG_init, while the postmaster
+ * preloads libraries; the prefix and the function stay valid for the life
+ * of the process.
+ */
+static inline void
+pg_otel_probe_register_metric_reporter(const char *prefix, PgOtelProbeMetricReporter reporter,
+									   int flags)
+{
+	PgOtelProbeMetricRegistry *reg;
+
+	pg_otel_probe_register_check();
+	if (prefix == NULL || prefix[0] == '\0' || reporter == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("a pg_otel_probe metric reporter needs its metrics' prefix and a function")));
+	reg = pg_otel_probe_metric_registry();
+	if (reg->nreporters >= PG_OTEL_PROBE_REPORTERS_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("too many pg_otel_probe metric reporters"),
+				 errdetail("At most %d can be registered.", PG_OTEL_PROBE_REPORTERS_MAX)));
+	reg->reporters[reg->nreporters].prefix = prefix;
+	reg->reporters[reg->nreporters].reporter = reporter;
+	reg->reporters[reg->nreporters].flags = flags;
+	reg->nreporters++;
 }
 
 /* ---- trace context ---- */

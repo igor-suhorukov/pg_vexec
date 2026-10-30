@@ -78,6 +78,8 @@
 #include "expr/expr.h"
 #include "expr/kernel.h"
 
+#include "vexec_device_format.h"
+
 /* A row's matching gives up past this many steps (above). */
 #define REGEX_MAX_STEPS		20000
 #define REGEX_MAX_ITEMS		64
@@ -735,8 +737,10 @@ regex_kernel(VexecKernelCall *kc)
 	bool		whole;
 
 	m.rc = rc;
-	whole = s->shape.layout == VEXEC_OFFSETS && s->encoding == VEXEC_FLAT &&
-		regex_batch_whole(rc, s, kc->nrows);
+	/* F5: a column whose source vouches for its text, in any layout, is whole unchecked */
+	whole = (s->flags & VEXEC_VEC_TEXT_WHOLE) ||
+		(s->shape.layout == VEXEC_OFFSETS && s->encoding == VEXEC_FLAT &&
+		 regex_batch_whole(rc, s, kc->nrows));
 	VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
 	{
 		const char *a;
@@ -851,4 +855,84 @@ void
 vexec_kernels_regex(void (*add) (Oid, const VexecKernelDef *, const void *))
 {
 	add(F_REGEXP_REPLACE_TEXT_TEXT_TEXT, &regex_replace_def, NULL);
+}
+
+/*
+ * W17 (pg_vector_executor.md §3.28): the pattern and replacement as the
+ * device's matcher takes them (vexec_device_format.h, VexecDevRegex) -- the
+ * items regex_parse() makes, the replacement's parts and their bytes --
+ * palloc'd in the current context, its bytes into *len; NULL where the
+ * pattern is not one the kernel matches as PostgreSQL's engine does, or the
+ * encoding is neither UTF8 nor a single-byte one.  The device's matcher is
+ * regex_match()'s, bounded by REGEX_MAX_STEPS as it is.
+ */
+char *
+vexec_regex_device_program(Datum pattern, Datum replacement, Size *len)
+{
+	RegexCall	rc;
+	text	   *t;
+	int			repl_len;
+	int			lits_len = 0;
+	VexecDevRegex *h;
+	VexecDevRegexItem *items;
+	VexecDevRegexPart *parts;
+	char	   *out;
+
+	*len = 0;
+	if (GetDatabaseEncoding() != PG_UTF8 && pg_database_encoding_max_length() != 1)
+		return NULL;
+	memset(&rc, 0, sizeof(rc));
+	rc.utf8 = GetDatabaseEncoding() == PG_UTF8;
+	rc.encoding = GetDatabaseEncoding();
+	t = DatumGetTextPP(pattern);
+	if (!regex_parse(&rc, VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t)))
+		return NULL;
+	t = DatumGetTextPP(replacement);
+	repl_len = VARSIZE_ANY_EXHDR(t);
+	regex_parse_replacement(&rc, VARDATA_ANY(t), repl_len);
+	for (int i = 0; i < rc.nitems; i++)
+		if (rc.items[i].kind == RI_LIT || rc.items[i].kind == RI_OPT)
+			lits_len = Max(lits_len, rc.items[i].off + rc.items[i].len);
+	*len = vexec_dev_regex_size(rc.nitems, rc.nparts, lits_len, repl_len);
+	out = palloc0(*len);
+	h = (VexecDevRegex *) out;
+	h->nitems = (uint32) rc.nitems;
+	h->ngroups = (uint32) rc.ngroups;
+	h->nparts = (uint32) rc.nparts;
+	h->lits_len = (uint32) lits_len;
+	h->repl_len = (uint32) repl_len;
+	h->max_steps = REGEX_MAX_STEPS;
+	h->utf8 = rc.utf8 ? 1 : 0;
+	items = vexec_dev_regex_items(h);
+	for (int i = 0; i < rc.nitems; i++)
+	{
+		const RegexItem *it = &rc.items[i];
+		VexecDevRegexItem *d = &items[i];
+
+		d->kind = it->kind == RI_LIT ? VEXEC_DEV_REGEX_LIT : it->kind == RI_OPT ? VEXEC_DEV_REGEX_OPT :
+			it->kind == RI_CLASS ? VEXEC_DEV_REGEX_CLASS : it->kind == RI_OPEN ? VEXEC_DEV_REGEX_OPEN :
+			VEXEC_DEV_REGEX_CLOSE;
+		d->any = it->any ? 1 : 0;
+		d->negate = it->negate ? 1 : 0;
+		d->min = it->min;
+		d->max = it->max;
+		d->excl = it->excl;
+		d->group = it->group;
+		d->off = it->off;
+		d->len = it->len;
+		d->member[0] = it->member[0];
+		d->member[1] = it->member[1];
+	}
+	parts = vexec_dev_regex_parts(h);
+	for (int k = 0; k < rc.nparts; k++)
+	{
+		parts[k].ref = rc.parts[k].ref;
+		parts[k].off = rc.parts[k].off;
+		parts[k].len = rc.parts[k].len;
+	}
+	if (lits_len > 0)
+		memcpy(vexec_dev_regex_lits(h), rc.lits, lits_len);
+	if (repl_len > 0)
+		memcpy(vexec_dev_regex_repl(h), rc.repl, repl_len);
+	return out;
 }

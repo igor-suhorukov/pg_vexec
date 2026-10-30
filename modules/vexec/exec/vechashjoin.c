@@ -135,6 +135,7 @@
 
 #include "vexec.h"
 #include "batch/batch.h"
+#include "exec/device.h"
 #include "exec/exec.h"
 #include "exec/keyhash.h"
 #include "expr/expr.h"
@@ -145,9 +146,12 @@
 #define HJ_PARTITIONS		(1 << HJ_PARTITION_BITS)
 #define HJ_MAX_DEPTH		(32 / HJ_PARTITION_BITS)
 
-/* rows of the table a chunk holds */
-#define HJ_CHUNK_ROWS		VEXEC_BATCH_ROWS
+/*
+ * Rows of the table a chunk holds, a power of two: a row id's low bits its
+ * place in its chunk.  The chunk's own, not a batch's (F24).
+ */
 #define HJ_CHUNK_SHIFT		10
+#define HJ_CHUNK_ROWS		(1 << HJ_CHUNK_SHIFT)
 
 /* gp_core's Motion (pg19/include/gp_motion.h) */
 #define HJ_MOTION_NAME		"GpMotion"
@@ -474,6 +478,16 @@ typedef struct HjState
 								 * segments' */
 	int64		outer_rows_one; /* outer rows read a row at a time */
 	int64		rounds;
+
+	/*
+	 * The device strategy (V8c): the node's device side where it may take
+	 * it as it begins, else why not; the in-progress row's probe chunk row,
+	 * -1 where it walks its bucket; the batch a resolved row's returns to
+	 */
+	struct HjDevice *dev;
+	const char *dev_why;
+	int32		inprog_k;
+	HjBatch    *resume_ob;
 } HjState;
 
 static void hj_begin(CustomScanState *css, EState *estate, int eflags);
@@ -532,8 +546,9 @@ vexec_create_hashjoin_state(CustomScan *cscan)
 List *
 vexec_join_plan_encode(const VexecJoinPlan *plan)
 {
-	return list_make4(list_make4(makeInteger(plan->jointype), makeBoolean(plan->inner_unique),
-								 makeInteger(plan->nouter), makeInteger(plan->ninner)),
+	return list_make4(list_make5(makeInteger(plan->jointype), makeBoolean(plan->inner_unique),
+								 makeInteger(plan->nouter), makeInteger(plan->ninner),
+								 makeBoolean(plan->device)),
 					  plan->hashoperators,
 					  plan->hashcollations,
 					  makeFloat(psprintf("%.1f", plan->inner_rows)));
@@ -552,6 +567,7 @@ vexec_join_plan_decode(CustomScan *cscan, VexecJoinPlan *plan)
 	plan->inner_unique = boolVal(lsecond(head));
 	plan->nouter = intVal(lthird(head));
 	plan->ninner = intVal(lfourth(head));
+	plan->device = list_length(head) > 4 && boolVal(list_nth(head, 4));
 	plan->hashoperators = lsecond(priv);
 	plan->hashcollations = lthird(priv);
 	plan->inner_rows = floatVal(lfourth(priv));
@@ -1137,10 +1153,11 @@ side_next(HjState *s, HjSide *side)
 	else
 	{
 		VexecBatch *b = side->rowbatch;
-		int			max = side->read_ahead ? VEXEC_BATCH_ROWS : 1;
+		int			max;
 
 		vexec_batch_reset(b);
 		vexec_batch_begin_rows(b);
+		max = side->read_ahead ? b->room : 1;
 		while (b->nrows < max)
 		{
 			TupleTableSlot *slot = ExecProcNode(side->ps);
@@ -2294,9 +2311,9 @@ file_batch(HjState *s, HjSide *side, BufFile *file, HjBatch *hb, VexecBatch *b)
 
 	vexec_batch_reset(b);
 	vexec_batch_begin_rows(b);
-	hjbatch_begin(side, hb, b, VEXEC_BATCH_ROWS, true);
+	hjbatch_begin(side, hb, b, b->room, true);
 	MemoryContextReset(s->readcxt);
-	while (b->nrows < VEXEC_BATCH_ROWS && spill_read(side, file, s->readcxt) != NULL)
+	while (b->nrows < b->room && spill_read(side, file, s->readcxt) != NULL)
 	{
 		int			r = b->nrows;
 
@@ -2311,7 +2328,7 @@ file_batch(HjState *s, HjSide *side, BufFile *file, HjBatch *hb, VexecBatch *b)
 	hb->nrows = n;
 	if (n % 64 != 0)
 		hb->rows[n / 64] &= (UINT64CONST(1) << (n % 64)) - 1;
-	for (int w = VEXEC_WORDS(n); w < VEXEC_WORDS(VEXEC_BATCH_ROWS); w++)
+	for (int w = VEXEC_WORDS(n); w < VEXEC_WORDS(b->room); w++)
 		hb->rows[w] = 0;
 	return n;
 }
@@ -2720,6 +2737,7 @@ prefetch_outer(HjState *s)
 			side_one_from_slot(s, out, slot);
 			vexec_bit_set(out->one.key_dirty, 0);
 			s->cur_resume = row + 1;
+			s->resume_ob = ob;
 			s->in_one = true;
 			s->ob = &out->one;
 			s->opos = 0;
@@ -2777,6 +2795,7 @@ spill_outer(HjState *s)
 			side_one_from_slot(s, out, slot);
 			vexec_bit_set(out->one.key_dirty, 0);
 			s->cur_resume = row + 1;
+			s->resume_ob = ob;
 			s->in_one = true;
 			s->ob = &out->one;
 			s->opos = 0;
@@ -3103,6 +3122,515 @@ build_phase(HjState *s)
 }
 
 /* ---------------------------------------------------------------------
+ * The device strategy (§3.11, "The operators on the device", V8c)
+ * ---------------------------------------------------------------------
+ *
+ * Where the node may take it as it begins -- an inner, left, semi or anti
+ * join whose hash clauses are its keys' equalities, its keys integers,
+ * bits or bytes, its table its own -- and its table, once built, fits its
+ * memory: the table's keys go to the device, a row for each rid, and the
+ * outer side is probed there a window of batches at a time -- each batch
+ * copied, so that it outlives the child's next one, and its rows' keys
+ * gathered into one probe chunk.  The device answers each outer row's
+ * matching rids, in the order the row's bucket would give them: the rid
+ * inserted last first.  The rounds then take a row's candidates from those
+ * pairs in place of its bucket's walk, and everything after -- the first
+ * level, a semi join's first match, an outer row null-extended -- is as it
+ * is.  The table is built as it is either way: a row the device has no
+ * pairs for -- one whose keys PostgreSQL's evaluator computes, a row the
+ * child resolves, the rows of a window the device did not answer -- walks
+ * its bucket, and so does every row after the executor is lost; a row
+ * whose pairs it lost part way walks it past the pairs it had taken.  A
+ * window ends at a batch with rows its vector child still resolves, which
+ * the child can resolve only before its next batch is read.
+ */
+
+typedef struct HjDevice
+{
+	VexecDevTask *t;
+	bool		started;
+	bool		lost;
+	const char *why;
+	const char *device;
+	VexecDevColType *types;		/* per key: INT64, or STRING */
+	int			wmax;			/* the batches a window takes */
+	int			wn;				/* the window's, */
+	int			wnext;			/* and the next probed */
+	HjBatch    *win;
+	int32	  **chunkrow;		/* per window batch, per row: its probe
+								 * chunk's row, or -1 */
+	MemoryContext wcxt;			/* the window's copies */
+	bool		pairs;			/* the window's rows have the device's pairs */
+	uint32		pages[2];
+	int			npages;
+	const int32 *pp;			/* the answer page's pairs: probe rows, */
+	const int32 *pb;			/* and rids */
+	uint32		np;
+	uint32		pi;
+	bool		more;			/* pages after it */
+	bool		continues;		/* its last row's pairs go on */
+	int64		taken;			/* the in-progress row's pairs taken so far */
+	int			skip;			/* a row whose pairs were lost part way: the
+								 * matches its bucket's walk passes over */
+
+	/* EXPLAIN ANALYZE's */
+	int64		windows;
+	int64		probe_rows;
+	int64		pairs_total;
+	int64		bucket_rows;	/* rows of a window that walked their bucket */
+	VexecDevFigures fig;
+} HjDevice;
+
+/* The node's device side, where it may take it as it begins; else why not. */
+static void
+dev_setup(HjState *s)
+{
+	const char *why = NULL;
+	HjDevice   *d;
+
+	if (!vexec_device_wanted(s->plan.device, vexec_enable_gpu_hashjoin, &why))
+	{
+		s->dev_why = why;
+		return;
+	}
+	if (s->jointype != JOIN_INNER && s->jointype != JOIN_LEFT && s->jointype != JOIN_SEMI &&
+		s->jointype != JOIN_ANTI)
+		why = "a join of another type than inner, left, semi or anti";
+	else if (!s->simple)
+		why = "hash clauses that are not its keys' equalities";
+	if (why == NULL)
+		for (int k = 0; k < s->nkeys && why == NULL; k++)
+			if (s->keys[k].kind == HJ_KEY_FMGR)
+				why = "a key compared by its operator's functions";
+	if (why != NULL)
+	{
+		s->dev_why = why;
+		return;
+	}
+	d = palloc0(sizeof(HjDevice));
+	d->types = palloc0_array(VexecDevColType, Max(s->nkeys, 1));
+	for (int k = 0; k < s->nkeys; k++)
+		d->types[k].type = s->keys[k].kind == HJ_KEY_BYTES ? VEXEC_DEV_STRING : VEXEC_DEV_INT64;
+	d->wmax = Max(Min(vexec_gpu_chunk_rows / vexec_batch_rows, 64), 1);
+	d->win = palloc0_array(HjBatch, d->wmax);
+	d->chunkrow = palloc0_array(int32 *, d->wmax);
+	d->wcxt = AllocSetContextCreate(s->node.mcxt, "VecHashJoin device window", ALLOCSET_DEFAULT_SIZES);
+	s->dev = d;
+}
+
+static void
+dev_end_task(HjDevice *d)
+{
+	if (d->t == NULL)
+		return;
+	d->fig.chunks += d->t->fig.chunks;
+	d->fig.rows += d->t->fig.rows;
+	d->fig.bytes += d->t->fig.bytes;
+	d->fig.answers += d->t->fig.answers;
+	d->fig.answer_rows += d->t->fig.answer_rows;
+	d->fig.answer_bytes += d->t->fig.answer_bytes;
+	d->fig.wait_ms += d->t->fig.wait_ms;
+	d->fig.device_ms += d->t->fig.device_ms;
+	d->fig.gpu_ms += d->t->fig.gpu_ms;
+	vexec_devtask_end(d->t);
+	d->t = NULL;
+}
+
+/* The device given up for the rest of the join: every row walks its bucket. */
+static void
+dev_lose(HjState *s, const char *why)
+{
+	HjDevice   *d = s->dev;
+	MemoryContext old = MemoryContextSwitchTo(s->node.mcxt);
+
+	d->why = pstrdup(why);
+	MemoryContextSwitchTo(old);
+	d->lost = true;
+	d->pairs = false;
+	d->np = d->pi = 0;
+	d->more = false;
+	dev_end_task(d);
+}
+
+static const char *
+dev_answer_why(HjDevice *d, int status)
+{
+	return psprintf("the device's answer was \"%s\"%s%s", vexec_dev_status_name(status),
+					d->t && d->t->message[0] ? ": " : "", d->t ? d->t->message : "");
+}
+
+/* A row's keys into a chunk, as the device holds them. */
+static void
+dev_put_keys(HjState *s, VexecDevFill *f, const HjKeyVal *kv, bool isnull)
+{
+	for (int k = 0; k < s->nkeys; k++)
+	{
+		if (s->keys[k].kind == HJ_KEY_BYTES)
+			vexec_devfill_put(f, k, isnull ? NULL : kv[k].u.p, isnull ? 0 : (uint32) kv[k].len, isnull);
+		else
+			vexec_devfill_put(f, k, &kv[k].u.i, sizeof(int64), isnull);
+	}
+}
+
+/* The bytes the rows' string keys take, a key each, into strings[]. */
+static void
+dev_key_bytes(HjState *s, const HjKeyVal *kv, int nrows, uint64 *strings)
+{
+	for (int k = 0; k < s->nkeys; k++)
+	{
+		strings[k] = 0;
+		if (s->keys[k].kind == HJ_KEY_BYTES)
+			for (int r = 0; r < nrows; r++)
+				strings[k] += kv[r * s->nkeys + k].len;
+	}
+}
+
+/*
+ * The task begun and the table's keys sent, a row for each rid -- a
+ * chunk of the table short of its rows padded with NULL keys, which meet
+ * no row -- once the table is built: false, the join then on the CPU,
+ * where it is not.
+ */
+static bool
+dev_start(HjState *s)
+{
+	HjDevice   *d = s->dev;
+	MemoryContext old = MemoryContextSwitchTo(s->node.mcxt);
+	VexecDevProgram *prog;
+	Size		len;
+	const char *why;
+	int			c = 0;
+	uint64		strings[INDEX_MAX_KEYS];
+	int			status;
+
+	d->started = true;
+	if (s->spilled || s->shared != NULL)
+	{
+		d->lost = true;
+		d->why = s->spilled ? "its table spilled to partitions" : "a table its participants share";
+		MemoryContextSwitchTo(old);
+		return false;
+	}
+	len = sizeof(VexecDevProgram) + VEXEC_DEV_ALIGN(sizeof(VexecDevColType) * s->nkeys);
+	prog = palloc0(len);
+	prog->ncols = s->nkeys;
+	prog->memory = (uint64) (s->nrows * (s->nkeys * 8 + 16) * 3);
+	prog->admission_wait_ms = VEXEC_DEV_WAIT_DEFAULT;
+	memcpy(vexec_dev_program_cols(prog), d->types, sizeof(VexecDevColType) * s->nkeys);
+	d->t = vexec_devtask_begin(VEXEC_DEV_OP_JOIN, prog, len, s->node.mcxt, &why);
+	pfree(prog);
+	if (d->t == NULL)
+	{
+		d->lost = true;
+		d->why = why;
+		MemoryContextSwitchTo(old);
+		return false;
+	}
+	d->device = vexec_device_ready() ? vexec_device_ready()->device_name() : NULL;
+	d->device = d->device ? pstrdup(d->device) : "the device";
+	d->npages = vexec_devtask_claim_answers(d->t, lengthof(d->pages), d->pages);
+	d->t->held += d->npages;
+	MemoryContextSwitchTo(old);
+	if (d->npages == 0)
+	{
+		dev_lose(s, "no block of the arena for its answers");
+		return false;
+	}
+
+	/* the table's keys, in chunks of the device's rows */
+	while (c < s->nchunks)
+	{
+		VexecDevFill *f = vexec_devfill_begin(d->t, s->nkeys, d->types,
+											  (uint32) Max(vexec_gpu_chunk_rows, HJ_CHUNK_ROWS), 0);
+
+		if (f == NULL)
+		{
+			dev_lose(s, "no room in the arena for the table's keys");
+			return false;
+		}
+		f->first_row = (uint64) c << HJ_CHUNK_SHIFT;
+		for (; c < s->nchunks; c++)
+		{
+			HjChunk    *ch = s->chunks[c];
+			int			rows = c < s->nchunks - 1 ? HJ_CHUNK_ROWS : ch->nrows;
+
+			dev_key_bytes(s, ch->keys, ch->nrows, strings);
+			if (!vexec_devfill_room(f, rows, strings))
+			{
+				if (f->nrows == 0)
+				{
+					vexec_devfill_free(f);
+					dev_lose(s, "a chunk of the table's keys larger than the arena takes");
+					return false;
+				}
+				break;
+			}
+			for (int r = 0; r < rows; r++)
+				dev_put_keys(s, f, r < ch->nrows ? &ch->keys[r * s->nkeys] : NULL, r >= ch->nrows);
+			vexec_devfill_rows(f, rows);
+			CHECK_FOR_INTERRUPTS();
+		}
+		vexec_devfill_submit_side(f, 0);
+		status = vexec_devtask_wait(d->t);
+		vexec_devfill_free(f);
+		if (status != VEXEC_DEV_OK)
+		{
+			dev_lose(s, dev_answer_why(d, status));
+			return false;
+		}
+	}
+	return true;
+}
+
+/* The answer's next page of pairs: false where there is none to read. */
+static bool
+dev_page(HjState *s)
+{
+	HjDevice   *d = s->dev;
+	const VexecDevAnswer *a;
+	int			status;
+
+	status = vexec_devtask_answer_page(d->t, d->npages, d->pages, 0);
+	if (status != VEXEC_DEV_OK && status != VEXEC_DEV_MORE)
+	{
+		dev_lose(s, dev_answer_why(d, status));
+		return false;
+	}
+	a = vexec_devtask_answer(d->t);
+	d->np = a->nrows;
+	d->pi = 0;
+	d->more = status == VEXEC_DEV_MORE;
+	d->continues = (a->flags & VEXEC_DEV_ANSF_ROW_CONTINUES) != 0;
+	if (a->nrows > 0)
+	{
+		const VexecDevAnsCol *cols = vexec_dev_answer_cols((VexecDevAnswer *) a);
+
+		d->pp = (const int32 *) vexec_devans_values(d->t, &cols[0]);
+		d->pb = (const int32 *) vexec_devans_values(d->t, &cols[1]);
+	}
+	d->pairs_total += a->nrows;
+	return true;
+}
+
+/* A side batch copied into the window's memory, with its keys and bitmaps. */
+static void
+dev_clone(HjState *s, HjBatch *dst, const HjBatch *src, MemoryContext cxt)
+{
+	MemoryContext old = MemoryContextSwitchTo(cxt);
+	int			n = src->nrows;
+	Size		words = sizeof(uint64) * VEXEC_WORDS(Max(n, 1));
+
+	memset(dst, 0, sizeof(HjBatch));
+	/* the values of the rows there are, but those the child still resolves */
+	if (src->child_dirty != NULL)
+	{
+		uint64	   *defined = palloc(words);
+
+		for (int w = 0; w < VEXEC_WORDS(Max(n, 1)); w++)
+			defined[w] = src->rows[w] & ~src->child_dirty[w];
+		dst->batch = vexec_batch_clone(cxt, src->batch, defined);
+	}
+	else
+		dst->batch = vexec_batch_clone(cxt, src->batch, src->rows);
+	dst->nrows = n;
+	dst->rows = palloc(words);
+	memcpy(dst->rows, src->rows, words);
+	if (src->child_dirty != NULL)
+	{
+		dst->child_dirty = palloc(words);
+		memcpy(dst->child_dirty, src->child_dirty, words);
+	}
+	dst->key_dirty = palloc(words);
+	memcpy(dst->key_dirty, src->key_dirty, words);
+	dst->nullkey = palloc(words);
+	memcpy(dst->nullkey, src->nullkey, words);
+	dst->hashes = palloc(sizeof(uint32) * VEXEC_BATCH_ROWS);
+	memcpy(dst->hashes, src->hashes, sizeof(uint32) * Max(n, 1));
+	dst->keys = palloc0(sizeof(HjKeyVal) * Max(s->nkeys, 1) * VEXEC_BATCH_ROWS);
+	memcpy(dst->keys, src->keys, sizeof(HjKeyVal) * Max(s->nkeys, 1) * Max(n, 1));
+	/* a key's bytes, wherever they were, the copy's own */
+	for (int k = 0; k < s->nkeys; k++)
+		if (s->keys[k].kind == HJ_KEY_BYTES)
+			for (int r = 0; r < n; r++)
+			{
+				HjKeyVal   *kv = &dst->keys[r * s->nkeys + k];
+
+				if (kv->u.p != NULL && kv->len > 0)
+				{
+					char	   *p = palloc(kv->len);
+
+					memcpy(p, kv->u.p, kv->len);
+					kv->u.p = p;
+				}
+			}
+	dst->matched = palloc0(VEXEC_BATCH_ROWS);
+	dst->keycxt = AllocSetContextCreate(cxt, "VecHashJoin window keys", ALLOCSET_SMALL_SIZES);
+	MemoryContextSwitchTo(old);
+}
+
+/*
+ * The next window: up to wmax batches of the outer side, copied, and the
+ * keys of those of their rows a probe can take sent as one chunk, its
+ * pairs' first page read.  False at the outer side's end.
+ */
+static bool
+dev_window(HjState *s)
+{
+	HjDevice   *d = s->dev;
+	HjSide	   *out = &s->side[0];
+	VexecDevFill *f;
+	int32		k = 0;
+	uint64		strings[INDEX_MAX_KEYS];
+	int			status;
+
+	MemoryContextReset(d->wcxt);
+	d->wn = d->wnext = 0;
+	d->pairs = false;
+	d->np = d->pi = 0;
+	d->more = false;
+	f = vexec_devfill_begin(d->t, s->nkeys, d->types, (uint32) d->wmax * vexec_batch_rows, 0);
+	if (f == NULL)
+	{
+		dev_lose(s, "no room in the arena for a probe");
+		return false;
+	}
+	while (d->wn < d->wmax && side_next(s, out))
+	{
+		HjBatch    *hb = &d->win[d->wn];
+		int32	   *cr;
+		int			n;
+		bool		dirty;
+
+		dev_clone(s, hb, &out->cur, d->wcxt);
+		n = hb->nrows;
+		cr = MemoryContextAlloc(d->wcxt, sizeof(int32) * Max(n, 1));
+		dirty = hb->child_dirty != NULL && vexec_bits_any(hb->child_dirty, n);
+		dev_key_bytes(s, hb->keys, n, strings);
+		if (!vexec_devfill_room(f, n, strings))
+		{
+			/* no room: the batch's rows walk their buckets */
+			for (int r = 0; r < n; r++)
+				cr[r] = -1;
+		}
+		else
+		{
+			for (int r = 0; r < n; r++)
+			{
+				cr[r] = -1;
+				if (!vexec_bit(hb->rows, r) || vexec_bit(hb->key_dirty, r) || vexec_bit(hb->nullkey, r) ||
+					(hb->child_dirty != NULL && vexec_bit(hb->child_dirty, r)))
+					continue;
+				dev_put_keys(s, f, &hb->keys[r * s->nkeys], false);
+				vexec_devfill_rows(f, 1);
+				cr[r] = k++;
+			}
+		}
+		d->chunkrow[d->wn] = cr;
+		d->wn++;
+		/* the child resolves its rows before its next batch is read */
+		if (dirty)
+			break;
+	}
+	if (d->wn == 0)
+	{
+		vexec_devfill_free(f);
+		return false;
+	}
+	d->windows++;
+	if (k == 0)
+	{
+		vexec_devfill_free(f);
+		return true;
+	}
+	vexec_devfill_submit_side(f, 1);
+	status = vexec_devtask_wait(d->t);
+	vexec_devfill_free(f);
+	if (status != VEXEC_DEV_OK)
+	{
+		dev_lose(s, dev_answer_why(d, status));
+		return true;
+	}
+	d->probe_rows += k;
+	/* the probe's answer says how many pairs; a page's answer is the page's */
+	if (vexec_devtask_answer(d->t)->value == 0)
+	{
+		d->pairs = true;
+		d->np = d->pi = 0;
+		d->more = false;
+	}
+	else
+		d->pairs = dev_page(s);
+	return true;
+}
+
+/* The probe chunk's row of the batch's row, or -1: its bucket walked. */
+static inline int32
+dev_row(HjState *s, HjBatch *ob, int row)
+{
+	HjDevice   *d = s->dev;
+
+	if (d == NULL || !d->pairs || ob < d->win || ob >= d->win + d->wn)
+		return -1;
+	return d->chunkrow[ob - d->win][row];
+}
+
+/*
+ * The next rid of probe row k's pairs, not yet taken: false where its
+ * pairs are done -- or lost, d->pairs then false, and the row's bucket is
+ * walked past the pairs it took.  A page ends where a row's pairs end
+ * unless it says the row goes on: so a page whose last row is k, and goes
+ * not on, holds all of k's.
+ */
+static bool
+dev_peek(HjState *s, int32 k, uint32 *rid)
+{
+	HjDevice   *d = s->dev;
+
+	for (;;)
+	{
+		while (d->pi < d->np && d->pp[d->pi] < k)
+			d->pi++;
+		if (d->pi < d->np)
+		{
+			if (d->pp[d->pi] != k)
+				return false;
+			*rid = (uint32) d->pb[d->pi];
+			return true;
+		}
+		if (!d->more)
+			return false;
+		if (d->np > 0 && d->pp[d->np - 1] == k && !d->continues)
+			return false;
+		if (!dev_page(s))
+			return false;
+	}
+}
+
+/*
+ * The device side for a run again, or the node's end: the task over, the
+ * window dropped.  A rescan that keeps the table begins a task again, the
+ * table's keys sent again, at its first probe.
+ */
+static void
+dev_reset(HjState *s)
+{
+	HjDevice   *d = s->dev;
+
+	if (d == NULL)
+		return;
+	dev_end_task(d);
+	MemoryContextReset(d->wcxt);
+	d->wn = d->wnext = 0;
+	d->pairs = false;
+	d->np = d->pi = 0;
+	d->more = false;
+	d->started = false;
+	d->lost = false;
+	s->inprog_k = -1;
+	s->resume_ob = NULL;
+}
+
+/* ---------------------------------------------------------------------
  * Probing: rounds of join rows
  * ---------------------------------------------------------------------
  */
@@ -3112,7 +3640,25 @@ static bool
 outer_next(HjState *s)
 {
 	HjSide	   *out = &s->side[0];
+	HjDevice   *d = s->dev;
 
+	/* V8c: the window's next batch, a window read where it is done */
+	if (d != NULL && d->started && !s->spilled && (d->wnext < d->wn || !d->lost))
+	{
+		if (d->wnext >= d->wn && !dev_window(s))
+		{
+			if (!d->lost)
+				return false;
+			/* lost before a window: the rest as the node reads it without one */
+		}
+		else
+		{
+			s->ob = &d->win[d->wnext++];
+			s->opos = 0;
+			s->inprog = -1;
+			return true;
+		}
+	}
 	if (s->spilled)
 	{
 		if (s->curpart == NULL || s->curpart->outer == NULL ||
@@ -3377,7 +3923,7 @@ static bool
 probe_round(HjState *s)
 {
 	HjSide	   *out = &s->side[0];
-	const int	limit = VEXEC_BATCH_ROWS;
+	const int	limit = vexec_batch_rows;
 	bool		stop_at_match = s->single_match || s->jointype == JOIN_ANTI;
 	bool		full = false;
 
@@ -3424,7 +3970,7 @@ probe_round(HjState *s)
 				if (s->in_one)
 				{
 					s->in_one = false;
-					s->ob = &out->cur;
+					s->ob = s->resume_ob != NULL ? s->resume_ob : &out->cur;
 					s->opos = s->cur_resume;
 					if (s->r_n > 0)
 						break;
@@ -3453,6 +3999,7 @@ probe_round(HjState *s)
 					side_one_from_slot(s, out, slot);
 					vexec_bit_set(out->one.key_dirty, 0);
 					s->cur_resume = row + 1;
+					s->resume_ob = ob;
 					s->in_one = true;
 					s->ob = &out->one;
 					s->opos = 0;
@@ -3476,9 +4023,23 @@ probe_round(HjState *s)
 				break;
 			s->opos = row + 1;
 			s->outer_not_empty = true;
-			probe_ahead(s, ob, row);
 			s->inprog = row;
-			s->inprog_next = s->heads[ob->hashes[row] & s->mask];
+			/* V8c: the row's pairs from the device, else its bucket */
+			s->inprog_k = dev_row(s, ob, row);
+			if (s->inprog_k >= 0)
+			{
+				s->dev->taken = 0;
+				s->dev->skip = 0;
+				s->inprog_next = 1;
+			}
+			else
+			{
+				probe_ahead(s, ob, row);
+				s->inprog_next = s->heads[ob->hashes[row] & s->mask];
+				if (s->dev != NULL && s->dev->pairs && ob >= s->dev->win &&
+					ob < s->dev->win + s->dev->wn)
+					s->dev->bucket_rows++;
+			}
 			if (s->r_n == 0)
 				s->jr_ob = ob;	/* the round's rows are this batch's */
 			s->r_row[s->r_n] = row;
@@ -3493,9 +4054,7 @@ probe_round(HjState *s)
 		h = ob->hashes[row];
 		while (s->inprog_next != 0)
 		{
-			uint32		rid = s->inprog_next - 1;
-			HjChunk    *ch = s->chunks[rid >> HJ_CHUNK_SHIFT];
-			int			cr = rid & (HJ_CHUNK_ROWS - 1);
+			uint32		rid;
 			uint8		st;
 
 			if (s->c_n + 1 + (s->fill_outer ? s->r_n : 0) > limit)
@@ -3503,17 +4062,51 @@ probe_round(HjState *s)
 				full = true;
 				break;
 			}
-			s->inprog_next = ch->next[cr];
-			if (ch->hashes[cr] != h)
-				continue;
-			if (s->simple)
+			if (s->inprog_k >= 0)
 			{
-				if (!keys_equal(s, okv, &ch->keys[cr * s->nkeys]))
-					continue;
+				/* V8c: the device's pair, the row's keys' equal by it */
+				if (!dev_peek(s, s->inprog_k, &rid))
+				{
+					if (!s->dev->pairs)
+					{
+						/* lost part way: the bucket, past the pairs taken */
+						s->dev->skip = (int) s->dev->taken;
+						s->inprog_k = -1;
+						s->inprog_next = s->heads[h & s->mask];
+						continue;
+					}
+					s->inprog_next = 0;
+					break;
+				}
+				s->dev->pi++;
+				s->dev->taken++;
 				st = s->nl1 == 0 ? HJ_C_MATCH : HJ_C_EVAL;
 			}
 			else
-				st = HJ_C_EVAL;
+			{
+				HjChunk    *ch;
+				int			cr;
+
+				rid = s->inprog_next - 1;
+				ch = s->chunks[rid >> HJ_CHUNK_SHIFT];
+				cr = rid & (HJ_CHUNK_ROWS - 1);
+				s->inprog_next = ch->next[cr];
+				if (ch->hashes[cr] != h)
+					continue;
+				if (s->simple)
+				{
+					if (!keys_equal(s, okv, &ch->keys[cr * s->nkeys]))
+						continue;
+					st = s->nl1 == 0 ? HJ_C_MATCH : HJ_C_EVAL;
+				}
+				else
+					st = HJ_C_EVAL;
+				if (s->dev != NULL && s->dev->skip > 0)
+				{
+					s->dev->skip--;
+					continue;
+				}
+			}
 			s->c_outer[s->c_n] = row;
 			s->c_rid[s->c_n] = rid;
 			s->c_status[s->c_n] = st;
@@ -3544,7 +4137,7 @@ fill_inner_round(HjState *s)
 	s->jr_n = 0;
 	s->jr_ob = NULL;
 	s->jr_src = HJ_SRC_TABLE;
-	while (s->jr_n < VEXEC_BATCH_ROWS && s->fill_rid < s->nrows)
+	while (s->jr_n < vexec_batch_rows && s->fill_rid < s->nrows)
 	{
 		uint32		rid = (uint32) s->fill_rid++;
 		HjChunk    *ch = s->chunks[rid >> HJ_CHUNK_SHIFT];
@@ -3569,7 +4162,7 @@ null_round(HjState *s, HjSide *side)
 		return false;
 	vexec_batch_reset(b);
 	vexec_batch_begin_rows(b);
-	while (b->nrows < VEXEC_BATCH_ROWS &&
+	while (b->nrows < b->room &&
 		   tuplestore_gettupleslot(side->nullrows, true, false, side->nullslot))
 	{
 		slot_getallattrs(side->nullslot);
@@ -3701,11 +4294,23 @@ hj_fetch(VexecNode *node)
 				}
 				if (s->spilled)
 				{
+					/* V8c: a grace join's partitions are the CPU's */
+					if (s->dev != NULL && !s->dev->started)
+					{
+						s->dev->started = true;
+						s->dev->lost = true;
+						s->dev->why = "its table spilled to partitions";
+					}
 					spill_outer(s);
 					s->phase = HJ_NEXT_PART;
 				}
 				else
+				{
+					/* V8c: the table's keys to the device, once it is built */
+					if (s->dev != NULL && !s->dev->started)
+						(void) dev_start(s);
 					s->phase = HJ_PROBE;
+				}
 				continue;
 			case HJ_PROBE:
 				if (probe_round(s))
@@ -4166,6 +4771,10 @@ hj_begin(CustomScanState *css, EState *estate, int eflags)
 
 	s->phase = HJ_BUILD;
 	s->inprog = -1;
+	s->inprog_k = -1;
+
+	/* V8c: the device strategy, where the node may take it */
+	dev_setup(s);
 }
 
 static void
@@ -4192,6 +4801,9 @@ hj_rescan(CustomScanState *css)
 			tuplestore_rescan(s->side[1].nullrows);
 		s->outer_not_empty = false;
 		s->phase = HJ_PROBE;
+		dev_reset(s);
+		if (s->dev != NULL)
+			(void) dev_start(s);
 	}
 	else
 	{
@@ -4208,6 +4820,7 @@ hj_rescan(CustomScanState *css)
 			s->side[1].nullrows = NULL;
 		}
 		s->phase = HJ_BUILD;
+		dev_reset(s);
 		if (s->side[1].touched && inner->chgParam == NULL)
 			ExecReScan(inner);
 		s->side[1].done = false;
@@ -4235,6 +4848,7 @@ hj_end(CustomScanState *css)
 {
 	HjState    *s = (HjState *) css;
 
+	dev_reset(s);
 	spill_close_all(s);
 	for (int i = 0; i < 2; i++)
 	{
@@ -4269,6 +4883,8 @@ hj_initialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordinate)
 {
 	HjState    *s = (HjState *) css;
 
+	vexec_pool_reserve(pcxt, &css->ss.ps);	/* F3: the pool's workers for the Gather's, where it may */
+
 	(void) pcxt;
 	shared_init((HjShared *) coordinate);
 	s->shared = (HjShared *) coordinate;
@@ -4285,6 +4901,8 @@ hj_reinitialize_dsm(CustomScanState *css, ParallelContext *pcxt, void *coordinat
 	HjState    *s = (HjState *) css;
 	dsa_area   *area = css->ss.ps.state->es_query_dsa != NULL ?
 		css->ss.ps.state->es_query_dsa : s->area;
+
+	vexec_pool_reserve(pcxt, &css->ss.ps);	/* F3: the pool's workers for the Gather's, where it may */
 
 	(void) pcxt;
 	shared_free(area, (HjShared *) coordinate);
@@ -4329,6 +4947,107 @@ key_kind_name(HjKeyKind kind)
 	}
 }
 
+/* V8c: the device strategy -- the device, or why not -- and what it did. */
+static void
+hj_explain_device(HjState *s, ExplainState *es)
+{
+	HjDevice   *d = s->dev;
+
+	if (d == NULL)
+	{
+		if (s->dev_why != NULL)
+			ExplainPropertyText("Device", psprintf("none: %s", s->dev_why), es);
+		return;
+	}
+	if (!es->analyze || !s->node.ran)
+	{
+		ExplainPropertyText("Device", "the GPU's probes, once the table is built", es);
+		return;
+	}
+	if (d->device != NULL && !d->lost)
+		ExplainPropertyText("Device", d->device, es);
+	else if (d->device != NULL)
+		ExplainPropertyText("Device", psprintf("%s, then the CPU: %s", d->device, d->why), es);
+	else
+		ExplainPropertyText("Device", psprintf("none: %s", d->why ? d->why : "it did not begin"), es);
+	ExplainPropertyInteger("Device Windows", NULL, d->windows, es);
+	ExplainPropertyInteger("Device Probe Rows", NULL, d->probe_rows, es);
+	ExplainPropertyInteger("Device Pairs", NULL, d->pairs_total, es);
+	if (d->bucket_rows > 0)
+		ExplainPropertyInteger("Window Rows Walking Their Bucket", NULL, d->bucket_rows, es);
+	if (es->verbose)
+	{
+		/* the ended tasks' figures, and the task's still running */
+		VexecDevFigures f = d->fig;
+
+		if (d->t != NULL)
+		{
+			f.bytes += d->t->fig.bytes;
+			f.answer_bytes += d->t->fig.answer_bytes;
+			f.wait_ms += d->t->fig.wait_ms;
+			f.device_ms += d->t->fig.device_ms;
+		}
+		ExplainPropertyInteger("Device Bytes In", "kB", (f.bytes + 1023) / 1024, es);
+		ExplainPropertyInteger("Device Bytes Out", "kB", (f.answer_bytes + 1023) / 1024, es);
+		if (es->timing)
+		{
+			ExplainPropertyFloat("Device Wait Time", "ms", f.wait_ms, 3, es);
+			ExplainPropertyFloat("Device Time", "ms", f.device_ms, 3, es);
+		}
+	}
+}
+
+/*
+ * pg_otel_probe's span of a VecHashJoin that ran (node.c; pg_vector_executor.md
+ * §3.41): its device strategy, as hj_explain_device() prints it -- the task
+ * still running added, but on a failed statement's error path (OT1) -- and
+ * its table's memory and spills (OT2).  Its fields alone.
+ */
+void
+vexec_hashjoin_figures(VexecNode *node, VexecNodeFigures *f, bool on_error)
+{
+	HjState    *s = (HjState *) node;
+	HjDevice   *d = s->dev;
+
+	if (d == NULL && s->dev_why != NULL)
+	{
+		f->device = "none";
+		f->device_why = s->dev_why;
+	}
+	else if (d != NULL)
+	{
+		VexecDevFigures fig = d->fig;
+
+		if (d->t != NULL && !on_error)
+		{
+			fig.requests += d->t->fig.requests;
+			fig.bytes += d->t->fig.bytes;
+			fig.answer_bytes += d->t->fig.answer_bytes;
+			fig.wait_ms += d->t->fig.wait_ms;
+			fig.device_ms += d->t->fig.device_ms;
+			fig.gpu_ms += d->t->fig.gpu_ms;
+		}
+		f->device = d->device != NULL ? d->device : "none";
+		if (d->device == NULL)
+			f->device_why = d->why != NULL ? d->why : "it did not begin";
+		else if (d->lost)
+			f->device_why = d->why;
+		f->device_requests = fig.requests;
+		f->device_bytes_in = fig.bytes;
+		f->device_bytes_out = fig.answer_bytes;
+		f->device_ms = fig.device_ms;
+		f->device_gpu_ms = fig.gpu_ms;
+		f->device_wait_ms = fig.wait_ms;
+	}
+	f->memory_kb = (int64) ((s->peak_memory + 1023) / 1024);
+	if (s->spilled_parts > 0)
+	{
+		f->spilled_partitions = s->spilled_parts;
+		f->spilled_rows = s->spilled_rows;
+		f->spill_depth = s->max_depth;
+	}
+}
+
 static void
 hj_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 {
@@ -4347,6 +5066,7 @@ hj_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 							deparse_expression((Node *) make_ands_explicit(s->joinqual),
 											   context, useprefix, false), es);
 	vexec_node_explain_properties(&s->node, ancestors, es);
+	hj_explain_device(s, es);
 	if (es->verbose)
 	{
 		StringInfoData buf;

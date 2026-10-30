@@ -11,6 +11,10 @@
 
 \i sql/vexec_corpus_setup.sql
 
+-- batches of 1,024 rows, as before F24 (§3.38) made their rows a setting:
+-- the corpus's 2,600 rows in three batches, the batches' edges between them
+SET vexec.batch_rows = 1024;
+
 -- every column, in each format: the shapes its frames carried
 SELECT * FROM vexec_test.frames('SELECT * FROM corpus ORDER BY id', 'postgres');
 SELECT * FROM vexec_test.frames('SELECT * FROM corpus ORDER BY id', 'arrow', parts => 7);

@@ -20,6 +20,10 @@
  *		with the row's.
  *	vexec_test.scaled(value, scale, width)
  *		A numeric through its scaled form and back.
+ *	vexec_test.scaled_key(value, scale, other)
+ *		F10's numeric key of a scaled int64: its hash against
+ *		hash_numeric()'s, its equality with another numeric against
+ *		numeric_eq()'s.
  *
  * The IPC codec's checks are in ipc_test.c.
  *
@@ -44,6 +48,7 @@
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datum.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
@@ -76,6 +81,7 @@ PG_MODULE_MAGIC_EXT(
 PG_FUNCTION_INFO_V1(vexec_test_roundtrip);
 PG_FUNCTION_INFO_V1(vexec_test_export);
 PG_FUNCTION_INFO_V1(vexec_test_scaled);
+PG_FUNCTION_INFO_V1(vexec_test_scaled_key);
 
 /* A query's rows, a batch at a time, through an SPI cursor (vexec_test.h). */
 void
@@ -120,7 +126,12 @@ rows_next(Rows *rows)
 {
 	uint64		i;
 
-	SPI_cursor_fetch(rows->portal, true, VEXEC_BATCH_ROWS);
+	/*
+	 * a batch's rows as vexec fills one: vexec.batch_rows (F24), read by its
+	 * name -- this library is loaded before vexec's, whose variables it may
+	 * not name
+	 */
+	SPI_cursor_fetch(rows->portal, true, atoi(GetConfigOption("vexec.batch_rows", false, false)));
 	rows->nrows = (int) SPI_processed;
 	for (i = 0; i < SPI_processed; i++)
 		heap_deform_tuple(SPI_tuptable->vals[i], SPI_tuptable->tupdesc,
@@ -971,4 +982,35 @@ vexec_test_scaled(PG_FUNCTION_ARGS)
 	result = psprintf("%s -> %s", p, DatumGetCString(DirectFunctionCall1(numeric_out, back)));
 	vexec_batch_free(batch);
 	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+/*
+ * vexec_test.scaled_key(value numeric, scale int4, other numeric): the value
+ * at the scale as an int64, VecAgg's key of it (F10) -- its hash, which must
+ * be hash_numeric()'s of the value, and whether it equals `other`, which must
+ * be numeric_eq()'s answer: 'ok', else both answers; 'none' where the value
+ * has no int64 at that scale.
+ */
+Datum
+vexec_test_scaled_key(PG_FUNCTION_ARGS)
+{
+	Datum		num = PG_GETARG_DATUM(0);
+	int			scale = PG_GETARG_INT32(1);
+	Datum		other = PG_GETARG_DATUM(2);
+	int128		value;
+	uint32		hash;
+	uint32		pg_hash;
+	bool		eq;
+	bool		pg_eq;
+
+	if (!vexec_numeric_to_scaled(num, scale, 18, 8, &value))
+		PG_RETURN_TEXT_P(cstring_to_text("none"));
+	hash = vexec_scaled_hash_numeric((int64) value, scale);
+	pg_hash = DatumGetUInt32(DirectFunctionCall1(hash_numeric, num));
+	eq = vexec_scaled_numeric_eq((int64) value, scale, other);
+	pg_eq = DatumGetBool(DirectFunctionCall2(numeric_eq, num, other));
+	if (hash != pg_hash || eq != pg_eq)
+		PG_RETURN_TEXT_P(cstring_to_text(psprintf("hash %u, hash_numeric %u; equal %s, numeric_eq %s",
+												  hash, pg_hash, eq ? "t" : "f", pg_eq ? "t" : "f")));
+	PG_RETURN_TEXT_P(cstring_to_text("ok"));
 }

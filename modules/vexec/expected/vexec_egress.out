@@ -129,6 +129,9 @@ SELECT g,
 		 ELSE 'short ' || g END
 FROM generate_series(1, 2600) g;
 ANALYZE corpus;
+-- batches of 1,024 rows, as before F24 (§3.38) made their rows a setting:
+-- the corpus's 2,600 rows in three batches, the batches' edges between them
+SET vexec.batch_rows = 1024;
 -- the rows of the corpus whose values Arrow holds in every column
 CREATE TEMP VIEW egress_corpus AS
   SELECT * FROM corpus WHERE id % 50 NOT IN (15, 16, 19, 20, 21, 23, 24, 26, 27, 28, 36);

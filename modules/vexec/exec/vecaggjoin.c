@@ -298,3 +298,24 @@ aggjoin_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 	if (es->analyze)
 		ExplainPropertyInteger("Groups Joined", NULL, s->joined, es);
 }
+
+/* Its methods, for pg_otel_probe's reporter of VecAggJoin (node.c). */
+const CustomExecMethods *
+vexec_aggjoin_exec_methods(void)
+{
+	return &aggjoin_exec_methods;
+}
+
+/*
+ * pg_otel_probe's span of it (node.c; pg_vector_executor.md §3.41, OT8):
+ * the outer groups that found their inner group, and the inner side's
+ * groups, once its table is built; -1 before.  Its fields alone.
+ */
+void
+vexec_aggjoin_figures(PlanState *ps, int64 *groups_joined, int64 *inner_groups)
+{
+	AggJoinState *s = (AggJoinState *) ps;
+
+	*groups_joined = s->built ? s->joined : -1;
+	*inner_groups = s->built ? s->nrows : -1;
+}

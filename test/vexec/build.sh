@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Build vexec, its tests' modules and the extensions beside it -- the kernel
-# packs, and vexec_flight where its dependencies are -- by PGXS against the
+# packs, vexec_flight where its dependencies are, and vexec_parquet where
+# Arrow C++ with Parquet and S3 is -- by PGXS against the
 # server of the container this runs in, and install them into it
 # (pg_vector_executor.md §3.2).  The tree is read where it is mounted and
 # built in a copy, so that nothing is written into it.  Warnings are errors.
@@ -43,9 +44,11 @@ fi
 echo "building against $("$PG_CONFIG" --version) at $(cat "$("$PG_CONFIG" --bindir)/../.pg_ref_commit" 2>/dev/null || echo '?')"
 # vexec, the tests' modules, and the extensions beside vexec, against
 # include/ here: the kernel packs on every image, vexec_flight where its
-# dependencies are -- its own dev images (modules/vexec_flight/docker).
+# dependencies are -- its own dev images (modules/vexec_flight/docker) --
+# and vexec_parquet where Arrow C++ is (docker/Dockerfile.parquet's image).
 modules="vexec vexec_test vexec_testpack vexec_pgvector vexec_postgis"
 command -v protoc-c > /dev/null && modules="$modules vexec_flight"
+pkg-config --exists arrow parquet arrow-s3 2> /dev/null && modules="$modules vexec_parquet"
 for m in $modules; do
 	[ -f "$BUILD/modules/$m/Makefile" ] || continue
 	case " ${VEXEC_SKIP_MODULES:-} " in *" $m "*) continue ;; esac

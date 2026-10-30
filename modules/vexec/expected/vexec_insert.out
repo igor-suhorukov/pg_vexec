@@ -184,7 +184,7 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
  Vec Insert on ins_vec (actual rows=0.00 loops=1)
    Write: table_multi_insert
    Rows Inserted: 2500
-   Batches Through table_multi_insert: 3
+   Batches Through table_multi_insert: 1
    ->  Function Scan on generate_series g (actual rows=2500.00 loops=1)
 (5 rows)
 
@@ -426,7 +426,7 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) INSERT INTO i
    Write: each partition's
    Rows Inserted: 10000
    Partitions Written: 4
-   Batches Through table_multi_insert: 40
+   Batches Through table_multi_insert: 12
    Rows Checked Row by Row: 2470
    ->  Vec Seq Scan on ins_pr_src (actual rows=10000.00 loops=1)
 (7 rows)
@@ -534,7 +534,7 @@ EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
    Write: each partition's
    Rows Inserted: 10000
    Partitions Written: 40
-   Batches Through table_multi_insert: 400
+   Batches Through table_multi_insert: 120
    Rows Checked Row by Row: 10000
    ->  Function Scan on generate_series g (actual rows=10000.00 loops=1)
 (7 rows)

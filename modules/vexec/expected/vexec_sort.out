@@ -951,6 +951,8 @@ SELECT sort_check('SELECT id, k FROM so WHERE s IN (3, 4) ORDER BY k, id LIMIT 6
  same, bounded VecSort
 (1 row)
 
+-- its 1,200 rows in batches of 1,024: the bound set by the first, applied to the next
+SET vexec.batch_rows = 1024;
 SELECT sort_explain('SELECT id, k FROM so WHERE s IN (3, 4) ORDER BY k, id LIMIT 6',
                     'Vec Bitmap|Running Bound|Rows Removed by Bound');
                               sort_explain                               
@@ -960,6 +962,7 @@ SELECT sort_explain('SELECT id, k FROM so WHERE s IN (3, 4) ORDER BY k, id LIMIT
                Rows Removed by Bound: N
 (3 rows)
 
+RESET vexec.batch_rows;
 RESET enable_seqscan;
 DROP INDEX so_s;
 -- no bound: the setting off, or a first key the scan computes
@@ -975,6 +978,160 @@ SELECT sort_explain('SELECT id, k FROM so ORDER BY k + 1, id LIMIT 10', 'Running
 --------------
 (0 rows)
 
+-- F18 (§3.38): a first key of bigint, timestamp, timestamptz, integer or
+-- date compared with the bound as the integers it holds, a word of rows at
+-- a time -- either order, NULLs first or last, the bound itself NULL where
+-- the NULLs fill the LIMIT -- the rows the comparator keeps; any other key,
+-- smallint's here, through the comparator.  Where the scan, not heap's
+-- page reader, checks the bound: the slot path, and after a qual that may
+-- raise
+CREATE TABLE sb AS
+  SELECT g AS id,
+         CASE WHEN g % 17 = 0 THEN NULL ELSE ((g * 7919) % 10007)::int8 * 1000003 - 5000000000 END AS b,
+         CASE WHEN g % 19 = 0 THEN NULL
+              ELSE timestamp '2020-01-01' + ((g * 31) % 9973) * interval '1 minute' END AS ts,
+         CASE WHEN g % 23 = 0 THEN NULL
+              ELSE timestamptz '2020-01-01 00:00:00+00' + ((g * 37) % 9967) * interval '1 second' END AS tz,
+         CASE WHEN g % 29 = 0 THEN NULL ELSE (g * 7907) % 10009 - 5000 END AS i,
+         CASE WHEN g % 31 = 0 THEN NULL ELSE date '2000-01-01' + (g * 13) % 9001 END AS d,
+         ((g * 101) % 997)::int2 AS s
+  FROM generate_series(1, 30000) g;
+ANALYZE sb;
+SET vexec.heap_page_reader = off;
+SELECT sort_check('SELECT id, b FROM sb ORDER BY b, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, b FROM sb ORDER BY b DESC NULLS LAST, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, b FROM sb ORDER BY b NULLS FIRST, id LIMIT 2000');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, b FROM sb ORDER BY b DESC, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, ts FROM sb ORDER BY ts, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, ts FROM sb ORDER BY ts DESC NULLS LAST, id LIMIT 25');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, ts FROM sb ORDER BY ts DESC, id LIMIT 1700');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, tz FROM sb ORDER BY tz, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, tz FROM sb ORDER BY tz DESC NULLS LAST, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, i FROM sb ORDER BY i, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, i FROM sb ORDER BY i DESC NULLS LAST, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, i FROM sb ORDER BY i NULLS FIRST, id LIMIT 1100');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, d FROM sb ORDER BY d, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, d FROM sb ORDER BY d DESC NULLS LAST, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, s FROM sb ORDER BY s DESC, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, b FROM sb WHERE 1000 / (id + 1) >= 0 ORDER BY b DESC NULLS LAST, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_check('SELECT id, d FROM sb WHERE 1000 / (id + 1) >= 0 ORDER BY d, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_explain('SELECT id, b FROM sb ORDER BY b, id LIMIT 10',
+                    'Rows Removed by Bound|Rows Bound as Integers');
+              sort_explain               
+-----------------------------------------
+               Rows Removed by Bound: N
+               Rows Bound as Integers: N
+(2 rows)
+
+SELECT sort_explain('SELECT id, s FROM sb ORDER BY s, id LIMIT 10',
+                    'Rows Removed by Bound|Rows Bound as Integers');
+              sort_explain              
+----------------------------------------
+               Rows Removed by Bound: N
+(1 row)
+
+SET vexec.enable_typed_bound = off;
+SELECT sort_check('SELECT id, b FROM sb ORDER BY b, id LIMIT 10');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SELECT sort_explain('SELECT id, b FROM sb ORDER BY b, id LIMIT 10',
+                    'Rows Removed by Bound|Rows Bound as Integers');
+              sort_explain              
+----------------------------------------
+               Rows Removed by Bound: N
+(1 row)
+
+RESET vexec.enable_typed_bound;
+RESET vexec.heap_page_reader;
+DROP TABLE sb;
 -- EXPLAIN ANALYZE: a bounded sort's top-N heap, an unbounded one's quicksort
 SELECT sort_explain('SELECT id, k FROM so ORDER BY k LIMIT 10', 'Vec Sort|Sort Method|Bound|Rows Sorted|Input');
                          sort_explain                          
@@ -1161,6 +1318,100 @@ SELECT sort_costs('SELECT * FROM sw ORDER BY k, id LIMIT 10');
 SET vexec.mode = auto;
 DROP FUNCTION sort_costs(text);
 DROP TABLE sw;
+-- F17 (§3.38): a parallel grouping ranked for its LIMIT in each participant
+-- whatever its groups' estimate: n_distinct says 50 groups of 40,000, which
+-- vexec.min_rows refused the bounded VecSort for, and a Sort of every group
+-- above the Gather took them all to the leader; off, as before.  And F27's
+-- shape, a LIMIT over a grouping by date_trunc(), its groups estimated at a
+-- group a row: VecSort over VecAgg, answers PostgreSQL's (Q42's plan at 100M
+-- rows checks the rule itself, core's sorted grouping costing less here)
+CREATE TABLE sg AS SELECT g AS id, (g::int8 * 7919) % 40000 AS k FROM generate_series(1, 200000) g;
+ALTER TABLE sg ALTER COLUMN k SET (n_distinct = 50);
+ANALYZE sg;
+CREATE TABLE st AS
+  SELECT g AS id, timestamp '2024-01-01' + g * interval '1 second' AS ts, g % 7 AS f
+  FROM generate_series(1, 200000) g;
+ANALYZE st;
+SET vexec.mode = auto;
+SET vexec.min_rows = 100000;
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0.01;
+SET min_parallel_table_scan_size = 0;
+SET cpu_operator_cost = 0.25;
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM sg GROUP BY k ORDER BY count(*) DESC, k LIMIT 10;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Limit
+   ->  Gather Merge
+         Workers Planned: 2
+         ->  Vec Sort
+               Sort Key: (count(*)) DESC, k
+               Bound: 10
+               ->  Vec Finalize HashAggregate
+                     Group Key: k
+                     ->  Parallel Vec Repartition
+                           Partition Key: k
+                           ->  Vec Partial HashAggregate
+                                 Group Key: k
+                                 ->  Parallel Vec Seq Scan on sg
+(13 rows)
+
+SELECT sort_check('SELECT k, count(*) FROM sg GROUP BY k ORDER BY count(*) DESC, k LIMIT 10', 'auto');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SET vexec.enable_participant_rank = off;
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM sg GROUP BY k ORDER BY count(*) DESC, k LIMIT 10;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: (count(*)) DESC, k
+         ->  Gather
+               Workers Planned: 2
+               ->  Vec Finalize HashAggregate
+                     Group Key: k
+                     ->  Parallel Vec Repartition
+                           Partition Key: k
+                           ->  Vec Partial HashAggregate
+                                 Group Key: k
+                                 ->  Parallel Vec Seq Scan on sg
+(12 rows)
+
+SELECT sort_check('SELECT k, count(*) FROM sg GROUP BY k ORDER BY count(*) DESC, k LIMIT 10', 'auto');
+    sort_check    
+------------------
+ same, no VecSort
+(1 row)
+
+RESET vexec.enable_participant_rank;
+SELECT sort_check($$SELECT date_trunc('hour', ts), count(*) FROM st WHERE f < 3 GROUP BY 1 ORDER BY 1
+  LIMIT 5 OFFSET 20$$, 'auto');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+SET vexec.enable_uninformed_groups = off;
+SELECT sort_check($$SELECT date_trunc('hour', ts), count(*) FROM st WHERE f < 3 GROUP BY 1 ORDER BY 1
+  LIMIT 5 OFFSET 20$$, 'auto');
+      sort_check       
+-----------------------
+ same, bounded VecSort
+(1 row)
+
+RESET vexec.enable_uninformed_groups;
+RESET cpu_operator_cost;
+RESET min_parallel_table_scan_size;
+RESET parallel_tuple_cost;
+RESET parallel_setup_cost;
+SET max_parallel_workers_per_gather = 0;
+RESET vexec.min_rows;
+SET vexec.mode = auto;
+DROP TABLE sg, st;
 DROP FUNCTION sort_check(text, text);
 DROP FUNCTION sort_error(text);
 DROP FUNCTION sort_explain(text, text);

@@ -106,6 +106,16 @@ typedef struct VexecAggPlan
 	bool		sorted_input;	/* VC4: hashed, but the input may come in the
 								 * keys' order, its scan's source's: taken so
 								 * where the scan says so as it begins */
+	bool		device;			/* V8b: the device's strategy, priced
+								 * cheaper; decided again as the node begins */
+	List	   *whole_cols;		/* W1: H3's upper stage the device's whole --
+								 * its keys and its distinct count's argument
+								 * as columns of its lower stage's scan, from
+								 * 1, which it reads itself; NIL: not so */
+	double		group_bytes;	/* W45 (pg_vector_executor.md §3.35): a group's
+								 * bytes on the device as the planner held them
+								 * against its free memory (W42), which the
+								 * node's task asks admission for; 0: none */
 } VexecAggPlan;
 
 /*
@@ -132,6 +142,8 @@ typedef struct VexecJoinPlan
 	List	   *hashoperators;	/* per hash key, its equality operator */
 	List	   *hashcollations;
 	double		inner_rows;		/* the planner's estimate of the build side */
+	bool		device;			/* V8c: the device's probes, priced cheaper;
+								 * decided again as the node begins */
 } VexecJoinPlan;
 
 /*
@@ -167,6 +179,8 @@ typedef struct VexecSortPlan
 	 */
 	AttrNumber	bound_attno;
 	bool		bound_before_quals;
+	bool		device;			/* V8d: the device's order, planned;
+								 * decided again as the node begins */
 } VexecSortPlan;
 
 /*
@@ -188,6 +202,7 @@ typedef struct VexecSortBound
 	bool		isnull;
 	uint64		version;		/* bumped as the bound moves */
 	int64		removed;		/* rows the scan dropped, EXPLAIN ANALYZE's */
+	int64		typed;			/* rows compared as integers (F18), VERBOSE's */
 	MemoryContext tmpcxt;		/* the comparisons' detoasted values */
 } VexecSortBound;
 
@@ -441,11 +456,28 @@ struct VexecNode
 	bool		bound_in_source;
 
 	/*
+	 * F19 (§3.38): whether this batch's quals go first though the bound was
+	 * planned before them -- its granule not yet seen whole by a VecScan's
+	 * condition cache, which then learns it -- NULL for never; what the batch
+	 * did, and whether a row passed its eager quals before the bound
+	 */
+	bool		(*bound_waits) (VexecNode *node);
+	bool		bound_waited;
+	bool		quals_left;
+
+	/*
 	 * X6: a VecHashJoin's inner keys over this scan's rows: the input column
 	 * jfilter_col holds the key; NULL: none
 	 */
 	VexecJoinFilter *jfilter;
 	int			jfilter_col;
+
+	/*
+	 * PQ21 (pg_vector_executor.md §3.40): per output column, the nested
+	 * layout a vector parent's kernels alone read it in -- handed up as it
+	 * is (vexec_next_batch()) -- 0 a Datum's; NULL none (vexec_node_parent_nested())
+	 */
+	uint8	   *out_nested;
 	bool		jfilter_in_source;	/* heap's page reader checks it */
 
 	/*
@@ -461,6 +493,13 @@ struct VexecNode
 	int8	   *qual_step;
 	int			steps_loaded;
 	void		(*load_step) (VexecNode *node, int step, const uint64 *rows);
+
+	/*
+	 * F7 (§3.28): called as a batch's eager parts are done (node.c,
+	 * eval_batch()), its candidates and redo rows known: a VecScan's
+	 * condition cache learns its granules' rows there; NULL for none
+	 */
+	void		(*after_eval) (VexecNode *node);
 
 	/*
 	 * The node read its input in this process.  On a cluster the node a
@@ -518,8 +557,63 @@ extern const CustomExecMethods *vexec_motion_send_exec_methods(void);
 extern const CustomExecMethods *vexec_motion_recv_exec_methods(void);
 extern void vexec_report_install(void);
 
+/*
+ * What a vector node's span carries of its kind's own, beside the counts
+ * every node keeps (pg_vector_executor.md §3.41, OT1 to OT3 and OT5): its
+ * kind's figures function fills them from the node's state alone, as the
+ * statement's executor ends or, on_error, on a failed statement's error
+ * path -- where it calls nothing that could allocate or raise -- and
+ * node.c's reporter makes them pg_otel_probe's attributes.  A count below
+ * 0, or a NULL string, is absent.
+ */
+typedef struct VexecNodeFigures
+{
+	/*
+	 * OT1: a device strategy the node had: the device's name, or "none";
+	 * why none, or why the node went back to the CPU; and what its tasks did
+	 */
+	const char *device;
+	const char *device_why;
+	int64		device_requests;
+	int64		device_bytes_in;	/* its chunks' bytes, to the device */
+	int64		device_bytes_out;	/* its answers' bytes */
+	double		device_ms;		/* the executor's time on its requests */
+	double		device_gpu_ms;	/* of it, the GPU's, by CUDA events (OT10) */
+	double		device_wait_ms; /* the node's, waiting for the answers */
+	int64		device_rows_redone; /* rows the CPU redid after a refusal */
+	/* OT2: memory and spills */
+	int64		memory_kb;
+	int64		spilled_rows;
+	int64		spilled_partitions;
+	int64		spill_depth;
+	int64		buckets;
+	const char *sort_method;
+	int64		sort_space_kb;
+	/* OT3: a vector scan's pruning */
+	int64		rows_prefiltered;
+	int64		granules_passed_over;
+	int64		units_not_searched;
+	int64		units_from_statistics;
+	/* OT5: its source's own (vexec_source.h, scan_figures()) */
+	int			nsource;
+	VexecSourceFigure source[VEXEC_SOURCE_FIGURES_MAX];
+} VexecNodeFigures;
+
+extern void vexec_node_figures(VexecNode *node, VexecNodeFigures *f, bool on_error);
+extern void vexec_scan_figures(VexecNode *node, VexecNodeFigures *f, bool on_error);
+extern void vexec_agg_figures(VexecNode *node, VexecNodeFigures *f, bool on_error);
+extern void vexec_hashjoin_figures(VexecNode *node, VexecNodeFigures *f, bool on_error);
+extern void vexec_sort_figures(VexecNode *node, VexecNodeFigures *f, bool on_error);
+extern void vexec_window_figures(VexecNode *node, VexecNodeFigures *f, bool on_error);
+
+/* VecAggJoin, a row node: its exec methods, and its groups (OT8) */
+extern const CustomExecMethods *vexec_aggjoin_exec_methods(void);
+extern void vexec_aggjoin_figures(PlanState *ps, int64 *groups_joined, int64 *inner_groups);
+
 /* node.c: what every node shares */
 extern void vexec_node_begin(VexecNode *node, EState *estate);
+extern int	vexec_node_nested_use(VexecNode *node, int col);
+extern void vexec_node_parent_nested(VexecNode *parent, VexecNode *child, const bool *excluded);
 extern void vexec_node_compile(VexecNode *node, List *quals, List *tlist);
 extern TupleTableSlot *vexec_node_exec(VexecNode *node);
 extern void vexec_node_rescan(VexecNode *node);
@@ -541,7 +635,52 @@ extern bool vexec_node_next_input(VexecNode *node);
 /* vecscan.c, vecresult.c, vecagg.c */
 extern Node *vexec_create_scan_state(CustomScan *cscan);
 extern Node *vexec_create_bitmapscan_state(CustomScan *cscan);
+extern bool vexec_scan_can_units(VexecNode *node, bool filters, const char **why);
+extern List *vexec_scan_quals(VexecNode *node, Index *varno);
+extern void vexec_scan_units_filtered(VexecNode *node);
+extern void vexec_scan_read_unit_bytes(VexecNode *node, const VexecSourceUnit *unit, int stream,
+									   uint64 offset, uint64 length, void *dest);
+extern int	vexec_scan_attr_unit_column(VexecNode *node, AttrNumber attnum);
+extern int	vexec_scan_unit_column(VexecNode *node, int col);
+extern Oid	vexec_scan_relid(VexecNode *node);
+extern Expr *vexec_scan_output_expr(VexecNode *node, int col);
+extern int	vexec_scan_unit_ncols(VexecNode *node);
+extern AttrNumber vexec_scan_unit_attnum(VexecNode *node, int uc);
+extern bool vexec_scan_next_unit(VexecNode *node, VexecSourceUnit *unit);
+/* W21: of a units request the device answered, a unit's granules none of whose rows the filter kept, into the condition cache */
+struct VexecDevUnitDesc;
+extern void vexec_scan_units_none(VexecNode *node, const struct VexecDevUnitDesc *x, const uint64 *none);
+extern void vexec_scan_unit_granules(VexecNode *node, struct VexecDevUnitDesc *x);
+
+/*
+ * W13 (§3.27): a VecScan's plan made the device's read of its own units
+ * (plan/paths.c), whether one is, and a bounded VecSort's rank lent to it
+ * (plan/sort.c): its bound, and its keys, the scan's attributes.
+ */
+extern void vexec_scan_plan_device(CustomScan *cscan);
+extern bool vexec_scan_plan_is_device(CustomScan *cscan);
+extern void vexec_scan_plan_rank(CustomScan *cscan, int64 bound, int n, const AttrNumber *attnos,
+								 const bool *desc, const bool *nulls_first);
+extern void vexec_scan_read_unit(VexecNode *node, const VexecSourceUnit *unit);
+extern void vexec_scan_resume(VexecNode *node);
 extern bool vexec_scan_can_aggregate(VexecNode *node);
+extern void vexec_scan_count_under_quals(VexecNode *node);
+
+/*
+ * F35 and F37 (§3.38): how an expression over a scan reads text columns: uses[i],
+ * of the Vars of varno with varattno i + 1, 1 where only length() and comparison
+ * with the empty string read it, 2 where anything else does (vexec_length_uses()).
+ */
+typedef struct VexecLengthUses
+{
+	Index		varno;
+	int			n;
+	uint8	   *uses;
+} VexecLengthUses;
+
+extern bool vexec_is_length_call(Node *node);
+extern bool vexec_length_uses(Node *node, VexecLengthUses *w);
+extern void vexec_scan_parent_lengths(VexecNode *node, const bool *outputs, int n);
 extern bool vexec_scan_aggregate(VexecNode *node, int nreqs, const VexecSourceAgg *reqs,
 								 VexecSourceAggAnswer *answers, int64 *nrows);
 extern const char *vexec_scan_source_name(VexecNode *node);
@@ -599,6 +738,25 @@ extern char *vexec_exchange_block(int32 block);
 extern bool vexec_exchange_holds(const void *p);
 extern void vexec_exchange_counts(int32 *nfree, int32 *nblocks);
 
+/* condcache.c: the granules no row of which is true of a scan's quals, in shared memory (F7) */
+extern int	vexec_condition_cache_size;
+extern bool vexec_enable_condition_cache;
+extern void vexec_condcache_install(void);
+extern bool vexec_condcache_enabled(void);
+extern bool vexec_condcache_key(List *quals, Index scanrelid, uint64 *key);
+extern int64 vexec_condcache_get(const uint64 *quals, const uint64 *unit, uint32 ngranules, uint32 begin, uint32 end,
+								 uint64 *out);
+extern int	vexec_condcache_set(const uint64 *quals, const uint64 *unit, int64 granule);
+extern int	vexec_condcache_seen(const uint64 *quals, const uint64 *unit, const int32 *granules, int n);
+/* F21 (§3.38): a relation's figures under its quals' order-free key, for planning */
+extern bool vexec_condcache_tally_key(List *quals, Index scanrelid, uint64 *tkey);
+extern void vexec_condcache_tally_add(Oid relid, const uint64 *tkey, int64 seen, int64 none, int64 rows);
+extern bool vexec_condcache_tally_get(Oid relid, const uint64 *tkey, uint64 *seen, uint64 *none, uint64 *rows);
+extern bool vexec_condcache_all_seen(const uint64 *quals, const uint64 *unit, const int32 *granules, int n);
+
+/* devasked.c: the columns statements have asked the device for, in shared memory (W20) */
+extern void vexec_device_asked_install(void);
+
 /* aggsizes.c: the groups VecAgg's tables reached, in shared memory (C6) */
 extern void vexec_aggsize_install(void);
 extern uint64 vexec_aggsize_key(EState *estate, int plan_node_id);
@@ -611,6 +769,7 @@ extern bool vexec_agg_set_topn(VexecNode *node, int64 bound, List *keycols, List
 extern Node *vexec_create_sort_state(CustomScan *cscan);
 extern List *vexec_sort_plan_encode(const VexecSortPlan *plan);
 extern void vexec_sort_plan_decode(CustomScan *cscan, VexecSortPlan *plan);
+extern const char *vexec_sort_device_key(Oid typid, Oid sortop, Oid collation, bool *descending);
 extern void vexec_sort_set_bound(CustomScan *cscan, int64 bound);
 extern bool vexec_sort_make_late(CustomScan *cscan, bool serial_ok, bool parallel_ok);
 extern bool vexec_sort_plan_running_bound(CustomScan *cscan);
@@ -660,7 +819,27 @@ extern const uint32 *vexec_repart_batch_hashes(VexecNode *node);
 extern VexecNode *vexec_repart_child_agg(VexecNode *node);
 extern bool vexec_repart_offer_unpack(VexecNode *node);
 extern bool vexec_repart_packed(VexecNode *node);
-extern bool vexec_repart_next_chunk(VexecNode *node, const char **groups, Size *len);
+/*
+ * pool.c (pg_vector_executor.md §3.28, F3): vexec's long-lived parallel
+ * workers -- reserved for a Gather's workers as a parallel-aware node of
+ * its fragment makes its shared state, started as the leader first runs a
+ * vexec node after it
+ */
+extern void vexec_pool_install(void);
+extern void vexec_pool_reserve(ParallelContext *pcxt, PlanState *ps);
+extern void vexec_pool_kick_slow(void);
+extern PGDLLIMPORT int vexec_pool_pending;
+
+static inline void
+vexec_pool_kick(void)
+{
+	if (unlikely(vexec_pool_pending > 0))
+		vexec_pool_kick_slow();
+}
+
+extern bool vexec_repart_next_chunk(VexecNode *node, const char **groups, Size *len, bool *kept);
+extern void vexec_repart_keep_chunks(VexecNode *node, bool keep);
+extern void vexec_repart_release_kept(VexecNode *node);
 
 /* vecwindow.c */
 extern Node *vexec_create_window_state(CustomScan *cscan);

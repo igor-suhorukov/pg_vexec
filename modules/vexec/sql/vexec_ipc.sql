@@ -10,6 +10,10 @@
 
 \i sql/vexec_corpus_setup.sql
 
+-- batches of 1,024 rows, as before F24 (§3.38) made their rows a setting:
+-- the corpus's 2,600 rows in three batches, the batches' edges between them
+SET vexec.batch_rows = 1024;
+
 -- every batch written and read back, in each format: the schema, and every
 -- value bit for bit, read where it lies and from an unaligned copy
 SELECT * FROM vexec_test.ipc('SELECT * FROM corpus ORDER BY id', 'postgres');

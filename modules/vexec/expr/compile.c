@@ -106,6 +106,16 @@ usable_kernel(Expr *expr, Oid funcid, List *args, Oid inputcollid, void **extra)
 
 	if (n > VEXEC_KERNEL_MAXARGS)
 		return NULL;
+	if (IsA(expr, ScalarArrayOpExpr) && n == 2 && !IsA(lsecond(args), Const))
+	{
+		/* PQ21 (§3.40): x = ANY of an array that is no constant, a list column's: a kernel of its own */
+		if (!((ScalarArrayOpExpr *) expr)->useOr)
+			return NULL;
+		ke = vexec_any_list_kernel(funcid, types[0], types[1], inputcollid);
+		if (ke != NULL && extra)
+			*extra = (void *) ke->info;
+		return ke;
+	}
 	if (IsA(expr, ScalarArrayOpExpr))
 	{
 		/* the comparison of x with each element of a constant array */
@@ -116,6 +126,9 @@ usable_kernel(Expr *expr, Oid funcid, List *args, Oid inputcollid, void **extra)
 			return NULL;
 	}
 	ke = vexec_kernel_find(funcid, n, types, inputcollid);
+	/* PQ21: another extension's function a kernel of vexec's own binds, by the kernel packs' rule */
+	if (ke == NULL && !IsA(expr, ScalarArrayOpExpr) && !IsA(expr, DistinctExpr))
+		ke = vexec_extension_kernel_find(funcid);
 	if (ke == NULL)
 		return NULL;
 	memset(&probe, 0, sizeof(probe));
@@ -377,19 +390,24 @@ compile_call(VexecCompileContext *cc, Expr *expr, VexecExprKind kind, Oid funcid
 	ListCell   *lc;
 	int			i = 0;
 
+	bool		any_list = IsA(expr, ScalarArrayOpExpr) && ke != NULL && !IsA(lsecond(args), Const);
+
 	if (ke == NULL &&
 		(kind != VE_CALL || list_length(args) > VEXEC_KERNEL_MAXARGS ||
 		 !vexec_declared_find(funcid, &declared)))
 		return NULL;
+	/* PQ21: x = ANY of an array column, a call of its kernel over (x, array), its NULLs ANY's own */
+	if (any_list)
+		kind = VE_CALL;
 	e = new_expr(cc, kind, expr, list_length(args));
 	e->kernel = ke != NULL ? ke->def : &vexec_declared_kernel;
 	e->pack = declared.pack;
 	e->decl = declared.decl;
 	e->funcid = funcid;
 	e->collation = inputcollid;
-	e->strict = func_strict(funcid);
+	e->strict = any_list ? false : func_strict(funcid);
 	e->extra = extra;
-	if (IsA(expr, ScalarArrayOpExpr))
+	if (IsA(expr, ScalarArrayOpExpr) && !any_list)
 	{
 		e->useOr = ((ScalarArrayOpExpr *) expr)->useOr;
 		e->saop = compile_saop_array(cc, lsecond_node(Const, args));

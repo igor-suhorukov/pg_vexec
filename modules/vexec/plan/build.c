@@ -48,9 +48,18 @@ static Plan *plan_vecscan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_p
 static Plan *plan_vecbitmapscan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 								List *tlist, List *clauses, List *custom_plans);
 
+static Plan *plan_vecscan_device(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+								 List *tlist, List *clauses, List *custom_plans);
+
 static const CustomPathMethods vecscan_path_methods = {
 	.CustomName = VEXEC_SCAN_NAME,
 	.PlanCustomPath = plan_vecscan,
+};
+
+/* W13: a VecScan whose units the device reads itself */
+static const CustomPathMethods vecscan_device_path_methods = {
+	.CustomName = VEXEC_SCAN_NAME,
+	.PlanCustomPath = plan_vecscan_device,
 };
 
 static const CustomPathMethods vecbitmapscan_path_methods = {
@@ -88,11 +97,46 @@ vexec_scan_path(PlannerInfo *root, RelOptInfo *rel, Path *rowpath, const VexecCo
 	return &cp->path;
 }
 
-/* Whether a path is a VecScan's, partial or not. */
+/* Whether a path is a VecScan's, partial or not -- not the device's read of its units (W13). */
 bool
 vexec_is_scan_path(Path *path)
 {
 	return IsA(path, CustomPath) && ((CustomPath *) path)->methods == &vecscan_path_methods;
+}
+
+/*
+ * W13 (§3.27): a VecScan path's twin whose units the device reads itself
+ * (exec/vecscan.c), priced by the cost model (paths.c,
+ * vexec_scan_device_variant()), handing up `rows` rows -- a bounded sort's
+ * rank above cuts them there (sort.c).  A serial scan's is serial; a
+ * parallel one's keeps its workers, one participant reading every unit
+ * (dev_scan_owner()).  Neither VecAgg's nor a sort's late columns take it
+ * for a VecScan of their own (vexec_is_scan_path()).
+ */
+Path *
+vexec_scan_device_path(Path *scan, const VexecCost *cost, double rows)
+{
+	CustomPath *cp = makeNode(CustomPath);
+
+	Assert(vexec_is_scan_path(scan));
+	memcpy(cp, scan, sizeof(CustomPath));
+	if (!scan->parallel_aware)
+	{
+		cp->path.parallel_safe = false;
+		cp->path.parallel_workers = 0;
+	}
+	cp->path.rows = rows;
+	cp->path.startup_cost = cost->startup;
+	cp->path.total_cost = cost->total;
+	cp->custom_private = NIL;
+	cp->methods = &vecscan_device_path_methods;
+	return &cp->path;
+}
+
+bool
+vexec_is_device_scan_path(Path *path)
+{
+	return IsA(path, CustomPath) && ((CustomPath *) path)->methods == &vecscan_device_path_methods;
 }
 
 /*
@@ -102,10 +146,18 @@ vexec_is_scan_path(Path *path)
  * no plan takes -- for VecAgg's price (agg.c).
  */
 void
-vexec_scan_path_set_answers(Path *path, double units)
+vexec_scan_path_set_answers(Path *path, double units, bool counts_only)
 {
 	Assert(vexec_is_scan_path(path) && !path->parallel_aware);
-	((CustomPath *) path)->custom_private = list_make1(makeFloat(psprintf("%.0f", units)));
+	((CustomPath *) path)->custom_private = list_make2(makeFloat(psprintf("%.0f", units)),
+													   makeBoolean(counts_only));
+}
+
+/* F36 (§3.38): whether the source answers count(*) alone, under the scan's qual */
+bool
+vexec_scan_path_counts_only(Path *path)
+{
+	return boolVal(lsecond(((CustomPath *) path)->custom_private));
 }
 
 bool
@@ -139,6 +191,17 @@ plan_vecscan(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_scan_tlist = NIL;
 	cscan->methods = vexec_scan_methods();
 	return &cscan->scan.plan;
+}
+
+/* W13: VecScan's plan, the device's read of its units */
+static Plan *
+plan_vecscan_device(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+					List *tlist, List *clauses, List *custom_plans)
+{
+	Plan	   *plan = plan_vecscan(root, rel, best_path, tlist, clauses, custom_plans);
+
+	vexec_scan_plan_device((CustomScan *) plan);
+	return plan;
 }
 
 /*

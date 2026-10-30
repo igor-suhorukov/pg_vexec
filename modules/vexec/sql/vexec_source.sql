@@ -346,6 +346,15 @@ SELECT source_check('SELECT k, upper(m), t || ''!'' FROM srcd WHERE k % 1001 = 0
 RESET vexec.batch_dictionary;
 RESET vexec_test.source_dictionaries;
 RESET vexec_test.source_text_offsets;
+-- a later step's column read for the row a fallback step loaded last, the
+-- only one its qual passed: the row loaded again with the step, not its
+-- placeholder's NULL
+CREATE TABLE srcn (k int4, nm name, t text) USING vexec_test_am;
+INSERT INTO srcn VALUES (1, 'bob', 'first'), (2, 'carol', 'second');
+CREATE FUNCTION srcn_seen(text) RETURNS bool COST 1000 LANGUAGE plpgsql AS 'BEGIN RETURN $1 IS NOT NULL; END';
+SELECT source_check('SELECT k, t FROM srcn WHERE nm = ''carol'' AND srcn_seen(t)');
+DROP FUNCTION srcn_seen(text);
+DROP TABLE srcn;
 SET vexec.enable_source_steps = off;
 SET vexec.mode = force;
 EXPLAIN (ANALYZE, VERBOSE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)

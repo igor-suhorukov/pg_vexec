@@ -102,6 +102,9 @@ def normalize(path, volatile=(), drops=()):
         lines = f.read().split('\n')
     for d in drops:
         lines = [line for line in lines if not d.search(line)]
+    # the results' tables found in the lines as psql printed them: a header
+    # or a separator whose padding varies, marked, is still one
+    raw = lines
     for v in volatile:
         lines = [v.sub(volatile_mark, line) for line in lines]
     out = []
@@ -110,10 +113,10 @@ def normalize(path, volatile=(), drops=()):
     n = len(lines)
     while i < n:
         line = lines[i]
-        if i + 1 < n and is_table_header(line, lines[i + 1]):
+        if i + 1 < n and is_table_header(raw[i], raw[i + 1]):
             j = i + 2
             body = []
-            while j < n and not FOOTER.match(lines[j]) and lines[j] != '':
+            while j < n and not FOOTER.match(raw[j]) and raw[j] != '':
                 body.append(lines[j])
                 j += 1
             text = '\n'.join(query)

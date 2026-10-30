@@ -36,6 +36,7 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_type.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -51,6 +52,7 @@
 #include "utils/lsyscache.h"
 
 #include "vexec.h"
+#include "exec/device.h"
 #include "exec/exec.h"
 #include "plan/plan.h"
 
@@ -290,6 +292,11 @@ hashjoin_path(RelOptInfo *joinrel, JoinType jointype, bool inner_unique, List *r
 			  Path *outer, Path *inner, List *hashrinfos, double rows, const VexecCost *cost)
 {
 	CustomPath *cp = makeNode(CustomPath);
+	List	   *ops = NIL;
+	ListCell   *lc;
+
+	foreach(lc, hashrinfos)
+		ops = lappend(ops, lfirst_node(RestrictInfo, lc)->clause);
 
 	cp->path.pathtype = T_CustomScan;
 	cp->path.parent = joinrel;
@@ -306,10 +313,77 @@ hashjoin_path(RelOptInfo *joinrel, JoinType jointype, bool inner_unique, List *r
 	cp->path.pathkeys = NIL;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = list_make2(outer, inner);
-	cp->custom_private = list_make4(makeInteger(jointype), makeBoolean(inner_unique),
-									list_copy(hashrinfos), list_copy(restrictlist));
+	cp->custom_private = list_make5(makeInteger(jointype), makeBoolean(inner_unique),
+									list_copy(hashrinfos), list_copy(restrictlist),
+									makeBoolean(vexec_join_device(jointype, ops, outer->rows,
+																  inner->rows)));
 	cp->methods = &vechashjoin_path_methods;
 	return &cp->path;
+}
+
+/*
+ * V8c: whether a VecHashJoin takes the device's probes (exec/vechashjoin.c)
+ * where the node can take them as it begins: an inner, left, semi or anti
+ * join over keys the device hashes -- integers of any width, one by-value
+ * type's bits, text's or bytea's bytes -- with a build side past four
+ * chunks of rows and a probe side past one.  The strategy changes no
+ * plan's shape and is not priced into the path: measured on this host, a
+ * table of 600,000 rows, which the CPU's caches hold, probed no faster on
+ * the device, one of 6M rows 10 to 15% faster, the table's build on the
+ * CPU being the same either way (§5, V8c).  Force takes it wherever it is
+ * possible.
+ */
+bool
+vexec_join_device(JoinType jointype, List *hashclauses, double outer_rows, double inner_rows)
+{
+	ListCell   *lc;
+
+	if (vexec_gpu == VEXEC_GPU_OFF || !vexec_enable_gpu_hashjoin)
+		return false;
+	if (jointype != JOIN_INNER && jointype != JOIN_LEFT && jointype != JOIN_SEMI &&
+		jointype != JOIN_ANTI)
+		return false;
+	if (vexec_device_ready() == NULL)
+		return false;
+	foreach(lc, hashclauses)
+	{
+		OpExpr	   *op = (OpExpr *) lfirst(lc);
+		Oid			l,
+					r;
+
+		if (!IsA(op, OpExpr) || list_length(op->args) != 2)
+			return false;
+		l = exprType(linitial(op->args));
+		r = exprType(lsecond(op->args));
+		if ((l == INT2OID || l == INT4OID || l == INT8OID) &&
+			(r == INT2OID || r == INT4OID || r == INT8OID))
+			continue;
+		if (l != r)
+			return false;
+		switch (l)
+		{
+			case BOOLOID:
+			case CHAROID:
+			case OIDOID:
+			case DATEOID:
+			case TIMEOID:
+			case TIMESTAMPOID:
+			case TIMESTAMPTZOID:
+			case CASHOID:
+			case BYTEAOID:
+				break;
+			case TEXTOID:
+			case VARCHAROID:
+				if (OidIsValid(op->inputcollid) && !get_collation_isdeterministic(op->inputcollid))
+					return false;
+				break;
+			default:
+				return false;
+		}
+	}
+	if (vexec_gpu == VEXEC_GPU_FORCE)
+		return true;
+	return inner_rows >= 4.0 * vexec_gpu_chunk_rows && outer_rows >= vexec_gpu_chunk_rows;
 }
 
 /*
@@ -860,6 +934,7 @@ plan_vechashjoin(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	memset(&plan, 0, sizeof(plan));
 	plan.jointype = jointype;
 	plan.inner_unique = boolVal(lsecond(priv));
+	plan.device = list_length(priv) > 4 && boolVal(list_nth(priv, 4));
 	{
 		VexecPlanState *ps = vexec_plan_state(root);
 
@@ -1159,6 +1234,8 @@ vexec_build_hashjoin_from_hashjoin(HashJoin *hj)
 	plan.hashoperators = hj->hashoperators;
 	plan.hashcollations = hj->hashcollations;
 	plan.inner_rows = inner->plan_rows;
+	plan.device = vexec_join_device(hj->join.jointype, hj->hashclauses, outer->plan_rows,
+									inner->plan_rows);
 
 	scan_tlist = side_entries(scan_tlist, outer->targetlist, OUTER_VAR);
 	scan_tlist = side_entries(scan_tlist, inner->targetlist, INNER_VAR);

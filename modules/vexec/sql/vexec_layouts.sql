@@ -8,6 +8,10 @@
 
 \i sql/vexec_corpus_setup.sql
 
+-- batches of 1,024 rows, as before F24 (§3.38) made their rows a setting:
+-- the corpus's 2,600 rows in three batches, the batches' edges between them
+SET vexec.batch_rows = 1024;
+
 -- every column of three batches through every shape and back
 SELECT * FROM vexec_test.roundtrip('SELECT * FROM corpus ORDER BY id');
 
@@ -43,6 +47,13 @@ GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5;
 SELECT n, (SELECT string_agg(DISTINCT batches::text || ' batches of ' || rows::text || ' rows', '; ')
            FROM vexec_test.roundtrip(format('SELECT * FROM corpus WHERE id <= %s ORDER BY id', n)))
 FROM unnest(ARRAY[1, 63, 64, 65, 1023, 1024, 1025, 2048, 2049]) n;
+-- and at 4,095, 4,096 and 4,097 rows: the most a batch holds, and
+-- vexec.batch_rows' default
+SET vexec.batch_rows = 4096;
+SELECT n, (SELECT string_agg(DISTINCT batches::text || ' batches of ' || rows::text || ' rows', '; ')
+           FROM vexec_test.roundtrip(format('SELECT g, g::int8 * 3, md5(g::text) FROM generate_series(1, %s) g', n)))
+FROM unnest(ARRAY[4095, 4096, 4097, 8192, 8193]) n;
+SET vexec.batch_rows = 1024;
 SELECT * FROM vexec_test.roundtrip('SELECT * FROM corpus WHERE false');
 
 -- numeric's scaled form at its edges: 18 and 38 digits, a value of another

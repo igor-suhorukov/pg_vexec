@@ -46,11 +46,26 @@
 
 #define VEXEC_SOURCE_RENDEZVOUS	"vexec/source_v1"	/* the major version is
 													 * in the name */
-#define VEXEC_SOURCE_MINOR		6	/* 1: aggregate; 2: set_keys; 3:
+#define VEXEC_SOURCE_MINOR		19	/* 1: aggregate; 2: set_keys; 3:
 									 * dictionary_id, estimate_ex; 4:
 									 * fetch_columns, ordering, a fetch's
 									 * price; 5: columns in steps; 6:
-									 * set_join_keys */
+									 * set_join_keys; 7: next_unit,
+									 * read_unit; 8: MergeTree's units,
+									 * read_unit_bytes; 9: unit_tids; 10:
+									 * a column's flags, granules passed
+									 * over; 11: a unit's granules' rows and
+									 * its part's identity; 12: a unit of
+									 * several ranges of granules, a sole
+									 * claimer's units; 13: a unit's bytes,
+									 * integers of days and of seconds; 14:
+									 * a fetch's threads; 15: the nested
+									 * layouts, LIST and MAP; 16: a scan's
+									 * and a planning's figures; 17:
+									 * set_keys() by granules; 18: an
+									 * estimate's raw bytes and parallel
+									 * units; 19: count(*) under a scan's
+									 * qual by aggregate() */
 
 /*
  * How a column holds its values (§3.4).  A format -- PostgreSQL's or
@@ -71,11 +86,15 @@ typedef enum VexecLayout
 								 * value */
 	VEXEC_VIEW,					/* Arrow's binary view: 16 bytes a row, and
 								 * data buffers */
-	VEXEC_OFFSETS				/* Arrow's binary: int32 offsets, and the
+	VEXEC_OFFSETS,				/* Arrow's binary: int32 offsets, and the
 								 * bytes */
+	VEXEC_LIST,					/* from minor version 15: Arrow's list,
+								 * int32 offsets into its elements */
+	VEXEC_MAP					/* from minor version 15: Arrow's map, int32
+								 * offsets into its keys and values */
 } VexecLayout;
 
-#define VEXEC_NUM_LAYOUTS	(VEXEC_OFFSETS + 1)
+#define VEXEC_NUM_LAYOUTS	(VEXEC_MAP + 1)
 
 /* How a column's rows map to its values (§3.4.3). */
 typedef enum VexecEncoding
@@ -107,6 +126,15 @@ typedef enum VexecEncoding
  *			buffer_sizes[0]; they need not start at 0, and a NULL row's
  *			pair must still lie in the buffer, as Arrow's does.
  *	VIEW	the views, and buffers and buffer_sizes for the bytes past 12.
+ *	LIST, MAP (from minor version 15, pg_vector_executor.md §3.40's PQ21) --
+ *			an array's value as Arrow's list holds it, hstore's or jsonb's as
+ *			its map does: nvalues + 1 int32 offsets into the column's
+ *			children (VexecSourceBatch.children), a row's of them those of
+ *			[offsets[row], offsets[row + 1]).  A source hands one only where
+ *			VexecSourceSpec.layouts asks for it, and gives each row's value
+ *			as a Datum of the column's type too (nested_datum): vexec reads
+ *			the children in its kernels, and the Datum wherever else a row's
+ *			value is read.
  *
  * A DICT column (VEXEC_SRC_DICT asks for one) has a code a row, each in
  * [0, ndictionary), and validity a bit a row; its dictionary is FLAT, in
@@ -116,6 +144,11 @@ typedef enum VexecEncoding
  *
  * vexec ignores the fields a layout does not read: a source may leave them
  * as it likes.
+ *
+ * From minor version 10, flags, in what was the padding byte after
+ * arrow_values, so that the struct's size and members stay where they were:
+ * vexec reads them only of a source of minor version 10 or later, which
+ * sets them or leaves them 0.
  */
 typedef struct VexecColumn
 {
@@ -123,6 +156,7 @@ typedef struct VexecColumn
 	uint8		encoding;		/* VexecEncoding */
 	bool		arrow_values;	/* date, timestamp[tz], interval: Arrow's
 								 * epoch and struct */
+	uint8		flags;			/* from minor version 10: VEXEC_COL_* */
 	int16		scale;			/* SCALED: digits after the point */
 	int32		width;			/* FIXED: bytes a value; SCALED: 8 or 16 */
 	int32		stride;			/* FIXED: bytes from one value to the next */
@@ -138,6 +172,25 @@ typedef struct VexecColumn
 	int			ndictionary;	/* DICT: how many */
 } VexecColumn;
 
+/*
+ * VexecColumn.flags, from minor version 10.
+ *
+ * VEXEC_COL_TEXT_WHOLE: a text column's values -- a DICT column's
+ * dictionary's -- each the database encoding's whole, no NUL, no truncated
+ * or invalid character, as the source vouches: written through
+ * PostgreSQL's input functions, as every Datum a table access method's row
+ * is, and kept as they were.  vexec checks none of them again, as
+ * PostgreSQL checks none of a stored value's (pg_vector_executor.md §3.28,
+ * F5); a source that cannot say so leaves it clear, and vexec checks them.
+ */
+#define VEXEC_COL_TEXT_WHOLE	0x01
+/*
+ * From minor version 19: an OFFSETS column asked for by VexecSourceSpec's
+ * length_columns, its offsets counting each value's characters, no byte behind
+ * them; NOT NULL
+ */
+#define VEXEC_COL_LENGTHS		0x02
+
 /* VexecSourceSpec.flags */
 #define VEXEC_SRC_COMPACT	0x0001	/* hand only visible rows */
 #define VEXEC_SRC_TIDS		0x0002	/* fill VexecSourceBatch.tids */
@@ -151,6 +204,9 @@ typedef struct VexecColumn
 									 * come in steps, the first from next(),
 									 * each later one from a call of
 									 * next_rest() (nsteps, step_ends) */
+#define VEXEC_SRC_COUNT_QUALS 0x0020	/* from minor version 19: aggregate()
+										 * may be asked count(*) under the
+										 * spec's quals */
 
 /* At most this many steps */
 #define VEXEC_SRC_MAX_STEPS	8
@@ -180,6 +236,47 @@ typedef struct VexecSourceSpec
 	 */
 	int			nsteps;
 	const int  *step_ends;
+
+	/*
+	 * From minor version 10 (VC30; pg_vector_executor.md §3.28, F7), vexec's
+	 * condition cache.  Where set, a source whose units are granules of
+	 * storage that never changes while it lives -- a MergeTree part's marks
+	 * -- calls it as it selects a unit's granules, with the unit's identity
+	 * (VexecSourceBatch's unit_id), its granules' count, and those of them
+	 * it is to read, [begin, end): NULL passes none over, else a bit a
+	 * granule of the unit's, set for one no row of which is true of the
+	 * scan's quals, which the source then leaves unread.  The bits are valid
+	 * until the next call.  Each batch then names its rows' granule, so that
+	 * vexec learns the granules none of whose rows its quals passed.
+	 */
+	const uint64 *(*granules_passed) (void *arg, const uint64 *unit_id, uint32 ngranules, uint32 begin,
+									  uint32 end);
+	void	   *granules_arg;
+
+	/*
+	 * From minor version 12 (W26, pg_vector_executor.md §3.28): whether vexec
+	 * takes a VEXEC_UNIT_MERGETREE unit of several ranges of its part's
+	 * granules (VexecSourceUnit's stream_rows), so that a source cuts no unit
+	 * at the granules granules_passed passes over -- a unit costs a device far
+	 * more than a granule's rows do -- but leaves them out of its ranges
+	 */
+	bool		unit_ranges;
+
+	/*
+	 * From minor version 17 (F25, pg_vector_executor.md §3.38): set_keys()'s
+	 * keys may pass over the granules of a unit the source reads, not only
+	 * whole units (set_keys(), below)
+	 */
+	bool		granule_keys;
+
+	/*
+	 * From minor version 19 (F35 and F37, §3.38): NULL, or per column whether
+	 * vexec reads its values only for their length in characters and whether
+	 * they are empty.  The source may then hand the column as
+	 * VEXEC_COL_LENGTHS, from something it keeps beside the values; a source
+	 * that keeps none hands the values as ever.
+	 */
+	const uint8 *length_columns;
 } VexecSourceSpec;
 
 /* One batch from a source. */
@@ -191,6 +288,33 @@ typedef struct VexecSourceBatch
 	const ItemPointerData *tids;	/* when VEXEC_SRC_TIDS */
 	VexecColumn *columns;		/* the layouts of §3.4 */
 	void	   *owner;			/* what retain/release name */
+
+	/*
+	 * From minor version 10, where the spec has granules_passed: the unit the
+	 * batch's rows are of, by an identity no other unit has while vexec may
+	 * keep it -- zeros for none -- the granule of the unit every one of them
+	 * is of, -1 where the source cannot say, and whether the batch holds the
+	 * granule's last row, a granule coming in one batch or more.  vexec
+	 * zeroes them before each next(), and reads them of a source of minor
+	 * version 10 or later; a source writes them only where the spec, of
+	 * that size, has granules_passed set.
+	 */
+	uint64		unit_id[2];
+	int64		granule;
+	bool		granule_last;
+
+	/*
+	 * From minor version 15, where a column is of a nested layout: its
+	 * children -- VEXEC_LIST's elements at children[2 * j], VEXEC_MAP's keys
+	 * there and its values at children[2 * j + 1], j the column's place in
+	 * the spec -- each FLAT, of the layouts above, its rows those the
+	 * offsets name, from 0; and the value of row `row` of column j as a
+	 * Datum of the column's type, made in the caller's memory context,
+	 * valid while the batch is.  vexec zeroes them before each next(), and
+	 * reads them of a source of minor version 15 or later.
+	 */
+	const VexecColumn *const *children;
+	Datum		(*nested_datum) (void *owner, int column, int row, bool *isnull);
 } VexecSourceBatch;
 
 /*
@@ -241,6 +365,20 @@ typedef struct VexecSourceEstimate
 								 * TID, the spec's columns alone read
 								 * (fetch_columns()), in the planner's units;
 								 * 0 where the source does not price it */
+	double		fetch_threads;	/* from minor version 14: the threads of the
+								 * source's own a fetch reads its columns on
+								 * at once, no more than the machine's
+								 * processors -- a parallel plan's
+								 * participants sharing a sort's rows then
+								 * fetch as many at once as the processors
+								 * hold; 0 or 1 its caller's thread */
+	double		raw;			/* from minor version 18: the columns' bytes
+								 * read as they are decoded, uncompressed --
+								 * the work a row makes; 0 unknown */
+	double		parallel_units; /* from minor version 18: the units a
+								 * parallel scan of what the pruning keeps
+								 * is cut into, which no more participants
+								 * than share; 0 unknown */
 } VexecSourceEstimate;
 
 /*
@@ -249,6 +387,160 @@ typedef struct VexecSourceEstimate
  * statistics are exact there, and no row of the units is deleted
  */
 #define VEXEC_EST_AGG_EXACT		0x0001
+
+/*
+ * Minor version 19 (pg_vector_executor.md §3.38, F36): aggregate() would answer
+ * count(*) of every unit of a serial scan begun with the spec's quals
+ * (VEXEC_SRC_COUNT_QUALS), each unit's rows that satisfy them
+ */
+#define VEXEC_EST_COUNT_QUALS	0x0002
+
+/*
+ * A unit a source hands for the GPU's executor to read itself, from its file
+ * (from minor version 7, next_unit(); pg_vector_executor.md §3.25, N2):
+ * some row groups of a Parquet file, some record batches of an Arrow IPC
+ * file.  The file is named by its path and pinned by the identity the
+ * source's listing gave it, which the executor checks before it reads; the
+ * spec's columns by their names in the file, each with what the source's
+ * own reader checks of its values as it reads them, which the executor
+ * checks too -- a unit that fails a check is read again on the CPU, whose
+ * reader raises the error.  A date is read as days, a timestamp as its
+ * file's unit, both from 1970-01-01, a decimal at its file's scale; the
+ * executor moves them to PostgreSQL's.
+ */
+typedef enum VexecUnitFormat
+{
+	VEXEC_UNIT_CPU,				/* not the device's: next() hands its rows */
+	VEXEC_UNIT_PARQUET,
+	VEXEC_UNIT_ARROW,			/* Arrow IPC's file format */
+	VEXEC_UNIT_MERGETREE		/* from minor version 8: granules of a part */
+} VexecUnitFormat;
+
+/*
+ * From minor version 8 (pg_vector_executor.md §3.26, W6): a unit of granules
+ * of a MergeTree part, its spec's columns as the part's files hold them:
+ * each column's streams, compressed blocks of ClickHouse's format -- a
+ * 16-byte checksum, a method's byte, the block's and its data's sizes --
+ * of its values, fixed-width little-endian or a String's bytes, of a
+ * String's sizes, a uint64 each, and of a Nullable's null map, a byte each,
+ * 1 a NULL; or, a column of the sparse serialization, of its offsets --
+ * VarUInts, each the rows of its default before the next value, a granule's
+ * last its rows of the default after them with bit 62 set -- its values'
+ * streams then those of its other rows alone, the default the type's 0 or
+ * empty string, or NULL (SPARSE_NULLS).  The device decompresses and decodes
+ * them itself; their bytes,
+ * which the source's storage alone may read -- PostgreSQL's buffers, where
+ * the part's pages are the relation's -- are copied by read_unit_bytes().
+ * path names the unit -- the relation, the part and its granules -- for
+ * as long as the part is, which never changes, as the device's cache keys
+ * it; file_size and file_mtime are 0.
+ */
+#define VEXEC_STREAM_VALUES		1
+#define VEXEC_STREAM_SIZES		2
+#define VEXEC_STREAM_NULLS		3
+#define VEXEC_STREAM_SPARSE		4
+#define VEXEC_STREAM_SPARSE_NULLS	5
+
+typedef struct VexecSourceStream
+{
+	int			column;			/* the spec column it is of */
+	int			kind;			/* VEXEC_STREAM_* */
+	int			width;			/* VALUES: a value's bytes, 0 a String's */
+	uint64		length;			/* its compressed blocks' bytes */
+	uint64		skip;			/* their data's bytes before the unit's
+								 * first row */
+} VexecSourceStream;
+
+/* VexecSourceUnit.column_flags */
+#define VEXEC_UNIT_NOT_NULL		0x01	/* a NULL is an error */
+#define VEXEC_UNIT_CHECK_UTF8	0x02	/* a string that is not UTF-8, or holds a
+										 * zero byte, is an error */
+/*
+ * From minor version 13 (PQ6, pg_vector_executor.md §3.35): the file's
+ * integer counts days since 1970, the column a date -- or seconds since
+ * 1970, a timestamp -- which the source's reader makes so; its values within
+ * the type's range, as the source found them
+ */
+#define VEXEC_UNIT_DAYS			0x04
+#define VEXEC_UNIT_SECONDS		0x08
+
+typedef struct VexecSourceUnit
+{
+	Size		size;			/* sizeof as the caller was built */
+	uint8		format;			/* VexecUnitFormat */
+	const char *path;			/* the file, an absolute path */
+	uint64		file_size;		/* its identity, as the source listed it */
+	int64		file_mtime;		/* nanoseconds since 1970 */
+	int			nparts;			/* its row groups or record batches: */
+	const int32 *parts;			/* their indexes in the file, ascending */
+	uint64		rows;			/* their rows, deleted ones among them */
+	const char *const *names;	/* per spec column: the file's name of it */
+	const uint8 *column_flags;	/* per spec column: VEXEC_UNIT_* */
+	const uint64 *deleted;		/* rows bits, 1 = a row the snapshot does not
+								 * see; NULL: it sees every one */
+	void	   *token;			/* the source's own: what read_unit() names */
+
+	/* from minor version 8, VEXEC_UNIT_MERGETREE's: its columns' streams */
+	int			nstreams;
+	const VexecSourceStream *streams;
+
+	/*
+	 * From minor version 9, a unit of a scan of TIDs: the column of its
+	 * rows' ids in its file, an unsigned 64-bit integer each, whose TIDs
+	 * row_tids() makes; NULL where unit_tids() gives them by their places
+	 */
+	const char *rowid_name;
+
+	/*
+	 * From minor version 11 (W21, pg_vector_executor.md §3.28), a
+	 * VEXEC_UNIT_MERGETREE unit's place in its part, for vexec's condition cache
+	 * (minor 10's granules_passed): the part's identity, as VexecSourceBatch's
+	 * unit_id has it -- zeros for none -- its granules' count, and each of the
+	 * unit's nparts granules' rows, in their order, so that the device says of
+	 * each granule whether a row of it passed the scan's quals; NULL where the
+	 * source does not say.  A unit of granules the cache passes over is handed
+	 * without them: a source cuts its units at them.
+	 */
+	uint64		unit_id[2];
+	uint32		ngranules;
+	const uint32 *granule_rows;
+
+	/*
+	 * From minor version 12 (W26, pg_vector_executor.md §3.28), where the
+	 * spec has unit_ranges: a VEXEC_UNIT_MERGETREE unit of several ranges of
+	 * its part's granules -- its parts and granule_rows those of each range in
+	 * turn -- its streams each range's in turn, a column's again for each:
+	 * each stream's range's rows, so that the device decodes each range alone
+	 * and puts them together; NULL where the unit is one range, each stream
+	 * the unit's rows'
+	 */
+	const uint32 *stream_rows;
+
+	/*
+	 * From minor version 13 (W38, pg_vector_executor.md §3.35): the bytes of
+	 * the unit's spec columns before their compression, as its files say --
+	 * the device's decoding of them takes about these, and their values'
+	 * width once more where a dictionary encodes them -- 0 where the source
+	 * does not say.  What vexec sizes a units request by, with its columns'
+	 * widths.
+	 */
+	uint64		bytes;
+} VexecSourceUnit;
+
+/*
+ * From minor version 16 (pg_vector_executor.md §3.41, OT5): a figure of the
+ * source's own -- what a scan of it read, or what planning its scans read --
+ * for pg_otel_probe's spans: a key under the source's prefix,
+ * "vexec_parquet.units_read", valid for the life of the process, and a count.
+ */
+typedef struct VexecSourceFigure
+{
+	const char *key;
+	int64		value;
+} VexecSourceFigure;
+
+/* The most figures of a scan, and of a planning, one source gives */
+#define VEXEC_SOURCE_FIGURES_MAX	4
 
 /*
  * A source.  vexec begins the scan itself through the generic wrappers
@@ -285,7 +577,8 @@ typedef struct VexecSourceRoutine
 	 * statistics of the scan's next unit, which is then passed over as read
 	 * -- true -- or the unit left to next(), which hands its rows as it
 	 * would have -- false.  Called only between batches, of a scan begun
-	 * with no quals and no keys; a source answers only at the start of a
+	 * with no quals and no keys -- or under count_under_quals() (minor 19);
+	 * a source answers only at the start of a
 	 * unit, for one none of whose rows is deleted, where its statistics are
 	 * exact.  *nrows is the unit's rows, which it counts in the statistics
 	 * as next() counts the rows it hands.  A by-reference answer lives
@@ -302,7 +595,11 @@ typedef struct VexecSourceRoutine
 	 * BTLessEqualStrategyNumber or BTGreaterEqualStrategyNumber.  Pruning
 	 * only: from the next unit the source begins -- a file, a group -- it
 	 * may pass over one whose statistics show that none of its rows
-	 * satisfies them, and never a row of a unit it reads.  vexec gives them
+	 * satisfies them, and never a row of a unit it reads; from minor
+	 * version 17, where the spec's granule_keys is set, a granule of a unit
+	 * it reads too, one it has not begun, whose statistics show the same --
+	 * a granule's rows passed over whole or not at all, so that vexec's
+	 * condition cache sees no granule in part.  vexec gives them
 	 * only where passing a row over unread raises no error PostgreSQL would
 	 * raise, and only under a NULLS order a key's NULLs never satisfy.
 	 * Called between batches; the source copies what it keeps of them.
@@ -408,6 +705,103 @@ typedef struct VexecSourceRoutine
 	 * keeps.
 	 */
 	void		(*set_join_keys) (void *state, int nkeys, const ScanKeyData *keys);
+
+	/*
+	 * Optional, from minor version 7: the scan's next unit, claimed as next()
+	 * claims its units -- a parallel scan's among its participants, the
+	 * spec's quals pruning as they prune -- between batches, for the GPU's
+	 * executor to read itself (pg_vector_executor.md §3.25, N2): true with
+	 * *unit filled, false at the scan's end.  A unit of a device's format the
+	 * scan passes over, its rows counted in the statistics as handed; the
+	 * executor reads them from the file.  A unit the source cannot hand so --
+	 * a file of another kind, a column the executor's reader may not decode
+	 * as the source's does -- comes as VEXEC_UNIT_CPU: next() then hands its
+	 * rows, and returns false at its end, and the scan goes on at the next
+	 * call of next_unit().  Called only for a scan begun with no keys, its
+	 * columns in one step, without TIDs -- or, from minor version 9, with
+	 * them (VEXEC_SRC_TIDS) where the source has unit_tids(), which then
+	 * gives a unit's rows' TIDs -- or row_tids(), from the ids of a column
+	 * of the unit's file it names (rowid_name).  The unit's pointers are the
+	 * source's until
+	 * the next call of next_unit() or read_unit(), or the scan's end; its
+	 * token, until the scan's end.
+	 */
+	bool		(*next_unit) (void *state, VexecSourceUnit *unit);
+
+	/*
+	 * Optional, from minor version 7: a unit next_unit() handed for the
+	 * device, read again by next() -- its rows, then false -- for an executor
+	 * that lost them, or a unit whose values failed a check there, so that
+	 * the source's reader raises its error.  Its rows are counted again.
+	 */
+	void		(*read_unit) (void *state, const VexecSourceUnit *unit);
+
+	/*
+	 * Optional, from minor version 8: bytes [offset, offset + length) of
+	 * stream `stream` of a VEXEC_UNIT_MERGETREE unit next_unit() handed, into
+	 * dest -- the device's memory a task shares with it -- before the unit's
+	 * request goes; called between batches, as often as the caller asks.
+	 */
+	void		(*read_unit_bytes) (void *state, const VexecSourceUnit *unit, int stream,
+									uint64 offset, uint64 length, void *dest);
+
+	/*
+	 * Optional, from minor version 9 (pg_vector_executor.md §3.27, W13): the
+	 * TIDs of n rows of a unit next_unit() handed a scan begun with TIDs,
+	 * each by its place among the unit's rows, deleted ones counted, in any
+	 * order -- into tids, as next() would have handed them: a fetch of the
+	 * row by its TID under the scan's snapshot finds it.  Called between
+	 * batches, for any of the scan's units, until its end.  A unit whose
+	 * rows' TIDs the source cannot give so comes as VEXEC_UNIT_CPU.
+	 */
+	void		(*unit_tids) (void *state, const VexecSourceUnit *unit, int n, const uint64 *rows,
+							  ItemPointerData *tids);
+
+	/*
+	 * Optional, from minor version 9: the TIDs of n rows of the relation by
+	 * their ids, as a unit's rowid_name column holds them (above).
+	 */
+	void		(*row_tids) (Relation rel, int n, const uint64 *ids, ItemPointerData *tids);
+
+	/*
+	 * Optional, from minor version 12 (W32, pg_vector_executor.md §3.29): the
+	 * participant of a parallel scan whose state this is alone claims the
+	 * scan's units from now on -- the device owner of W13's parallel twin,
+	 * which reads every unit -- so that the source may hand it a part's
+	 * adjacent units at once, as a serial scan's: a parallel scan's unit is a
+	 * sixty-fourth of the table, ClickBench's twenty granules, each else one
+	 * device unit.  Called once, before the participant asks for its first.
+	 * A unit another participant claimed meanwhile stays its own.
+	 */
+	void		(*claim_alone) (void *state);
+
+	/*
+	 * Optional, from minor version 16 (pg_vector_executor.md §3.41, OT5): the
+	 * scan's own figures so far -- at most VEXEC_SOURCE_FIGURES_MAX, into
+	 * figures -- and how many it filled, which pg_otel_probe puts on the span
+	 * of the node that reads it.  Called as the statement's executor ends,
+	 * and on a failed statement's error path, with the state as the error left
+	 * it: it reads the state alone, and neither allocates nor raises.
+	 */
+	int			(*scan_figures) (void *state, VexecSourceFigure *figures);
+
+	/*
+	 * Optional, from minor version 16: the process's reads to plan the
+	 * source's scans since it started -- footers, listings, statistics --
+	 * at most VEXEC_SOURCE_FIGURES_MAX of them, the same keys in the same
+	 * order at every call.  vexec takes them as a statement's planning
+	 * begins and ends, and keeps what grew for the statement's span.
+	 */
+	int			(*planning_figures) (VexecSourceFigure *figures);
+
+	/*
+	 * Optional, from minor version 19 (pg_vector_executor.md §3.38, F36):
+	 * whether aggregate() counts this scan's units under the qual it was begun
+	 * with, a scan begun with VEXEC_SRC_COUNT_QUALS.  Its *nrows then each
+	 * unit's rows that satisfy the qual; a unit it cannot so answer it leaves
+	 * to next(), whose rows the scan judges by the qual as ever.
+	 */
+	bool		(*count_under_quals) (void *state);
 } VexecSourceRoutine;
 
 /*

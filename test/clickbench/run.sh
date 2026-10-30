@@ -24,7 +24,15 @@
 #                             (CB_ORCA_STAGE), ORCA and the planner; or
 #                             ch_table_engines' vanilla-mergetree and
 #                             vanilla-mergetree_files (ch_table_engines.md §4),
-#                             not among the baseline's, built from CHTE_SRC
+#                             and its tables of their own files,
+#                             vanilla-parquet and vanilla-arrow (its CH8,
+#                             §2.18), not among the baseline's, built from
+#                             CHTE_SRC; or vexec_parquet's tables
+#                             (pg_vector_executor.md §3.34),
+#                             vanilla-vpq_none and vanilla-vpq_lz4,
+#                             uncompressed and LZ4, the module built with
+#                             vexec in its -parquet images and run on
+#                             pg_accel/clickbench-vanilla-parquet
 #   run.sh baseline           the baseline, before development: every load in
 #                             check mode on 1M rows and in time mode on 10M rows,
 #                             ClickBench's protocol three times over, saved into
@@ -51,7 +59,8 @@
 #                      ~/.cache/pg_accel/postgres
 #   CB_TESTS_MEM       each container's memory, 40g (the port's tests' cap)
 #   CB_SUBSET, CB_REPS, CB_TRIES, CB_TIMEOUT, CB_COLD, CB_QUERIES, CB_WORKERS,
-#   CB_STATS, CB_MT_WITH, CB_MT_MERGES, CB_SETTINGS, CB_VEXEC_ONLY
+#   CB_STATS, CB_MT_WITH, CB_MT_MERGES, CB_SETTINGS, CB_VEXEC_ONLY,
+#   CB_OWN_WITH
 #                      passed to bench.sh, which says what they do
 #   LOADS              the loads of "baseline": all eleven
 #   CHECK_RUN, TIME_RUN, AGAIN_RUN
@@ -135,6 +144,7 @@ export PG_PATCHED_COMMIT="${PG_PATCHED_COMMIT:-$(git -C "$PG_SRC" rev-parse "${P
 ORCA_CHECK_IMAGE="pg_accel/cb-ext:$CB_COMMIT"
 ORCA_TIME_IMAGE="pg_accel/cb-ext-noassert:$CB_COMMIT"
 VANILLA_IMAGE="pg_accel/clickbench-vanilla:latest"
+VPQ_IMAGE="pg_accel/clickbench-vanilla-parquet:latest"
 VANILLAORCA_CHECK_IMAGE="pg_accel/vexec-dev:vanilla-orca"
 VANILLAORCA_TIME_IMAGE="pg_accel/vexec-dev:vanilla-noassert-orca"
 ALL_LOADS="vanilla-heap vanilla-heap_pk port-aoco-s4 port-aoco-s8 port-aoco-s16 port-porc-s4 port-porc-s8 port-porc-s16 port-porc_vec-s4 port-porc_vec-s8 port-porc_vec-s16"
@@ -161,6 +171,7 @@ have_images() {
 			port-*) imgs="$imgs $ORCA_CHECK_IMAGE" ;;
 			vanillaorca-*:time) imgs="$imgs $VANILLAORCA_TIME_IMAGE" ;;
 			vanillaorca-*) imgs="$imgs $VANILLAORCA_CHECK_IMAGE" ;;
+			vanilla-vpq_*) imgs="$imgs $VPQ_IMAGE" ;;
 		esac
 	done
 	for i in $imgs; do
@@ -229,7 +240,7 @@ environment() {
 # vexec_build <mode> [<load>...]: the routes of the loads given, every route
 # without loads.
 vexec_build() {
-	local mode="$1" leg legs="" load dest stage flavors=() asserts=yes
+	local mode="$1" leg legs="" load dest stage flavors=() asserts=yes service vpq=0
 	shift
 	[ $# -eq 0 ] && set -- vanilla- port-
 	for load in "$@"; do
@@ -237,6 +248,9 @@ vexec_build() {
 			vanilla-*|vanillaorca-*) [[ " $legs " == *" vanilla "* ]] || legs="$legs vanilla" ;;
 			port-*) [[ " $legs " == *" port "* ]] || legs="$legs port" ;;
 		esac
+		# vexec_parquet's loads: vexec built with the module, in vexec's
+		# -parquet images, which have Arrow C++ (docker/Dockerfile.parquet)
+		case "$load" in vanilla-vpq_*) vpq=1 ;; esac
 	done
 	if [ "$mode" = time ]; then
 		stage="${VEXEC_PORT_STAGE:-$HOME/.cache/pg_accel/vexec/portbuild-noassert/stage}"
@@ -254,25 +268,33 @@ vexec_build() {
 		dest="$CLICKBENCH_CACHE/vexec/$leg"
 		rm -rf "$dest"
 		mkdir -p "$dest"
+		service="$leg"
+		[ "$leg" = vanilla ] && [ $vpq = 1 ] && service=parquet
 		env "${flavors[@]}" VEXEC_WORK="$dest" VEXEC_PORT_STAGE="$stage" CB_COMMIT="$CB_COMMIT" \
-			docker compose -f "$ROOT/docker/vexec.yml" --profile run run --rm -T "$leg" bash -c '
+			docker compose -f "$ROOT/docker/vexec.yml" --profile run run --rm -T "$service" bash -c '
 				/src/test/vexec/build.sh > /work/build.log 2>&1 || { cat /work/build.log; exit 1; }
 				mkdir -p /work/lib /work/extension
 				cp "$(pg_config --pkglibdir)/vexec.so" /work/lib/
 				cp "$(pg_config --sharedir)"/extension/vexec* /work/extension/
+				# vexec_parquet, where Arrow C++ is (its extension files are vexec*)
+				if [ -f "$(pg_config --pkglibdir)/vexec_parquet.so" ]; then
+					cp "$(pg_config --pkglibdir)/vexec_parquet.so" /work/lib/
+				fi
 				sed -n "s/^building against //p" /work/build.log > /work/BUILT
 				if grep -q "^#define USE_ASSERT_CHECKING" "$(pg_config --includedir-server)/pg_config.h"; then
 					echo yes; else echo no; fi > /work/ASSERTS' 2>&1 |
 			grep -v -E '^ (Container|Network) '
 		[ -f "$dest/lib/vexec.so" ] || die "vexec for the $leg route did not build"
+		[ "$leg" = vanilla ] && [ $vpq = 1 ] && { [ -f "$dest/lib/vexec_parquet.so" ] || die "vexec_parquet did not build"; }
 		[ "$(cat "$dest/ASSERTS" 2> /dev/null)" = "$asserts" ] ||
 			die "vexec for the $leg route was built against a server whose assertions are $(cat "$dest/ASSERTS" 2> /dev/null), not $asserts"
 		[ "$leg" = port ] && cp -a "$stage" "$dest/stage"
-		echo "  vexec for the $leg route: $(cat "$dest/BUILT"), assertions $asserts"
+		echo "  vexec for the $leg route: $(cat "$dest/BUILT"), assertions $asserts$([ -f "$dest/lib/vexec_parquet.so" ] && echo ", with vexec_parquet")"
 	done
 }
 
-# chte_build <mode>: ch_table_engines for the mergetree loads, built by PGXS
+# chte_build <mode>: ch_table_engines for the mergetree loads and the tables
+# of their own files (vanilla-parquet, vanilla-arrow), built by PGXS
 # in its dev image of the server the mode runs -- with assertions for check
 # mode, without for time mode -- into the cache, where vexec-entry.sh
 # installs it from.
@@ -309,8 +331,11 @@ run_loads() {
 	[ -n "$others" ] && echo "  (other containers are running: $others-- timings measure the host)"
 	for load in "$@"; do
 		case "$load" in
-			vanilla-heap|vanilla-heap_pk|vanilla-mergetree|vanilla-mergetree_files)
+			vanilla-heap|vanilla-heap_pk|vanilla-mergetree|vanilla-mergetree_files|vanilla-parquet|vanilla-arrow)
 				route=vanilla; storage="${load#vanilla-}"; seg=0; service=vanilla; image="$VANILLA_IMAGE" ;;
+			vanilla-vpq_none|vanilla-vpq_lz4)
+				[ -n "${CB_VEXEC:-}" ] || die "$load: vexec_parquet is built with vexec, CB_VEXEC"
+				route=vanilla; storage="${load#vanilla-}"; seg=0; service=vanilla; image="$VPQ_IMAGE" ;;
 			port-aoco-s*|port-porc-s*|port-porc_vec-s*)
 				route=port; seg="${load##*-s}"; storage="${load#port-}"; storage="${storage%-s*}"; service=orca
 				[ "$mode" = time ] && image="$ORCA_TIME_IMAGE" || image="$ORCA_CHECK_IMAGE" ;;
@@ -337,8 +362,10 @@ run_loads() {
 		local start=() mt=()
 		[ -n "${CB_MT_WITH+set}" ] && mt=(-e "CB_MT_WITH=$CB_MT_WITH")
 		mt+=(-e "CB_MT_MERGES=${CB_MT_MERGES:-}" -e "CB_SETTINGS=${CB_SETTINGS:-}")
-		{ [ -n "${CB_VEXEC:-}" ] || [ "$route" = vanilla-orca ] || [[ "$storage" == mergetree* ]]; } &&
+		{ [ -n "${CB_VEXEC:-}" ] || [ "$route" = vanilla-orca ] || [[ "$storage" =~ ^(mergetree|parquet$|arrow$|vpq_) ]]; } &&
 			start=(--user root --entrypoint /clickbench/vexec-entry.sh)
+		mt+=(-e "CB_OWN_WITH=${CB_OWN_WITH:-}")
+		CB_VANILLA_IMAGE="$([ "$route" = vanilla ] && echo "$image" || echo "$VANILLA_IMAGE")" \
 		ORCA_IMAGE="$image" CB_ORCA_STAGE="$orca_stage" compose --profile run run --rm -T "${start[@]}" \
 			-e CB_MODE="$mode" -e CB_ROUTE="$route" -e CB_STORAGE="$storage" -e CB_SEGMENTS="$seg" \
 			-e CB_VEXEC="${CB_VEXEC:-}" -e CB_VEXEC_ONLY="${CB_VEXEC_ONLY:-}" "${mt[@]}" \
@@ -403,7 +430,7 @@ case "$cmd" in
 		if [ -n "${CB_VEXEC:-}" ]; then
 			vexec_build "$mode" "$@" || exit 1
 		fi
-		case " $* " in *" vanilla-mergetree"*) chte_build "$mode" || exit 1 ;; esac
+		case " $* " in *" vanilla-mergetree"*|*" vanilla-parquet "*|*" vanilla-arrow "*) chte_build "$mode" || exit 1 ;; esac
 		run_loads "$mode" "${CB_RUN:-$(date +%Y%m%dT%H%M%S)-$mode${CB_VEXEC:+-vexec}}" "$@" ;;
 	baseline) baseline ;;
 	report)

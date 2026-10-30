@@ -29,9 +29,12 @@
 #ifndef VEXEC_AGGTRANS_H
 #define VEXEC_AGGTRANS_H
 
+#include "common/int.h"
 #include "executor/nodeAgg.h"
 #include "lib/stringinfo.h"
 #include "nodes/execnodes.h"
+
+#include "vexec_device_format.h"
 
 #include "batch/batch.h"
 
@@ -114,6 +117,10 @@ typedef struct VexecAggTrans
 	 */
 	bool		may_raise;
 	bool		order_dependent;
+	bool		user_combine;	/* its aggregate's combine function a user's:
+								 * the device's merging of groups, which the
+								 * combine function's place it takes, is not
+								 * its (vexec_aggtrans_device_aggs()) */
 
 	/* its state in a group */
 	Size		stateoff;
@@ -170,6 +177,20 @@ extern void vexec_aggtrans_batch(VexecAggTrans *t, AggState *aggstate, VexecBatc
 								 VexecVec *arg, VexecVec *filter);
 
 /*
+ * F32 (§3.38): a run's rows added at once to a count(*)'s state, an int64.
+ */
+pg_noreturn extern void vexec_aggtrans_count_overflow(void);
+
+static inline void
+vexec_aggtrans_count_run(void *state, int64 rows)
+{
+	int64	   *n = (int64 *) state;
+
+	if (unlikely(pg_add_s64_overflow(*n, rows, n)))
+		vexec_aggtrans_count_overflow();
+}
+
+/*
  * An aggregate's result for a group, into the output tuple's memory: its
  * final function's, or, past a stage that skips it, its state, serialized
  * where the split asks.
@@ -201,10 +222,44 @@ extern void vexec_aggtrans_stats_apply(VexecAggTrans *t, AggState *aggstate, voi
  * partial state the producer would have handed on.
  */
 extern bool vexec_aggtrans_packable(const VexecAggTrans *t);
+extern bool vexec_aggtrans_packs_value(const VexecAggTrans *t);
+extern const varlena *vexec_aggtrans_state_value(const VexecAggTrans *t, const void *state);
+extern void vexec_aggtrans_state_value_at(const VexecAggTrans *t, void *state, uint32 offset);
 extern bool vexec_aggtrans_int64_result(const VexecAggTrans *t, AggState *aggstate, int aggno);
 extern bool vexec_aggtrans_merges(const VexecAggTrans *t, const VexecAggTrans *producer);
+extern bool vexec_aggtrans_state_as_is(const VexecAggTrans *t, const VexecAggTrans *producer);
 extern void vexec_aggtrans_merge(VexecAggTrans *t, AggState *aggstate, void *state,
 								 const VexecAggTrans *producer, const void *pstate);
+
+/*
+ * The device strategy (§3.11, V8b): a transition's aggregates on the
+ * device, at most VEXEC_AGGTRANS_DEVICE_MAX, -1 where it has none, and a
+ * group's results merged into its state.
+ */
+#define VEXEC_AGGTRANS_DEVICE_MAX	3
+
+typedef struct VexecAggDevValue
+{
+	int64		i64;			/* INT64 results: counts and sums */
+	int128		i128;			/* DECIMAL128 */
+	int16		scale;			/* DECIMAL128: its digits after the point */
+	Datum		d;				/* MIN, MAX, ALL, ANY: as the argument's Datum */
+	const char *bytes;			/* W12: a STRING's MIN, MAX: its bytes, */
+	int32		len;			/* as the answer's page holds them */
+	bool		isnull;
+} VexecAggDevValue;
+
+extern int	vexec_aggtrans_device_aggs(const VexecAggTrans *t, int argtype, bool fast,
+									   VexecDevAgg *aggs);
+extern void vexec_aggtrans_device_merge(VexecAggTrans *t, AggState *aggstate, void *state,
+										const VexecAggDevValue *v);
+/* W2: the device aggregate whose value is the aggregate's result, or -1 */
+extern int	vexec_aggtrans_device_rank(const VexecAggTrans *t, AggState *aggstate, int aggno);
+extern bool vexec_agg_device_ok(Oid aggfnoid, AggSplit split, Oid argtype, int32 argtypmod, Oid collation,
+								bool fast);
+/* W17: whether the aggregate's result is one device aggregate's value, for a HAVING the device applies */
+extern bool vexec_agg_device_result(Oid aggfnoid, AggSplit split, Oid argtype, int32 argtypmod, Oid collation,
+									bool fast);
 
 /* H8's SUM(x + k): over x, from the state of `share` where it is >= 0. */
 extern void vexec_aggtrans_set_offset(VexecAggTrans *t, int64 offset, int share);

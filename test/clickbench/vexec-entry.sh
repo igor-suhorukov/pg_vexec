@@ -53,11 +53,12 @@ if [ -n "${CB_VEXEC:-}" ]; then
 	echo "  vexec, built against $(cat "$src/BUILT" 2> /dev/null || echo '?')"
 fi
 
-# ch_table_engines' loads (CB_STORAGE mergetree*): the extension run.sh built
-# by PGXS in its dev images, whose servers are this image's builds, into the
-# cache, and its engine library, mounted at /engine
+# ch_table_engines' loads (CB_STORAGE mergetree*, and its tables of their own
+# files, parquet and arrow): the extension run.sh built by PGXS in its dev
+# images, whose servers are this image's builds, into the cache, and its
+# engine library, mounted at /engine
 case "${CB_STORAGE:-}" in
-	mergetree*)
+	mergetree*|parquet|arrow)
 		src="/cache/chte/vanilla"
 		[ -f "$src/lib/ch_table_engines.so" ] || die "no $src/lib/ch_table_engines.so: run.sh builds it for a mergetree load"
 		[ "$(cat "$src/ASSERTS" 2> /dev/null)" = "$asserts" ] ||
@@ -67,6 +68,17 @@ case "${CB_STORAGE:-}" in
 		ln -sf /engine/libchte_engine.so "$("$prefix/bin/pg_config" --pkglibdir)/libchte_engine.so"
 		cp "$src"/extension/ch_table_engines* "$("$prefix/bin/pg_config" --sharedir)/extension/"
 		echo "  ch_table_engines, built against $(cat "$src/BUILT" 2> /dev/null || echo '?')" ;;
+	# vexec_parquet's loads (pg_vector_executor.md §3.34): the module run.sh
+	# built with vexec in vexec's -parquet images, Arrow C++'s libraries this
+	# image's (docker/Dockerfile.clickbench-parquet)
+	vpq_*)
+		src="/cache/vexec/vanilla"
+		[ -f "$src/lib/vexec_parquet.so" ] || die "no $src/lib/vexec_parquet.so: run.sh builds it for a vexec_parquet load"
+		ldd "$src/lib/vexec_parquet.so" | grep -q 'not found' &&
+			die "vexec_parquet's libraries are not in this image: $(ldd "$src/lib/vexec_parquet.so" | grep 'not found' | tr -s ' \t\n' ' ')"
+		cp "$src/lib/vexec_parquet.so" "$("$prefix/bin/pg_config" --pkglibdir)/"
+		cp "$src"/extension/vexec_parquet* "$("$prefix/bin/pg_config" --sharedir)/extension/"
+		echo "  vexec_parquet, built against $(cat "$src/BUILT" 2> /dev/null || echo '?')" ;;
 esac
 
 export HOME=/home/postgres

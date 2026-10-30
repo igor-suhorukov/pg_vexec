@@ -46,4 +46,7 @@ extern void layout_config(FunctionCallInfo fcinfo, int arg, VexecLayoutConfig *c
 
 extern void check_views(struct ArrowArray *a, int col);
 
+/* otel_test.c: pg_otel_probe's side of its reporters, its hooks from _PG_init */
+extern void vexec_test_otel_init(void);
+
 #endif							/* VEXEC_TEST_H */

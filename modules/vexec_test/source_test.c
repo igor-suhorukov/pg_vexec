@@ -110,6 +110,8 @@
 #include "vexec_sink.h"
 #include "vexec_source.h"
 
+#include "vexec_test.h"
+
 #define UNIT_ROWS 1000
 
 PG_FUNCTION_INFO_V1(vexec_test_am_handler);
@@ -322,6 +324,8 @@ typedef struct SrcState
 	bool		ordered;		/* begun with VEXEC_SRC_ORDERED, serially */
 	int			nsteps;			/* VEXEC_SRC_STEPS: the steps, and each column's */
 	int		   *col_step;
+	int64		batches;		/* minor 16's scan_figures(): handed so far */
+	int64		rows;
 } SrcState;
 
 static bool
@@ -915,6 +919,8 @@ src_next(void *arg, VexecSourceBatch *batch)
 	}
 	MemoryContextSwitchTo(old);
 	st->pos += n;
+	st->batches++;
+	st->rows += n;
 	batch->nrows = n;
 	batch->visible = NULL;
 	batch->tids = st->tids ? out->tids : NULL;
@@ -1055,6 +1061,32 @@ src_estimate(Relation rel, Snapshot snapshot, const VexecSourceSpec *spec, doubl
 {
 	calls[M_ESTIMATE]++;
 	estimate_scan(rel, spec, rows, bytes);
+}
+
+/*
+ * Minor version 16 (pg_vector_executor.md §3.41, OT5): a scan's batches and
+ * rows handed, for pg_otel_probe's span of its VecScan; and the estimates
+ * the process's planning asked of the source, the figure whose growth vexec
+ * keeps for the statement.  The state's fields alone.
+ */
+static int
+src_scan_figures(void *arg, VexecSourceFigure *figures)
+{
+	SrcState   *st = arg;
+
+	figures[0].key = "vexec_test.batches";
+	figures[0].value = st->batches;
+	figures[1].key = "vexec_test.rows";
+	figures[1].value = st->rows;
+	return 2;
+}
+
+static int
+src_planning_figures(VexecSourceFigure *figures)
+{
+	figures[0].key = "vexec_test.planning.estimates";
+	figures[0].value = calls[M_ESTIMATE] + calls[M_ESTIMATE_EX];
+	return 1;
 }
 
 static void
@@ -1456,6 +1488,8 @@ static VexecSourceRoutine source = {
 	.ordering = src_ordering,
 	.next_rest = src_next_rest,
 	.set_join_keys = src_set_join_keys,
+	.scan_figures = src_scan_figures,
+	.planning_figures = src_planning_figures,
 };
 
 static VexecSinkRoutine sink = {
@@ -1470,10 +1504,15 @@ static VexecSinkRoutine sink = {
 
 void		_PG_init(void);
 
-/* Only while the postmaster preloads the library, after vexec */
+/*
+ * The source's settings, and otel_test.c's hooks, wherever the library is
+ * loaded; the source and the sink only while the postmaster preloads it,
+ * after vexec
+ */
 void
 _PG_init(void)
 {
+	vexec_test_otel_init();
 	DefineCustomBoolVariable("vexec_test.source_text_offsets",
 							 "Hands the test source's varlena columns as int32 offsets into their bytes.",
 							 NULL, &text_offsets, false,

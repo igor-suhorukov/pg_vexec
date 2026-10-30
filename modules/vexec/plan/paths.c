@@ -68,6 +68,9 @@
 #include "utils/snapmgr.h"
 
 #include "vexec.h"
+#include "batch/batch.h"
+#include "exec/exec.h"
+#include "exec/device.h"
 #include "plan/plan.h"
 #include "source/source.h"
 
@@ -202,6 +205,8 @@ vexec_planner_setup(PlannerGlobal *glob, Query *parse, const char *query_string,
 		ps->gate_open = ps->gate_reason == NULL;
 		ps->record = vexec_mode == VEXEC_MODE_EXPLAIN || vexec_explain_requested(es);
 		ps->layout = vexec_layout_config();
+		ps->statement = vexec_device_asked_token();
+		vexec_planning_mark(ps);
 		SetPlannerGlobalExtensionState(glob, planner_id, ps);
 	}
 
@@ -231,6 +236,10 @@ vexec_planner_shutdown(PlannerGlobal *glob, Query *parse, const char *query_stri
 	if (ps != NULL && ps->record)
 		pstmt->extension_state = lappend(pstmt->extension_state,
 										 makeDefElem("vexec", vexec_reasons_node(ps), -1));
+	/* OT6: the planning's summary, for pg_otel_probe's span, in every mode */
+	if (ps != NULL)
+		pstmt->extension_state = lappend(pstmt->extension_state,
+										 makeDefElem("vexec_summary", vexec_summary_node(ps), -1));
 
 	if (vexec_debug_require_vector && ps != NULL && ps->gate_open &&
 		(ps->mode == VEXEC_MODE_AUTO || ps->mode == VEXEC_MODE_FORCE) &&
@@ -332,7 +341,7 @@ source_estimate(RelOptInfo *rel, Relation relation, const VexecSourceRoutine *sr
 	spec.attnums = attnums;
 	spec.layouts = NULL;
 	spec.quals = quals;
-	spec.max_rows = VEXEC_BATCH_ROWS;
+	spec.max_rows = vexec_batch_rows;
 	spec.flags = need_tid ? VEXEC_SRC_TIDS : 0;
 	memset(est, 0, sizeof(*est));
 	est->size = sizeof(*est);
@@ -343,6 +352,62 @@ source_estimate(RelOptInfo *rel, Relation relation, const VexecSourceRoutine *sr
 	else
 		src->estimate(relation, ActiveSnapshotSet() ? GetActiveSnapshot() : NULL, &spec,
 					  &est->rows, &est->bytes);
+}
+
+/*
+ * F21 (§3.38): the share of the scan's granules the condition cache leaves
+ * it -- by the relation's figures under its quals' order-free key: the
+ * granules scans of the quals saw whole, and of those the ones found none
+ * true (vexec_condcache_tally_get()) -- taken off the source's estimate of
+ * the rows and bytes the scan reads, which its costs and its workers are
+ * priced by: a statement whose quals' granules are nearly all known false
+ * plans the few left without workers.  ClickBench's Q19 at 100M rows, a
+ * point read, started 16 workers for the granules the cache left it, 11 ms
+ * where one process took 3.7.  Only where the cache leaves half the granules
+ * or fewer, and where the scans saw about as many granules as the estimate
+ * holds -- a granule taken as CACHE_GRANULE_ROWS rows -- so that a table
+ * grown or merged since is priced as before -- by the rows of the granules
+ * seen where the scans counted them, a device's search of a unit counting
+ * none; a statement's first plan has none.
+ */
+#define CACHE_GRANULE_ROWS	8192.0
+
+static void
+cache_left(RelOptInfo *rel, Oid relid, VexecSourceEstimate *est)
+{
+	List	   *quals = NIL;
+	uint64		tkey[2];
+	uint64		seen;
+	uint64		none;
+	uint64		rows;
+	double		left;
+	ListCell   *lc;
+
+	if (!vexec_condcache_planning || !vexec_condcache_enabled() || est->rows <= 0)
+		return;
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		if (!rinfo->pseudoconstant)
+			quals = lappend(quals, rinfo->clause);
+	}
+	if (!vexec_condcache_tally_key(quals, rel->relid, tkey) ||
+		!vexec_condcache_tally_get(relid, tkey, &seen, &none, &rows))
+		return;
+	/* the granules seen as many rows as the estimate's, by their rows where counted */
+	if (rows > 0 ? ((double) rows < 0.5 * est->rows || (double) rows > 2.0 * est->rows) :
+		((double) seen < 0.5 * est->rows / CACHE_GRANULE_ROWS ||
+		 (double) seen > 2.0 * est->rows / CACHE_GRANULE_ROWS + 64))
+		return;
+	left = 1.0 - (double) Min(none, seen) / (double) seen;
+	if (left > 0.5)
+		return;
+	est->rows = Max(est->rows * left, 1.0);
+	if (est->bytes > 0)
+		est->bytes = Max(est->bytes * left, (double) BLCKSZ);
+	if (est->raw > 0)
+		est->raw *= left;		/* F28's bytes a row stay its own */
 }
 
 /*
@@ -398,13 +463,15 @@ reads_other_system_column(Bitmapset *attrs)
  * same scan, of as many workers, with the source's estimate of those
  * columns' bytes -- and in *fetch what the source prices a fetch by TID of
  * the columns read late at (VexecSourceEstimate.fetch, minor 4, VC16), or 0
- * where it does not.  False where the path is no VecScan of a base
+ * where it does not; in *threads the threads of its own such a fetch reads
+ * them on (fetch_threads, minor 14), or 0.  False where the path is no
+ * VecScan of a base
  * relation, or no column of its target would be read late: every entry
  * that is no key must be a Var of the relation, and one at least a column
  * of its own.
  */
 bool
-vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost, Cost *fetch)
+vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost, Cost *fetch, double *threads)
 {
 	RelOptInfo *rel = path->parent;
 	Bitmapset  *attrs = NULL;
@@ -420,6 +487,7 @@ vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost,
 	ListCell   *lc;
 
 	*fetch = 0;
+	*threads = 0;
 	if (!vexec_is_scan_path(path) || path->param_info != NULL ||
 		rel->reloptkind != RELOPT_BASEREL || rel->rtekind != RTE_RELATION)
 		return false;
@@ -456,6 +524,7 @@ vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost,
 
 		source_estimate(rel, relation, src, late, &fest);
 		*fetch = Max(fest.fetch, 0);
+		*threads = Max(fest.fetch_threads, 0);
 	}
 	table_close(relation, NoLock);
 
@@ -467,6 +536,91 @@ vexec_late_scan_cost(PlannerInfo *root, Path *path, List *keys, VexecCost *cost,
 	vexec_cost_scan(root, rel, rowpath, &quals, &target, bms_num_members(attrs),
 					list_length(keys) + 1, est.rows, est.bytes, cost);
 	return true;
+}
+
+/*
+ * W13 (§3.27): a VecScan path's twin whose units the device reads itself --
+ * a parallel one's in one participant, the others handing up none, for a
+ * bounded sort above whose participants fetch its rows' late columns
+ * together (sort.c) -- reading the attributes `attrs` (pull_varattnos()'s
+ * form, ctid among them for a scan of TIDs) and handing up `rows` rows of
+ * ncols_out columns, width_out bytes, priced (cost.c,
+ * vexec_cost_scan_device()), the one participant's read whole; or
+ * NULL where the device may not read it so: vexec.gpu off or no device
+ * serving, a source that hands no units -- or, for a scan of TIDs, no TIDs
+ * of their rows (vexec_source.h's minor 9) -- an attribute of a type the
+ * device does not hold, or a qual of no form its filter takes (W4).  The
+ * node decides again as it begins (exec/vecscan.c).
+ */
+/* a qual's column, as the filter's program would number it: any attribute the units hold */
+static int
+units_filter_column(void *arg, AttrNumber attnum, Oid typid, Oid collid)
+{
+	(void) attnum;
+	(void) typid;
+	(void) collid;
+	return (*(int *) arg)++;
+}
+
+Path *
+vexec_scan_device_variant(PlannerInfo *root, Path *scan, Bitmapset *attrs, double rows, int ncols_out,
+						  double width_out)
+{
+	RelOptInfo *rel = scan->parent;
+	RangeTblEntry *rte;
+	Relation	relation;
+	const VexecSourceRoutine *src;
+	const char *how;
+	bool		ok;
+	bool		tids;
+	double		bytes = 0;
+	double		per_byte = 1.0;
+	VexecCost	cost;
+	int			i = -1;
+
+	if (vexec_gpu == VEXEC_GPU_OFF || !vexec_enable_gpu_scan || !vexec_is_scan_path(scan) ||
+		scan->param_info != NULL || rel->reloptkind != RELOPT_BASEREL ||
+		rel->rtekind != RTE_RELATION || rows > (double) (1 << 20) || vexec_device_ready() == NULL)
+		return NULL;
+	if (rel->baserestrictinfo != NIL)
+	{
+		int			counter = 0;
+		Size		len;
+		const char *why;
+
+		if (vexec_devfilter_build(rel->baserestrictinfo, rel->relid, units_filter_column, &counter, &len,
+								  &why) == NULL)
+			return NULL;
+	}
+	tids = bms_is_member(SelfItemPointerAttributeNumber - FirstLowInvalidHeapAttributeNumber, attrs);
+	rte = planner_rt_fetch(rel->relid, root);
+	relation = table_open(rte->relid, NoLock);
+	src = vexec_source_for(relation, &how);
+	ok = src != NULL && VEXEC_SOURCE_HAS(src, next_unit) && VEXEC_SOURCE_HAS(src, read_unit) &&
+		(!tids || VEXEC_SOURCE_HAS(src, unit_tids));
+	while (ok && (i = bms_next_member(attrs, i)) >= 0)
+	{
+		AttrNumber	a = i + FirstLowInvalidHeapAttributeNumber;
+		Form_pg_attribute att;
+		VexecType  *type;
+		int16		scale;
+
+		if (a == SelfItemPointerAttributeNumber)
+			continue;
+		if (a <= 0)
+		{
+			ok = false;			/* a whole row, or another system column */
+			break;
+		}
+		att = TupleDescAttr(RelationGetDescr(relation), a - 1);
+		type = vexec_type_make(att->atttypid, att->atttypmod, att->attcollation);
+		ok = vexec_dev_type_of(type, &scale) != VEXEC_DEV_NONE;
+	}
+	table_close(relation, NoLock);
+	if (!ok || !vexec_units_bytes(root, rel, attrs, &bytes, &per_byte))
+		return NULL;
+	vexec_cost_scan_device(root, rel, bytes * per_byte, rows, ncols_out, width_out, &cost);
+	return vexec_scan_device_path(scan, &cost, rows);
 }
 
 /*
@@ -547,7 +701,10 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 	if (src == NULL && vexec_heap_page_reader && vexec_heap_reader_possible(relation))
 		how = "heap's pages";
 	if (src != NULL && VEXEC_SOURCE_HAS(src, estimate))
+	{
 		source_estimate(rel, relation, src, attrs, &est);
+		cache_left(rel, rte->relid, &est);	/* F21 */
+	}
 	table_close(relation, NoLock);
 
 	/*
@@ -624,7 +781,11 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 
 		/* VC13: a scan of no qual whose source's statistics answer its units */
 		if ((est.flags & VEXEC_EST_AGG_EXACT) && rel->baserestrictinfo == NIL && required_outer == NULL)
-			vexec_scan_path_set_answers(path, est.units);
+			vexec_scan_path_set_answers(path, est.units, false);
+		/* F36 (§3.38): a scan of one qual whose source counts each unit's rows under it */
+		else if ((est.flags & VEXEC_EST_COUNT_QUALS) && vexec_enable_count_under_quals &&
+				 list_length(rel->baserestrictinfo) == 1 && required_outer == NULL)
+			vexec_scan_path_set_answers(path, est.units, true);
 
 		/*
 		 * Force mode: wherever the oracle accepts it, the vector scan is the
@@ -651,6 +812,25 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 		if (rel->reloptkind == RELOPT_BASEREL && required_outer == NULL)
 			vexec_sort_keep_scan(ps, path);
 		add_path(rel, path);
+
+		/*
+		 * W13 (§3.27): the device's read of the relation's units, its quals
+		 * the units' filter, where the rows they keep are few enough to come
+		 * back over the bus: ClickBench's Q19, one row of ten million, took 18
+		 * ms on 16 workers.  Not where the query aggregates: a VecAgg the
+		 * device takes reads the units itself (agg.c, units_input()), the
+		 * groups crossing the bus and not the rows
+		 */
+		if (rel->reloptkind == RELOPT_BASEREL && required_outer == NULL && !root->parse->hasAggs &&
+			root->parse->groupClause == NIL && root->parse->groupingSets == NIL && !root->hasHavingQual)
+		{
+			Path	   *dpath = vexec_scan_device_variant(root, path, attrs, rowpath->rows,
+														  list_length(rel->reltarget->exprs),
+														  rel->reltarget->width);
+
+			if (dpath != NULL)
+				add_path(rel, dpath);
+		}
 		foreach(lc, bitmap_paths)
 			add_path(rel, lfirst(lc));
 		if (!index_kept)
@@ -691,9 +871,30 @@ consider_scan(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte,
 				workers = compute_parallel_worker(rel, ceil(est.bytes / BLCKSZ), -1,
 												  max_parallel_workers_per_gather);
 			if (src != NULL && vexec_scan_rows_per_worker > 0 && rel->rel_parallel_workers < 0)
+			{
+				double		rows = est.rows >= 0 ? est.rows : rel->tuples;
+				double		weight = 1;
+
+				/*
+				 * F28 (§3.38): a row counted by the bytes its columns
+				 * decode to, where the source tells them -- ClickBench's
+				 * Q36, URLs of 82 granules at 100M rows, ran 70 ms on 4
+				 * workers and 43 on 16, Q40's integers of as many rows a
+				 * millisecond or two slower on 16 -- and no more
+				 * participants than the units the source cuts the scan
+				 * into (its minor 18): of Q36's 17, the 14 the key's
+				 * units left without one read no row -- one worker at
+				 * least, the path kept where there is one unit
+				 */
+				if (vexec_scan_row_bytes > 0 && est.raw > 0 && rows > 0)
+					weight = Max(est.raw / rows / vexec_scan_row_bytes, 1.0);
 				workers = Max(workers,
-							  (int) Min(floor((est.rows >= 0 ? est.rows : rel->tuples) / vexec_scan_rows_per_worker),
+							  (int) Min(floor(rows * weight / vexec_scan_rows_per_worker),
 										(double) max_parallel_workers_per_gather));
+				if (vexec_scan_row_bytes > 0 && est.parallel_units >= 1)
+					workers = Min(workers,
+								  Max((int) est.parallel_units - (parallel_leader_participation ? 1 : 0), 1));
+			}
 
 			if (workers > 0)
 			{

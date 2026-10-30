@@ -39,6 +39,15 @@
 #             phases bring (unique indexes and ON CONFLICT, merges), and every
 #             other session must answer as it does.  Run where the extension
 #             is installed (chte.sh).
+#   pg_parquet, vexec_parquet
+#             pg's and vexec's corpora over vexec_parquet's tables of their
+#             own files (modules/vexec_parquet), the same way:
+#             default_table_access_method = vexec_parquet in every session;
+#             the off session's answers differ from heap's expected output
+#             where the access method is not heap (no TOAST table, no pages,
+#             CREATE INDEX CONCURRENTLY refused), and every other session
+#             must answer as it does.  Run where it is installed
+#             (parquet.sh).
 #
 # Each session runs in a temporary instance pg_regress makes, with vexec
 # preloaded and the session's settings in PGOPTIONS, so that every
@@ -127,6 +136,20 @@ ch.max_merge_workers = 0"
 			# a test of a group fails where it would make what another of
 			# the group reads (an index, an UPDATE): run apart, each test
 			# meets the same leftovers in every session
+			corpus_maxconn=1
+			reference_expected=0 ;;
+		pg_parquet|vexec_parquet)
+			if [ "$corpus" = pg_parquet ]; then
+				schedule="$W/pg_schedule"; inputdir="$PGSUITE"
+			else
+				schedule="$here/differential/vexec_schedule"; inputdir="$BUILD/modules/vexec"
+			fi
+			dlpath="$PGSUITE"
+			extra=(--load-extension=vexec_parquet)
+			corpus_preload=",vexec_parquet"
+			corpus_conf="default_table_access_method = vexec_parquet
+vexec_parquet.sync = off"
+			session_extra="-c lock_timeout=60s"
 			corpus_maxconn=1
 			reference_expected=0 ;;
 		pgvector)

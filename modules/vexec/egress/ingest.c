@@ -14,7 +14,7 @@
  * names each column's type.  One reader reads the stream, once:
  *
  *	VecIngest		the function scan's vector path (plan/ingest.c): each
- *					RecordBatch cut into windows of at most VEXEC_BATCH_ROWS
+ *					RecordBatch cut into windows of at most vexec.batch_rows
  *					rows.  Where the list names the type the column's Arrow
  *					type names, its buffers are the window's column as they
  *					lie -- booleans, integers, floats, utf8 and binary, uuid
@@ -630,7 +630,7 @@ vexec_ingest_next_window(VexecIngestCursor *c, VexecBatch *batch, const VexecLay
 	if ((!c->have_array || c->next >= c->array.length) && !next_array(c))
 		return false;
 	start = c->next;
-	n = (int) Min((int64) VEXEC_BATCH_ROWS, c->array.length - start);
+	n = (int) Min((int64) vexec_batch_rows, c->array.length - start);
 	vexec_batch_reset(batch);
 	if (c->all_columns)
 	{

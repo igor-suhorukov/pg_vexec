@@ -1,0 +1,257 @@
+-- Tables that read the files of another writer, pyarrow's
+-- (test/data/make_files.py, written into VPQ_TEST_DATA before the test)
+\getenv data VPQ_TEST_DATA
+SELECT :'data' || '/all.parquet' AS all_file, :'data' || '/part-*.parquet' AS parts,
+	:'data' || '/nested.parquet' AS nested, :'data' || '/paged.parquet' AS paged \gset
+-- the columns as a table would declare them
+SELECT name, type, nullable, arrow_type FROM vexec_parquet.columns(:'all_file');
+ name  |       type       | nullable |                     arrow_type                      
+-------+------------------+----------+-----------------------------------------------------
+ id    | bigint           | t        | int64
+ i8    | smallint         | t        | int8
+ i16   | smallint         | t        | int16
+ i32   | integer          | t        | int32
+ u8    | smallint         | t        | uint8
+ u16   | integer          | t        | uint16
+ u32   | bigint           | t        | uint32
+ u64   | numeric(20,0)    | t        | uint64
+ f16   | real             | t        | halffloat
+ f32   | real             | t        | float
+ f64   | double precision | t        | double
+ b     | boolean          | t        | bool
+ s     | text             | t        | string
+ ls    | text             | t        | large_string
+ bin   | bytea            | t        | binary
+ dict  | text             | t        | dictionary<values=string, indices=int32, ordered=0>
+ d32   | date             | t        | date32[day]
+ d64   | date             | t        | date32[day]
+ ts_s  | timestamp        | t        | timestamp[ms]
+ ts_ms | timestamp        | t        | timestamp[ms]
+ ts_us | timestamp        | t        | timestamp[us]
+ ts_ns | timestamp        | t        | timestamp[ns]
+ tz_us | timestamptz      | t        | timestamp[us, tz=UTC]
+ t32   | time             | t        | time32[ms]
+ t64   | time             | t        | time64[ns]
+ dec9  | numeric(9,2)     | t        | decimal128(9, 2)
+ dec18 | numeric(18,4)    | t        | decimal128(18, 4)
+ dec38 | numeric(38,10)   | t        | decimal128(38, 10)
+ uu    | bytea            | t        | fixed_size_binary[16]
+ nul   |                  | t        | null
+(30 rows)
+
+SELECT vexec_parquet.column_list(:'all_file') AS columns \gset
+CREATE TABLE arrow_all (:columns) USING vexec_parquet WITH (location = :'all_file');
+SELECT count(*) FROM arrow_all;
+ count 
+-------
+  1000
+(1 row)
+
+SELECT * FROM arrow_all WHERE id IN (0, 1, 3, 5, 999) ORDER BY id;
+ id  | i8  |  i16  |    i32    | u8  |  u16  |    u32     | u64  |  f16   |    f32     |         f64         | b |     s     |    ls     |   bin    | dict |    d32     |    d64     |           ts_s           |            ts_ms             |              ts_us              |              ts_ns              |            tz_us             |   t32    |       t64       | dec9  |    dec18    |              dec38               |                 uu                 | nul 
+-----+-----+-------+-----------+-----+-------+------------+------+--------+------------+---------------------+---+-----------+-----------+----------+------+------------+------------+--------------------------+------------------------------+---------------------------------+---------------------------------+------------------------------+----------+-----------------+-------+-------------+----------------------------------+------------------------------------+-----
+   0 | -50 | -3000 |         0 |   0 |     0 |          0 |    0 |      0 |          0 |                   0 | t | str 0 ü   | large 0   | \x0000ff | cat0 | 01-01-2000 | 01-01-1960 | Wed Jan 01 12:00:00 2020 | Wed Jan 01 12:00:00 2020     | Wed Jan 01 12:00:00 2020        | Wed Jan 01 12:00:00 2020        | Wed Jan 01 04:00:00 2020 PST | 00:00:00 | 00:00:00        |  0.00 |      0.0000 |                     0.0000000000 | \x00000000000000000000000000000000 | 
+   1 | -49 | -2993 |   1000003 |   1 |    60 |    4000000 |   10 |   0.25 | 0.33333334 | 0.14285714285714285 | f | str 1 ü   | large 1   | \x0100ff | cat1 | 01-02-2000 | 01-02-1960 | Wed Jan 01 12:00:01 2020 | Wed Jan 01 12:00:01.001 2020 | Wed Jan 01 12:00:01.000001 2020 | Wed Jan 01 12:00:00.000001 2020 | Wed Jan 01 05:00:00 2020 PST | 00:00:01 | 00:00:01        |  0.03 |    123.4567 |    123456789012345678.0123456789 | \x00000000000000010000000000000001 | 
+   3 |     |       |           |     |       |            |      |        |            |                     |   |           |           |          |      |            |            |                          |                              |                                 |                                 |                              |          |                 |       |             |                                  |                                    | 
+   5 | -45 | -2965 |   5000015 |   5 |   300 |   20000000 |   50 |   1.25 |  1.6666666 |                 NaN | f | str 5 ü   | large 5   | \x0500ff | cat0 | 01-06-2000 | 01-06-1960 | Wed Jan 01 12:00:05 2020 | Wed Jan 01 12:00:05.005 2020 | Wed Jan 01 12:00:05.000005 2020 | Wed Jan 01 12:00:00.000005 2020 | Wed Jan 01 09:00:00 2020 PST | 00:00:05 | 00:00:05        |  0.15 |    617.2835 |    617283945061728390.0617283945 | \x00000000000000050000000000000005 | 
+ 999 |  49 |  3993 | 999002997 | 231 | 59940 | 3996000000 | 9990 | 249.75 |        333 |  142.71428571428572 | t | str 999 ü | large 999 | \xe700ff | cat4 | 09-26-2002 | 09-26-1962 | Wed Jan 01 12:16:39 2020 | Wed Jan 01 12:16:39.999 2020 | Wed Jan 01 12:16:39.000999 2020 | Wed Jan 01 12:00:00.000999 2020 | Tue Feb 11 19:00:00 2020 PST | 00:16:39 | 00:16:39.000006 | 29.97 | 123333.2433 | 123333332223333332334.3333332000 | \x00000000000003e700000000000003e7 | 
+(5 rows)
+
+SELECT count(*), sum(i8), sum(i16), sum(i32), sum(u8), sum(u16), sum(u32), sum(u64), sum(f16), sum(f32),
+	count(b) FILTER (WHERE b), count(DISTINCT dict), min(s), max(ls), sum(length(bin)) FROM arrow_all;
+ count | sum  |  sum   |     sum      |  sum   |   sum    |      sum      |   sum   |  sum   |    sum    | count | count |   min   |    max    | sum  
+-------+------+--------+--------------+--------+----------+---------------+---------+--------+-----------+-------+-------+---------+-----------+------
+  1000 | -450 | 425000 | 428001284000 | 106720 | 25680000 | 1712000000000 | 4280000 | 107000 | 142666.69 |   286 |     5 | str 0 ü | large 999 | 2571
+(1 row)
+
+SELECT min(d32), max(d64), min(ts_s), max(ts_ms), min(ts_us), max(ts_ns), min(tz_us), max(t32), min(t64)
+FROM arrow_all;
+    min     |    max     |           min            |             max              |           min            |               max               |             min              |   max    |   min    
+------------+------------+--------------------------+------------------------------+--------------------------+---------------------------------+------------------------------+----------+----------
+ 01-01-2000 | 09-26-1962 | Wed Jan 01 12:00:00 2020 | Wed Jan 01 12:16:39.999 2020 | Wed Jan 01 12:00:00 2020 | Wed Jan 01 12:00:00.000999 2020 | Wed Jan 01 04:00:00 2020 PST | 00:16:39 | 00:00:00
+(1 row)
+
+SELECT sum(dec9), sum(dec18), sum(dec38), count(uu), count(nul) FROM arrow_all;
+   sum    |      sum      |                sum                 | count | count 
+----------+---------------+------------------------------------+-------+-------
+ 12840.00 | 52839467.6000 | 52839505697283950189283.9505691057 |   857 |     0
+(1 row)
+
+SELECT row_group, rows FROM vexec_parquet.file_row_groups(:'all_file');
+ row_group | rows 
+-----------+------
+         0 |  250
+         1 |  250
+         2 |  250
+         3 |  250
+(4 rows)
+
+-- the same rows in three files: other codecs, another order of columns
+CREATE TABLE arrow_parts (:columns) USING vexec_parquet WITH (location = :'parts');
+SELECT count(*) AS differ FROM ((TABLE arrow_all EXCEPT ALL TABLE arrow_parts)
+	UNION ALL (TABLE arrow_parts EXCEPT ALL TABLE arrow_all)) x;
+ differ 
+--------
+      0
+(1 row)
+
+-- through vexec's source, in both formats
+SET vexec.mode = force;
+SELECT count(*) AS differ FROM ((TABLE arrow_all EXCEPT ALL TABLE arrow_parts)
+	UNION ALL (TABLE arrow_parts EXCEPT ALL TABLE arrow_all)) x;
+ differ 
+--------
+      0
+(1 row)
+
+SELECT count(*), sum(u32), sum(f16), min(ts_ns), max(dec38), count(DISTINCT dict) FROM arrow_parts;
+ count |      sum      |  sum   |           min            |               max                | count 
+-------+---------------+--------+--------------------------+----------------------------------+-------
+  1000 | 1712000000000 | 107000 | Wed Jan 01 12:00:00 2020 | 123333332223333332334.3333332000 |     5
+(1 row)
+
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+	SELECT count(*), sum(i32) FROM arrow_all WHERE id BETWEEN 600 AND 610;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Vec Aggregate (actual rows=1.00 loops=1)
+   ->  Vec Seq Scan on arrow_all (actual rows=11.00 loops=1)
+         Filter: ((id >= 600) AND (id <= 610))
+         Rows Removed by Filter: 239
+(4 rows)
+
+SELECT count(*), sum(i32) FROM arrow_all WHERE id BETWEEN 600 AND 610;
+ count |    sum     
+-------+------------
+    11 | 6050018150
+(1 row)
+
+EXPLAIN (VERBOSE, COSTS OFF) SELECT count(*), min(id), max(ts_us) FROM arrow_all;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Vec Aggregate
+   Output: (count(*)), (min(id)), (max(ts_us))
+   Batch Format: postgres
+   Vector Transitions: 3 of 3
+   Transitions: count(*), min, max
+   Kernel Steps: 0
+   Fallback Steps: 0
+   Input: batches
+   From Statistics: vexec_parquet
+   ->  Vec Seq Scan on public.arrow_all
+         Output: id, ts_us
+         Batch Format: postgres
+         Kernel Steps: 0
+         Fallback Steps: 0
+         Source: vexec_parquet
+(15 rows)
+
+SELECT count(*), min(id), max(ts_us) FROM arrow_all;
+ count | min |               max               
+-------+-----+---------------------------------
+  1000 |   0 | Wed Jan 01 12:16:39.000999 2020
+(1 row)
+
+SET vexec.batch_format = arrow;
+SELECT count(*), sum(u64), max(s), min(d64), max(t32) FROM arrow_parts;
+ count |   sum   |    max    |    min     |   max    
+-------+---------+-----------+------------+----------
+  1000 | 4280000 | str 999 ü | 01-01-1960 | 00:16:39
+(1 row)
+
+RESET vexec.batch_format;
+RESET vexec.mode;
+-- columns read as other types: integers, half and single floats as
+-- doubles, every unit of time, decimals as numeric, a dictionary as text
+CREATE TABLE arrow_cast (id int4, u8 int8, f16 float8, f32 float8, s varchar(9), ts_ns timestamptz,
+	t32 time, dec9 numeric, u64 numeric, dict varchar) USING vexec_parquet WITH (location = :'all_file');
+SELECT * FROM arrow_cast WHERE id < 3 ORDER BY id;
+ id | u8 | f16  |        f32         |    s    |                ts_ns                |   t32    | dec9 | u64 | dict 
+----+----+------+--------------------+---------+-------------------------------------+----------+------+-----+------
+  0 |  0 |    0 |                  0 | str 0 ü | Wed Jan 01 04:00:00 2020 PST        | 00:00:00 | 0.00 |   0 | cat0
+  1 |  1 | 0.25 | 0.3333333432674408 | str 1 ü | Wed Jan 01 04:00:00.000001 2020 PST | 00:00:01 | 0.03 |  10 | cat1
+  2 |  2 |  0.5 | 0.6666666865348816 | str 2 ü | Wed Jan 01 04:00:00.000002 2020 PST | 00:00:02 | 0.06 |  20 | cat2
+(3 rows)
+
+-- a type no file's column is read as
+SELECT vpq_error(format('CREATE TABLE arrow_bad (dec9 float8) USING vexec_parquet WITH (location = %L)', :'all_file'));
+                                                                           vpq_error                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ column "dec9" of type double precision of a vexec_parquet table cannot be read from the file's column "dec9" of type decimal128(9, 2) / The file is "<path>".
+(1 row)
+
+-- an unsigned value past the column's type, and a nested column as text; columns() declares it an array (PQ20)
+CREATE TABLE arrow_narrow (u32 int2) USING vexec_parquet WITH (location = :'all_file');
+SELECT max(u32) FROM arrow_narrow;
+ERROR:  value of column "u32" is out of range for type smallint
+SELECT vpq_error(format('CREATE TABLE arrow_nested (id int8, l text) USING vexec_parquet WITH (location = %L)', :'nested'));
+                                                                    vpq_error                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------
+ column "l" of type text of a vexec_parquet table cannot be read from the file's column "l" of type list<element: int64> / The file is "<path>".
+(1 row)
+
+SELECT * FROM vexec_parquet.columns(:'nested');
+ name |   type   | nullable |      arrow_type      
+------+----------+----------+----------------------
+ id   | bigint   | t        | int64
+ l    | bigint[] | t        | list<element: int64>
+(2 rows)
+
+-- rows fetched by their TIDs (a TID scan; scan.c's point reads): each
+-- column's data page holding the row read alone, walked to by the pages'
+-- headers where the file has no offset index (pyarrow's default), found by
+-- it where it has one; a type a point read does not make -- a half float, a
+-- dictionary, a date64, seconds and nanoseconds -- read from its chunk whole
+CREATE TABLE arrow_paged (:columns) USING vexec_parquet WITH (location = :'paged');
+SELECT vexec_parquet.fetch_stats(true) IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+CREATE TEMP TABLE fetched_all AS SELECT * FROM arrow_all
+WHERE ctid = ANY (ARRAY(SELECT ctid FROM arrow_all WHERE id % 37 = 0 OR id IN (0, 249, 250, 999)));
+RESET enable_seqscan;
+SELECT fetches, pages > 0 AS pages_read, indexed AS by_offset_index, whole > 0 AS some_read_whole
+FROM vexec_parquet.fetch_stats();
+ fetches | pages_read | by_offset_index | some_read_whole 
+---------+------------+-----------------+-----------------
+      30 | t          |               0 | t
+(1 row)
+
+SELECT count(*) AS rows, (SELECT count(*) FROM ((TABLE fetched_all EXCEPT ALL
+	(SELECT * FROM arrow_all WHERE id % 37 = 0 OR id IN (0, 249, 250, 999))) UNION ALL
+	((SELECT * FROM arrow_all WHERE id % 37 = 0 OR id IN (0, 249, 250, 999)) EXCEPT ALL TABLE fetched_all)) x) AS differ
+FROM fetched_all;
+ rows | differ 
+------+--------
+   30 |      0
+(1 row)
+
+SELECT vexec_parquet.fetch_stats(true) IS NOT NULL AS reset;
+ reset 
+-------
+ t
+(1 row)
+
+SET enable_seqscan = off;
+CREATE TEMP TABLE fetched_paged AS SELECT * FROM arrow_paged
+WHERE ctid = ANY (ARRAY(SELECT ctid FROM arrow_paged WHERE id % 37 = 0 OR id IN (0, 399, 400, 999)));
+RESET enable_seqscan;
+SELECT fetches, pages > 0 AS pages_read, indexed = pages AS by_offset_index, whole > 0 AS some_read_whole
+FROM vexec_parquet.fetch_stats();
+ fetches | pages_read | by_offset_index | some_read_whole 
+---------+------------+-----------------+-----------------
+      30 | t          | t               | t
+(1 row)
+
+SELECT count(*) AS rows, (SELECT count(*) FROM ((TABLE fetched_paged EXCEPT ALL
+	(SELECT * FROM arrow_all WHERE id % 37 = 0 OR id IN (0, 399, 400, 999))) UNION ALL
+	((SELECT * FROM arrow_all WHERE id % 37 = 0 OR id IN (0, 399, 400, 999)) EXCEPT ALL TABLE fetched_paged)) x) AS differ
+FROM fetched_paged;
+ rows | differ 
+------+--------
+   30 |      0
+(1 row)
+

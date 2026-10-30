@@ -1,0 +1,64 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1ins s2ins s1c s2sel
+step s1ins: INSERT INTO kv VALUES (1, 'a') ON CONFLICT (k) DO UPDATE SET v = kv.v || excluded.v;
+step s2ins: INSERT INTO kv VALUES (1, 'b') ON CONFLICT (k) DO UPDATE SET v = kv.v || excluded.v RETURNING v, xmax = 0 AS inserted; <waiting ...>
+step s1c: COMMIT;
+step s2ins: <... completed>
+v |inserted
+--+--------
+ab|f       
+(1 row)
+
+step s2sel: SELECT * FROM kv ORDER BY k;
+k|v 
+-+--
+1|ab
+(1 row)
+
+
+starting permutation: s1ins s2ins s1a s2sel
+step s1ins: INSERT INTO kv VALUES (1, 'a') ON CONFLICT (k) DO UPDATE SET v = kv.v || excluded.v;
+step s2ins: INSERT INTO kv VALUES (1, 'b') ON CONFLICT (k) DO UPDATE SET v = kv.v || excluded.v RETURNING v, xmax = 0 AS inserted; <waiting ...>
+step s1a: ROLLBACK;
+step s2ins: <... completed>
+v|inserted
+-+--------
+b|t       
+(1 row)
+
+step s2sel: SELECT * FROM kv ORDER BY k;
+k|v
+-+-
+1|b
+(1 row)
+
+
+starting permutation: s1ins s2nothing s1c s2sel
+step s1ins: INSERT INTO kv VALUES (1, 'a') ON CONFLICT (k) DO UPDATE SET v = kv.v || excluded.v;
+step s2nothing: INSERT INTO kv VALUES (1, 'c') ON CONFLICT DO NOTHING RETURNING v; <waiting ...>
+step s1c: COMMIT;
+step s2nothing: <... completed>
+v
+-
+(0 rows)
+
+step s2sel: SELECT * FROM kv ORDER BY k;
+k|v
+-+-
+1|a
+(1 row)
+
+
+starting permutation: s1child s2delp s1c
+step s1child: INSERT INTO child VALUES (1);
+step s2delp: DELETE FROM parent WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2delp: <... completed>
+ERROR:  update or delete on table "parent" violates foreign key constraint "child_pid_fkey" on table "child"
+
+starting permutation: s1child s2delp s1a
+step s1child: INSERT INTO child VALUES (1);
+step s2delp: DELETE FROM parent WHERE id = 1; <waiting ...>
+step s1a: ROLLBACK;
+step s2delp: <... completed>

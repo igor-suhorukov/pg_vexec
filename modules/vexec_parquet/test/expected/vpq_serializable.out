@@ -1,0 +1,38 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1r s2r s1w s2w s1c s2c
+step s1r: SELECT count(*) FROM doctors WHERE oncall;
+count
+-----
+    2
+(1 row)
+
+step s2r: SELECT count(*) FROM doctors WHERE oncall;
+count
+-----
+    2
+(1 row)
+
+step s1w: UPDATE doctors SET oncall = false WHERE name = 'alice';
+step s2w: UPDATE doctors SET oncall = false WHERE name = 'bob';
+step s1c: COMMIT;
+step s2c: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1r s1w s1c s2r s2w s2c
+step s1r: SELECT count(*) FROM doctors WHERE oncall;
+count
+-----
+    2
+(1 row)
+
+step s1w: UPDATE doctors SET oncall = false WHERE name = 'alice';
+step s1c: COMMIT;
+step s2r: SELECT count(*) FROM doctors WHERE oncall;
+count
+-----
+    1
+(1 row)
+
+step s2w: UPDATE doctors SET oncall = false WHERE name = 'bob';
+step s2c: COMMIT;

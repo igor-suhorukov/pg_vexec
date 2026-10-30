@@ -446,6 +446,10 @@ vexec_layout_name(int layout)
 			return "view";
 		case VEXEC_OFFSETS:
 			return "offsets";
+		case VEXEC_LIST:
+			return "list";
+		case VEXEC_MAP:
+			return "map";
 	}
 	return "?";
 }

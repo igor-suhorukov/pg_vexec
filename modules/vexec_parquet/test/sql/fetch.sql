@@ -1,0 +1,103 @@
+-- Fetches by TID (scan.c): each column a fetch reads, from the data page
+-- that holds its row, read alone -- found by the offset index the
+-- extension's files have -- and kept for the next fetch in it; with point
+-- reads off, its column chunk read whole.  The rows a scan's either way,
+-- every type class among them; and vexec's late columns, the fetch's
+-- columns alone (fetch_columns()).
+CREATE TABLE ft (id int8 NOT NULL, i2 int2, i4 int4, f4 float4, f8 float8, b bool, ch "char", d date,
+  ts timestamp, tz timestamptz, tm time, n numeric(12, 3), nb numeric(30, 4), nu numeric, t text,
+  vc varchar(20), by bytea, u uuid, iv interval, js jsonb, arr int4[])
+  USING vexec_parquet WITH (row_group_rows = 50000, page_bytes = 4096);
+INSERT INTO ft
+SELECT i, (i % 30000)::int2, CASE WHEN i % 13 = 0 THEN NULL ELSE i * 7 END, i / 3.0, i / 7.0,
+  CASE WHEN i % 17 = 0 THEN NULL ELSE i % 3 = 0 END, chr(65 + i % 26)::"char",
+  DATE '2001-01-01' + i % 3000, TIMESTAMP '2001-01-01' + i * INTERVAL '17 seconds',
+  TIMESTAMPTZ '2001-01-01 00:00+00' + i * INTERVAL '19 seconds', TIME '00:00' + (i % 86400) * INTERVAL '1 second',
+  i * 1.001, CASE WHEN i % 19 = 0 THEN NULL ELSE i * 12345.6789 END, i / 13.0,
+  CASE WHEN i % 11 = 0 THEN NULL ELSE 'text ' || i || repeat('é', i % 4) END, 'v' || i % 1000,
+  decode(lpad(to_hex(i), 8, '0'), 'hex'), md5(i::text)::uuid, i * INTERVAL '1 minute',
+  jsonb_build_object('i', i), ARRAY[i, i + 1]
+FROM generate_series(1, 120000) i;
+CREATE INDEX ft_id ON ft (id);
+ANALYZE ft;
+SELECT row_group, rows FROM vexec_parquet.file_row_groups((SELECT path FROM vexec_parquet.files('ft'))) ORDER BY 1;
+
+-- the rows of some ids as the scan reads them, and as the index fetches them
+CREATE TEMP TABLE want AS
+SELECT * FROM ft WHERE id IN (1, 2, 3, 500, 49999, 50000, 50001, 99999, 100000, 120000) OR id % 10007 = 0;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+EXPLAIN (COSTS OFF) SELECT * FROM ft WHERE id = ANY (ARRAY(SELECT id FROM want));
+SELECT vexec_parquet.fetch_stats(true) IS NOT NULL AS reset;
+CREATE TEMP TABLE got AS SELECT * FROM ft WHERE id = ANY (ARRAY(SELECT id FROM want));
+SELECT (SELECT count(*) FROM want) AS rows,
+  (SELECT count(*) FROM ((TABLE want EXCEPT ALL TABLE got) UNION ALL (TABLE got EXCEPT ALL TABLE want)) x) AS differ;
+-- every column of each row read from its page, found by the offset index
+SELECT fetches, "values" = fetches * 21 AS every_column, pages > 0 AS pages_read, indexed = pages AS by_offset_index,
+  whole AS chunks_read_whole FROM vexec_parquet.fetch_stats();
+
+-- a range of ids fetched one after another: each page read once, kept for the next rows in it
+SELECT vexec_parquet.fetch_stats(true) IS NOT NULL AS reset;
+SELECT count(*), sum(i4), sum(n), max(t), max(tz), count(u) FROM ft WHERE id BETWEEN 60001 AND 61000;
+SELECT fetches, kept > 10 * pages AS pages_kept, whole AS chunks_read_whole FROM vexec_parquet.fetch_stats();
+SET enable_seqscan = on;
+SET enable_indexscan = off;
+SELECT count(*), sum(i4), sum(n), max(t), max(tz), count(u) FROM ft WHERE id BETWEEN 60001 AND 61000;
+SET enable_seqscan = off;
+SET enable_indexscan = on;
+
+-- point reads off: each column's chunk read whole, the same rows
+SET vexec_parquet.enable_point_reads = off;
+SELECT vexec_parquet.fetch_stats(true) IS NOT NULL AS reset;
+CREATE TEMP TABLE got_whole AS SELECT * FROM ft WHERE id = ANY (ARRAY(SELECT id FROM want));
+SELECT (SELECT count(*) FROM ((TABLE want EXCEPT ALL TABLE got_whole) UNION ALL (TABLE got_whole EXCEPT ALL TABLE want)) x) AS differ;
+SELECT pages AS pages_read, whole > 0 AS chunks_read_whole FROM vexec_parquet.fetch_stats();
+RESET vexec_parquet.enable_point_reads;
+
+-- W55 (pg_vector_executor.md §3.36): a fetch's columns' pages read at once,
+-- on vexec_parquet.fetch_threads threads of the engine's own (16, those
+-- above); on one, a page at a time: the same rows, the same pages read
+SELECT vexec_parquet.fetch_stats(true) IS NOT NULL AS reset;
+CREATE TEMP TABLE got_threads AS SELECT * FROM ft WHERE id = ANY (ARRAY(SELECT id FROM want));
+CREATE TEMP TABLE threads_stats AS SELECT * FROM vexec_parquet.fetch_stats(true);
+SET vexec_parquet.fetch_threads = 1;
+CREATE TEMP TABLE got_one AS SELECT * FROM ft WHERE id = ANY (ARRAY(SELECT id FROM want));
+SELECT (SELECT count(*) FROM ((TABLE want EXCEPT ALL TABLE got_one) UNION ALL (TABLE got_one EXCEPT ALL TABLE want)) x) AS differ_one,
+  (SELECT count(*) FROM ((TABLE got_threads EXCEPT ALL TABLE got_one) UNION ALL (TABLE got_one EXCEPT ALL TABLE got_threads)) x) AS differ_threads;
+SELECT o.fetches = t.fetches AS same_fetches, o.pages = t.pages AS same_pages, o.kept = t.kept AS same_kept,
+  o.whole = t.whole AS same_whole FROM vexec_parquet.fetch_stats() o, threads_stats t;
+RESET vexec_parquet.fetch_threads;
+SET vexec_parquet.fetch_threads = 0;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- rows deleted and updated since: a fetch of a row the snapshot does not see finds none
+DELETE FROM ft WHERE id % 10007 = 0;
+UPDATE ft SET t = 'updated' WHERE id = 500;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id, t FROM ft WHERE id IN (500, 10007, 20014) ORDER BY id;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+-- vexec's late columns (a bounded VecSort, H6): the rows' sort key read by
+-- the scan, their columns fetched by their TIDs -- the sort's output's five,
+-- its key among them -- those alone
+SET vexec.mode = force;
+SET max_parallel_workers_per_gather = 0;
+SELECT vexec_parquet.fetch_stats(true) IS NOT NULL AS reset;
+CREATE TEMP TABLE late AS SELECT id, t, ts, nb FROM ft ORDER BY f8 DESC LIMIT 5;
+SELECT fetches, "values" = fetches * 5 AS its_five_columns_alone FROM vexec_parquet.fetch_stats();
+SET vexec.mode = off;
+SELECT count(*) AS differ FROM ((TABLE late EXCEPT ALL (SELECT id, t, ts, nb FROM ft ORDER BY f8 DESC LIMIT 5))
+  UNION ALL ((SELECT id, t, ts, nb FROM ft ORDER BY f8 DESC LIMIT 5) EXCEPT ALL TABLE late)) x;
+SET vexec_parquet.enable_fetch_columns = off;
+SET vexec.mode = force;
+SELECT vexec_parquet.fetch_stats(true) IS NOT NULL AS reset;
+CREATE TEMP TABLE late_every AS SELECT id, t, ts, nb FROM ft ORDER BY f8 DESC LIMIT 5;
+SELECT fetches, "values" = fetches * 21 AS every_column FROM vexec_parquet.fetch_stats();
+SELECT count(*) AS differ FROM ((TABLE late EXCEPT ALL TABLE late_every) UNION ALL (TABLE late_every EXCEPT ALL TABLE late)) x;
+RESET vexec_parquet.enable_fetch_columns;
+RESET vexec.mode;
+RESET max_parallel_workers_per_gather;
+DROP TABLE ft;

@@ -550,12 +550,54 @@ offsets_to_view(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 	v->shape = *to;
 }
 
+/*
+ * PQ21 (pg_vector_executor.md §3.40): a nested column -- a scan's input,
+ * as its source handed it -- made Datums at the rows of `rows` (NULL every
+ * row), its source's, every other row NULL
+ */
+static void
+nested_to_datum(VexecBatch *batch, VexecVec *v, const uint64 *rows)
+{
+	int			n = v->nvalues;
+	Datum	   *out = vexec_batch_alloc0(batch, sizeof(Datum) * Max(n, 1));
+	uint64	   *validity = vexec_bitmap_alloc(batch, n, false);
+
+	vexec_batch_column_changed(batch, v);
+	for (int i = 0; i < n; i++)
+	{
+		bool		isnull;
+
+		if ((rows != NULL && !vexec_bit(rows, i)) || vexec_vec_isnull(v, i))
+			continue;
+		out[i] = vexec_vec_datum(batch, v, i, &isnull);
+		if (!isnull)
+			vexec_bit_set(validity, i);
+	}
+	v->values = out;
+	v->validity = validity;
+	v->datums = NULL;
+	v->buffers = NULL;
+	v->buffer_sizes = NULL;
+	v->nbuffers = 0;
+	v->children[0] = v->children[1] = NULL;
+	v->nested = NULL;
+	memset(&v->shape, 0, sizeof(VexecShape));
+	v->shape.layout = VEXEC_DATUM;
+}
+
 static bool
 convert_flat(VexecBatch *batch, VexecVec *v, const VexecShape *to)
 {
 	const VexecShape *from = &v->shape;
 	int			fl = from->layout;
 	int			tl = to->layout;
+
+	/* PQ21: a nested column, Datums first, then whatever the bytes layouts make of them */
+	if (VEXEC_NESTED_LAYOUT(fl))
+	{
+		nested_to_datum(batch, v, NULL);
+		return tl == VEXEC_DATUM ? true : convert_flat(batch, v, to);
+	}
 
 	if (fl == VEXEC_BYTE_BOOL && tl == VEXEC_BIT_BOOL)
 	{
@@ -764,6 +806,12 @@ vexec_batch_apply_config_cols(VexecBatch *batch, const VexecLayoutConfig *cfg,
 
 		if (cols != NULL && !cols[i])
 			continue;
+		/* PQ21: a nested column stays as its source handed it, for its kernels; made Datums where they are read */
+		if (keep_bytes && VEXEC_NESTED_LAYOUT(v->shape.layout))
+		{
+			kept++;
+			continue;
+		}
 		if (keep_bytes)
 		{
 			vexec_type_shape(v->type, cfg, &target);
@@ -799,6 +847,12 @@ vexec_vec_convert_rows(VexecBatch *batch, VexecVec *v, const VexecShape *to,
 
 	if (vexec_shape_equal(&v->shape, to))
 		return true;
+	/* PQ21: a nested column, Datums at those rows -- whatever the layout asked, Datums are the one it reads */
+	if (VEXEC_NESTED_LAYOUT(v->shape.layout) && rows != NULL && v->encoding == VEXEC_FLAT)
+	{
+		nested_to_datum(batch, v, rows);
+		return to->layout == VEXEC_DATUM;
+	}
 	if (rows == NULL || v->encoding == VEXEC_CONST || to->layout != VEXEC_DATUM ||
 		(v->shape.layout != VEXEC_VIEW && v->shape.layout != VEXEC_OFFSETS))
 		return vexec_vec_convert(batch, v, to);

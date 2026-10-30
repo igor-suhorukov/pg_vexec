@@ -236,8 +236,8 @@
 +(23 rows)
  
  select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(1, 0, 0)');
-                                explain_parallel_append                               
- -------------------------------------------------------------------------------------
+-                                  explain_parallel_append                                  
+--------------------------------------------------------------------------------------------
 -                     ->  Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
 -                     ->  Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
 -                     ->  Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
@@ -248,6 +248,8 @@
 -                     ->  Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
 -                     ->  Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
 -                     Columns: a
++                               explain_parallel_append                               
++-------------------------------------------------------------------------------------
 +                           ->  Vec Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
 +                           ->  Vec Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
 +                           ->  Vec Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
@@ -259,7 +261,7 @@
 +                           ->  Vec Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
 +                     ->  Parallel Append (actual rows=N loops=N)
                       Filter: (a = ANY ('{1,0,0}'::integer[]))
--                     Granules: 2 read of 3, parts pruned: 1
+-                     Granules: 2 read of 3, parts pruned: 1, units of the granules kept: 3
 -                     Pruning: (a.a = ANY ('{1,0,0}'::integer[]))
 -               ->  Parallel Append (actual rows=N loops=N)
 -               ->  Parallel Custom Scan (ChScan) on lprt_a a (actual rows=N loops=N)
@@ -283,9 +285,11 @@
 +(23 rows)
  
  delete from lprt_a where a = 1;
-@@ -1267,29 +1263,28 @@
-                                explain_parallel_append                               
- -------------------------------------------------------------------------------------
+@@ -1265,31 +1261,30 @@
+ HINT:  To enable deleting from the table, set REPLICA IDENTITY using ALTER TABLE.
+ select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(1, 0, 0)');
+-                                  explain_parallel_append                                  
+--------------------------------------------------------------------------------------------
 -                     ->  Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
 -                     ->  Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
 -                     ->  Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
@@ -296,6 +300,8 @@
 -                     ->  Seq Scan on ab_a3_b2 ab_8 (actual rows=N loops=N)
 -                     ->  Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
 -                     Columns: a
++                               explain_parallel_append                               
++-------------------------------------------------------------------------------------
 +                           ->  Vec Seq Scan on ab_a1_b1 ab_1 (actual rows=N loops=N)
 +                           ->  Vec Seq Scan on ab_a1_b2 ab_2 (actual rows=N loops=N)
 +                           ->  Vec Seq Scan on ab_a1_b3 ab_3 (actual rows=N loops=N)
@@ -307,7 +313,7 @@
 +                           ->  Vec Seq Scan on ab_a3_b3 ab_9 (actual rows=N loops=N)
 +                     ->  Parallel Append (actual rows=N loops=N)
                       Filter: (a = ANY ('{1,0,0}'::integer[]))
--                     Granules: 2 read of 3, parts pruned: 1
+-                     Granules: 2 read of 3, parts pruned: 1, units of the granules kept: 3
 -                     Pruning: (a.a = ANY ('{1,0,0}'::integer[]))
 -               ->  Parallel Append (actual rows=N loops=N)
 -               ->  Parallel Custom Scan (ChScan) on lprt_a a (actual rows=N loops=N)

@@ -28,10 +28,14 @@ OBJS = \
 	egress/routine.o \
 	egress/run.o \
 	exec/aggsizes.o \
+	exec/condcache.o \
+	exec/devasked.o \
 	exec/exchange.o \
 	exec/aggtrans.o \
+	exec/device.o \
 	exec/methods.o \
 	exec/node.o \
+	exec/pool.o \
 	exec/vecagg.o \
 	exec/vecaggjoin.o \
 	exec/vecingest.o \
@@ -51,6 +55,7 @@ OBJS = \
 	expr/k_numeric.o \
 	expr/k_text.o \
 	expr/k_regex.o \
+	expr/k_nested.o \
 	expr/kernels.o \
 	expr/packs.o \
 	expr/strsearch.o \
@@ -88,9 +93,9 @@ DATA = vexec--1.0.sql
 # an extension that serves Arrow to clients (V10): installed into the
 # server's include directory, under extension/vexec/.
 HEADERS = ../../include/vexec_source.h ../../include/vexec_kernels.h ../../include/vexec_egress.h \
-	../../include/vexec_sink.h
+	../../include/vexec_sink.h ../../include/vexec_device.h ../../include/vexec_device_format.h
 
-REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_ingest vexec_insert vexec_frames vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs vexec_source vexec_regex
+REGRESS = vexec_settings vexec_oracle vexec_explain vexec_layouts vexec_ipc vexec_egress vexec_ingest vexec_insert vexec_frames vexec_scan vexec_agg vexec_join vexec_heap vexec_sort vexec_packs vexec_source vexec_regex vexec_otel
 
 PG_CPPFLAGS = -I$(srcdir) -I$(srcdir)/pgxs/include -I$(srcdir)/../../include
 

@@ -1,0 +1,78 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1share s2share s1c s2c
+step s1share: SELECT id FROM things WHERE id = 1 FOR SHARE;
+id
+--
+ 1
+(1 row)
+
+step s2share: SELECT id FROM things WHERE id = 1 FOR SHARE;
+id
+--
+ 1
+(1 row)
+
+step s1c: COMMIT;
+step s2c: COMMIT;
+
+starting permutation: s1share s2upd s1c s2sel s2c
+step s1share: SELECT id FROM things WHERE id = 1 FOR SHARE;
+id
+--
+ 1
+(1 row)
+
+step s2upd: UPDATE things SET v = 'changed' WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2upd: <... completed>
+step s2sel: SELECT * FROM things ORDER BY id;
+id|v      
+--+-------
+ 1|changed
+ 2|two    
+ 3|three  
+(3 rows)
+
+step s2c: COMMIT;
+
+starting permutation: s1keyshare s2upd s1c s2c
+step s1keyshare: SELECT id FROM things WHERE id = 1 FOR KEY SHARE;
+id
+--
+ 1
+(1 row)
+
+step s2upd: UPDATE things SET v = 'changed' WHERE id = 1; <waiting ...>
+step s1c: COMMIT;
+step s2upd: <... completed>
+step s2c: COMMIT;
+
+starting permutation: s1update s2nowait s1c s2c
+step s1update: SELECT id FROM things WHERE id = 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2nowait: SELECT id FROM things WHERE id = 1 FOR UPDATE NOWAIT;
+ERROR:  could not obtain lock on row in relation "things"
+step s1c: COMMIT;
+step s2c: COMMIT;
+
+starting permutation: s1update s2skip s1c s2c
+step s1update: SELECT id FROM things WHERE id = 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2skip: SELECT id FROM things ORDER BY id FOR UPDATE SKIP LOCKED;
+id
+--
+ 2
+ 3
+(2 rows)
+
+step s1c: COMMIT;
+step s2c: COMMIT;

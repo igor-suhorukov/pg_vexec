@@ -38,6 +38,14 @@ RETURNS text
 AS 'MODULE_PATHNAME', 'vexec_test_scaled'
 LANGUAGE C STRICT IMMUTABLE;
 
+-- F10: VecAgg's key of a numeric's scaled int64 at a scale -- its hash
+-- against hash_numeric()'s, its equality with another numeric against
+-- numeric_eq()'s: 'ok', both answers, or 'none' where it has no int64.
+CREATE FUNCTION scaled_key(value numeric, scale int4, other numeric)
+RETURNS text
+AS 'MODULE_PATHNAME', 'vexec_test_scaled_key'
+LANGUAGE C STRICT IMMUTABLE;
+
 -- The IPC codec (V7_0): every batch of a query, exported as export() exports
 -- it, written as Arrow IPC messages and read back, validated, and compared
 -- with the export bit for bit.  An error names the first difference.
@@ -181,4 +189,25 @@ CREATE ACCESS METHOD vexec_test_am TYPE TABLE HANDLER am_handler;
 CREATE FUNCTION source_calls(OUT member text, OUT calls int8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'vexec_test_source_calls'
+LANGUAGE C STRICT VOLATILE;
+
+-- pg_otel_probe's reporters (pg_otel_probe_api.h) called for a query's
+-- statement and nodes as the probe calls them (otel_test.c): each attribute
+-- a row -- node 0 the statement, else its plan node's id + 1 -- and, past a
+-- node's bounds, a row of node -2 with those dropped; where the query
+-- fails, its nodes' attributes from the abort-safe reporters, as the error
+-- left them, and a row of node -1 with the error.
+CREATE FUNCTION otel_report(query text, OUT node int4, OUT name text, OUT key text,
+                            OUT value text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_test_otel_report'
+LANGUAGE C STRICT VOLATILE;
+
+-- pg_otel_probe's metric reporters (pg_otel_probe_api.h) called as the
+-- probe's collector calls them (otel_test.c): each data point a row, and a
+-- last row named "dropped" where the probe would have dropped any.
+CREATE FUNCTION otel_metrics(OUT reporter text, OUT name text, OUT unit text, OUT kind text,
+                             OUT value double precision, OUT attributes jsonb)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_test_otel_metrics'
 LANGUAGE C STRICT VOLATILE;

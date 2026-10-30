@@ -36,6 +36,35 @@ RETURNS record
 AS 'MODULE_PATHNAME', 'vexec_exchange_area'
 LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
 
+-- The pool of long-lived parallel workers (vexec.pool_workers;
+-- pg_vector_executor.md §3.28, F3): its workers up now, those idle and those
+-- running a job, and the jobs this backend gave it since it started; NULLs
+-- but the last where there is no pool.
+CREATE FUNCTION pool(OUT workers int4, OUT idle int4, OUT running int4, OUT jobs int8)
+RETURNS record
+AS 'MODULE_PATHNAME', 'vexec_pool_info'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
+-- The condition cache (pg_vector_executor.md §3.28, F7): its entries now,
+-- the granules it kept and handed to sources to pass over since the server
+-- started, and how often the full table was emptied; NULLs where none was
+-- made (vexec.condition_cache_size 0).
+CREATE FUNCTION condition_cache(OUT entries int4, OUT kept int8, OUT passed int8, OUT emptied int8)
+RETURNS record
+AS 'MODULE_PATHNAME', 'vexec_condition_cache'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
+-- The columns statements have asked the device for (pg_vector_executor.md
+-- §3.28, W20), of the session's database: each column's relation and
+-- attribute, and its state -- asked, priced as the device keeps it; tried,
+-- priced as kept by the statement after; kept, kept by the device since and
+-- priced as kept whole.  A column the device keeps not is priced as kept
+-- once a statement has asked for it (vexec.gpu_price_asked).
+CREATE FUNCTION device_asked(OUT relation regclass, OUT attnum int2, OUT state text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'vexec_device_asked'
+LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+
 -- How a batch holds a type: its class, its layout in the PostgreSQL format
 -- and in the Arrow format, and every layout it can be held in.  The type is
 -- named as SQL names it, typmod and all: 'numeric(10,2)'.

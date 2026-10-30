@@ -1,0 +1,7 @@
+# vexec_parquet: Parquet tables through Apache Arrow C++, with vexec's source and sink
+comment = 'table access method of Parquet files, local or on S3, read and written by Apache Arrow C++'
+default_version = '1.0'
+module_pathname = '$libdir/vexec_parquet'
+relocatable = false
+schema = vexec_parquet
+superuser = true

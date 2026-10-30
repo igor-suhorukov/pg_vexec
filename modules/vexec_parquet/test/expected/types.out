@@ -1,0 +1,342 @@
+-- Every type class a table of its own files keeps, through the plain scan:
+-- the Arrow type each column is written as, and each value read back as it
+-- was written
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+CREATE DOMAIN posint AS int4 CHECK (VALUE > 0);
+CREATE TYPE pair AS (x int4, y text);
+CREATE TABLE scalars_heap (
+	b bool, i2 int2, i4 int4, i8 int8, f4 float4, f8 float8, o oid, c "char",
+	d date, t time, ts timestamp, tz timestamptz, tt timetz, iv interval,
+	n numeric(20,4), nbig numeric(38,10), nany numeric, nneg numeric(5,-2),
+	tx text, vc varchar(10), bc char(5), by bytea, u uuid, j json, jb jsonb,
+	nm name, mo money, ip inet, cid cidr, mac macaddr, mac8 macaddr8,
+	bt bit(8), vb varbit, lsn pg_lsn, x8 xid8, en mood, dm posint
+) USING heap;
+INSERT INTO scalars_heap VALUES
+ (true, 1, 2, 3, 1.5, 2.5, 7, 'a',
+  '2024-02-29', '12:34:56.789', '2024-02-29 12:34:56.789', '2024-02-29 12:34:56.789+03', '12:00:00+05', '1 year 2 mons 3 days 04:05:06.789',
+  12345.6789, 1234567890.0123456789, 'NaN', 12300,
+  'héllo wörld ✓', 'short', 'ab', '\xdeadbeef', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '{"a": 1}', '{"b": [1, 2]}',
+  'pg_name', 12.34, '192.168.1.5/24', '10.0.0.0/8', '08:00:2b:01:02:03', '08:00:2b:01:02:03:04:05',
+  B'10101010', B'101', '16/B374D848', '42', 'happy', 42),
+ (false, -32768, -2147483648, -9223372036854775808, '-Infinity', 'NaN', 4294967295, 'z',
+  '-infinity', '00:00:00', 'infinity', '-infinity', '00:00:00+00', '-1 day',
+  -9999999999999999.9999, -9999999999999999999999999999.9999999999, 'Infinity', -9999900,
+  '', '', '', '\x', '00000000-0000-0000-0000-000000000000', '[]', 'null',
+  '', -1, '::1', '::/0', '00:00:00:00:00:00', '00:00:00:00:00:00:00:00',
+  B'00000000', B'', '0/0', '0', 'sad', 1),
+ (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+  NULL, NULL, NULL, NULL, NULL, NULL,
+  NULL, NULL, NULL, NULL,
+  NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+  NULL, NULL, NULL, NULL, NULL, NULL,
+  NULL, NULL, NULL, NULL, NULL, NULL),
+ (true, 32767, 2147483647, 9223372036854775807, 3.4e38, 1.7e308, 0, ' ',
+  '4713-01-01 BC', '24:00:00', '4713-01-01 00:00:00 BC', '290000-12-31 00:00:00+00', '23:59:59.999999-12', '178000000 years',
+  0.0001, 0, 123456789012345678901234567890.123456789, 0,
+  repeat('x', 3000), 'tenchars!!', 'abcde', decode(repeat('ff', 1000), 'hex'), 'ffffffff-ffff-ffff-ffff-ffffffffffff', '"str"', '{"deep": {"x": [true, false, null]}}',
+  'x', 92233720368547758.07, '2001:db8::1/64', '2001:db8::/32', 'ff:ff:ff:ff:ff:ff', 'ff:ff:ff:ff:ff:ff:ff:ff',
+  B'11111111', repeat('1', 100)::varbit, 'FFFFFFFF/FFFFFFFF', '18446744073709551615', 'ok', 2147483647);
+CREATE TABLE scalars (LIKE scalars_heap) USING vexec_parquet;
+INSERT INTO scalars SELECT * FROM scalars_heap;
+-- json has no equality: compared as text
+CREATE VIEW scalars_cmp AS SELECT b, i2, i4, i8, f4, f8, o, c, d, t, ts, tz, tt, iv, n, nbig, nany, nneg,
+	tx, vc, bc, by, u, j::text AS j, jb, nm, mo, ip, cid, mac, mac8, bt, vb, lsn, x8, en, dm FROM scalars;
+CREATE VIEW scalars_heap_cmp AS SELECT b, i2, i4, i8, f4, f8, o, c, d, t, ts, tz, tt, iv, n, nbig, nany, nneg,
+	tx, vc, bc, by, u, j::text AS j, jb, nm, mo, ip, cid, mac, mac8, bt, vb, lsn, x8, en, dm FROM scalars_heap;
+SELECT count(*) AS differ FROM ((TABLE scalars_cmp EXCEPT ALL TABLE scalars_heap_cmp)
+	UNION ALL (TABLE scalars_heap_cmp EXCEPT ALL TABLE scalars_cmp)) x;
+ differ 
+--------
+      0
+(1 row)
+
+SELECT b, i2, i4, i8, f4, f8, o, c, d, t, ts, tz, tt, iv FROM scalars ORDER BY i4 NULLS LAST;
+ b |   i2   |     i4      |          i8          |    f4     |    f8    |     o      | c |       d       |      t       |              ts              |                tz                |         tt         |                        iv                        
+---+--------+-------------+----------------------+-----------+----------+------------+---+---------------+--------------+------------------------------+----------------------------------+--------------------+--------------------------------------------------
+ f | -32768 | -2147483648 | -9223372036854775808 | -Infinity |      NaN | 4294967295 | z | -infinity     | 00:00:00     | infinity                     | -infinity                        | 00:00:00+00        | @ 1 day ago
+ t |      1 |           2 |                    3 |       1.5 |      2.5 |          7 | a | 02-29-2024    | 12:34:56.789 | Thu Feb 29 12:34:56.789 2024 | Thu Feb 29 01:34:56.789 2024 PST | 12:00:00+05        | @ 1 year 2 mons 3 days 4 hours 5 mins 6.789 secs
+ t |  32767 |  2147483647 |  9223372036854775807 |   3.4e+38 | 1.7e+308 |          0 |   | 01-01-4713 BC | 24:00:00     | Thu Jan 01 00:00:00 4713 BC  | Sat Dec 30 16:00:00 290000 PST   | 23:59:59.999999-12 | @ 178000000 years
+   |        |             |                      |           |          |            |   |               |              |                              |                                  |                    | 
+(4 rows)
+
+SELECT n, nbig, nany, nneg, left(tx, 20) AS tx, length(tx) AS len, vc, bc || '|' AS bc, length(by) AS bylen, u FROM scalars ORDER BY i4 NULLS LAST;
+           n            |                   nbig                   |                   nany                   |   nneg   |          tx          | len  |     vc     |   bc   | bylen |                  u                   
+------------------------+------------------------------------------+------------------------------------------+----------+----------------------+------+------------+--------+-------+--------------------------------------
+ -9999999999999999.9999 | -9999999999999999999999999999.9999999999 |                                 Infinity | -9999900 |                      |    0 |            | |      |     0 | 00000000-0000-0000-0000-000000000000
+             12345.6789 |                    1234567890.0123456789 |                                      NaN |    12300 | héllo wörld ✓        |   13 | short      | ab|    |     4 | a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+                 0.0001 |                             0.0000000000 | 123456789012345678901234567890.123456789 |        0 | xxxxxxxxxxxxxxxxxxxx | 3000 | tenchars!! | abcde| |  1000 | ffffffff-ffff-ffff-ffff-ffffffffffff
+                        |                                          |                                          |          |                      |      |            |        |       | 
+(4 rows)
+
+SELECT j, jb, nm, mo, ip, cid, mac, mac8, bt, length(vb) AS vblen, lsn, x8, en, dm FROM scalars ORDER BY i4 NULLS LAST;
+    j     |                  jb                  |   nm    |             mo             |       ip       |      cid      |        mac        |          mac8           |    bt    | vblen |        lsn        |          x8          |  en   |     dm     
+----------+--------------------------------------+---------+----------------------------+----------------+---------------+-------------------+-------------------------+----------+-------+-------------------+----------------------+-------+------------
+ []       | null                                 |         |                     -$1.00 | ::1            | ::/0          | 00:00:00:00:00:00 | 00:00:00:00:00:00:00:00 | 00000000 |     0 | 0/00000000        |                    0 | sad   |          1
+ {"a": 1} | {"b": [1, 2]}                        | pg_name |                     $12.34 | 192.168.1.5/24 | 10.0.0.0/8    | 08:00:2b:01:02:03 | 08:00:2b:01:02:03:04:05 | 10101010 |     3 | 16/B374D848       |                   42 | happy |         42
+ "str"    | {"deep": {"x": [true, false, null]}} | x       | $92,233,720,368,547,758.07 | 2001:db8::1/64 | 2001:db8::/32 | ff:ff:ff:ff:ff:ff | ff:ff:ff:ff:ff:ff:ff:ff | 11111111 |   100 | FFFFFFFF/FFFFFFFF | 18446744073709551615 | ok    | 2147483647
+          |                                      |         |                            |                |               |                   |                         |          |       |                   |                      |       |           
+(4 rows)
+
+-- the Arrow types: numeric(p,s) as decimal128, uuid and json as Arrow's
+-- extension types, a fixed-length type's bytes as fixed_size_binary, every
+-- other type's own binary image
+SELECT s.name, s.field_id, s.arrow_type, s.nullable
+FROM vexec_parquet.files('scalars') f, vexec_parquet.file_schema(f.path) s ORDER BY s.field_id;
+ name | field_id |      arrow_type       | nullable 
+------+----------+-----------------------+----------
+ b    |        1 | bool                  | t
+ i2   |        2 | int16                 | t
+ i4   |        3 | int32                 | t
+ i8   |        4 | int64                 | t
+ f4   |        5 | float                 | t
+ f8   |        6 | double                | t
+ o    |        7 | uint32                | t
+ c    |        8 | int8                  | t
+ d    |        9 | date32[day]           | t
+ t    |       10 | time64[us]            | t
+ ts   |       11 | timestamp[us]         | t
+ tz   |       12 | timestamp[us, tz=UTC] | t
+ tt   |       13 | fixed_size_binary[12] | t
+ iv   |       14 | fixed_size_binary[16] | t
+ n    |       15 | decimal128(20, 4)     | t
+ nbig |       16 | decimal128(38, 10)    | t
+ nany |       17 | binary                | t
+ nneg |       18 | binary                | t
+ tx   |       19 | string                | t
+ vc   |       20 | string                | t
+ bc   |       21 | string                | t
+ by   |       22 | binary                | t
+ u    |       23 | extension<arrow.uuid> | t
+ j    |       24 | extension<arrow.json> | t
+ jb   |       25 | binary                | t
+ nm   |       26 | fixed_size_binary[64] | t
+ mo   |       27 | fixed_size_binary[8]  | t
+ ip   |       28 | binary                | t
+ cid  |       29 | binary                | t
+ mac  |       30 | fixed_size_binary[6]  | t
+ mac8 |       31 | fixed_size_binary[8]  | t
+ bt   |       32 | binary                | t
+ vb   |       33 | binary                | t
+ lsn  |       34 | fixed_size_binary[8]  | t
+ x8   |       35 | fixed_size_binary[8]  | t
+ en   |       36 | fixed_size_binary[4]  | t
+ dm   |       37 | int32                 | t
+(37 rows)
+
+CREATE TABLE composites_heap (
+	id int4, pt point, bx box, ln line, sg lseg, pa path, pg polygon, ci circle,
+	arr int4[], txa text[], r int4range, mr int4multirange, tsv tsvector, pr pair, prs pair[], ens mood[]
+) USING heap;
+INSERT INTO composites_heap VALUES
+ (1, '(1.5,2.5)', '((0,0),(1,1))', '{1,2,3}', '[(0,0),(1,1)]', '((0,0),(1,1),(2,0))', '((0,0),(1,1),(1,0))', '<(0,0),5>',
+  '{1,2,NULL}', '{"x","y z",NULL}', '[1,10)', '{[1,3), [5,7)}', 'a fat cat sat', ROW(1, 'one'), ARRAY[ROW(2, 'two')::pair, NULL], '{happy,sad}'),
+ (2, '(-1e300,1e300)', '((-1,-1),(1,1))', '{-1,0,0}', '[(1,2),(3,4)]', '[(0,0),(5,5)]', '((0,0))', '<(1,1),0>',
+  '{}', '{}', 'empty', '{}', '', ROW(NULL, NULL), '{}', '{}'),
+ (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+CREATE TABLE composites (LIKE composites_heap) USING vexec_parquet;
+INSERT INTO composites SELECT * FROM composites_heap;
+-- the geometric types have no equality: compared as text
+SELECT count(*) AS differ FROM (
+	(SELECT id, pt::text, bx::text, ln::text, sg::text, pa::text, pg::text, ci::text, arr, txa, r, mr, tsv, pr, prs, ens FROM composites
+	 EXCEPT ALL
+	 SELECT id, pt::text, bx::text, ln::text, sg::text, pa::text, pg::text, ci::text, arr, txa, r, mr, tsv, pr, prs, ens FROM composites_heap)
+	UNION ALL
+	(SELECT id, pt::text, bx::text, ln::text, sg::text, pa::text, pg::text, ci::text, arr, txa, r, mr, tsv, pr, prs, ens FROM composites_heap
+	 EXCEPT ALL
+	 SELECT id, pt::text, bx::text, ln::text, sg::text, pa::text, pg::text, ci::text, arr, txa, r, mr, tsv, pr, prs, ens FROM composites)) x;
+ differ 
+--------
+      0
+(1 row)
+
+SELECT * FROM composites ORDER BY id;
+ id |        pt        |      bx       |    ln    |      sg       |         pa          |         pg          |    ci     |    arr     |      txa       |   r    |      mr       |          tsv          |   pr    |       prs        |     ens     
+----+------------------+---------------+----------+---------------+---------------------+---------------------+-----------+------------+----------------+--------+---------------+-----------------------+---------+------------------+-------------
+  1 | (1.5,2.5)        | (1,1),(0,0)   | {1,2,3}  | [(0,0),(1,1)] | ((0,0),(1,1),(2,0)) | ((0,0),(1,1),(1,0)) | <(0,0),5> | {1,2,NULL} | {x,"y z",NULL} | [1,10) | {[1,3),[5,7)} | 'a' 'cat' 'fat' 'sat' | (1,one) | {"(2,two)",NULL} | {happy,sad}
+  2 | (-1e+300,1e+300) | (1,1),(-1,-1) | {-1,0,0} | [(1,2),(3,4)] | [(0,0),(5,5)]       | ((0,0))             | <(1,1),0> | {}         | {}             | empty  | {}            |                       | (,)     | {}               | {}
+  3 |                  |               |          |               |                     |                     |           |            |                |        |               |                       |         |                  | 
+(3 rows)
+
+SELECT s.name, s.arrow_type
+FROM vexec_parquet.files('composites') f, vexec_parquet.file_schema(f.path) s ORDER BY s.field_id;
+ name |      arrow_type       
+------+-----------------------
+ id   | int32
+ pt   | fixed_size_binary[16]
+ bx   | fixed_size_binary[32]
+ ln   | fixed_size_binary[24]
+ sg   | fixed_size_binary[32]
+ pa   | binary
+ pg   | binary
+ ci   | fixed_size_binary[24]
+ arr  | binary
+ txa  | binary
+ r    | binary
+ mr   | binary
+ tsv  | binary
+ pr   | binary
+ prs  | binary
+ ens  | binary
+(16 rows)
+
+-- numeric(p,s)'s NaN has no decimal: a file with one keeps the column's
+-- binary images, another file its decimals
+CREATE TABLE nums (n numeric(10,2)) USING vexec_parquet;
+INSERT INTO nums VALUES (1.5), (-2.25);
+INSERT INTO nums VALUES ('NaN'), (3);
+SELECT n FROM nums ORDER BY n;
+   n   
+-------
+ -2.25
+  1.50
+  3.00
+   NaN
+(4 rows)
+
+SELECT f.file_id, s.arrow_type FROM vexec_parquet.files('nums') f, vexec_parquet.file_schema(f.path) s ORDER BY 1;
+ file_id |    arrow_type     
+---------+-------------------
+       1 | decimal128(10, 2)
+       2 | binary
+(2 rows)
+
+-- values TOASTed in heap, whole in a file
+CREATE TABLE big (id int4, tx text, by bytea) USING vexec_parquet;
+INSERT INTO big SELECT i, repeat(md5(i::text), 32768), decode(repeat(md5(i::text), 16384), 'hex') FROM generate_series(1, 3) i;
+SELECT id, length(tx), md5(tx) = md5(repeat(md5(id::text), 32768)) AS tx_ok,
+	length(by), md5(by) = md5(decode(repeat(md5(id::text), 16384), 'hex')) AS by_ok FROM big ORDER BY id;
+ id | length  | tx_ok | length | by_ok 
+----+---------+-------+--------+-------
+  1 | 1048576 | t     | 262144 | t
+  2 | 1048576 | t     | 262144 | t
+  3 | 1048576 | t     | 262144 | t
+(3 rows)
+
+-- row groups: the table's row_group_rows
+CREATE TABLE groups (id int8, v text) USING vexec_parquet WITH (row_group_rows = 1024);
+INSERT INTO groups SELECT i, 'v' || i FROM generate_series(1, 10000) i;
+SELECT g.row_group, g.rows FROM vexec_parquet.files('groups') f, vexec_parquet.file_row_groups(f.path) g ORDER BY 1;
+ row_group | rows 
+-----------+------
+         0 | 1024
+         1 | 1024
+         2 | 1024
+         3 | 1024
+         4 | 1024
+         5 | 1024
+         6 | 1024
+         7 | 1024
+         8 | 1024
+         9 |  784
+(10 rows)
+
+SELECT count(*), sum(id), min(v), max(v) FROM groups;
+ count |   sum    | min |  max  
+-------+----------+-----+-------
+ 10000 | 50005000 | v1  | v9999
+(1 row)
+
+-- every codec
+CREATE TABLE codecs (codec text, id int4, v text) USING vexec_parquet;
+DO $$
+DECLARE c text;
+BEGIN
+	FOREACH c IN ARRAY ARRAY['zstd', 'lz4', 'snappy', 'gzip', 'brotli', 'none'] LOOP
+		EXECUTE format('SET LOCAL vexec_parquet.codec = %L', c);
+		EXECUTE format('INSERT INTO codecs SELECT %L, i, repeat(%L, i %% 50) FROM generate_series(1, 2000) i', c, c);
+		-- each codec's rows its own file
+		EXECUTE 'SELECT 1 FROM codecs LIMIT 1';
+	END LOOP;
+END $$;
+SELECT codec, count(*), sum(id), sum(length(v)) FROM codecs GROUP BY codec ORDER BY codec;
+ codec  | count |   sum   |  sum   
+--------+-------+---------+--------
+ brotli |  2000 | 2001000 | 294000
+ gzip   |  2000 | 2001000 | 196000
+ lz4    |  2000 | 2001000 | 147000
+ none   |  2000 | 2001000 | 196000
+ snappy |  2000 | 2001000 | 294000
+ zstd   |  2000 | 2001000 | 196000
+(6 rows)
+
+SELECT count(*) AS files FROM vexec_parquet.files('codecs');
+ files 
+-------
+     6
+(1 row)
+
+-- a timestamp past Arrow's microseconds since 1970 has no file to go into
+CREATE TABLE far (ts timestamp) USING vexec_parquet;
+INSERT INTO far VALUES ('294270-01-01 00:00:00');
+ERROR:  timestamp out of range for a Parquet file of column "ts"
+SELECT count(*) FROM far;
+ count 
+-------
+     0
+(1 row)
+
+-- a table of no columns keeps its rows' count
+CREATE TABLE nocols () USING vexec_parquet;
+INSERT INTO nocols DEFAULT VALUES;
+INSERT INTO nocols SELECT FROM generate_series(1, 9);
+SELECT count(*) FROM nocols;
+ count 
+-------
+    10
+(1 row)
+
+SELECT s.name, s.field_id, s.arrow_type FROM vexec_parquet.files('nocols') f, vexec_parquet.file_schema(f.path) s ORDER BY 1, 2;
+   name    | field_id | arrow_type 
+-----------+----------+------------
+ _vpq_rows |        0 | bool
+ _vpq_rows |        0 | bool
+(2 rows)
+
+-- columns added, dropped and retyped: older files read by field id
+CREATE TABLE evolve (a int4, b text, c int4) USING vexec_parquet;
+INSERT INTO evolve VALUES (1, 'one', 10), (2, 'two', 20);
+ALTER TABLE evolve ADD COLUMN d text DEFAULT 'dflt';
+ALTER TABLE evolve ADD COLUMN e int8;
+INSERT INTO evolve VALUES (3, 'three', 30, 'given', 300);
+ALTER TABLE evolve DROP COLUMN b;
+INSERT INTO evolve VALUES (4, 40, NULL, 400);
+SELECT * FROM evolve ORDER BY a;
+ a | c  |   d   |  e  
+---+----+-------+-----
+ 1 | 10 | dflt  |    
+ 2 | 20 | dflt  |    
+ 3 | 30 | given | 300
+ 4 | 40 |       | 400
+(4 rows)
+
+ALTER TABLE evolve ALTER COLUMN c TYPE int8, ALTER COLUMN a TYPE numeric(10,1);
+SELECT * FROM evolve ORDER BY a;
+  a  | c  |   d   |  e  
+-----+----+-------+-----
+ 1.0 | 10 | dflt  |    
+ 2.0 | 20 | dflt  |    
+ 3.0 | 30 | given | 300
+ 4.0 | 40 |       | 400
+(4 rows)
+
+SELECT s.name, s.field_id, s.arrow_type FROM vexec_parquet.files('evolve') f, vexec_parquet.file_schema(f.path) s ORDER BY 2;
+ name | field_id |    arrow_type     
+------+----------+-------------------
+ a    |        1 | decimal128(10, 1)
+ c    |        3 | int64
+ d    |        4 | string
+ e    |        5 | int64
+(4 rows)
+
+-- a column renamed: still its attribute's, by field id
+ALTER TABLE evolve RENAME COLUMN d TO dd;
+SELECT a, dd FROM evolve ORDER BY a;
+  a  |  dd   
+-----+-------
+ 1.0 | dflt
+ 2.0 | dflt
+ 3.0 | given
+ 4.0 | 
+(4 rows)
+

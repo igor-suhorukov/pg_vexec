@@ -6,7 +6,8 @@
  *	  (pg_vector_executor.md §3.4).
  *
  * A batch is a header and a column per output attribute, up to
- * VEXEC_BATCH_ROWS rows.  How a column holds its values is its layout, a
+ * vexec.batch_rows rows (VEXEC_BATCH_ROWS at most).  How a column holds its
+ * values is its layout, a
  * VexecShape here: a VexecLayout (vexec_source.h) and the few parameters
  * that go with it.  A format gives each type its shape:
  *
@@ -47,10 +48,14 @@
 #endif
 
 /*
- * Rows a batch holds at most.  A compile-time constant, so that loops may
- * specialise (§3.4.1).  A multiple of 64: the bitmaps are uint64 words.
+ * Rows a batch can hold, the most vexec.batch_rows takes (F24, §3.38): a
+ * compile-time constant, so that loops may specialise and a node's arrays
+ * of a batch's rows be sized once (§3.4.1).  A power of two: a sort's row
+ * ids and a hash join's table keep a row's place in its chunk in their low
+ * bits.  How many rows a node puts into a batch is vexec.batch_rows'
+ * (vexec_batch_rows): a node takes a batch of any rows up to this.
  */
-#define VEXEC_BATCH_ROWS	1024
+#define VEXEC_BATCH_ROWS	VEXEC_BATCH_ROWS_SETTING_MAX
 #define VEXEC_WORDS(nrows)	(((nrows) + 63) / 64)
 
 /* The alignment of a batch's buffers (§3.4.1). */
@@ -153,6 +158,21 @@ typedef struct VexecArena
 } VexecArena;
 
 /*
+ * PQ21 (pg_vector_executor.md §3.40): a nested column's source, which gives
+ * a row's value as a Datum of the column's type (vexec_source.h,
+ * VexecSourceBatch.nested_datum)
+ */
+typedef struct VexecNestedSource
+{
+	Datum		(*datum) (void *owner, int column, int row, bool *isnull);
+	void	   *owner;
+	int			column;
+} VexecNestedSource;
+
+/* The nested layouts (vexec_source.h): a scan's input columns alone have them */
+#define VEXEC_NESTED_LAYOUT(l)	((l) == VEXEC_LIST || (l) == VEXEC_MAP)
+
+/*
  * A column of a batch.  The source contract's VexecColumn, with what vexec
  * needs to write into one.
  */
@@ -161,6 +181,8 @@ typedef struct VexecVec
 	const VexecType *type;
 	VexecShape	shape;
 	uint8		encoding;		/* VexecEncoding */
+	uint8		flags;			/* VEXEC_VEC_*: a source's column's, kept with
+								 * its values */
 	int			nvalues;		/* FLAT: the batch's rows; CONST: 1; DICT: the
 								 * batch's rows of codes */
 	uint64	   *validity;		/* NULL: no NULLs; else 1 = valid */
@@ -178,7 +200,33 @@ typedef struct VexecVec
 								 * vexec_dict_new_id(), or 0 for none: two
 								 * columns with one hold the same values at
 								 * the same codes (VC5) */
+
+	/*
+	 * PQ21: LIST's elements (children[0]), MAP's keys and values, FLAT,
+	 * their rows from 0 those the offsets name; and the source that gives a
+	 * row's value as a Datum.  A scan's input column of a nested layout
+	 * alone has them: it is made Datums before any other reader -- vexec's
+	 * parents, PostgreSQL's evaluator, a kernel of other layouts -- reads it.
+	 */
+	struct VexecVec *children[2];
+	const VexecNestedSource *nested;
 } VexecVec;
+
+/*
+ * VexecVec.flags.  VEXEC_VEC_TEXT_WHOLE: the values -- a DICT column's
+ * dictionary's -- each the database encoding's whole, as the source vouched
+ * (VEXEC_COL_TEXT_WHOLE, F5): the text kernels check none.  Set only on a
+ * scan's input column; a vector made anew, by vexec_vec_init() or a batch's
+ * reset, has none, and a copy of the struct keeps it with the same values.
+ */
+#define VEXEC_VEC_TEXT_WHOLE	0x01
+
+/*
+ * VEXEC_VEC_LENGTHS (F35 and F37, §3.38): an OFFSETS column whose offsets count
+ * each value's characters, no byte behind them (VEXEC_COL_LENGTHS): read only by
+ * length() and by comparison with the empty string, as the scan asked it.
+ */
+#define VEXEC_VEC_LENGTHS		0x02
 
 typedef struct VexecBatch
 {
@@ -188,8 +236,9 @@ typedef struct VexecBatch
 	VexecVec   *cols;
 	VexecType **types;			/* the columns' types, which outlive resets */
 	bool		filling;		/* rows may be added: every column is flat,
-								 * in its build shape, with room for
-								 * VEXEC_BATCH_ROWS */
+								 * in its build shape, with room for `room` */
+	int			room;			/* the rows it takes while filling: F24's
+								 * vexec.batch_rows when its rows began */
 	MemoryContext mcxt;			/* the batch's memory, reset with it */
 	VexecArena	arena;
 	uint64		generation;		/* its resets: what was computed into it
@@ -274,6 +323,8 @@ extern VEXEC_API const char *vexec_type_class_name(int tclass);
 extern VEXEC_API VexecBatch *vexec_batch_create(MemoryContext parent, int ncols,
 													 VexecType *const *types);
 extern VEXEC_API void vexec_batch_reset(VexecBatch *batch);
+extern VEXEC_API VexecBatch *vexec_batch_clone(MemoryContext mcxt, const VexecBatch *src,
+												  const uint64 *defined);
 extern VEXEC_API void vexec_batch_free(VexecBatch *batch);
 extern VEXEC_API void *vexec_batch_alloc(VexecBatch *batch, Size size);
 extern VEXEC_API void *vexec_batch_alloc0(VexecBatch *batch, Size size);
@@ -334,6 +385,8 @@ extern VEXEC_API bool vexec_numeric_to_scaled(Datum num, int scale, int digits,
 												   int width, int128 *result);
 extern VEXEC_API Datum vexec_scaled_to_numeric(VexecBatch *batch, int128 value, int scale);
 extern VEXEC_API int vexec_numeric_dscale(Datum num);
+extern VEXEC_API uint32 vexec_scaled_hash_numeric(int64 value, int scale);
+extern VEXEC_API bool vexec_scaled_numeric_eq(int64 value, int scale, Datum num);
 
 /* rows.c */
 extern VEXEC_API void vexec_batch_begin_rows(VexecBatch *batch);

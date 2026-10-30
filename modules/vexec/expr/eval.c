@@ -355,12 +355,26 @@ keep_failures(VexecEval *ev, const uint64 *failed, const uint64 *asked)
 		ev->redo[w] |= failed[w] & asked[w];
 }
 
-/* A column a kernel can read: flat or constant, never a dictionary's codes. */
+/*
+ * A column a kernel can read: flat or constant, never a dictionary's codes;
+ * a nested one (PQ21, §3.40) as its source handed it only where the kernel
+ * reads that argument so, else its source's Datums.
+ */
 static VexecVec *
-kernel_arg(VexecEval *ev, VexecVec *v)
+kernel_arg(VexecEval *ev, VexecVec *v, const VexecKernelDef *def, int arg)
 {
 	VexecVec   *c;
 
+	if (VEXEC_NESTED_LAYOUT(v->shape.layout) &&
+		!(def != NULL && def->nested_layout == v->shape.layout && def->nested_arg == arg))
+	{
+		VexecShape	datum = {VEXEC_DATUM, false, 0, 0, 0};
+
+		c = vexec_batch_alloc(ev->work, sizeof(VexecVec));
+		*c = *v;
+		(void) vexec_vec_convert(ev->work, c, &datum);
+		return c;
+	}
 	if (v->encoding != VEXEC_DICT)
 		return v;
 	c = vexec_batch_alloc(ev->work, sizeof(VexecVec));
@@ -1282,7 +1296,7 @@ eval_call(VexecEval *ev, VexecExpr *e, const uint64 *active)
 	int			i;
 
 	for (i = 0; i < e->nargs; i++)
-		args[i] = kernel_arg(ev, vexec_eval(ev, e->args[i], live));
+		args[i] = kernel_arg(ev, vexec_eval(ev, e->args[i], live), e->kernel, i);
 	/* the arguments' evaluation may have sent rows to redo */
 	live = live_rows(ev, live);
 
@@ -1335,7 +1349,7 @@ eval_distinct(VexecEval *ev, VexecExpr *e, const uint64 *active)
 	int			r;
 
 	for (r = 0; r < 2; r++)
-		args[r] = kernel_arg(ev, vexec_eval(ev, e->args[r], live));
+		args[r] = kernel_arg(ev, vexec_eval(ev, e->args[r], live), NULL, r);
 	live = live_rows(ev, live);
 	both = strict_rows(ev, args, 2, live, &validity);
 
@@ -1414,7 +1428,7 @@ eval_saop(VexecEval *ev, VexecExpr *e, const uint64 *active)
 	if (s->nelems == 0)
 		return bool_register(ev, vexec_bitmap_alloc(ev->work, n, !e->useOr), NULL);
 
-	x = kernel_arg(ev, vexec_eval(ev, e->args[0], live));
+	x = kernel_arg(ev, vexec_eval(ev, e->args[0], live), NULL, 0);
 	live = live_rows(ev, live);
 	compute = strict_rows(ev, &x, 1, live, &xvalid);
 	decided = vexec_bitmap_alloc(ev->work, n, false);

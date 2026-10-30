@@ -127,6 +127,37 @@ vexec_cost_scan(PlannerInfo *root, RelOptInfo *rel, Path *rowpath,
 }
 
 /*
+ * W13 (§3.27): a VecScan whose units the device reads itself (exec/vecscan.c),
+ * its quals the units' filter: the vector CPU's work of each row -- its
+ * tuple and its quals, at vexec.cpu_tuple_factor and
+ * vexec.cpu_operator_factor, as vexec_cost_scan() prices a VecScan's -- at
+ * vexec.gpu_operator_factor, as a VecAgg the device takes is priced
+ * (vexec_cost_agg_device()); the units' bytes the device reads, as
+ * units_input() prices them, and the rows it keeps back over the bus, each
+ * made a batch's row here and handed out.  Its start is all of it but the
+ * rows' making: the device hands back its rows once it has read every unit.
+ * ClickBench's Q19 took 6.9 ms so on mergetree, its column kept, where 16
+ * workers took 17.5; on Parquet 6.8, where they took 127.
+ */
+void
+vexec_cost_scan_device(PlannerInfo *root, RelOptInfo *rel, double bytes, double rows,
+					   int ncols_out, double width_out, VexecCost *cost)
+{
+	Cost		own = (cpu_tuple_cost * vexec_cpu_tuple_factor +
+					   rel->baserestrictcost.per_tuple * vexec_cpu_operator_factor) * rel->tuples;
+
+	(void) root;
+	memset(cost, 0, sizeof(VexecCost));
+	cost->rows = rows;
+	cost->rowout = vexec_convert_cost * Max(ncols_out, 1) * rows;
+	cost->startup = vexec_batch_setup_cost + vexec_gpu_setup_cost +
+		vexec_gpu_transfer_cost * (bytes + rows * Max(width_out, 8)) + vexec_gpu_operator_factor * own;
+	cost->total = cost->startup + cpu_tuple_cost * rows + cost->rowout;
+	cost->row_startup = cost->startup;
+	cost->row_total = cost->total;
+}
+
+/*
  * A bitmap heap scan's vector alternative (H9).  rowpath is PostgreSQL's
  * bitmap heap path (cost_bitmap_heap_scan): the bitmap's index scans, the
  * pages it fetches, cpu_tuple_cost and the quals a fetched tuple, the
@@ -265,6 +296,21 @@ vexec_cost_agg(PlannerInfo *root, Path *rowpath, Path *input, bool input_vector,
 }
 
 /*
+ * VecAgg's device strategy (§3.11, "Planned, then decided at the node's
+ * start"; V8b, V8e): its own cost past the CPU strategy's input -- a task's
+ * start, vexec.gpu_setup_cost; the bytes that cross the bus, or that the
+ * device reads, and the groups' back, vexec.gpu_transfer_cost a byte; and
+ * the device's hashing and transitions, vexec.gpu_operator_factor of the
+ * CPU strategy's own (cpu).  agg.c sets it beside the CPU strategy's.
+ */
+Cost
+vexec_cost_agg_device(Cost cpu, double bytes, double group_bytes)
+{
+	return vexec_gpu_setup_cost + vexec_gpu_transfer_cost * (bytes + group_bytes) +
+		vexec_gpu_operator_factor * cpu;
+}
+
+/*
  * A sort's vector alternative.  It sorts through PostgreSQL's tuplesort,
  * as the row Sort does, so rowpath -- PostgreSQL's SortPath over the same
  * input, bounded as the VecSort is (cost_sort) -- gives its sorting; its
@@ -296,13 +342,22 @@ vexec_cost_sort(PlannerInfo *root, Path *rowpath, Path *input, bool input_vector
  * the bound's best groups inside (vexec_agg_set_topn()): every group is
  * still ranked, and the others are neither handed up nor projected, nor
  * sorted.  So the sort's cost, PostgreSQL's over every group, gives back a
- * tuple's cost and the projection's for each group past the bound.
+ * tuple's cost and the projection's for each group past the bound.  W2
+ * (§3.26): a VecAgg the device takes ranks its answer there, by the sort's
+ * keys where it orders them as PostgreSQL does -- a count, a sum, a key,
+ * which ClickBench's groupings sort by: the groups past the bound cross no
+ * bus, and none is compared on the CPU -- the bounded sort's comparisons,
+ * which C3's heap makes for every group -- (agg.c's price, W3).
  */
 void
 vexec_cost_topn(VexecCost *cost, Path *input, int64 bound)
 {
 	double		skipped = Max(input->rows - (double) bound, 0);
 	Cost		save = skipped * (cpu_tuple_cost + input->pathtarget->cost.per_tuple);
+
+	if (vexec_agg_path_device(input))
+		save += skipped * (2.0 * cpu_operator_cost * log2(2.0 * Max((double) bound, 1.0)) +
+						   vexec_gpu_transfer_cost * Max(input->pathtarget->width, 8));
 
 	cost->startup = Max(cost->startup - save, 0);
 	cost->total = Max(cost->total - save, cost->startup);

@@ -1,0 +1,17 @@
+# What differs from run to run of PostgreSQL's suite with the same settings
+# (differential.py): a regular expression a line, its groups replaced; "!" a
+# line dropped; "@test" one test's alone.
+#
+# The gpu session (differential.sh, V8): the explain test's plan of a
+# parallel sort, handed as rows (jsonb_pretty), says whether the leader's
+# VecSort sorted on the device or passed work_mem first and handed its kept
+# rows to tuplesort, by how much of the table the leader read, run by run --
+# as the test drops core's Sort Method for.  Those lines dropped, the comma of
+# the line before them marked, and psql's padding to the widest line marked:
+# the header's, the separator's and each line's before its "+".
+@explain !"Device": "
+@explain !"Kept Rows Put into tuplesort":
+@explain "Shared Written Blocks": 0(,?) *\+?$
+@explain ^ +jsonb_pretty *$
+@explain ^(-+)$
+@explain [^ ]( +)\+$

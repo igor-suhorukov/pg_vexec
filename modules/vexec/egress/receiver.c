@@ -8,7 +8,7 @@
  * Each column of the result has a fixed Arrow type, chosen by its type
  * when the receiver starts (the table in vexec_egress.h), so that the
  * stream's schema holds before the first batch (Columnar.rst:1470-1477).
- * The rows go into a batch of up to VEXEC_BATCH_ROWS rows, a column at a
+ * The rows go into a batch of up to vexec.batch_rows rows, a column at a
  * time in Arrow's buffers, and each full batch goes out as a RecordBatch
  * message through vexec's IPC writer (ipc/), its buffers in a memory
  * context that is reset as soon as the caller has sent it.  A value its
@@ -147,6 +147,7 @@ typedef struct EgressReceiver
 	struct ArrowSchema **children;
 	VexecIpcWriter *writer;
 	int			nrows;			/* rows in the batch being built */
+	int			room;			/* the rows it takes: vexec.batch_rows as it began */
 	int64		bytes;			/* its variable-length bytes */
 	int64		rows_sent;
 	int64		batches_sent;
@@ -518,16 +519,16 @@ column_begin(EgressReceiver *r, EgressColumn *c)
 	switch (c->kind)
 	{
 		case EGRESS_BOOL:
-			c->values = MemoryContextAllocZero(r->batchcxt, VEXEC_WORDS(VEXEC_BATCH_ROWS) * 8);
+			c->values = MemoryContextAllocZero(r->batchcxt, VEXEC_WORDS(r->room) * 8);
 			break;
 		case EGRESS_TEXT:
 		case EGRESS_NAME:
 		case EGRESS_BYTEA:
 		case EGRESS_OUTPUT:
-			c->offsets = MemoryContextAllocZero(r->batchcxt, sizeof(int32) * (VEXEC_BATCH_ROWS + 1));
+			c->offsets = MemoryContextAllocZero(r->batchcxt, sizeof(int32) * (r->room + 1));
 			break;
 		default:
-			c->values = MemoryContextAllocZero(r->batchcxt, (Size) c->width * VEXEC_BATCH_ROWS);
+			c->values = MemoryContextAllocZero(r->batchcxt, (Size) c->width * r->room);
 			break;
 	}
 }
@@ -537,6 +538,7 @@ batch_begin(EgressReceiver *r)
 {
 	int			i;
 
+	r->room = vexec_batch_rows;
 	for (i = 0; i < r->ncols; i++)
 		column_begin(r, &r->cols[i]);
 	r->nrows = 0;
@@ -649,7 +651,7 @@ column_append(EgressReceiver *r, EgressColumn *c, int row, Datum d, bool isnull)
 		{
 			int			i;
 
-			c->validity = MemoryContextAllocZero(r->batchcxt, VEXEC_WORDS(VEXEC_BATCH_ROWS) * 8);
+			c->validity = MemoryContextAllocZero(r->batchcxt, VEXEC_WORDS(r->room) * 8);
 			for (i = 0; i < row; i++)
 				vexec_bit_set(c->validity, i);
 		}
@@ -901,7 +903,7 @@ append_row(EgressReceiver *r, const Datum *values, const bool *isnull)
 	for (i = 0; i < r->ncols; i++)
 		column_append(r, &r->cols[i], r->nrows, values[i], isnull[i]);
 	r->nrows++;
-	if (r->nrows >= VEXEC_BATCH_ROWS || r->bytes >= EGRESS_BATCH_BYTES)
+	if (r->nrows >= r->room || r->bytes >= EGRESS_BATCH_BYTES)
 		flush_rows(r);
 }
 

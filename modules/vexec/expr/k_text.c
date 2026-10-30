@@ -55,6 +55,10 @@
 #ifdef __SSE2__
 #include <emmintrin.h>
 #endif
+#ifdef USE_AVX512_POPCNT_WITH_RUNTIME_CHECK
+#include <immintrin.h>
+#include "port/pg_cpu.h"
+#endif
 
 #include "vexec.h"
 #include "expr/expr.h"
@@ -551,7 +555,10 @@ utf8_char_len(unsigned char c)
  * prefix without a NUL is found a chunk at a time (is_valid_ascii()), the
  * rest checked by pg_encoding_verifymbstr(); *ascii says whether every byte
  * was ASCII.  The rows not active are checked too; one not whole sends the
- * caller to its check of each value.
+ * caller to its check of each value.  A column whose source vouches for its
+ * text (F5, VEXEC_VEC_TEXT_WHOLE) is whole unchecked, *ascii false: each of
+ * its values is the database encoding's whole, so none begins or ends inside
+ * a character.
  */
 bool
 vexec_text_batch_whole(const VexecVec *s, int nrows, int encoding, bool *ascii)
@@ -565,6 +572,8 @@ vexec_text_batch_whole(const VexecVec *s, int nrows, int encoding, bool *ascii)
 	int			i = 0;
 
 	*ascii = false;
+	if (s->flags & VEXEC_VEC_TEXT_WHOLE)
+		return true;
 	while (i + (int) sizeof(Vector8) <= len &&
 		   is_valid_ascii((const unsigned char *) p + i, (int) sizeof(Vector8)))
 		i += (int) sizeof(Vector8);
@@ -629,6 +638,152 @@ utf8_chars_whole(const char *a, int alen)
 }
 
 /*
+ * Of 64 bytes, a bit each, least significant first: set where the byte
+ * begins a UTF8 character, one that is not a continuation byte, 10xxxxxx.
+ */
+static inline uint64
+utf8_starts64(const unsigned char *p)
+{
+	uint64		cont = 0;
+
+#ifdef __SSE2__
+	const __m128i lim = _mm_set1_epi8((char) 0xC0);
+
+	for (int k = 0; k < 4; k++)
+	{
+		__m128i		v = _mm_loadu_si128((const __m128i *) (p + 16 * k));
+
+		cont |= (uint64) (uint32) _mm_movemask_epi8(_mm_cmplt_epi8(v, lim)) << (16 * k);
+	}
+#else
+	for (int k = 0; k < 64; k++)
+		cont |= (uint64) ((p[k] & 0xC0) == 0x80) << k;
+#endif
+	return ~cont;
+}
+
+/*
+ * utf8_lengths_whole()'s first nfull blocks of 64 bytes from p: each one's
+ * characters' first bytes into starts[], the characters before it into
+ * before[], counting on from n; the count after them returned
+ */
+typedef int32 (*Utf8BlocksFn) (const unsigned char *p, int64 nfull, uint64 *starts, int32 *before, int32 n);
+
+static int32
+utf8_blocks_sse2(const unsigned char *p, int64 nfull, uint64 *starts, int32 *before, int32 n)
+{
+	for (int64 k = 0; k < nfull; k++)
+	{
+		uint64		m = utf8_starts64(p + k * 64);
+
+		starts[k] = m;
+		before[k] = n;
+		n += pg_popcount64(m);
+	}
+	return n;
+}
+
+#ifdef USE_AVX512_POPCNT_WITH_RUNTIME_CHECK
+/*
+ * F31 (§3.38): the blocks by AVX-512's -- a block's continuation bytes the
+ * mask of one comparison of its 64 bytes, where SSE2's takes four and their
+ * masks' shifts: the length kernel was 15% of ClickBench's Q27
+ */
+pg_attribute_target("avx512bw,popcnt")
+static int32
+utf8_blocks_avx512(const unsigned char *p, int64 nfull, uint64 *starts, int32 *before, int32 n)
+{
+	const __m512i lim = _mm512_set1_epi8((char) 0xC0);
+
+	for (int64 k = 0; k < nfull; k++)
+	{
+		__m512i		v = _mm512_loadu_si512((const void *) (p + k * 64));
+		uint64		m = ~(uint64) _mm512_cmplt_epi8_mask(v, lim);
+
+		starts[k] = m;
+		before[k] = n;
+		n += (int32) __builtin_popcountll(m);
+	}
+	return n;
+}
+#endif
+
+static int32 utf8_blocks_choose(const unsigned char *p, int64 nfull, uint64 *starts, int32 *before, int32 n);
+static Utf8BlocksFn utf8_blocks = utf8_blocks_choose;
+
+static int32
+utf8_blocks_choose(const unsigned char *p, int64 nfull, uint64 *starts, int32 *before, int32 n)
+{
+	utf8_blocks = utf8_blocks_sse2;
+#ifdef USE_AVX512_POPCNT_WITH_RUNTIME_CHECK
+	if (x86_feature_available(PG_AVX512_BW))
+		utf8_blocks = utf8_blocks_avx512;
+#endif
+	return utf8_blocks(p, nfull, starts, before, n);
+}
+
+/*
+ * F5 (§3.28): the characters of each active row of a UTF8 OFFSETS column
+ * whose batch is whole, counted over the batch's bytes at once rather than a
+ * value at a time: each 64 bytes' characters' first bytes a bit each
+ * (utf8_starts64()), and the count of the bits before each 64 -- one pass,
+ * and a value's characters are then the bits between its two offsets, two
+ * popcounts a row, where utf8_chars_whole() counts a value's bytes and its
+ * tail one by one.  As utf8_chars_whole() counts a whole value.  The last 64
+ * bytes padded with continuation bytes, which begin no character.  Few rows
+ * active, each value is counted on its own.
+ */
+static void
+utf8_lengths_whole(VexecKernelCall *kc, const VexecVec *s, int32 *out)
+{
+	const int32 *off = (const int32 *) s->values;
+	const unsigned char *p = (const unsigned char *) s->buffers[0] + off[0];
+	int64		len = (int64) off[kc->nrows] - off[0];
+	int64		nblocks = len / 64 + 1;
+	uint64	   *starts;
+	int32	   *before;
+	int32		n = 0;
+	int			nactive = 0;
+
+	for (int w = 0; w < VEXEC_WORDS(kc->nrows); w++)
+		nactive += pg_popcount64(kc->active[w]);
+	if (nactive * 4 < kc->nrows)
+	{
+		VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+			out[i] = utf8_chars_whole(s->buffers[0] + off[i], off[i + 1] - off[i]);
+		return;
+	}
+	starts = vexec_batch_alloc(kc->work, sizeof(uint64) * nblocks);
+	before = vexec_batch_alloc(kc->work, sizeof(int32) * nblocks);
+	/* every block but the last whole (F31: by AVX-512's where it is), the last, short, padded */
+	n = utf8_blocks(p, nblocks - 1, starts, before, n);
+	{
+		int64		k = nblocks - 1;
+		int64		left = len - k * 64;
+		unsigned char tail[64];
+		uint64		m;
+
+		memset(tail, 0x80, sizeof(tail));
+		if (left > 0)
+			memcpy(tail, p + k * 64, left);
+		m = utf8_starts64(tail);
+		starts[k] = m;
+		before[k] = n;
+		n += pg_popcount64(m);
+	}
+#define CHARS_BEFORE(at) \
+	(before[(at) >> 6] + pg_popcount64(starts[(at) >> 6] & ((UINT64CONST(1) << ((at) & 63)) - 1)))
+	VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+	{
+		int64		a = off[i] - off[0];
+		int64		e = off[i + 1] - off[0];
+
+		out[i] = CHARS_BEFORE(e) - CHARS_BEFORE(a);
+	}
+#undef CHARS_BEFORE
+}
+
+/*
  * The characters of a UTF8 value, or -1 where a character runs past its
  * end.  Eight bytes at a time while they are ASCII and none is a NUL.
  */
@@ -677,12 +832,24 @@ len_kernel(VexecKernelCall *kc)
 	bool		bytes = li->octets || pg_database_encoding_max_length() == 1;
 	int32	   *out = (int32 *) kc->result->values;
 
+	/* F37 (§3.38): the source's character counts, no value's bytes behind them */
+	if (s->flags & VEXEC_VEC_LENGTHS)
+	{
+		const int32 *off = (const int32 *) s->values;
+
+		Assert(!li->octets);
+		VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
+			out[i] = off[i + 1] - off[i];
+		return;
+	}
+
 	/*
 	 * M2 (§3.21): an OFFSETS column whose batch is UTF8's whole at once --
 	 * no value of it walked, as below -- its lengths are its offsets'
-	 * differences where every byte is ASCII, else each value's bytes less
-	 * its continuation bytes.  A batch not whole, and the other layouts,
-	 * walk each value.
+	 * differences where every byte is ASCII, else counted over the batch's
+	 * bytes at once (F5, utf8_lengths_whole()).  A batch not whole, and the
+	 * other layouts, walk each value; a value whose source vouches for it is
+	 * whole, its bytes less its continuation bytes.
 	 */
 	if (!bytes && s->encoding == VEXEC_FLAT && s->shape.layout == VEXEC_OFFSETS &&
 		s->nbuffers == 1 && kc->nrows > 0 && s->nvalues >= kc->nrows)
@@ -692,7 +859,6 @@ len_kernel(VexecKernelCall *kc)
 		if (vexec_text_batch_whole(s, kc->nrows, PG_UTF8, &ascii))
 		{
 			const int32 *off = (const int32 *) s->values;
-			const char *b = s->buffers[0];
 
 			if (ascii)
 			{
@@ -700,10 +866,7 @@ len_kernel(VexecKernelCall *kc)
 					out[i] = off[i + 1] - off[i];
 			}
 			else
-			{
-				VEXEC_FOREACH_ROW(kc->active, kc->nrows, i)
-					out[i] = utf8_chars_whole(b + off[i], off[i + 1] - off[i]);
-			}
+				utf8_lengths_whole(kc, s, out);
 			return;
 		}
 	}
@@ -716,6 +879,8 @@ len_kernel(VexecKernelCall *kc)
 		bytes_at(s, i, &a, &alen);
 		if (bytes)
 			out[i] = alen;
+		else if (s->flags & VEXEC_VEC_TEXT_WHOLE)
+			out[i] = utf8_chars_whole(a, alen);
 		else
 		{
 			int32		n = utf8_chars(a, alen);

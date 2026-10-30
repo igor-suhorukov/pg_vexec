@@ -49,6 +49,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/regproc.h"
+#include "utils/sortsupport.h"
 #include "varatt.h"
 
 #include "cb_explain.h"
@@ -408,6 +409,89 @@ vexec_node_load_input(VexecNode *node, int row)
 }
 
 /*
+ * F18 (§3.38): whether the bound's key is one apply_typed_bound() compares
+ * as the integers it holds -- a flat column of 8 bytes ordered by
+ * PostgreSQL's ssup_datum_signed_cmp(), bigint's, timestamp's and
+ * timestamptz's, or of 4 by ssup_datum_int32_cmp(), integer's and date's,
+ * in PostgreSQL's own representation -- the bound itself not NULL.
+ */
+static bool
+typed_bound(const VexecSortBound *b, const VexecVec *v)
+{
+	if (!vexec_enable_typed_bound || b->isnull || v->encoding != VEXEC_FLAT ||
+		v->shape.layout != VEXEC_FIXED || v->shape.arrow_values ||
+		v->shape.stride != v->shape.width)
+		return false;
+	return (v->shape.width == 8 && b->ssup.comparator == ssup_datum_signed_cmp) ||
+		(v->shape.width == 4 && b->ssup.comparator == ssup_datum_int32_cmp);
+}
+
+/*
+ * F18: apply_bound() over a key typed_bound() takes, a word of rows at a
+ * time: each value compared with the bound as the comparator compares them,
+ * the order reversed where the sort's is descending, a NULL key past the
+ * bound where the order puts NULLs last -- ApplySortComparator()'s rules
+ * -- with no Datum made and no comparator called a row.
+ */
+static int
+apply_typed_bound(VexecSortBound *b, const VexecVec *v, uint64 *active, const uint64 *redo, int n)
+{
+	bool		reverse = b->ssup.ssup_reverse;
+	int			removed = 0;
+
+	for (int w = 0; w < VEXEC_WORDS(n); w++)
+	{
+		int			base = w * 64;
+		int			rows = Min(64, n - base);
+		uint64		live = active[w] & (redo != NULL ? ~redo[w] : ~UINT64CONST(0));
+		uint64		past = 0;
+
+		if (rows < 64)
+			live &= (UINT64CONST(1) << rows) - 1;
+		if (live == 0)
+			continue;
+		b->typed += pg_popcount64(live);
+		if (v->shape.width == 8)
+		{
+			const int64 *x = (const int64 *) v->values + base;
+			int64		bound = DatumGetInt64(b->value);
+
+			if (reverse)
+				for (int i = 0; i < rows; i++)
+					past |= (uint64) (x[i] < bound) << i;
+			else
+				for (int i = 0; i < rows; i++)
+					past |= (uint64) (x[i] > bound) << i;
+		}
+		else
+		{
+			const int32 *x = (const int32 *) v->values + base;
+			int32		bound = DatumGetInt32(b->value);
+
+			if (reverse)
+				for (int i = 0; i < rows; i++)
+					past |= (uint64) (x[i] < bound) << i;
+			else
+				for (int i = 0; i < rows; i++)
+					past |= (uint64) (x[i] > bound) << i;
+		}
+		if (v->validity != NULL)
+		{
+			uint64		nulls = ~v->validity[w];
+
+			past &= ~nulls;
+			if (!b->ssup.ssup_nulls_first)
+				past |= nulls;
+		}
+		past &= live;
+		active[w] &= ~past;
+		removed += pg_popcount64(past);
+	}
+	b->removed += removed;
+	return removed;
+}
+
+/*
  * A VecSort's running bound over the rows of `active` (H6, vecsort.c): a
  * row whose bound key is strictly past the bound is one the sort would
  * discard, and leaves `active`; a row PostgreSQL's evaluator is to decide,
@@ -424,6 +508,8 @@ apply_bound(VexecNode *node, uint64 *active, const uint64 *redo, int n)
 
 	if (!b->active)
 		return 0;
+	if (typed_bound(b, v))
+		return apply_typed_bound(b, v, active, redo, n);
 	old = MemoryContextSwitchTo(b->tmpcxt);
 	for (row = 0; row < n; row++)
 	{
@@ -527,6 +613,69 @@ row_past_bound(VexecNode *node, int row)
 	return past;
 }
 
+/*
+ * PQ21 (pg_vector_executor.md §3.40): how a node's eager programs read its
+ * input column `col` -- *use the nested layout its kernels read it in (a
+ * kernel's nested_arg of nested_layout), -1 where anything reads it another
+ * way, 0 where nothing reads it but as an output or a NULL test, which take
+ * its Datums and its validity whatever its layout
+ */
+static void
+nested_use_walk(const VexecExpr *e, const VexecExpr *parent, int argno, int col, int *use)
+{
+	if (e == NULL || *use < 0)
+		return;
+	if (e->kind == VE_VAR)
+	{
+		int			want = 0;
+
+		if (e->col != col || parent == NULL || parent->kind == VE_NULLTEST)
+			return;
+		if (parent->kind == VE_CALL && parent->kernel != NULL && parent->kernel->nested_layout != 0 &&
+			parent->kernel->nested_arg == argno)
+			want = parent->kernel->nested_layout;
+		*use = want == 0 || (*use > 0 && *use != want) ? -1 : want;
+		return;
+	}
+	for (int a = 0; a < e->nargs; a++)
+		nested_use_walk(e->args[a], e, a, col, use);
+}
+
+int
+vexec_node_nested_use(VexecNode *node, int col)
+{
+	int			use = 0;
+
+	for (int q = 0; q < node->nquals && use >= 0; q++)
+		nested_use_walk(node->quals[q].eager, NULL, 0, col, &use);
+	for (int q = 0; q < node->ntargets && use >= 0; q++)
+		nested_use_walk(node->targets[q].eager, NULL, 0, col, &use);
+	return use;
+}
+
+/*
+ * PQ21: a vector parent's input columns its kernels alone read in a nested
+ * layout -- none of `excluded`, which it reads otherwise -- handed up by the
+ * child as they are, which a scan then asks its source for (vecscan.c)
+ */
+void
+vexec_node_parent_nested(VexecNode *parent, VexecNode *child, const bool *excluded)
+{
+	for (int c = 0; c < parent->ninput && c < child->ntargets; c++)
+	{
+		int			use;
+
+		if (excluded != NULL && excluded[c])
+			continue;
+		use = vexec_node_nested_use(parent, c);
+		if (use <= 0)
+			continue;
+		if (child->out_nested == NULL)
+			child->out_nested = MemoryContextAllocZero(child->mcxt, Max(child->ntargets, 1));
+		child->out_nested[c] = (uint8) use;
+	}
+}
+
 /* The layouts that hold a value's bytes, which a scan may keep (VC14). */
 #define BYTES_LAYOUT(l) ((l) == VEXEC_DATUM || (l) == VEXEC_VIEW || (l) == VEXEC_OFFSETS)
 
@@ -553,8 +702,15 @@ convert_kept(VexecNode *node, const uint64 *active, const uint64 *redo)
 		VexecShape	target;
 
 		vexec_type_shape(v->type, &node->layout, &target);
-		if (BYTES_LAYOUT(target.layout) && BYTES_LAYOUT(v->shape.layout) &&
-			!vexec_shape_equal(&v->shape, &target))
+		/* PQ21 (§3.40): a nested column, its source's Datums at those rows */
+		if (VEXEC_NESTED_LAYOUT(v->shape.layout))
+		{
+			VexecShape	datum = {VEXEC_DATUM, false, 0, 0, 0};
+
+			(void) vexec_vec_convert_rows(in, v, &datum, rows);
+		}
+		else if (BYTES_LAYOUT(target.layout) && BYTES_LAYOUT(v->shape.layout) &&
+				 !vexec_shape_equal(&v->shape, &target))
 			(void) vexec_vec_convert_rows(in, v, &target, rows);
 	}
 	node->stats.text_converted += vexec_bits_count(rows, n);
@@ -589,6 +745,11 @@ load_steps(VexecNode *node, int upto, const uint64 *active, const uint64 *redo, 
 		return false;
 	while (node->steps_loaded <= upto)
 		node->load_step(node, node->steps_loaded++, rows);
+	/*
+	 * a row a fallback step loaded holds the steps' placeholders, NULLs: the
+	 * next read of it loads it again
+	 */
+	node->loaded_row = -1;
 	return true;
 }
 
@@ -623,9 +784,15 @@ eval_batch(VexecNode *node)
 	 * a VecSort's running bound before the quals, where no source checked it;
 	 * its column read first where it comes in a later step (VC2)
 	 */
-	if (node->bound != NULL && node->bound->before_quals && !node->bound_in_source &&
-		(node->nsteps == 0 || load_steps(node, node->in_step[node->bound_col], active, NULL, n)))
-		(void) apply_bound(node, active, NULL, n);
+	node->bound_waited = false;
+	if (node->bound != NULL && node->bound->before_quals && !node->bound_in_source)
+	{
+		/* F19: after them, where the condition cache has yet to see the batch's granule whole */
+		if (node->bound_waits != NULL && node->bound_waits(node))
+			node->bound_waited = true;
+		else if (node->nsteps == 0 || load_steps(node, node->in_step[node->bound_col], active, NULL, n))
+			(void) apply_bound(node, active, NULL, n);
+	}
 	/* a VecHashJoin's inner keys before the quals, where none may raise (X6) */
 	if (node->jfilter != NULL && node->jfilter->before_quals && !node->jfilter_in_source &&
 		(node->nsteps == 0 || load_steps(node, node->in_step[node->jfilter_col], active, NULL, n)))
@@ -656,7 +823,9 @@ eval_batch(VexecNode *node)
 	 * or after them, where every qual is eager; with a lazy one, a row is
 	 * checked once the lazy quals have passed it (vexec_node_exec())
 	 */
-	if (node->bound != NULL && !node->bound->before_quals && node->first_lazy == node->nquals)
+	node->quals_left = vexec_bits_any(active, n);
+	if (node->bound != NULL && (!node->bound->before_quals || node->bound_waited) &&
+		node->first_lazy == node->nquals)
 		bounded = apply_bound(node, active, ev.redo, n);
 	/* or after them (X6; vexec_scan_set_join_filter() asks every one eager) */
 	if (node->jfilter != NULL && !node->jfilter->before_quals)
@@ -694,6 +863,9 @@ eval_batch(VexecNode *node)
 
 	node->redo = ev.redo;
 	node->candidates = vexec_bits_andnot(node->work, active, ev.redo, n);
+	/* F7: a scan's condition cache learns the batch's granule's rows (vecscan.c) */
+	if (node->after_eval != NULL)
+		node->after_eval(node);
 
 	/* what the eager quals removed, for EXPLAIN ANALYZE */
 	if (node->css.ss.ps.instrument)
@@ -710,6 +882,7 @@ eval_batch(VexecNode *node)
 static bool
 next_batch(VexecNode *node)
 {
+	vexec_pool_kick();		/* F3: the leader's pool workers started, as its fragment first runs */
 	for (;;)
 	{
 		vexec_batch_reset(node->work);
@@ -1158,7 +1331,23 @@ vexec_next_batch(PlanState *ps)
 	for (i = 0; i < node->ntargets; i++)
 	{
 		if (node->outputs[i] != NULL)
+		{
 			out->cols[i] = *node->outputs[i];
+			/*
+			 * PQ21 (§3.40): a scan's nested column leaves it as Datums, at the
+			 * rows past its quals and those to redo -- no parent reads its layout
+			 */
+			if (VEXEC_NESTED_LAYOUT(out->cols[i].shape.layout) &&
+				!(node->out_nested != NULL && node->out_nested[i] == out->cols[i].shape.layout))
+			{
+				VexecShape	datum = {VEXEC_DATUM, false, 0, 0, 0};
+				uint64	   *rows = vexec_bits_copy(out, node->candidates, out->nrows);
+
+				if (node->redo != NULL)
+					vexec_bits_or_into(rows, node->redo, out->nrows);
+				(void) vexec_vec_convert_rows(out, &out->cols[i], &datum, rows);
+			}
+		}
 		else
 		{
 			/* no row past the quals: an empty column, every row NULL */
@@ -1341,6 +1530,14 @@ vexec_node_explain_declared(VexecNode *node, ExplainState *es)
  * ---------------------------------------------------------------------
  */
 
+/* A count where there is one: below 0, none */
+static void
+add_count(PgOtelProbeAttrs *attrs, const char *key, int64 value)
+{
+	if (value >= 0)
+		attrs->add_int(attrs, key, value);
+}
+
 /*
  * What a vector node's span carries in pg_otel_probe's traces (its PLAN.md
  * §4.7.4, pg_otel_probe_api.h): the batches it read and the rows in them,
@@ -1349,8 +1546,12 @@ vexec_node_explain_declared(VexecNode *node, ExplainState *es)
  * declared calls answered -- its batch format, and the share of its input
  * rows its quals passed.  A VecMotion's also its frames, their bytes and
  * the schema frames among them.  On the coordinator, a node the segments
- * ran carries their sums, as EXPLAIN ANALYZE prints them.  It reads the
- * node's fields alone, and so is safe on a failed statement's error path.
+ * ran carries their sums, as EXPLAIN ANALYZE prints them.  A node that ran
+ * here carries its kind's own too (pg_vector_executor.md §3.41): its device
+ * strategy's device, or why none, and what its tasks did (OT1); its memory
+ * and spills (OT2); a vector scan's rows and granules passed over (OT3) and
+ * its source's own figures (OT5).  It reads the node's fields alone, and so
+ * is safe on a failed statement's error path.
  */
 static void
 vexec_node_report(PlanState *ps, PgOtelProbeAttrs *attrs, int when)
@@ -1396,11 +1597,102 @@ vexec_node_report(PlanState *ps, PgOtelProbeAttrs *attrs, int when)
 		if (m->rows_by_postgres > 0)
 			attrs->add_int(attrs, "vexec.motion.rows_by_postgres", m->rows_by_postgres);
 	}
+	if (node->ran)
+	{
+		VexecNodeFigures f;
+
+		vexec_node_figures(node, &f, when == PG_OTEL_PROBE_REPORT_ABORT);
+		if (f.device != NULL)
+		{
+			attrs->add_string(attrs, "vexec.device", f.device);
+			if (f.device_why != NULL)
+				attrs->add_string(attrs, "vexec.device.why", f.device_why);
+			add_count(attrs, "vexec.device.requests", f.device_requests);
+			add_count(attrs, "vexec.device.bytes_in", f.device_bytes_in);
+			add_count(attrs, "vexec.device.bytes_out", f.device_bytes_out);
+			if (f.device_ms >= 0)
+				attrs->add_double(attrs, "vexec.device.ms", f.device_ms);
+			if (f.device_gpu_ms >= 0)
+				attrs->add_double(attrs, "vexec.device.gpu_ms", f.device_gpu_ms);
+			if (f.device_wait_ms >= 0)
+				attrs->add_double(attrs, "vexec.device.wait_ms", f.device_wait_ms);
+			add_count(attrs, "vexec.device.rows_redone", f.device_rows_redone);
+		}
+		add_count(attrs, "vexec.memory_kb", f.memory_kb);
+		add_count(attrs, "vexec.spilled_rows", f.spilled_rows);
+		add_count(attrs, "vexec.spilled_partitions", f.spilled_partitions);
+		add_count(attrs, "vexec.spill_depth", f.spill_depth);
+		add_count(attrs, "vexec.buckets", f.buckets);
+		if (f.sort_method != NULL)
+			attrs->add_string(attrs, "vexec.sort_method", f.sort_method);
+		add_count(attrs, "vexec.sort_space_kb", f.sort_space_kb);
+		add_count(attrs, "vexec.rows_prefiltered", f.rows_prefiltered);
+		add_count(attrs, "vexec.granules_passed_over", f.granules_passed_over);
+		add_count(attrs, "vexec.units_not_searched", f.units_not_searched);
+		add_count(attrs, "vexec.units_from_statistics", f.units_from_statistics);
+		for (int i = 0; i < f.nsource; i++)
+			if (f.source[i].key != NULL)
+				attrs->add_int(attrs, f.source[i].key, f.source[i].value);
+	}
 }
 
 /*
- * The reporter of every kind of vector node, from _PG_init: an entry of
- * pg_otel_probe's registry, unused where pg_otel_probe is not loaded.
+ * A node's figures of its kind's own (OT1 to OT3, OT5), every one absent
+ * until its kind's function fills it.
+ */
+void
+vexec_node_figures(VexecNode *node, VexecNodeFigures *f, bool on_error)
+{
+	memset(f, 0, sizeof(VexecNodeFigures));
+	f->device_requests = f->device_bytes_in = f->device_bytes_out = -1;
+	f->device_ms = f->device_gpu_ms = f->device_wait_ms = -1;
+	f->device_rows_redone = -1;
+	f->memory_kb = f->spilled_rows = f->spilled_partitions = f->spill_depth = -1;
+	f->buckets = f->sort_space_kb = -1;
+	f->rows_prefiltered = f->granules_passed_over = -1;
+	f->units_not_searched = f->units_from_statistics = -1;
+	switch (node->kind)
+	{
+		case VEXEC_NODE_SCAN:
+			vexec_scan_figures(node, f, on_error);
+			break;
+		case VEXEC_NODE_AGG:
+			vexec_agg_figures(node, f, on_error);
+			break;
+		case VEXEC_NODE_HASHJOIN:
+			vexec_hashjoin_figures(node, f, on_error);
+			break;
+		case VEXEC_NODE_SORT:
+			vexec_sort_figures(node, f, on_error);
+			break;
+		case VEXEC_NODE_WINDOW:
+			vexec_window_figures(node, f, on_error);
+			break;
+		default:
+			break;
+	}
+}
+
+/*
+ * VecAggJoin's span (OT8): the groups its outer side found of its inner
+ * side's, and the inner side's groups.  A row node, no VexecNode: a reporter
+ * of its own, which reads its state alone.
+ */
+static void
+vexec_aggjoin_report(PlanState *ps, PgOtelProbeAttrs *attrs, int when)
+{
+	int64		joined;
+	int64		inner;
+
+	vexec_aggjoin_figures(ps, &joined, &inner);
+	add_count(attrs, "vexec.groups_joined", joined);
+	add_count(attrs, "vexec.inner_groups", inner);
+}
+
+/*
+ * The reporter of every kind of vector node, and VecAggJoin's, from
+ * _PG_init: entries of pg_otel_probe's registry, unused where pg_otel_probe
+ * is not loaded.
  */
 void
 vexec_report_install(void)
@@ -1423,4 +1715,6 @@ vexec_report_install(void)
 	for (int i = 0; i < lengthof(kinds); i++)
 		pg_otel_probe_register_node_reporter(kinds[i](), vexec_node_report,
 											 PG_OTEL_PROBE_ABORT_SAFE);
+	pg_otel_probe_register_node_reporter(vexec_aggjoin_exec_methods(), vexec_aggjoin_report,
+										 PG_OTEL_PROBE_ABORT_SAFE);
 }

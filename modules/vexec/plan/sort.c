@@ -76,6 +76,12 @@
  * ExecSetTupleBound() would give a Sort, when the Limit is offered to the
  * front end after its children.
  *
+ * The device's order (V8d, §3.11).  The plan says whether an unbounded
+ * VecSort takes the device's order (exec/vecsort.c), as VecHashJoin's says
+ * whether it takes the device's probes: the strategy changes no plan's
+ * shape and is not priced into the path; the node decides again as it
+ * begins.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -84,6 +90,7 @@
 
 #include "access/sysattr.h"
 #include "catalog/pg_type.h"
+#include "miscadmin.h"
 #include "nodes/extensible.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -94,10 +101,13 @@
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
 #include "optimizer/tlist.h"
+#include "parser/parsetree.h"
 #include "utils/lsyscache.h"
+#include "utils/selfuncs.h"
 #include "utils/spccache.h"
 
 #include "vexec.h"
+#include "exec/device.h"
 #include "exec/exec.h"
 #include "plan/plan.h"
 
@@ -107,8 +117,14 @@ static Plan *plan_vecsort(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_p
 /* add_path()'s fuzz, STD_FUZZ_FACTOR (PG19:src/backend/optimizer/util/pathnode.c:47) */
 #define VEXEC_PATH_FUZZ		1.01
 
-/* A bounded sort keeps its columns late up to this many rows (H6). */
-#define VEXEC_LATE_ROWS		VEXEC_BATCH_ROWS
+/*
+ * A bounded sort keeps its columns late up to this many rows (H6): a
+ * batch's rows before F24 made them a setting, kept
+ */
+#define VEXEC_LATE_ROWS		1024
+
+/* W13: a bounded sort lends the device's read of its scan's units its rank up to this bound */
+#define VEXEC_SCAN_RANK_MAX	(1 << 20)
 
 /*
  * And over a relation's VecScan kept aside (vexec_sort_keep_scan()), up to
@@ -145,8 +161,8 @@ count_of(int n, const char *one, const char *many)
  * constants once folded, and nothing after the sort makes or drops rows.
  * 0: no bound.
  */
-static int64
-query_bound(PlannerInfo *root)
+int64
+vexec_query_bound(PlannerInfo *root)
 {
 	Query	   *parse = root->parse;
 	Const	   *count = (Const *) parse->limitCount;
@@ -341,6 +357,95 @@ drop_row_sort_gather(RelOptInfo *output_rel, Path *pinput, Path *gm)
 }
 
 /*
+ * F17 (§3.38): whether pinput is a grouping a bounded VecSort ranks in each
+ * participant -- a hashed VecAgg's final stage below the Gather, its LIMIT a
+ * batch's rows at most -- which the planner's estimate of its groups neither
+ * refuses (vexec.min_rows) nor prices out: ANALYZE's sample counts a text
+ * column's values hundreds of times short at 100M rows, ClickBench's Q12
+ * 4,285 groups for 6.0M, and core's Sort over a Gather then took every group
+ * through the Gather to the leader (37.5% of Q12's time).  Where the groups
+ * are few, each participant sorts a few.  Not where the device groups --
+ * either input -- whose own rank (W2) hands up the bound's groups alone.
+ */
+static bool
+ranked_in_participants(Path *input, Path *pinput, int64 bound)
+{
+	return vexec_enable_participant_rank && pinput != NULL && bound > 0 && bound <= vexec_batch_rows &&
+		vexec_is_vector_path(pinput) && vexec_agg_path_ranks(pinput) && !vexec_agg_path_device(pinput) &&
+		!(input != NULL && vexec_agg_path_device(input));
+}
+
+/*
+ * F17: core's Sort over a Gather of the same grouping, pinput, taken out of
+ * the ordered relation where the Gather Merge over each participant's
+ * bounded VecSort, gm, costs no more by add_path()'s fuzz, as M5's
+ * drop_row_sort_gather() does for a scan
+ */
+static void
+drop_sort_over_gather(RelOptInfo *output_rel, Path *pinput, Path *gm)
+{
+	ListCell   *lc;
+
+	foreach(lc, output_rel->pathlist)
+	{
+		Path	   *p = lfirst(lc);
+		Path	   *sub;
+
+		if (!IsA(p, SortPath))
+			continue;
+		sub = ((SortPath *) p)->subpath;
+		if (!IsA(sub, GatherPath) || ((GatherPath *) sub)->subpath != pinput)
+			continue;
+		if (!pathkeys_contained_in(gm->pathkeys, p->pathkeys) ||
+			gm->total_cost > p->total_cost * VEXEC_PATH_FUZZ)
+			continue;
+		output_rel->pathlist = foreach_delete_current(output_rel->pathlist, lc);
+	}
+}
+
+/*
+ * F27 (§3.38): core's sorted grouping -- a GroupAggregate whose order is the
+ * query's -- taken out of the ordered relation where the grouping's estimate
+ * knows nothing of its groups -- an expression's, which has no statistics,
+ * estimated at nine in ten of the input's rows or more -- and VecSort over
+ * the hashed VecAgg of the same grouping, vsort, costs no more in whole.  A
+ * LIMIT prices the sorted grouping by the share of its groups it takes, as
+ * if those groups were all there are; ClickBench's Q42, date_trunc('minute',
+ * EventTime) under a filter on EventDate, had 81,330 groups estimated of
+ * 85,562 rows for about 1,440: its LIMIT 1010's share, 1.2%, made core's
+ * plan 4,825 against VecAgg's and VecSort's 11,374, which ran 16 ms where
+ * core's took 40.
+ */
+static void
+drop_uninformed_sorted_agg(PlannerInfo *root, RelOptInfo *output_rel, Path *input, Path *vsort,
+						   PathTarget *target)
+{
+	List	   *keys;
+	Path	   *child;
+	ListCell   *lc;
+
+	if (!vexec_enable_uninformed_groups || !vexec_agg_path_ranks(input) ||
+		((CustomPath *) input)->custom_paths == NIL)
+		return;
+	keys = sort_key_exprs(root->sort_pathkeys, target);
+	if (keys == NIL || IsA(linitial(keys), Var))
+		return;
+	child = linitial(((CustomPath *) input)->custom_paths);
+	if (child->rows <= 0 || input->rows < 0.9 * child->rows)
+		return;
+	foreach(lc, output_rel->pathlist)
+	{
+		Path	   *p = lfirst(lc);
+
+		if (!IsA(p, AggPath) || ((AggPath *) p)->aggstrategy != AGG_SORTED ||
+			!pathkeys_contained_in(root->sort_pathkeys, p->pathkeys) ||
+			vsort->total_cost > p->total_cost)
+			continue;
+		output_rel->pathlist = foreach_delete_current(output_rel->pathlist, lc);
+	}
+}
+
+/*
  * M4 (§3.21): whether a parallel sort's participants fetch its late columns
  * for the whole sort's rows alone, whichever of them is free fetching each
  * (vecsort.c): where its first key is a column the shared bound encodes.
@@ -353,6 +458,26 @@ late_exchanged(List *keys)
 }
 
 /*
+ * M4: the rows each participant fetches one after another where they
+ * exchange a parallel sort's n rows, each fetched once by the next one free:
+ * n's share of them.  Priced as n fetches one after another, ClickBench's
+ * Q23 over a table of its own Parquet files sorted every column of its rows
+ * on the CPU, 813 to 841 ms, where late it takes 216 to 241.  W55 (§3.36):
+ * shared among no more participants than the processors parallel query may
+ * use -- max_parallel_workers' and the leader's -- hold their fetches at
+ * once, each fetch on `threads` threads of the source's own
+ * (VexecSourceEstimate.fetch_threads, minor 14): all of them for a fetch on
+ * its caller's thread alone, one where a fetch takes them all
+ */
+static double
+late_shared_rows(Path *input, double n, double threads)
+{
+	double		at_once = floor(((double) max_parallel_workers + 1) / Max(threads, 1.0));
+
+	return ceil(n / Max(Min(vexec_parallel_divisor(input), at_once), 1.0));
+}
+
+/*
  * H6, priced: a bounded VecSort straight over a VecScan sorts the keys and
  * TIDs alone and fetches the rest of each row it keeps
  * (vexec_sort_make_late()), so its input costs what the narrower scan
@@ -360,8 +485,9 @@ late_exchanged(List *keys)
  * its kept rows: at the price the source gives a fetch of the late columns
  * (VexecSourceEstimate.fetch, minor 4, VC16) -- a column store's decodes a
  * granule of each -- each participant fetching its own beside the others;
- * else at a random page and a tuple each, the whole sort's N rows once
- * where the participants exchange them (late_exchanged()).  What a sort
+ * else at a random page and a tuple each; the whole sort's N rows once
+ * where the participants exchange them (late_exchanged()), each
+ * participant fetching its share (late_shared_rows()).  What a sort
  * over the input as it is saves so; 0 where it is not made late, or saves
  * nothing.  *priced says whether the source priced its fetches.
  *
@@ -377,23 +503,27 @@ late_saving(PlannerInfo *root, Path *input, int64 bound, bool *priced)
 	List	   *keys;
 	VexecCost	late;
 	double		participants;
+	double		fetched;
 	double		spc_random_page_cost;
 	Cost		fetch;
+	double		threads;
 	Cost		saved;
 
 	*priced = false;
 	if (bound <= 0 || bound > VEXEC_LATE_ROWS)
 		return 0;
 	keys = sort_key_exprs(root->sort_pathkeys, input->pathtarget);
-	if (keys == NIL || !vexec_late_scan_cost(root, input, keys, &late, &fetch))
+	if (keys == NIL || !vexec_late_scan_cost(root, input, keys, &late, &fetch, &threads))
 		return 0;
 	participants = input->parallel_workers > 0 && !late_exchanged(keys) ?
 		ceil(vexec_parallel_divisor(input)) : 1.0;
+	fetched = input->parallel_workers > 0 && late_exchanged(keys) ?
+		late_shared_rows(input, (double) bound, threads) : (double) bound;
 	get_tablespace_page_costs(input->parent->reltablespace, &spc_random_page_cost, NULL);
 	*priced = fetch > 0;
 	saved = (input->total_cost - vexec_cost_rowout(input)) - (late.total - late.rowout) -
-		(fetch > 0 ? bound * (fetch + cpu_tuple_cost) :
-		 bound * participants * (spc_random_page_cost + cpu_tuple_cost));
+		(fetch > 0 ? fetched * (fetch + cpu_tuple_cost) :
+		 fetched * participants * (spc_random_page_cost + cpu_tuple_cost));
 	return Max(saved, 0);
 }
 
@@ -549,6 +679,163 @@ vexec_sort_kept_scan(VexecPlanState *ps, RelOptInfo *rel)
 }
 
 /*
+ * W13 (§3.27): whether the device ranks a sort key of the scanned relation
+ * as the sort orders it -- a column of the relation, of a type the device
+ * orders as the key's operator does (vexec_sort_device_key()), no float --
+ * ordered by its type's < or >: *descending set.
+ */
+static bool
+device_rank_key(Expr *key, Index relid, Oid sortop, Oid collation, bool *descending)
+{
+	Oid			typid = exprType((Node *) key);
+
+	if (!IsA(key, Var) || ((Var *) key)->varno != relid || ((Var *) key)->varattno <= 0 ||
+		((Var *) key)->varlevelsup != 0)
+		return false;
+	if (getBaseType(typid) == FLOAT4OID || getBaseType(typid) == FLOAT8OID)
+		return false;
+	return OidIsValid(sortop) && vexec_sort_device_key(typid, sortop, collation, descending) == NULL;
+}
+
+/*
+ * W13 (§3.27): a bounded sort over the device's read of a serial VecScan's
+ * units, its rank cut there (exec/vecscan.c): the scan's twin reading the
+ * sort keys' columns and its quals' -- and each row's TID, where the sort's
+ * target holds more of the relation's columns than its keys, those then
+ * fetched late (H6; *late, and the source's price of a fetch in *fetch) --
+ * every column of the target else, the bound's rows handed up.  NULL where
+ * a key is no column of the relation the device ranks, or the device may
+ * not read the units so (paths.c, vexec_scan_device_variant()).
+ */
+static Path *
+ranked_device_input(PlannerInfo *root, Path *scan, PathTarget *target, int64 bound, bool *late, Cost *fetch,
+					double *threads)
+{
+	RelOptInfo *rel = scan->parent;
+	List	   *keys = sort_key_exprs(root->sort_pathkeys, target);
+	Bitmapset  *attrs = NULL;
+	Path	   *dscan;
+	double		width = 0;
+	ListCell   *lc;
+	ListCell   *lk;
+
+	*late = false;
+	*fetch = 0;
+	*threads = 0;
+	if (keys == NIL || list_length(keys) != list_length(root->sort_pathkeys))
+		return NULL;
+	forboth(lc, keys, lk, root->sort_pathkeys)
+	{
+		Expr	   *key = lfirst(lc);
+		PathKey    *pk = lfirst(lk);
+		Oid			typid = exprType((Node *) key);
+		Oid			sortop = get_opfamily_member_for_cmptype(pk->pk_opfamily, typid, typid, pk->pk_cmptype);
+		bool		desc;
+
+		if (!device_rank_key(key, rel->relid, sortop, exprCollation((Node *) key), &desc))
+			return NULL;
+		width += get_typavgwidth(typid, exprTypmod((Node *) key));
+	}
+
+	/*
+	 * late columns where every other column of the target is the relation's,
+	 * one of its own among them the device would not read anyway, for the
+	 * quals: ClickBench's Q24 fetched its SearchPhrase by TID, 80 ms of a
+	 * fresh backend's on Parquet, where its qual had the device read it
+	 */
+	{
+		Bitmapset  *qual_attrs = NULL;
+
+		foreach(lc, rel->baserestrictinfo)
+			pull_varattnos((Node *) ((RestrictInfo *) lfirst(lc))->clause, rel->relid, &qual_attrs);
+		foreach(lc, target->exprs)
+		{
+			Var		   *v = lfirst(lc);
+
+			if (list_member(keys, v))
+				continue;
+			if (!IsA(v, Var) || v->varno != rel->relid || v->varlevelsup != 0 || v->varattno == 0)
+			{
+				*late = false;
+				break;
+			}
+			if (v->varattno > 0 && !bms_is_member(v->varattno - FirstLowInvalidHeapAttributeNumber, qual_attrs))
+				*late = true;
+		}
+	}
+	if (*late)
+	{
+		VexecCost	lcost;
+
+		if (bound > VEXEC_LATE_ROWS || !vexec_late_scan_cost(root, scan, keys, &lcost, fetch, threads))
+			*late = false;
+	}
+	if (*late)
+	{
+		pull_varattnos((Node *) keys, rel->relid, &attrs);
+		foreach(lc, rel->baserestrictinfo)
+			pull_varattnos((Node *) ((RestrictInfo *) lfirst(lc))->clause, rel->relid, &attrs);
+		attrs = bms_add_member(attrs, SelfItemPointerAttributeNumber - FirstLowInvalidHeapAttributeNumber);
+		width += sizeof(ItemPointerData);
+	}
+	else
+	{
+		pull_varattnos((Node *) target->exprs, rel->relid, &attrs);
+		foreach(lc, rel->baserestrictinfo)
+			pull_varattnos((Node *) ((RestrictInfo *) lfirst(lc))->clause, rel->relid, &attrs);
+		width = target->width;
+	}
+	dscan = vexec_scan_device_variant(root, scan, attrs, Min((double) bound, scan->rows),
+									  *late ? list_length(keys) + 1 : list_length(target->exprs), width);
+	if (dscan != NULL)
+		dscan->pathtarget = target;
+	return dscan;
+}
+
+/*
+ * W13: the device's read of a VecSort's child's units, where the plan made
+ * it so (paths.c), lent the sort's rank: its bound and its keys, each a
+ * column of the child's relation the device ranks -- after the late columns
+ * made the child's target list the keys and each row's TID.  Unranked where
+ * a key is not, its rows every one the filter keeps.
+ */
+static void
+rank_device_scan(CustomScan *cscan)
+{
+	VexecSortPlan plan;
+	CustomScan *child = (CustomScan *) cscan->scan.plan.lefttree;
+	int			n;
+	AttrNumber *attnos;
+	bool	   *desc;
+	bool	   *nulls_first;
+	int			i = 0;
+	ListCell   *lk;
+	ListCell   *lo;
+	ListCell   *lcoll;
+	ListCell   *ln;
+
+	vexec_sort_plan_decode(cscan, &plan);
+	if (plan.bound <= 0 || plan.bound > VEXEC_SCAN_RANK_MAX)
+		return;
+	n = list_length(plan.keycols);
+	attnos = palloc(sizeof(AttrNumber) * n);
+	desc = palloc(sizeof(bool) * n);
+	nulls_first = palloc(sizeof(bool) * n);
+	forfour(lk, plan.keycols, lo, plan.operators, lcoll, plan.collations, ln, plan.nullsfirst)
+	{
+		TargetEntry *tle = get_tle_by_resno(child->scan.plan.targetlist, lfirst_int(lk));
+
+		if (tle == NULL ||
+			!device_rank_key(tle->expr, child->scan.scanrelid, lfirst_oid(lo), lfirst_oid(lcoll), &desc[i]))
+			return;
+		attnos[i] = ((Var *) tle->expr)->varattno;
+		nulls_first[i] = lfirst_int(ln) != 0;
+		i++;
+	}
+	vexec_scan_plan_rank(child, plan.bound, n, attnos, desc, nulls_first);
+}
+
+/*
  * VecSort's alternative for the query's ORDER BY (§3.3.3, UPPERREL_ORDERED):
  * recorded for EXPLAIN, and in auto and force mode added.  In parallel, the
  * input's cheapest partial path is sorted in each participant too, under a
@@ -585,6 +872,21 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 	VexecCost	lpcost;
 	Cost		lsaving = 0;
 	Cost		lpsaving = 0;
+	Path	   *dinput = NULL;
+	SortPath   *drow = NULL;
+	VexecCost	dcost;
+	Path	   *rinput = NULL;
+	SortPath   *rrow = NULL;
+	VexecCost	rcost;
+	bool		rlate = false;
+	Cost		rfetch = 0;
+	double		rthreads = 0;
+	Path	   *rpinput = NULL;
+	SortPath   *rprow = NULL;
+	VexecCost	rpcost;
+	bool		rplate = false;
+	Cost		rpfetch = 0;
+	double		rpthreads = 0;
 	List	   *newpaths;
 	VexecSteps	steps;
 	VexecCost	cost;
@@ -639,7 +941,7 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 	 * columns save, which a sort of few rows over a large scan is for (H6):
 	 * such a sort is not refused for its few rows.
 	 */
-	bound = query_bound(root);
+	bound = vexec_query_bound(root);
 	if (output_rel->consider_parallel && input_rel->partial_pathlist != NIL)
 	{
 		pinput = linitial(input_rel->partial_pathlist);
@@ -673,8 +975,71 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 			lpinput = kept_late_input(root, kept->partial, base->pathtarget, bound, &lpsaving);
 	}
 
+	/*
+	 * W7 (§3.27): the grouped relation's device path, kept aside where a
+	 * cheaper one dropped it (agg.c, vexec_agg_kept_device()): a bounded sort
+	 * over it gives back what the device's rank saves, which the grouped
+	 * relation's choice did not count -- ClickBench's Q36 on mergetree,
+	 * 741.56 so where the cheapest input's plan was 1,807.21
+	 */
+	if (bound > 0 && (input == NULL || !vexec_agg_path_device(input)))
+	{
+		dinput = vexec_agg_kept_device(ps, input_rel);
+		if (dinput != NULL && !equal(dinput->pathtarget->exprs, base->pathtarget->exprs))
+			dinput = NULL;
+	}
+
+	/*
+	 * W13 (§3.27): over the device's read of the relation's units, ranked
+	 * there by the sort's keys -- the bound's rows and those tying with the
+	 * last of them handed up, the rest of each row fetched late by its TID:
+	 * ClickBench's Q23, the ten earliest of 18,000 rows with "google" in
+	 * their URLs, took 78 ms on 16 workers -- over the relation's serial
+	 * VecScan, the input or the one kept aside
+	 */
+	if (bound > 0 && bound <= VEXEC_SCAN_RANK_MAX)
+	{
+		Path	   *sscan = input != NULL && vexec_is_scan_path(input) && !input->parallel_aware ? input :
+			kept != NULL ? kept->path : NULL;
+
+		if (sscan != NULL)
+			rinput = ranked_device_input(root, sscan, base->pathtarget, bound, &rlate, &rfetch, &rthreads);
+	}
+
+	/*
+	 * The same over the relation's parallel VecScan kept aside, the device's
+	 * read in one participant of a parallel plan (exec/vecscan.c,
+	 * dev_scan_owner()), where the rows have late columns the participants
+	 * fetch together (M4) -- not where none is late: the serial read hands
+	 * up the same rows without the workers.  ClickBench's Q23 on mergetree
+	 * took 114 ms over the serial read, its ten rows' 103 late columns
+	 * fetched in its one process, where 16 workers took 68; over this one,
+	 * 58
+	 */
+	if (bound > 0 && bound <= VEXEC_LATE_ROWS && output_rel->consider_parallel && kept != NULL &&
+		kept->partial != NULL)
+	{
+		List	   *keys = sort_key_exprs(root->sort_pathkeys, base->pathtarget);
+
+		if (keys != NIL && late_exchanged(keys))
+			rpinput = ranked_device_input(root, kept->partial, base->pathtarget, bound, &rplate, &rpfetch,
+										  &rpthreads);
+		if (rpinput != NULL && !rplate)
+			rpinput = NULL;
+	}
+
+	/*
+	 * Nor a bounded sort over a VecAgg the device takes, whose groups it
+	 * ranks there and hands back the bound's alone (W2, §3.26): that rank is
+	 * this node's to lend, and the planner's estimate of the groups may be
+	 * far short -- ClickBench's Q12, 4,241 groups of SearchPhrase estimated,
+	 * whose 892,231 PostgreSQL's Sort then took from the device: 106 ms
+	 * where the rank took 6
+	 */
 	if (ps->mode != VEXEC_MODE_FORCE && rows < vexec_min_rows && saving <= 0 && psaving <= 0 &&
-		linput == NULL && lpinput == NULL)
+		linput == NULL && lpinput == NULL && dinput == NULL && rinput == NULL && rpinput == NULL &&
+		!(bound > 0 && input != NULL && vexec_agg_path_device(input) && vexec_agg_path_ranks(input)) &&
+		!ranked_in_participants(input, pinput, bound))
 	{
 		vexec_alt_refuse(ps, alt, psprintf("%.0f input rows, fewer than vexec.min_rows", rows));
 		return;
@@ -719,12 +1084,62 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 		vexec_cost_sort(root, &lprow->path, lpinput, true, &lpcost);
 		take_saving(&lpcost, lpsaving);
 	}
+	if (dinput != NULL)
+	{
+		/* W7: over the device's grouping, its rank given back (C3, W2) */
+		drow = create_sort_path(root, output_rel, dinput, root->sort_pathkeys, (double) bound);
+		vexec_cost_sort(root, &drow->path, dinput, true, &dcost);
+		vexec_cost_topn(&dcost, dinput, bound);
+	}
+	if (rinput != NULL)
+	{
+		/* W13: the bound's rows the device hands up sorted, each fetched late by its TID as H6 prices it */
+		rrow = create_sort_path(root, output_rel, rinput, root->sort_pathkeys, (double) bound);
+		vexec_cost_sort(root, &rrow->path, rinput, true, &rcost);
+		if (rlate)
+		{
+			Cost		fetches = Min((double) bound, rinput->rows) * (rfetch + cpu_tuple_cost);
+
+			rcost.startup += fetches;
+			rcost.total += fetches;
+		}
+	}
+	if (rpinput != NULL)
+	{
+		/*
+		 * the one participant's rows handed up sorted, fetched late by every
+		 * participant (M4), as many at once as late_shared_rows() says; and
+		 * W55 (§3.36), the other participants' starts, which the exchange
+		 * waits for though they read nothing: each worker's launch at
+		 * parallel_setup_cost.  ClickBench's Q23 on its own Parquet file of
+		 * 100M rows, a fetch on 16 threads: 16 workers 245 to 272 ms, the
+		 * serial read 137 to 142; on mergetree, a fetch a granule of each
+		 * column on its process's thread: 58 against 114 (§3.21)
+		 */
+		double		nfetched = Min((double) bound, rpinput->rows);
+		Cost		fetches = late_shared_rows(kept->partial, nfetched, rpthreads) * (rpfetch + cpu_tuple_cost) +
+			kept->partial->parallel_workers * parallel_setup_cost;
+
+		rprow = create_sort_path(root, output_rel, rpinput, root->sort_pathkeys, (double) bound);
+		vexec_cost_sort(root, &rprow->path, rpinput, true, &rpcost);
+		rpcost.startup += fetches;
+		rpcost.total += fetches;
+	}
 	vexec_alt_costed(ps, alt, input != NULL ? &cost : &pcost,
-					 psprintf("%s%s%s%s", count_of(list_length(root->sort_pathkeys), "sort key", "sort keys"),
+					 psprintf("%s%s%s%s%s", count_of(list_length(root->sort_pathkeys), "sort key", "sort keys"),
 							  bound > 0 ? psprintf(", bounded at " INT64_FORMAT, bound) : "",
 							  input != NULL ? "" : "; in each participant alone",
 							  linput != NULL || lpinput != NULL ?
-							  "; also over the relation's VecScan, its keys alone read" : ""));
+							  "; also over the relation's VecScan, its keys alone read" : "",
+							  dinput != NULL ? "; also over the device's grouping, ranked there" : ""));
+	if (dinput != NULL)
+		vexec_alt_costed(ps, alt, &dcost, "over the device's grouping, its groups ranked there");
+	if (rpinput != NULL)
+		vexec_alt_costed(ps, alt, &rpcost,
+						 "over the device's read of its units in one participant, ranked there, its other columns late, fetched by every participant");
+	if (rinput != NULL)
+		vexec_alt_costed(ps, alt, &rcost, rlate ? "over the device's read of its units, ranked there, its other columns late" :
+						 "over the device's read of its units, ranked there");
 	if (!add)
 		return;
 	newpaths = NIL;
@@ -741,10 +1156,41 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 		if (vexec_prefer_vector_sort && vexec_is_vector_path(pinput) &&
 			first_key_integer(root->sort_pathkeys, pinput->pathtarget))
 			drop_row_sort_gather(output_rel, pinput, gm);
+		/*
+		 * F17: a grouping ranked in each participant over core's Sort of a
+		 * Gather of every group, and over VecSort's own, within the fuzz --
+		 * left to the costs where the device may rank the grouping itself
+		 */
+		if (ranked_in_participants(input, pinput, bound) && dinput == NULL && rpinput == NULL)
+		{
+			drop_sort_over_gather(output_rel, pinput, gm);
+			if (input != NULL && newpaths != NIL)
+			{
+				Path	   *over_gather = linitial(newpaths);
+
+				elog(DEBUG2, "vexec F17: ranked in each participant %.2f..%.2f, over the Gather %.2f..%.2f",
+					 gm->startup_cost, gm->total_cost, over_gather->startup_cost, over_gather->total_cost);
+				if (gm->total_cost <= over_gather->total_cost * VEXEC_PATH_FUZZ)
+					newpaths = list_delete_first(newpaths);
+			}
+		}
 		newpaths = lappend(newpaths, gm);
 	}
 	if (linput != NULL)
 		newpaths = lappend(newpaths, vecsort_path(output_rel, target, lrow, &lcost, bound, true));
+	if (dinput != NULL)
+		newpaths = lappend(newpaths, vecsort_path(output_rel, target, drow, &dcost, bound, false));
+	if (rinput != NULL)
+		newpaths = lappend(newpaths, vecsort_path(output_rel, target, rrow, &rcost, bound, rlate));
+	if (rpinput != NULL)
+	{
+		Path	   *psort = vecsort_path(output_rel, target, rprow, &rpcost, bound, true);
+		double		total = compute_gather_rows(psort);
+
+		newpaths = lappend(newpaths,
+						   create_gather_merge_path(root, output_rel, psort, target,
+													root->sort_pathkeys, NULL, &total));
+	}
 	if (lpinput != NULL)
 	{
 		Path	   *psort = vecsort_path(output_rel, target, lprow, &lpcost, bound, true);
@@ -775,11 +1221,59 @@ vexec_consider_sort(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output
 		output_rel->pathlist = kept;
 		index_kept = kept != NIL;
 	}
+	/* F27: core's sorted grouping by an estimate that knows nothing, against the VecSort's whole cost */
+	if (input != NULL && newpaths != NIL && linitial(newpaths) != NULL && bound > 0)
+		drop_uninformed_sorted_agg(root, output_rel, input, (Path *) linitial(newpaths), target);
 	foreach(lc, newpaths)
 		add_path(output_rel, lfirst(lc));
 	if (!index_kept)
 		ps->npossible++;
 	ps->sorts_built = true;
+}
+
+/*
+ * V8d: whether a VecSort takes the device's order where the node can take
+ * it as it begins: an unbounded sort over keys the device orders as their
+ * operators do (vexec_sort_device_key()), of SORT_DEVICE_MIN_ROWS rows or
+ * more, the rows' width within work_mem, which the node's kept rows may not
+ * pass; and, where PostgreSQL's planner gives root, keys of as many
+ * distinct values as rows, by its estimate: rows that tie are tuplesort's
+ * to order, which the node learns only once the device has their keys --
+ * from its first chunk, of a few batches, where they tie early.  Measured
+ * on this host (§5, V8d), the device's order was as fast as tuplesort's at
+ * 5,000 rows, 1.1 to 1.4 times at 10,000 and 2.3 to 2.6 at 100,000.  Force
+ * takes it wherever it is possible.
+ */
+#define SORT_DEVICE_MIN_ROWS	(16 * 1024)
+
+static bool
+sort_device(PlannerInfo *root, Sort *sort, int64 bound)
+{
+	Plan	   *child = sort->plan.lefttree;
+	List	   *exprs = NIL;
+
+	if (vexec_gpu == VEXEC_GPU_OFF || !vexec_enable_gpu_sort || bound > 0 || child == NULL)
+		return false;
+	if (vexec_device_ready() == NULL)
+		return false;
+	for (int i = 0; i < sort->numCols; i++)
+	{
+		TargetEntry *tle = get_tle_by_resno(child->targetlist, sort->sortColIdx[i]);
+		bool		desc;
+
+		if (tle == NULL ||
+			vexec_sort_device_key(exprType((Node *) tle->expr), sort->sortOperators[i],
+								  sort->collations[i], &desc) != NULL)
+			return false;
+		exprs = lappend(exprs, tle->expr);
+	}
+	if (vexec_gpu == VEXEC_GPU_FORCE)
+		return true;
+	if (child->plan_rows < SORT_DEVICE_MIN_ROWS ||
+		child->plan_rows * (child->plan_width + 32) > (double) work_mem * 1024.0)
+		return false;
+	return root == NULL ||
+		estimate_num_groups(root, exprs, child->plan_rows, NULL, NULL) >= 0.99 * child->plan_rows;
 }
 
 /*
@@ -800,7 +1294,6 @@ plan_vecsort(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	ListCell   *lc;
 	int			i;
 
-	(void) root;
 	(void) rel;
 	(void) clauses;
 	if (list_length(custom_plans) != 1 || !IsA(sort, Sort) || sort->plan.lefttree == NULL)
@@ -815,6 +1308,7 @@ plan_vecsort(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		plan.nullsfirst = lappend_int(plan.nullsfirst, sort->nullsFirst[i] ? 1 : 0);
 	}
 	plan.bound = intVal(linitial(best_path->custom_private));
+	plan.device = sort_device(root, sort, plan.bound);
 
 	/* the scan tuple: the child's row, column by column */
 	foreach(lc, sort->plan.lefttree->targetlist)
@@ -841,6 +1335,10 @@ plan_vecsort(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 		(void) vexec_sort_make_late(cscan, late_ok, late_ok);
 	}
+	/* W13: the device's read of the child's units ranked by the sort's keys */
+	if (IsA(cscan->scan.plan.lefttree, CustomScan) &&
+		vexec_scan_plan_is_device((CustomScan *) cscan->scan.plan.lefttree))
+		rank_device_scan(cscan);
 	(void) vexec_sort_plan_running_bound(cscan);
 	return &cscan->scan.plan;
 }
@@ -1022,6 +1520,13 @@ vexec_expr_may_raise(Node *node)
 }
 
 /*
+ * Whether a running bound over a text key goes after the quals: where they only
+ * ask of a text column's length or whether it is empty, which reads no value's
+ * bytes, and the bound's comparison reads the key's -- ClickBench's Q25 at 100M
+ * rows, 87% of its rows empty, each compared before its qual dropped it, took 128
+ * ms and 89 by core's row Sort.
+ */
+/*
  * The running bound (H6): a bounded VecSort straight over a vector scan --
  * a VecScan or a VecBitmapHeapScan, parallel-aware or not -- whose first
  * sort key is a column of the scan's relation lends the scan the first key
@@ -1033,6 +1538,24 @@ vexec_expr_may_raise(Node *node)
  * list may raise: PostgreSQL computes it for every row the quals pass, a
  * row the sort then discards among them.  Whether it was planned.
  */
+static bool
+bound_after_empty_text(CustomScan *scan, const Var *key)
+{
+	VexecLengthUses w;
+	bool		after = scan->scan.plan.qual != NIL && !get_typbyval(key->vartype);
+
+	if (!after)
+		return false;
+	w.varno = scan->scan.scanrelid;
+	w.n = MaxHeapAttributeNumber;
+	w.uses = palloc0(w.n);
+	(void) vexec_length_uses((Node *) scan->scan.plan.qual, &w);
+	for (int i = 0; i < w.n && after; i++)
+		after = w.uses[i] != 2;
+	pfree(w.uses);
+	return after;
+}
+
 bool
 vexec_sort_plan_running_bound(CustomScan *cscan)
 {
@@ -1059,7 +1582,8 @@ vexec_sort_plan_running_bound(CustomScan *cscan)
 			v->varlevelsup == 0 && !may_raise_walker((Node *) child->targetlist, NULL))
 		{
 			plan.bound_attno = v->varattno;
-			plan.bound_before_quals = !may_raise_walker((Node *) child->qual, NULL) &&
+			plan.bound_before_quals = !bound_after_empty_text(scan, v) &&
+				!may_raise_walker((Node *) child->qual, NULL) &&
 				!may_raise_walker((Node *) scan->custom_exprs, NULL);
 		}
 	}
@@ -1124,6 +1648,8 @@ vexec_build_sort_from_sort(Sort *sort)
 		plan.collations = lappend_oid(plan.collations, sort->collations[i]);
 		plan.nullsfirst = lappend_int(plan.nullsfirst, sort->nullsFirst[i] ? 1 : 0);
 	}
+	/* a Limit above may bound it yet (vexec_sort_set_bound()): the node then keeps tuplesort's */
+	plan.device = sort_device(NULL, sort, 0);
 	foreach(lc, sort->plan.lefttree->targetlist)
 	{
 		Var		   *v = makeVarFromTargetEntry(OUTER_VAR, lfirst_node(TargetEntry, lc));

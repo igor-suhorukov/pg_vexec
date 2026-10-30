@@ -714,7 +714,7 @@ add_pending(VexecInsertState *s, VexecInsertTarget *t, TupleTableSlot *slot)
 		vexec_batch_begin_rows(t->pending);
 	}
 	vexec_batch_add_slot(t->pending, slot, NULL);
-	if (++s->npending >= VEXEC_BATCH_ROWS)
+	if (++s->npending >= vexec_batch_rows || t->pending->nrows >= t->pending->room)
 		flush_all_pending(s);
 }
 
@@ -883,7 +883,7 @@ static void
 gather_slot(VexecInsertState *s, TupleTableSlot *slot)
 {
 	vexec_batch_add_slot(s->gather, slot, NULL);
-	if (s->gather->nrows >= VEXEC_BATCH_ROWS)
+	if (s->gather->nrows >= s->gather->room)
 		flush_gather(s);
 }
 

@@ -246,7 +246,7 @@ pin_budget(VexecHeapReader *hr)
 	if (hr->scan->rs_strategy != NULL)
 		hr->maxpins = VEXEC_HEAP_PINS;
 	else
-		hr->maxpins = (int) Min(Max(share, (uint32) VEXEC_HEAP_PINS), (uint32) VEXEC_BATCH_ROWS);
+		hr->maxpins = (int) Min(Max(share, (uint32) VEXEC_HEAP_PINS), (uint32) vexec_batch_rows);
 	hr->pins = palloc(sizeof(Buffer) * hr->maxpins);
 }
 
@@ -1194,7 +1194,7 @@ past_bound(VexecHeapReader *hr, HeapTupleHeader tup, uint32 len)
 	d = heap_getattr(&htup, b->attno, hr->desc, &isnull);
 	past = ApplySortComparator(d, isnull, b->value, b->isnull, &b->ssup) > 0;
 	MemoryContextSwitchTo(old);
-	if (++hr->bound_checks >= VEXEC_BATCH_ROWS)
+	if (++hr->bound_checks >= vexec_batch_rows)
 	{
 		MemoryContextReset(b->tmpcxt);
 		hr->bound_checks = 0;
@@ -1206,7 +1206,7 @@ past_bound(VexecHeapReader *hr, HeapTupleHeader tup, uint32 len)
 
 /*
  * The scan's next batch into `in`, whose columns are the reader's, in
- * their build shapes: up to VEXEC_BATCH_ROWS visible rows, from as many
+ * their build shapes: up to vexec.batch_rows visible rows, from as many
  * pages as they take.  False at the end.
  */
 bool
@@ -1216,6 +1216,7 @@ vexec_heap_reader_next(VexecHeapReader *hr, VexecBatch *in)
 	bool		deforms = hr->ncols > 0 || hr->need_tid;
 	int			row = 0;
 	int			dropped = 0;	/* rows the checks dropped */
+	int			limit;
 	int			i;
 
 	/* the last batch is done with: its pages go, the current one stays */
@@ -1227,6 +1228,8 @@ vexec_heap_reader_next(VexecHeapReader *hr, VexecBatch *in)
 		return false;
 	if (deforms)
 		vexec_batch_begin_rows(in);
+	/* F24: the batch's room, or the setting's rows where no column is made */
+	limit = deforms ? in->room : vexec_batch_rows;
 
 	/* X6: the join's keys this batch, unless its switch has them off */
 	hr->jf_now = false;
@@ -1243,7 +1246,7 @@ vexec_heap_reader_next(VexecHeapReader *hr, VexecBatch *in)
 	hr->jf_checked = 0;
 	hr->jf_passed = 0;
 
-	while (row < VEXEC_BATCH_ROWS)
+	while (row < limit)
 	{
 		uint32		take;
 		Page		page;
@@ -1263,7 +1266,7 @@ vexec_heap_reader_next(VexecHeapReader *hr, VexecBatch *in)
 			continue;			/* a page with no visible tuple is passed */
 		}
 
-		take = Min(scan->rs_ntuples - hr->index, (uint32) (VEXEC_BATCH_ROWS - row));
+		take = Min(scan->rs_ntuples - hr->index, (uint32) (limit - row));
 		if (deforms)
 		{
 			bool		page_values = hr->any_page_values &&
