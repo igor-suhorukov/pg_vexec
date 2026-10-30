@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# mergetree on pg_vexec's image (docker/simple/Dockerfile.base): vexec with the
+# extension ch_table_engines, whose tables are ClickHouse's MergeTree parts, and
+# its engine library, the core of ClickHouse compiled from its sources.  It
+# takes no build context:
+#
+#   docker build -t pg_vexec:19rc1 - < docker/simple/Dockerfile.base
+#   docker build -t pg_vexec:19rc1-mergetree - < docker/simple/Dockerfile.mergetree
+#   docker run -d --name vexec --shm-size 1g -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1-mergetree \
+#       -c shared_preload_libraries=vexec,ch_table_engines -c vexec.mode=auto
+#
+#   CREATE EXTENSION ch_table_engines;
+#   CREATE TABLE t (...) USING mergetree WITH (order_by = '...');
+#
+#   BASE_IMAGE   Dockerfile.base's image: pg_vexec:19rc1
+#   CHTE_REPO    ch_table_engines' repository: on this project's GitHub
+#   CHTE_REF     the branch or tag to build: main
+#   ENGINE_JOBS  the engine's compile jobs: 16, which ch_table_engines gives 44 GB
+#                of memory; fewer on a smaller machine
+#
+# The engine's stage is the long one: ClickHouse's sources are fetched, at the
+# release test/engine-sources.sh pins, from github.com/ClickHouse/ClickHouse and
+# the repositories of the submodules engine/submodules.txt lists, and compiled by
+# test/engine.sh, as ch_table_engines' docker/Dockerfile.engine has it: Clang 21
+# from trixie-backports.  Docker keeps its layers, some 30 GB of them: a later
+# build takes them unless --no-cache or another CHTE_REF asks for it all again.
+# The library goes in without its debug information.
+#
+# The extension is built from the commit the engine was, which the image names in
+# ch_table_engines.commit in the server's share directory, beside the base's
+# pg_vexec.commit.  The server finds the library in its $libdir, as the setting
+# ch.engine_library has it by default.
+#
+# opentelemetry-cpp is Debian trixie's.  Neither the extension nor the engine
+# links it.
+#
+# The stages engine and build (--target) have the compilers and the repository
+# at /src; the image it ends in is the base with the extension and the library.
+
+ARG BASE_IMAGE=pg_vexec:19rc1
+
+FROM debian:trixie AS engine
+ARG CHTE_REPO=https://github.com/igor-suhorukov/pg_ch_table_engines.git
+ARG CHTE_REF=main
+ARG ENGINE_JOBS=16
+RUN echo "deb http://deb.debian.org/debian trixie-backports main" > /etc/apt/sources.list.d/backports.list \
+ && apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates cmake ninja-build ccache nasm yasm python3 git perl file binutils \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -t trixie-backports \
+        clang-21 lld-21 llvm-21 \
+ && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch "$CHTE_REF" "$CHTE_REPO" /src \
+ && git -C /src log -1 --format='building %h %s' \
+ && mkdir /engine \
+ && git -C /src rev-parse HEAD > /engine/ch_table_engines.commit \
+ && CHTE_CH_SRC=/ch /src/test/engine-sources.sh
+RUN CC=clang-21 CXX=clang++-21 CHTE_ENGINE_JOBS="$ENGINE_JOBS" /src/test/engine.sh \
+ && objcopy --strip-debug /build/lib/libchte_engine.so /engine/libchte_engine.so \
+ && rm -rf /build
+
+FROM ${BASE_IMAGE} AS build
+ARG CHTE_REPO=https://github.com/igor-suhorukov/pg_ch_table_engines.git
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential git ca-certificates \
+        "postgresql-server-dev-$PG_MAJOR=$PG_VERSION" liblz4-dev libzstd-dev
+COPY --from=engine /engine/ch_table_engines.commit /tmp/ch_table_engines.commit
+RUN pg_config="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" \
+ && git init -q /src \
+ && git -C /src remote add origin "$CHTE_REPO" \
+ && git -C /src fetch -q --depth 1 origin "$(cat /tmp/ch_table_engines.commit)" \
+ && git -C /src -c advice.detachedHead=false checkout -q FETCH_HEAD \
+ && git -C /src log -1 --format='building %h %s' \
+ && make -C /src -j"$(nproc)" PG_CONFIG="$pg_config" with_llvm=no \
+ && make -C /src PG_CONFIG="$pg_config" with_llvm=no DESTDIR=/out install \
+ && mkdir -p "/out$("$pg_config" --sharedir)" \
+ && cp /tmp/ch_table_engines.commit "/out$("$pg_config" --sharedir)/"
+
+FROM ${BASE_IMAGE}
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends opentelemetry-cpp \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/ /
+COPY --from=engine /engine/libchte_engine.so /usr/lib/postgresql/$PG_MAJOR/lib/libchte_engine.so
+RUN ! ldd "/usr/lib/postgresql/$PG_MAJOR/lib/ch_table_engines.so" "/usr/lib/postgresql/$PG_MAJOR/lib/libchte_engine.so" | grep 'not found'

@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# pg_vexec on vanilla PostgreSQL 19: Docker Hub's postgres, as the PostgreSQL
+# Global Development Group packages it for Debian trixie, with the extensions
+# built from this project's repository on GitHub.  It takes no build context,
+# so nothing of a checkout goes in, and needs none of vexec's dev images and
+# no checkout of the port or of PostgreSQL's fork:
+#
+#   docker build -t pg_vexec:19rc1 - < docker/simple/Dockerfile.base
+#   docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1 \
+#       -c shared_preload_libraries=vexec -c vexec.mode=auto
+#
+#   REF    the branch or tag to build: main
+#   REPO   its repository: this project's on GitHub
+#
+# Docker keeps the clone's layer: after a push, build with --no-cache, or it
+# builds what it cloned before.  The image says which commit it holds, in
+# pg_vexec.commit in the server's share directory.
+#
+# What the base lacks comes from Debian's and PGDG's packages:
+#   build-essential, postgresql-server-dev-19   PGXS and the server's headers,
+#                       at the server's own version (PG_VERSION, the base's)
+#   git, ca-certificates                        the clone
+#   libnghttp2-dev, libprotobuf-c-dev, protobuf-c-compiler, libprotobuf-dev,
+#   libssl-dev          vexec_flight
+#   libkrb5-dev         gssapi/gssapi.h: PGDG's server is built with GSSAPI,
+#                       and vexec_flight includes libpq-be.h
+#
+# The Makefile's extensions: vexec, vexec_pgvector, vexec_postgis, vexec_flight.
+# Not vexec_parquet: neither Debian trixie nor PGDG packages its Arrow C++, which
+# docker/simple/Dockerfile.execparquet adds on this image.  Not pgvector or PostGIS,
+# without which the packs load and bind nothing.
+#
+# The build stage (--target build) has the compilers and the repository at
+# /src; the image it ends in is the base with the extensions and what
+# vexec_flight loads.
+
+ARG BASE_IMAGE=postgres:19rc1-trixie
+
+FROM ${BASE_IMAGE} AS build
+ARG REPO=https://github.com/igor-suhorukov/pg_vexec.git
+ARG REF=main
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential git ca-certificates \
+        "postgresql-server-dev-$PG_MAJOR=$PG_VERSION" \
+        libnghttp2-dev libprotobuf-c-dev protobuf-c-compiler libprotobuf-dev libssl-dev libkrb5-dev
+RUN git clone --depth 1 --branch "$REF" "$REPO" /src \
+ && git -C /src log -1 --format='building %h %s' \
+ && pg_config="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" \
+ && make -C /src -j"$(nproc)" PG_CONFIG="$pg_config" \
+ && make -C /src PG_CONFIG="$pg_config" DESTDIR=/out install \
+ && mkdir -p "/out$("$pg_config" --sharedir)" \
+ && git -C /src rev-parse HEAD > "/out$("$pg_config" --sharedir)/pg_vexec.commit"
+
+FROM ${BASE_IMAGE}
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libnghttp2-14 libprotobuf-c1 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/ /

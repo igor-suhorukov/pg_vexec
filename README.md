@@ -110,6 +110,7 @@ The plan's phases land here in order, each on a branch of its own:
 | `test/tpc/` | the port's tpc suite, with `TPC_STORAGE` (heap, `ao_column`, PAX porc and porc_vec) and `vexec` preloaded |
 | `docker/vexec.yml`, `docker/Dockerfile.vexec` | `vexec`'s images and containers: a server image with a C toolchain, vanilla or the port's |
 | `docker/Dockerfile.arrow` | pyarrow on those images, against which the IPC codec and the egress are checked |
+| `docker/simple/` | the extensions on Docker Hub's postgres, built from this repository on GitHub, and on that image `vexec_parquet` and mergetree (below) |
 | `docker/compose.yml`, `docker/Dockerfile.clickbench` | ClickBench's images and containers (VB) |
 | `test/clickbench/` | ClickBench's suite and its baseline (VB) |
 
@@ -147,6 +148,51 @@ Each of them also builds alone from its directory (`make -C
 modules/vexec_pgvector PG_CONFIG=...`), against the headers `vexec` installs
 under `$(pg_config --includedir-server)/extension/vexec`, where storage
 modules and packs built elsewhere find them too.
+
+### An image on Docker Hub's postgres
+
+`docker/simple/Dockerfile.base` builds those four extensions on vanilla
+PostgreSQL 19 as the PostgreSQL Global Development Group packages it for
+Debian trixie, `postgres:19rc1-trixie`, from this repository on GitHub. It
+takes no build context, and needs none of the images or checkouts of [the
+development environment](#the-development-environment); what the base lacks
+comes from Debian's and PGDG's packages.
+
+```sh
+docker build -t pg_vexec:19rc1 - < docker/simple/Dockerfile.base
+docker build -t pg_vexec:19rc1 --build-arg REF=<branch or tag> --no-cache - < docker/simple/Dockerfile.base
+docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1 \
+    -c shared_preload_libraries=vexec -c vexec.mode=auto
+```
+
+After a push, build with `--no-cache`: Docker otherwise keeps the clone it made
+before. The image says which commit it holds:
+`docker run --rm pg_vexec:19rc1 cat /usr/share/postgresql/19/pg_vexec.commit`.
+
+`docker/simple/Dockerfile.execparquet` adds `vexec_parquet` to that image, built
+from the commit the image holds, with Arrow C++ from Apache's own Debian
+packages, which neither Debian trixie nor PGDG packages:
+
+```sh
+docker build -t pg_vexec:19rc1-parquet - < docker/simple/Dockerfile.execparquet
+docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1-parquet \
+    -c shared_preload_libraries=vexec,vexec_parquet -c vexec.mode=auto
+```
+
+`docker/simple/Dockerfile.mergetree` adds to that image, instead, the extension
+[`ch_table_engines`](https://github.com/igor-suhorukov/pg_ch_table_engines) and
+its engine library, the core of ClickHouse compiled from its sources in a stage
+of the build: some 30 GB of disk, 44 GB of memory at its 16 jobs (`ENGINE_JOBS`),
+and hours.
+
+```sh
+docker build -t pg_vexec:19rc1-mergetree - < docker/simple/Dockerfile.mergetree
+docker run -d --name vexec --shm-size 1g -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1-mergetree \
+    -c shared_preload_libraries=vexec,ch_table_engines -c vexec.mode=auto
+```
+
+None of these images has pgvector or PostGIS, without which the packs load and
+bind nothing.
 
 ### Loading them
 

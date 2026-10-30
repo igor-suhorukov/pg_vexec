@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# vexec_parquet on pg_vexec's image (docker/simple/Dockerfile.base): tables of Parquet
+# files, read and written by Apache Arrow C++.  Built from the commit the base
+# image says it holds, its pg_vexec.commit, so that vexec_parquet and the vexec
+# it runs beside are of one commit whatever the branch has moved to since.  It
+# takes no build context:
+#
+#   docker build -t pg_vexec:19rc1 - < docker/simple/Dockerfile.base
+#   docker build -t pg_vexec:19rc1-parquet - < docker/simple/Dockerfile.execparquet
+#   docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1-parquet \
+#       -c shared_preload_libraries=vexec,vexec_parquet -c vexec.mode=auto
+#
+#   BASE_IMAGE     Dockerfile.base's image: pg_vexec:19rc1
+#   REPO           the repository holding its commit: this project's on GitHub
+#   ARROW_VERSION  26.0.0-1, as docker/Dockerfile.parquet's; the packages'
+#                  names, libarrow2600 and the others, carry its major version
+#
+# What the base lacks:
+#   build-essential, pkg-config, git, postgresql-server-dev-19   the build, the
+#                       server's headers at its own version, as the base's
+#   libarrow-dev, libparquet-dev, libarrow-s3-dev   Arrow C++ with Parquet and
+#                       S3, from Apache's own Debian packages
+#                       (packages.apache.org/artifactory/arrow): neither Debian
+#                       trixie nor PGDG packages it
+#   libarrow2600, libparquet2600, libarrow-s3-2600, opentelemetry-cpp   what the
+#                       module loads: Arrow's Debian builds link OpenTelemetry's
+#                       libraries, and only its -dev packages ask for them
+#
+# Not what docker/Dockerfile.arrow and docker/Dockerfile.parquet add for the
+# tests alone: pyarrow, moto's S3 server, and PostGIS, which a table needs only
+# for a GeoParquet file's geometry read as PostGIS's types.
+#
+# with_llvm=no: PGDG's server has LLVM, so PGXS would make each file's bitcode
+# too, and the module's Makefile gives C++20 and Arrow's flags to engine.o alone.
+#
+# The build stage (--target build) has the compilers, Arrow's headers and the
+# repository at /src; the image it ends in is the base with vexec_parquet and
+# what it loads.
+
+ARG BASE_IMAGE=pg_vexec:19rc1
+
+FROM ${BASE_IMAGE} AS build
+ARG REPO=https://github.com/igor-suhorukov/pg_vexec.git
+ARG ARROW_VERSION=26.0.0-1
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential pkg-config git ca-certificates lsb-release wget \
+        "postgresql-server-dev-$PG_MAJOR=$PG_VERSION" \
+ && wget -q -O /tmp/apache-arrow-apt-source.deb \
+        https://packages.apache.org/artifactory/arrow/debian/apache-arrow-apt-source-latest-trixie.deb \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /tmp/apache-arrow-apt-source.deb \
+ && rm /tmp/apache-arrow-apt-source.deb \
+ && apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        "libarrow-dev=$ARROW_VERSION" "libparquet-dev=$ARROW_VERSION" "libarrow-s3-dev=$ARROW_VERSION"
+RUN pg_config="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" \
+ && commit="$(cat "$("$pg_config" --sharedir)/pg_vexec.commit")" \
+ && git init -q /src \
+ && git -C /src remote add origin "$REPO" \
+ && git -C /src fetch -q --depth 1 origin "$commit" \
+ && git -C /src -c advice.detachedHead=false checkout -q FETCH_HEAD \
+ && git -C /src log -1 --format='building %h %s' \
+ && make -C /src -j"$(nproc)" PG_CONFIG="$pg_config" EXTENSIONS=vexec_parquet with_llvm=no \
+ && make -C /src PG_CONFIG="$pg_config" EXTENSIONS=vexec_parquet with_llvm=no DESTDIR=/out install
+
+FROM ${BASE_IMAGE}
+ARG ARROW_VERSION=26.0.0-1
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates lsb-release wget \
+ && wget -q -O /tmp/apache-arrow-apt-source.deb \
+        https://packages.apache.org/artifactory/arrow/debian/apache-arrow-apt-source-latest-trixie.deb \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /tmp/apache-arrow-apt-source.deb \
+ && rm /tmp/apache-arrow-apt-source.deb \
+ && apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        "libarrow2600=$ARROW_VERSION" "libparquet2600=$ARROW_VERSION" "libarrow-s3-2600=$ARROW_VERSION" opentelemetry-cpp \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/ /
+RUN ! ldd "/usr/lib/postgresql/$PG_MAJOR/lib/vexec_parquet.so" | grep 'not found'
