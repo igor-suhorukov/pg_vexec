@@ -85,12 +85,51 @@ typedef enum VexecExprKind
 								 * a pure subtree without a kernel */
 } VexecExprKind;
 
-/* VE_SAOP's array: its elements as constant registers. */
+/*
+ * How a VE_SAOP of many elements reads a row's value as its set's key
+ * (inset.h): of an equality, x = ANY, or of its negation, x <> ALL, whose
+ * keys are equal exactly where the function says the values are; LINEAR
+ * where it compares x with each element.
+ */
+typedef enum VexecSaopKey
+{
+	VEXEC_SAOP_LINEAR = 0,
+	VEXEC_SAOP_INT,				/* int2, int4, int8, any pair: the value */
+	VEXEC_SAOP_OID,				/* unsigned */
+	VEXEC_SAOP_CHAR,			/* "char", unsigned */
+	VEXEC_SAOP_BOOL,
+	VEXEC_SAOP_FLOAT,			/* float4, float8, any pair: the double's
+								 * bits, every NaN one and -0 made 0 */
+	VEXEC_SAOP_DATE,			/* in PostgreSQL's epoch */
+	VEXEC_SAOP_TIMESTAMP,		/* timestamp, timestamptz: the same */
+	VEXEC_SAOP_UUID,			/* the 16 bytes */
+	VEXEC_SAOP_TEXT,			/* the bytes, a deterministic collation's */
+	VEXEC_SAOP_BPCHAR,			/* the same, without trailing blanks */
+	VEXEC_SAOP_NUMERIC			/* by hash_numeric() and numeric_eq() */
+} VexecSaopKey;
+
+/* VE_SAOP's set: its elements but NULLs, looked up once a row (inset.h). */
+typedef struct VexecSaopHash
+{
+	uint8		key;			/* VexecSaopKey */
+	bool		has_null;		/* a NULL element: no match is NULL */
+	struct VexecInSet *set;
+} VexecSaopHash;
+
+/*
+ * VE_SAOP's array: its elements as constant registers, or, where they are
+ * many, as a set; the registers are then made only for a batch the set
+ * cannot read, from the plan's constant.
+ */
 typedef struct VexecSaop
 {
 	bool		array_null;		/* the array itself is NULL */
 	int			nelems;
-	VexecVec  **elems;			/* constant registers; NULL for a NULL element */
+	VexecVec  **elems;			/* constant registers; NULL for a NULL element;
+								 * NULL until made, with a set */
+	VexecSaopHash *hash;		/* NULL: compared element by element */
+	Const	   *arr;			/* the plan's array */
+	VexecType  *elem_type;		/* the elements' */
 } VexecSaop;
 
 /* A compiled expression: a node of a vector program. */
@@ -178,6 +217,7 @@ typedef struct VexecCompileContext
 	MemoryContext mcxt;			/* the node's */
 	int			nkernels;		/* compiled: kernel steps */
 	int			nfallbacks;		/* fallback steps */
+	int			nhashed;		/* VE_SAOPs that look their rows up in a set */
 	List	   *declared;		/* compiled: the declared calls' steps,
 								 * VexecExpr *, for EXPLAIN */
 	const char *why;			/* why the last top-level one is lazy */
@@ -210,6 +250,9 @@ extern VexecExpr *vexec_compile_expr(VexecCompileContext *cc, Expr *expr);
 extern void vexec_compile_top(VexecCompileContext *cc, Expr *expr, bool is_qual,
 							  VexecTop *top);
 extern Oid	vexec_collation_class(Oid collation);
+extern int	vexec_saop_key(Oid opfuncid, bool useOr, Oid collation, int nelems);
+extern int	vexec_saop_key_of(ScalarArrayOpExpr *saop);
+extern void vexec_saop_elems(MemoryContext mcxt, VexecSaop *s);
 
 /* k_text.c: a LIKE pattern's kind (H7, §3.14) */
 typedef enum VexecLikeKind

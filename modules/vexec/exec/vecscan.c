@@ -3773,9 +3773,18 @@ scan_explain(CustomScanState *css, List *ancestors, ExplainState *es)
 		ExplainPropertyText("Source", s->src != NULL ? how :
 							s->heap_pages ? "heap's pages" : "the slot path", es);
 		if (s->nchecks > 0)
+		{
+			int			hashed = 0;
+
 			ExplainPropertyText("Prefilter",
 								psprintf("%d of %d quals", s->nchecked_quals,
 										 list_length(css->ss.ps.plan->qual)), es);
+			for (int i = 0; i < s->nchecks; i++)
+				if (s->checks[i].set != NULL)
+					hashed++;
+			if (hashed > 0)
+				ExplainPropertyInteger("Prefilter Hashed IN Lists", NULL, hashed, es);
+		}
 	}
 	if (es->analyze && s->bitmap && s->scan != NULL)
 	{

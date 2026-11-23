@@ -55,7 +55,9 @@
 #include "nodes/nodeFuncs.h"
 #include "port/pg_bitutils.h"
 #include "utils/array.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "utils/uuid.h"
 
 #include "vexec_kernels.h"
 
@@ -63,6 +65,7 @@
 #include "batch/batch.h"
 #include "exec/exec.h"
 #include "expr/expr.h"
+#include "expr/inset.h"
 #include "expr/kernel.h"
 
 const VexecShape vexec_bool_bits = {VEXEC_BIT_BOOL, false, 0, 1, 1};
@@ -1399,41 +1402,23 @@ eval_distinct(VexecEval *ev, VexecExpr *e, const uint64 *active)
 }
 
 /*
- * x op ANY / ALL (array): the comparison's kernel once per element, its
- * results combined as ExecEvalScalarArrayOp combines them
- * (PG19:src/backend/executor/execExprInterp.c): an empty array gives false
- * for ANY and true for ALL whatever x is; a NULL x gives NULL; otherwise
- * ANY is true where any element's comparison is true, else NULL where any
- * was NULL, else false, and ALL the reverse.
+ * x op ANY / ALL (array), element by element: the comparison's kernel once
+ * per element over the rows still undecided, ANY's rows decided by a true
+ * comparison and ALL's by a false one into `decided`, and a NULL element's
+ * or comparison's rows into `nulls`.  `compute` is used up.
  */
-static VexecVec *
-eval_saop(VexecEval *ev, VexecExpr *e, const uint64 *active)
+static void
+saop_compare(VexecEval *ev, VexecExpr *e, VexecVec *x, uint64 *compute, uint64 *decided,
+			 uint64 *nulls)
 {
 	VexecSaop  *s = (VexecSaop *) e->saop;
-	uint64	   *live = live_rows(ev, active);
-	VexecVec   *x;
-	uint64	   *xvalid = NULL;
-	uint64	   *compute;
-	uint64	   *decided;
-	uint64	   *nulls;
-	uint64	   *truth;
-	uint64	   *valid = NULL;
 	int			n = ev->nrows;
 	int			i,
 				w;
 
-	if (s->array_null)
-		return bool_register(ev, vexec_bitmap_alloc(ev->work, n, false),
-							 vexec_bitmap_alloc(ev->work, n, false));
-	if (s->nelems == 0)
-		return bool_register(ev, vexec_bitmap_alloc(ev->work, n, !e->useOr), NULL);
-
-	x = kernel_arg(ev, vexec_eval(ev, e->args[0], live), NULL, 0);
-	live = live_rows(ev, live);
-	compute = strict_rows(ev, &x, 1, live, &xvalid);
-	decided = vexec_bitmap_alloc(ev->work, n, false);
-	nulls = vexec_bitmap_alloc(ev->work, n, false);
-
+	/* a set's elements, as registers, for the batch the set could not read */
+	if (s->elems == NULL)
+		vexec_saop_elems(ev->node->mcxt, s);
 	for (i = 0; i < s->nelems && vexec_bits_any(compute, n); i++)
 	{
 		VexecVec   *args[2];
@@ -1488,6 +1473,266 @@ eval_saop(VexecEval *ev, VexecExpr *e, const uint64 *active)
 			}
 		}
 	}
+}
+
+/* VEXEC_SAOP_NUMERIC's equalities of a row's value with a key (inset.h) */
+typedef struct SaopScaled
+{
+	int64		value;
+	int			scale;
+} SaopScaled;
+
+static bool
+saop_scaled_eq(void *arg, Datum key)
+{
+	const SaopScaled *v = arg;
+
+	return vexec_scaled_numeric_eq(v->value, v->scale, key);
+}
+
+static bool
+saop_numeric_eq(void *arg, Datum key)
+{
+	return DatumGetBool(DirectFunctionCall2(numeric_eq, *(const Datum *) arg, key));
+}
+
+/*
+ * Whether the set has row i's value, x read as saop_lookup() made it
+ * readable.  A numeric is looked up by hash_numeric()'s hash and compared by
+ * numeric_eq()'s rule: a scaled int64 through batch/numeric.c's own, which
+ * make no numeric (F10), an int128 or a Datum through numeric.c's, which
+ * allocate in the work batch's memory, the current one.
+ */
+static bool
+saop_found(VexecEval *ev, const VexecSaopHash *h, const VexecVec *x, int i)
+{
+	const VexecInSet *set = h->set;
+	int			r = vexec_arg_row(x, i);
+
+	switch (h->key)
+	{
+		case VEXEC_SAOP_INT:
+			switch (x->shape.width)
+			{
+				case 2:
+					return vexec_inset_has_int(set, ((const int16 *) x->values)[r]);
+				case 4:
+					return vexec_inset_has_int(set, ((const int32 *) x->values)[r]);
+				default:
+					return vexec_inset_has_int(set, ((const int64 *) x->values)[r]);
+			}
+		case VEXEC_SAOP_OID:
+			return vexec_inset_has_int(set, (int64) ((const uint32 *) x->values)[r]);
+		case VEXEC_SAOP_CHAR:
+			return vexec_inset_has_int(set, (int64) ((const uint8 *) x->values)[r]);
+		case VEXEC_SAOP_BOOL:
+			return vexec_inset_has_int(set, x->shape.layout == VEXEC_BIT_BOOL ?
+									   (vexec_bit((const uint64 *) x->values, r) ? 1 : 0) :
+									   (((const uint8 *) x->values)[r] != 0 ? 1 : 0));
+		case VEXEC_SAOP_FLOAT:
+			return vexec_inset_has_int(set,
+									   vexec_inset_float_key(x->shape.width == 4 ?
+															 (float8) ((const float4 *) x->values)[r] :
+															 ((const float8 *) x->values)[r]));
+		case VEXEC_SAOP_DATE:
+			return vexec_inset_has_int(set, ((const int32 *) x->values)[r]);
+		case VEXEC_SAOP_TIMESTAMP:
+			return vexec_inset_has_int(set, ((const int64 *) x->values)[r]);
+		case VEXEC_SAOP_UUID:
+			return vexec_inset_has_bytes(set, (const char *) x->values + (Size) r * x->shape.stride,
+										 UUID_LEN);
+		case VEXEC_SAOP_TEXT:
+		case VEXEC_SAOP_BPCHAR:
+			{
+				const char *p;
+				Size		len;
+
+				vexec_vec_value_bytes(x, r, &p, &len);
+				if (h->key == VEXEC_SAOP_BPCHAR)
+					len = vexec_inset_bpchar_len(p, (int) len);
+				return vexec_inset_has_bytes(set, p, (int) len);
+			}
+		case VEXEC_SAOP_NUMERIC:
+			{
+				Datum		d;
+
+				if (x->shape.layout == VEXEC_SCALED && x->shape.width == 8)
+				{
+					SaopScaled	v = {((const int64 *) x->values)[r], x->shape.scale};
+
+					return vexec_inset_has_hashed(set, vexec_scaled_hash_numeric(v.value, v.scale),
+												  saop_scaled_eq, &v);
+				}
+				if (x->shape.layout == VEXEC_SCALED)
+					d = vexec_scaled_to_numeric(ev->work, ((const int128 *) x->values)[r],
+												x->shape.scale);
+				else
+					d = ((const Datum *) x->values)[r];
+				return vexec_inset_has_hashed(set,
+											  DatumGetUInt32(DirectFunctionCall1(hash_numeric, d)),
+											  saop_numeric_eq, &d);
+			}
+	}
+	return false;
+}
+
+/*
+ * x op ANY / ALL (array) of many elements, by its set (inset.h): the rows
+ * of `compute` whose value the set has into `found` -- ANY's true, ALL's
+ * false -- and, where the array has a NULL, every row of `compute` into
+ * `nulls`, which a found row's answer overrides: ExecEvalHashedScalarArrayOp()'s
+ * answers, for a strict equality (execExprInterp.c:4426-4450).  False, with
+ * nothing written, where x's layout is none a key is read from here: the
+ * elements are then compared one by one (saop_compare()).
+ */
+static bool
+saop_lookup(VexecEval *ev, VexecExpr *e, VexecVec *x, const uint64 *compute, uint64 *found,
+			uint64 *nulls)
+{
+	const VexecSaopHash *h = e->saop->hash;
+	const VexecInSet *set = h->set;
+	int			n = ev->nrows;
+	int			layout = x->shape.layout;
+	int			width = x->shape.width;
+	bool		readable;
+	MemoryContext old;
+
+	switch (h->key)
+	{
+		case VEXEC_SAOP_INT:
+			readable = layout == VEXEC_FIXED && (width == 2 || width == 4 || width == 8);
+			break;
+		case VEXEC_SAOP_OID:
+		case VEXEC_SAOP_DATE:
+			readable = layout == VEXEC_FIXED && width == 4;
+			break;
+		case VEXEC_SAOP_CHAR:
+			readable = layout == VEXEC_FIXED && width == 1;
+			break;
+		case VEXEC_SAOP_TIMESTAMP:
+			readable = layout == VEXEC_FIXED && width == 8;
+			break;
+		case VEXEC_SAOP_FLOAT:
+			readable = layout == VEXEC_FIXED && (width == 4 || width == 8);
+			break;
+		case VEXEC_SAOP_BOOL:
+			readable = layout == VEXEC_BIT_BOOL || layout == VEXEC_BYTE_BOOL;
+			break;
+		case VEXEC_SAOP_UUID:
+			readable = layout == VEXEC_FIXED && width == UUID_LEN;
+			break;
+		case VEXEC_SAOP_TEXT:
+		case VEXEC_SAOP_BPCHAR:
+			readable = (layout == VEXEC_DATUM && x->type->typlen == -1) ||
+				layout == VEXEC_VIEW || layout == VEXEC_OFFSETS;
+			break;
+		case VEXEC_SAOP_NUMERIC:
+			readable = (layout == VEXEC_SCALED && (width == 8 || width == 16)) ||
+				layout == VEXEC_DATUM;
+			break;
+		default:
+			readable = false;
+			break;
+	}
+	if (!readable)
+		return false;
+
+	/* a date or a timestamp kept in Arrow's epoch, back in PostgreSQL's (§3.4.2) */
+	if ((h->key == VEXEC_SAOP_DATE || h->key == VEXEC_SAOP_TIMESTAMP) && x->shape.arrow_values)
+	{
+		VexecShape	to = x->shape;
+		VexecVec   *c = vexec_batch_alloc(ev->work, sizeof(VexecVec));
+
+		to.arrow_values = false;
+		*c = *x;
+		if (!vexec_vec_convert(ev->work, c, &to))
+			return false;
+		x = c;
+	}
+	/* a text Datum compressed or stored out of line, detoasted */
+	if ((h->key == VEXEC_SAOP_TEXT || h->key == VEXEC_SAOP_BPCHAR) && layout == VEXEC_DATUM)
+	{
+		VexecKernelCall kc;
+
+		memset(&kc, 0, sizeof(kc));
+		kc.work = ev->work;
+		kc.nrows = n;
+		kc.active = compute;
+		x = vexec_text_plain(&kc, x);
+	}
+
+	if (h->has_null)
+		vexec_bits_or_into(nulls, compute, n);
+	old = MemoryContextSwitchTo(ev->work->mcxt);
+	if (x->encoding == VEXEC_CONST)
+	{
+		if (vexec_bits_any(compute, n) && saop_found(ev, h, x, 0))
+			vexec_bits_or_into(found, compute, n);
+	}
+	else if (h->key == VEXEC_SAOP_INT && width == 4)
+	{
+		const int32 *v = x->values;
+
+		VEXEC_FOREACH_ROW(compute, n, i)
+			if (vexec_inset_has_int(set, v[i]))
+			vexec_bit_set(found, i);
+	}
+	else if ((h->key == VEXEC_SAOP_INT || h->key == VEXEC_SAOP_TIMESTAMP) && width == 8)
+	{
+		const int64 *v = x->values;
+
+		VEXEC_FOREACH_ROW(compute, n, i)
+			if (vexec_inset_has_int(set, v[i]))
+			vexec_bit_set(found, i);
+	}
+	else
+	{
+		VEXEC_FOREACH_ROW(compute, n, i)
+			if (saop_found(ev, h, x, i))
+			vexec_bit_set(found, i);
+	}
+	MemoryContextSwitchTo(old);
+	return true;
+}
+
+/*
+ * x op ANY / ALL (array), combined as ExecEvalScalarArrayOp combines them
+ * (PG19:src/backend/executor/execExprInterp.c:4033): an empty array gives
+ * false for ANY and true for ALL whatever x is; a NULL x gives NULL;
+ * otherwise ANY is true where any element's comparison is true, else NULL
+ * where any was NULL, else false, and ALL the reverse.  Many elements of an
+ * equality are looked up in a set, as ExecEvalHashedScalarArrayOp() looks
+ * them up (saop_lookup()); others are compared one by one.
+ */
+static VexecVec *
+eval_saop(VexecEval *ev, VexecExpr *e, const uint64 *active)
+{
+	VexecSaop  *s = (VexecSaop *) e->saop;
+	uint64	   *live = live_rows(ev, active);
+	VexecVec   *x;
+	uint64	   *xvalid = NULL;
+	uint64	   *compute;
+	uint64	   *decided;
+	uint64	   *nulls;
+	uint64	   *truth;
+	uint64	   *valid = NULL;
+	int			n = ev->nrows;
+	int			w;
+
+	if (s->array_null)
+		return bool_register(ev, vexec_bitmap_alloc(ev->work, n, false),
+							 vexec_bitmap_alloc(ev->work, n, false));
+	if (s->nelems == 0)
+		return bool_register(ev, vexec_bitmap_alloc(ev->work, n, !e->useOr), NULL);
+
+	x = kernel_arg(ev, vexec_eval(ev, e->args[0], live), NULL, 0);
+	live = live_rows(ev, live);
+	compute = strict_rows(ev, &x, 1, live, &xvalid);
+	decided = vexec_bitmap_alloc(ev->work, n, false);
+	nulls = vexec_bitmap_alloc(ev->work, n, false);
+
+	if (s->hash == NULL || !saop_lookup(ev, e, x, compute, decided, nulls))
+		saop_compare(ev, e, x, compute, decided, nulls);
 
 	truth = vexec_bitmap_alloc(ev->work, n, false);
 	for (w = 0; w < VEXEC_WORDS(n); w++)

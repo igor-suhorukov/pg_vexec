@@ -42,7 +42,9 @@ typedef enum VexecHeapCheckKind
 								 * compared with constants */
 	VEXEC_CHECK_BYTES,			/* text or bytea equal to one of constants */
 	VEXEC_CHECK_LIKE,			/* text LIKE a literal pattern */
-	VEXEC_CHECK_NULL			/* IS NULL */
+	VEXEC_CHECK_NULL,			/* IS NULL */
+	VEXEC_CHECK_INT_SET,		/* INT's equal to one of many: in `set` */
+	VEXEC_CHECK_BYTES_SET		/* BYTES' of many: in `set` */
 } VexecHeapCheckKind;
 
 typedef struct VexecHeapCheck
@@ -58,6 +60,8 @@ typedef struct VexecHeapCheck
 	int64	   *ints;
 	const char **bytes;			/* BYTES, and LIKE's literal */
 	int		   *lens;
+	struct VexecInSet *set;		/* INT_SET's and BYTES_SET's values, the set of
+								 * them (expr/inset.h), else NULL */
 } VexecHeapCheck;
 
 extern VexecHeapCheck *vexec_heap_checks(Relation rel, Index scanrelid, List *quals,

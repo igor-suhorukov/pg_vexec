@@ -52,13 +52,19 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "utils/array.h"
+#include "utils/date.h"
+#include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/pg_locale.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
+#include "utils/uuid.h"
 
 #include "vexec.h"
 #include "batch/batch.h"
 #include "expr/expr.h"
+#include "expr/inset.h"
 #include "expr/kernel.h"
 
 /*
@@ -301,22 +307,29 @@ new_expr(VexecCompileContext *cc, VexecExprKind kind, Expr *expr, int nargs)
 	return e;
 }
 
-/* A constant as a one-value batch column, in the node's memory. */
+/* A constant as a one-value batch column, in mcxt. */
 static VexecVec *
-const_vec(VexecCompileContext *cc, Const *c, VexecType *type)
+const_vec_in(MemoryContext mcxt, Const *c, VexecType *type)
 {
-	VexecBatch *b = vexec_batch_create(cc->mcxt, 1, &type);
+	VexecBatch *b = vexec_batch_create(mcxt, 1, &type);
 	Datum		value = c->constvalue;
 	bool		isnull = c->constisnull;
 	VexecVec   *v;
 
 	vexec_batch_begin_rows(b);
 	vexec_batch_add_values(b, &value, &isnull);
-	v = MemoryContextAlloc(cc->mcxt, sizeof(VexecVec));
+	v = MemoryContextAlloc(mcxt, sizeof(VexecVec));
 	*v = b->cols[0];
 	v->encoding = VEXEC_CONST;
 	v->nvalues = 1;
 	return v;
+}
+
+/* A constant as a one-value batch column, in the node's memory. */
+static VexecVec *
+const_vec(VexecCompileContext *cc, Const *c, VexecType *type)
+{
+	return const_vec_in(cc->mcxt, c, type);
 }
 
 /* A Var of the node's input, or NULL when the input has no column for it. */
@@ -336,13 +349,216 @@ compile_var(VexecCompileContext *cc, Var *var)
 	return e;
 }
 
-/* An IN list's array as constant registers, one per element. */
+/*
+ * The equalities, and their negations, whose IN lists of many elements are
+ * looked up in a set (inset.h), and how a value is read as a key: each a
+ * function a kernel is bound to (k_compare.c, k_text.c, k_numeric.c), so
+ * that its VE_SAOP is compiled at all.  x = ANY of an equality is true where
+ * the set has x; x <> ALL of its negation is false there, as
+ * ExecEvalHashedScalarArrayOp() answers NOT IN (execExprInterp.c:4426-4430).
+ * The pairs of integer widths and of float widths compare their values
+ * widened, so their keys are too: PostgreSQL hashes none of them, since the
+ * two sides' hash functions differ (clauses.c's condition 3), and prices
+ * them as a linear search, above what the set costs.
+ */
+static const struct
+{
+	Oid			funcid;
+	bool		eq;				/* =, else <> */
+	uint8		key;			/* VexecSaopKey */
+}			saop_keys[] =
+{
+	{F_INT2EQ, true, VEXEC_SAOP_INT}, {F_INT2NE, false, VEXEC_SAOP_INT},
+	{F_INT4EQ, true, VEXEC_SAOP_INT}, {F_INT4NE, false, VEXEC_SAOP_INT},
+	{F_INT8EQ, true, VEXEC_SAOP_INT}, {F_INT8NE, false, VEXEC_SAOP_INT},
+	{F_INT24EQ, true, VEXEC_SAOP_INT}, {F_INT24NE, false, VEXEC_SAOP_INT},
+	{F_INT42EQ, true, VEXEC_SAOP_INT}, {F_INT42NE, false, VEXEC_SAOP_INT},
+	{F_INT28EQ, true, VEXEC_SAOP_INT}, {F_INT28NE, false, VEXEC_SAOP_INT},
+	{F_INT82EQ, true, VEXEC_SAOP_INT}, {F_INT82NE, false, VEXEC_SAOP_INT},
+	{F_INT48EQ, true, VEXEC_SAOP_INT}, {F_INT48NE, false, VEXEC_SAOP_INT},
+	{F_INT84EQ, true, VEXEC_SAOP_INT}, {F_INT84NE, false, VEXEC_SAOP_INT},
+	{F_OIDEQ, true, VEXEC_SAOP_OID}, {F_OIDNE, false, VEXEC_SAOP_OID},
+	{F_CHAREQ, true, VEXEC_SAOP_CHAR}, {F_CHARNE, false, VEXEC_SAOP_CHAR},
+	{F_BOOLEQ, true, VEXEC_SAOP_BOOL}, {F_BOOLNE, false, VEXEC_SAOP_BOOL},
+	{F_FLOAT4EQ, true, VEXEC_SAOP_FLOAT}, {F_FLOAT4NE, false, VEXEC_SAOP_FLOAT},
+	{F_FLOAT8EQ, true, VEXEC_SAOP_FLOAT}, {F_FLOAT8NE, false, VEXEC_SAOP_FLOAT},
+	{F_FLOAT48EQ, true, VEXEC_SAOP_FLOAT}, {F_FLOAT48NE, false, VEXEC_SAOP_FLOAT},
+	{F_FLOAT84EQ, true, VEXEC_SAOP_FLOAT}, {F_FLOAT84NE, false, VEXEC_SAOP_FLOAT},
+	{F_DATE_EQ, true, VEXEC_SAOP_DATE}, {F_DATE_NE, false, VEXEC_SAOP_DATE},
+	{F_TIMESTAMP_EQ, true, VEXEC_SAOP_TIMESTAMP}, {F_TIMESTAMP_NE, false, VEXEC_SAOP_TIMESTAMP},
+	{F_TIMESTAMPTZ_EQ, true, VEXEC_SAOP_TIMESTAMP}, {F_TIMESTAMPTZ_NE, false, VEXEC_SAOP_TIMESTAMP},
+	{F_UUID_EQ, true, VEXEC_SAOP_UUID}, {F_UUID_NE, false, VEXEC_SAOP_UUID},
+	{F_TEXTEQ, true, VEXEC_SAOP_TEXT}, {F_TEXTNE, false, VEXEC_SAOP_TEXT},
+	{F_BPCHAREQ, true, VEXEC_SAOP_BPCHAR}, {F_BPCHARNE, false, VEXEC_SAOP_BPCHAR},
+	{F_NUMERIC_EQ, true, VEXEC_SAOP_NUMERIC}, {F_NUMERIC_NE, false, VEXEC_SAOP_NUMERIC},
+};
+
+/*
+ * How x op ANY / ALL of a constant array of nelems elements is decided: by
+ * a set's lookup, its key's kind (VexecSaopKey), where the elements are as
+ * many as PostgreSQL hashes (inset.h) and the call is x = ANY of an
+ * equality above, or x <> ALL of its negation, text's under a
+ * deterministic collation, which compares bytes; else VEXEC_SAOP_LINEAR.
+ * The planner asks it too (plan/oracle.c), and the node's compilation
+ * answers it again when the node begins.
+ */
+int
+vexec_saop_key(Oid opfuncid, bool useOr, Oid collation, int nelems)
+{
+	int			i;
+
+	if (nelems < VEXEC_INSET_MIN)
+		return VEXEC_SAOP_LINEAR;
+	for (i = 0; i < lengthof(saop_keys); i++)
+	{
+		if (saop_keys[i].funcid != opfuncid)
+			continue;
+		if (saop_keys[i].eq != useOr)
+			return VEXEC_SAOP_LINEAR;
+		if ((saop_keys[i].key == VEXEC_SAOP_TEXT || saop_keys[i].key == VEXEC_SAOP_BPCHAR) &&
+			vexec_collation_class(collation) == InvalidOid)
+			return VEXEC_SAOP_LINEAR;
+		return saop_keys[i].key;
+	}
+	return VEXEC_SAOP_LINEAR;
+}
+
+/* vexec_saop_key() of an expression: LINEAR unless its array is a constant */
+int
+vexec_saop_key_of(ScalarArrayOpExpr *saop)
+{
+	Const	   *c;
+	ArrayType  *arr;
+
+	if (list_length(saop->args) != 2 || !IsA(lsecond(saop->args), Const))
+		return VEXEC_SAOP_LINEAR;
+	c = lsecond_node(Const, saop->args);
+	if (c->constisnull)
+		return VEXEC_SAOP_LINEAR;
+	set_sa_opfuncid(saop);
+	arr = DatumGetArrayTypeP(c->constvalue);
+	return vexec_saop_key(saop->opfuncid, saop->useOr, saop->inputcollid,
+						  ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)));
+}
+
+/*
+ * The elements but NULLs as a set of the key's kind, in the current memory
+ * context, the node's; NULL where they are ints too few for a set that is
+ * no bitmap (inset.h's VEXEC_INSET_MIN_HASHED_INTS), which a kernel's
+ * comparisons answer sooner -- the planner prices either as about one
+ * lookup.  An element is read by its key and its length, not its type's
+ * OID: a constant folded from a binary-compatible relabelling, an array of
+ * regclass taken as oid's, keeps its own element type.
+ */
+static VexecSaopHash *
+saop_set(int key, const Datum *values, const bool *nulls, int nelems, int16 elmlen)
+{
+	VexecSaopHash *h = palloc0(sizeof(VexecSaopHash));
+	VexecInSetKind kind;
+	int			i;
+
+	kind = key == VEXEC_SAOP_UUID || key == VEXEC_SAOP_TEXT || key == VEXEC_SAOP_BPCHAR ?
+		VEXEC_INSET_BYTES : key == VEXEC_SAOP_NUMERIC ? VEXEC_INSET_HASHED : VEXEC_INSET_INTS;
+	h->key = key;
+	h->set = vexec_inset_create(CurrentMemoryContext, kind, nelems);
+	for (i = 0; i < nelems; i++)
+	{
+		Datum		d = values[i];
+
+		if (nulls[i])
+		{
+			h->has_null = true;
+			continue;
+		}
+		switch (key)
+		{
+			case VEXEC_SAOP_INT:
+				vexec_inset_add_int(h->set, elmlen == 2 ? (int64) DatumGetInt16(d) :
+									elmlen == 4 ? (int64) DatumGetInt32(d) : DatumGetInt64(d));
+				break;
+			case VEXEC_SAOP_OID:
+				vexec_inset_add_int(h->set, (int64) DatumGetObjectId(d));
+				break;
+			case VEXEC_SAOP_CHAR:
+				vexec_inset_add_int(h->set, (int64) (uint8) DatumGetChar(d));
+				break;
+			case VEXEC_SAOP_BOOL:
+				vexec_inset_add_int(h->set, DatumGetBool(d) ? 1 : 0);
+				break;
+			case VEXEC_SAOP_FLOAT:
+				vexec_inset_add_int(h->set,
+									vexec_inset_float_key(elmlen == 4 ? (float8) DatumGetFloat4(d) :
+														  DatumGetFloat8(d)));
+				break;
+			case VEXEC_SAOP_DATE:
+				vexec_inset_add_int(h->set, (int64) DatumGetDateADT(d));
+				break;
+			case VEXEC_SAOP_TIMESTAMP:
+				vexec_inset_add_int(h->set, (int64) DatumGetTimestamp(d));
+				break;
+			case VEXEC_SAOP_UUID:
+				vexec_inset_add_bytes(h->set, (const char *) DatumGetUUIDP(d)->data, UUID_LEN);
+				break;
+			case VEXEC_SAOP_TEXT:
+			case VEXEC_SAOP_BPCHAR:
+				{
+					varlena    *v = (varlena *) PG_DETOAST_DATUM_PACKED(d);
+					const char *p = VARDATA_ANY(v);
+					int			len = VARSIZE_ANY_EXHDR(v);
+
+					if (key == VEXEC_SAOP_BPCHAR)
+						len = vexec_inset_bpchar_len(p, len);
+					vexec_inset_add_bytes(h->set, p, len);
+					break;
+				}
+			case VEXEC_SAOP_NUMERIC:
+				{
+					Datum		copy = PointerGetDatum(PG_DETOAST_DATUM_COPY(d));
+
+					vexec_inset_add_hashed(h->set,
+										   DatumGetUInt32(DirectFunctionCall1(hash_numeric, copy)),
+										   copy);
+					break;
+				}
+		}
+	}
+	vexec_inset_finish(h->set);
+	if (kind == VEXEC_INSET_INTS && h->set->bits == NULL && nelems < VEXEC_INSET_MIN_HASHED_INTS)
+		return NULL;
+	return h;
+}
+
+/* The elements as constant registers, in the current memory context. */
+static void
+saop_make_elems(VexecSaop *s, const Datum *values, const bool *nulls, Oid elemtype,
+				int16 elmlen, bool elmbyval)
+{
+	MemoryContext mcxt = CurrentMemoryContext;
+	int			i;
+
+	s->elems = palloc0(sizeof(VexecVec *) * Max(s->nelems, 1));
+	for (i = 0; i < s->nelems; i++)
+	{
+		Const	   *c;
+
+		if (nulls[i])
+			continue;
+		c = makeConst(elemtype, -1, s->arr->constcollid, elmlen, values[i], false, elmbyval);
+		s->elems[i] = const_vec_in(mcxt, c, s->elem_type);
+	}
+}
+
+/*
+ * An IN list's array: its elements as a set where vexec_saop_key() says
+ * so and saop_set() makes one, else as constant registers, one per element.
+ */
 static VexecSaop *
-compile_saop_array(VexecCompileContext *cc, Const *arr)
+compile_saop_array(VexecCompileContext *cc, Const *arr, Oid funcid, bool useOr, Oid collation)
 {
 	VexecSaop  *s = MemoryContextAllocZero(cc->mcxt, sizeof(VexecSaop));
 	MemoryContext old = MemoryContextSwitchTo(cc->mcxt);
 
+	s->arr = arr;
 	if (arr->constisnull)
 		s->array_null = true;
 	else
@@ -354,24 +570,48 @@ compile_saop_array(VexecCompileContext *cc, Const *arr)
 		char		elmalign;
 		Datum	   *values;
 		bool	   *nulls;
-		int			i;
-		VexecType  *type = vexec_type_make(elemtype, exprTypmod((Node *) arr), arr->constcollid);
+		int			key;
 
+		s->elem_type = vexec_type_make(elemtype, exprTypmod((Node *) arr), arr->constcollid);
 		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 		deconstruct_array(a, elemtype, elmlen, elmbyval, elmalign, &values, &nulls, &s->nelems);
-		s->elems = palloc0(sizeof(VexecVec *) * Max(s->nelems, 1));
-		for (i = 0; i < s->nelems; i++)
-		{
-			Const	   *c;
-
-			if (nulls[i])
-				continue;
-			c = makeConst(elemtype, -1, arr->constcollid, elmlen, values[i], false, elmbyval);
-			s->elems[i] = const_vec(cc, c, type);
-		}
+		key = vexec_saop_key(funcid, useOr, collation, s->nelems);
+		if (key != VEXEC_SAOP_LINEAR)
+			s->hash = saop_set(key, values, nulls, s->nelems, elmlen);
+		if (s->hash == NULL)
+			saop_make_elems(s, values, nulls, elemtype, elmlen, elmbyval);
 	}
 	MemoryContextSwitchTo(old);
 	return s;
+}
+
+/*
+ * A set's elements as constant registers, made in mcxt the first time a
+ * batch comes that the set cannot read (eval.c's eval_saop()).
+ */
+void
+vexec_saop_elems(MemoryContext mcxt, VexecSaop *s)
+{
+	MemoryContext old;
+	ArrayType  *a;
+	Oid			elemtype;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *values;
+	bool	   *nulls;
+	int			n;
+
+	if (s->elems != NULL || s->array_null)
+		return;
+	old = MemoryContextSwitchTo(mcxt);
+	a = DatumGetArrayTypeP(s->arr->constvalue);
+	elemtype = ARR_ELEMTYPE(a);
+	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(a, elemtype, elmlen, elmbyval, elmalign, &values, &nulls, &n);
+	Assert(n == s->nelems);
+	saop_make_elems(s, values, nulls, elemtype, elmlen, elmbyval);
+	MemoryContextSwitchTo(old);
 }
 
 /*
@@ -410,7 +650,8 @@ compile_call(VexecCompileContext *cc, Expr *expr, VexecExprKind kind, Oid funcid
 	if (IsA(expr, ScalarArrayOpExpr) && !any_list)
 	{
 		e->useOr = ((ScalarArrayOpExpr *) expr)->useOr;
-		e->saop = compile_saop_array(cc, lsecond_node(Const, args));
+		e->saop = compile_saop_array(cc, lsecond_node(Const, args), funcid, e->useOr,
+									 inputcollid);
 	}
 	foreach(lc, args)
 	{
@@ -431,6 +672,8 @@ compile_call(VexecCompileContext *cc, Expr *expr, VexecExprKind kind, Oid funcid
 	}
 	if (e->decl == NULL)
 		cc->nkernels++;
+	if (e->saop != NULL && e->saop->hash != NULL)
+		cc->nhashed++;
 	return e;
 }
 
@@ -746,6 +989,7 @@ vexec_compile_expr(VexecCompileContext *cc, Expr *expr)
 	VexecExpr  *e;
 	int			nkernels = cc->nkernels;
 	int			nfallbacks = cc->nfallbacks;
+	int			nhashed = cc->nhashed;
 	int			ndeclared = list_length(cc->declared);
 
 	e = compile_vector(cc, expr);
@@ -754,6 +998,7 @@ vexec_compile_expr(VexecCompileContext *cc, Expr *expr)
 	/* what a failed vector form counted is not in the program */
 	cc->nkernels = nkernels;
 	cc->nfallbacks = nfallbacks;
+	cc->nhashed = nhashed;
 	cc->declared = list_truncate(cc->declared, ndeclared);
 	return dict_input(compile_fallback(cc, expr));
 }
@@ -769,6 +1014,7 @@ vexec_compile_top(VexecCompileContext *cc, Expr *expr, bool is_qual, VexecTop *t
 	MemoryContext old = MemoryContextSwitchTo(cc->mcxt);
 	int			nkernels = cc->nkernels;
 	int			nfallbacks = cc->nfallbacks;
+	int			nhashed = cc->nhashed;
 	int			ndeclared = list_length(cc->declared);
 
 	memset(top, 0, sizeof(VexecTop));
@@ -788,6 +1034,7 @@ vexec_compile_top(VexecCompileContext *cc, Expr *expr, bool is_qual, VexecTop *t
 		top->why_lazy = cc->why ? cc->why : "no vector form";
 		cc->nkernels = nkernels;
 		cc->nfallbacks = nfallbacks;
+		cc->nhashed = nhashed;
 		cc->declared = list_truncate(cc->declared, ndeclared);
 	}
 }

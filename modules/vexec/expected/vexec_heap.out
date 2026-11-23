@@ -398,6 +398,52 @@ SELECT heap_check($$SELECT id FROM hp WHERE t IN ('ccc', 'late9100', NULL)$$);
  same, vector scan
 (1 row)
 
+-- = ANY of nine values and more, as many as PostgreSQL hashes: the reader
+-- looks a tuple's value up in a set of them (expr/inset.h), and so does the
+-- node after it
+SELECT heap_check('SELECT id FROM hp WHERE s = ANY (ARRAY[1, 5, NULL, 299, 250, 251, 252, 253, 254, 255])');
+    heap_check     
+-------------------
+ same, vector scan
+(1 row)
+
+SELECT heap_check(format('SELECT id, s FROM hp WHERE s = ANY (%L::int4[])',
+	(SELECT array_agg(g * 3 - 1)::text FROM generate_series(1, 16000) g)));
+    heap_check     
+-------------------
+ same, vector scan
+(1 row)
+
+SELECT heap_check($$SELECT id FROM hp WHERE d IN ('2020-01-01', '2020-01-02', '2020-01-03', '2020-01-04', '2020-01-05', '2020-02-01', '2020-03-01', '2021-01-01', '2022-06-01')$$);
+    heap_check     
+-------------------
+ same, vector scan
+(1 row)
+
+SELECT heap_check($$SELECT id, t FROM hp WHERE t IN ('ccc', 'late9100', NULL, 'late9101', 'late9102', 'b', 'bb', 'dflt', 'late9299', '')$$);
+    heap_check     
+-------------------
+ same, vector scan
+(1 row)
+
+SELECT heap_check(format('SELECT id FROM hp WHERE v = ANY (%L::text[])',
+	(SELECT array_agg('v' || g)::text FROM generate_series(1, 500, 2) g)));
+    heap_check     
+-------------------
+ same, vector scan
+(1 row)
+
+SELECT heap_explain($$SELECT id FROM hp WHERE s IN (1, 5, 299, 250, 251, 252, 253, 254, 255) AND t IN ('ccc', 'late9100')$$,
+	'Vec Seq Scan|Prefilter|Hashed IN Lists');
+                    heap_explain                     
+-----------------------------------------------------
+ Vec Seq Scan on public.hp (actual rows=N.N loops=N)
+   Hashed IN Lists: N
+   Prefilter: N of N quals
+   Prefilter Hashed IN Lists: N
+   Rows Prefiltered: N
+(5 rows)
+
 SELECT heap_check($$SELECT id FROM hp WHERE t LIKE 'ddd%' AND t NOT LIKE '%dddddddddddddddd%'$$);
     heap_check     
 -------------------

@@ -9,7 +9,8 @@
 --
 -- The cases: batch edges (1023, 1024 and 1025 rows; filters that keep 63,
 -- 64 and 65 rows of a word); NULLs, three-valued logic, IS DISTINCT FROM,
--- ANY and ALL with NULLs; errors inside a batch and at its edge, and none
+-- ANY and ALL with NULLs, and IN lists looked up in a set (expr/inset.h);
+-- errors inside a batch and at its edge, and none
 -- from rows PostgreSQL never evaluates; floats' NaN, -0 and infinities;
 -- collations; bpchar; numerics at their layout's edges; dates and
 -- timestamps at their limits; LIKE; parameters and InitPlans; rescans;
@@ -121,6 +122,98 @@ SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 < ANY (ARRAY[-100, NULL])')
 SELECT vexec_check('SELECT count(*) FROM vs WHERE t IN (''text 1'', ''text 2'')');
 SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 = ANY (NULL::int4[])');
 
+-- IN lists of nine elements and more, as many as PostgreSQL hashes, looked
+-- up in a set (expr/inset.h): each kind of key -- ints within a bitmap's
+-- range from nine elements, ints too far apart for one from 64, and those
+-- fewer compared one by one -- the integer and float pairs PostgreSQL does
+-- not hash, NULL elements, NOT IN, repeated elements, and lists too long to
+-- compare element by element; the heap reader's checks off, so that the
+-- node decides every row, then on, so that the reader's check of = ANY
+-- looks its values up first
+SET vexec.enable_prefilter = off;
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i2 IN (1, 2, 3, 4, 5, 6, 7, 8, -100, 99)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 IN (-500, -463, 1, 2, 3, 37, 74, 111, 148, NULL)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 NOT IN (-500, -463, 1, 2, 3, 37, 74, 111, 148)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 NOT IN (-500, -463, 1, 2, 3, 37, 74, 111, 148, NULL)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 = ANY (''{37,37,37,74,74,111,148,185,222,259}''::int8[])');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i2 <> ALL (''{1,2,3,4,5,6,7,8,9}''::int8[])');
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE i8 IN (%s)',
+	(SELECT string_agg((g * 1000000007::int8)::text, ', ') FROM generate_series(1, 12) g)));
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE i8 = ANY (%L::int8[])',
+	(SELECT array_agg(g * 1000000007::int8)::text FROM generate_series(1, 100) g)));
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE i8 <> ALL (%L::int8[])',
+	(SELECT (array_agg(g * 1000000007::int8) || NULL::int8)::text FROM generate_series(1, 100) g)));
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE o = ANY (%L::oid[])',
+	'{' || (SELECT string_agg(g::text, ',') FROM generate_series(1, 70) g) || ',4294967295}'));
+SELECT vexec_check('SELECT count(*) FROM vs WHERE f4 IN (0.125, 0.25, 0.375, 0.5, 1, 2, 3, 4, 5)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE f4 = ANY (''{0.125,0.25,0.375,0.5,1,2,3,4,5}''::float8[])');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE f8 IN (0.0625, 0.125, 1, 2, 3, 4, 5, 6, 7.5, NULL)');
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE f8 = ANY (%L::float8[])',
+	(SELECT array_agg(g / 16.0)::text FROM generate_series(1, 200, 3) g)));
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE f4 = ANY (%L::float8[])',
+	(SELECT array_agg(g / 8.0)::text FROM generate_series(1, 200, 3) g)));
+SELECT vexec_check('SELECT count(*) FROM vs WHERE n IN (0.143, 0.1430, 0.286, 1.000, 1.143, 2, 3.5, 140.143, 141.000)');
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE nb IN (%s)',
+	(SELECT string_agg((10::numeric ^ 37 + g)::text, ', ') FROM generate_series(1, 9) g)));
+SELECT vexec_check('SELECT count(*) FROM vs WHERE nf IN (1.5, 3.0, 4.50, 6, 7.5, 9.000, 10.5, ''NaN'', 12, NULL)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE nf NOT IN (1.5, 3.0, 4.50, 6, 7.5, 9.000, 10.5, 12, 13.5)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t IN (''text 1'', ''text 2'', ''text 3'', ''text 10'', ''text 11'', ''text 100'', ''text 0'', '''', ''text 50'')');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t NOT IN (''text 1'', ''text 2'', ''text 3'', ''text 10'', ''text 11'', ''text 100'', ''text 0'', '''', ''text 50'', NULL)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE v IN (''v1'', ''v2'', ''v3'', ''v4'', ''v5'', ''v6'', ''v7'', ''v8'', ''v16'')');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE bp IN (''1'', ''2  '', ''3'', ''x'', ''y'', ''z'', ''w'', ''q'', ''r'')');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE d IN (''2001-01-02'', ''2001-01-03'', ''2001-02-01'', ''2002-01-01'', ''2003-03-03'', ''2004-04-04'', ''2005-05-05'', ''2006-06-06'', ''2007-07-07'', ''infinity'')');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE d IN (''2001-01-02'', ''2001-01-03'', ''2001-02-01'', ''2002-01-01'', ''2003-03-03'', ''2004-04-04'', ''2005-05-05'', ''2006-06-06'', ''2007-07-07'')');
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE d = ANY (%L::date[])',
+	(SELECT (array_agg(DATE '2001-01-01' + g * 13) || '{infinity,-infinity}'::date[])::text
+	 FROM generate_series(1, 70) g)));
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE ts IN (%s)',
+	(SELECT string_agg(quote_literal(TIMESTAMP '2001-01-01' + g * 3 * interval '7 hours'), ', ')
+	 FROM generate_series(1, 12) g)));
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE tz NOT IN (%s)',
+	(SELECT string_agg(quote_literal(TIMESTAMPTZ '2001-01-01 00:00:00+00' + g * 2 * interval '11 hours'), ', ')
+	 FROM generate_series(1, 12) g)));
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE ts = ANY (%L::timestamp[])',
+	(SELECT array_agg(TIMESTAMP '2001-01-01' + g * 3 * interval '7 hours')::text FROM generate_series(1, 80) g)));
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE tz <> ALL (%L::timestamptz[])',
+	(SELECT array_agg(TIMESTAMPTZ '2001-01-01 00:00:00+00' + g * 2 * interval '11 hours')::text
+	 FROM generate_series(1, 80) g)));
+SELECT vexec_check('SELECT count(*) FROM vs WHERE b IN (true, true, true, true, true, true, true, true, true)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE b NOT IN (true, true, true, true, true, true, true, true, true, NULL)');
+SELECT vexec_check(format('SELECT count(*) FROM vs WHERE u IN (%s)',
+	(SELECT string_agg(quote_literal(md5(g::text)), ', ') FROM generate_series(1, 12) g)));
+SELECT vexec_check('SELECT count(*) FROM vs WHERE o IN (1, 2, 3, 4, 5, 6, 7, 8, 9, 4294967295)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE c IN (''A'', ''B'', ''C'', ''D'', ''E'', ''F'', ''G'', ''H'', ''Z'')');
+SELECT vexec_check(format('SELECT count(*), sum(id) FROM vs WHERE i4 = ANY (%L::int4[])',
+	(SELECT array_agg(g * 7 - 500)::text FROM generate_series(1, 16000) g)));
+SELECT vexec_check(format('SELECT count(*), sum(id) FROM vs WHERE t = ANY (%L::text[])',
+	(SELECT array_agg('text ' || g)::text FROM generate_series(0, 20000, 3) g)));
+RESET vexec.enable_prefilter;
+SELECT vexec_check('SELECT count(*) FROM vs WHERE i4 IN (-500, -463, 1, 2, 3, 37, 74, 111, 148, NULL)');
+SELECT vexec_check('SELECT count(*) FROM vs WHERE t IN (''text 1'', ''text 2'', ''text 3'', ''text 10'', ''text 11'', ''text 100'', ''text 0'', '''', ''text 50'')');
+SELECT vexec_check(format('SELECT count(*), sum(id) FROM vs WHERE i4 = ANY (%L::int4[])',
+	(SELECT array_agg(g * 7 - 500)::text FROM generate_series(1, 16000) g)));
+
+-- EXPLAIN VERBOSE counts the lists a node looks up in a set, and those
+-- the heap reader's check does: nine elements are a set, eight are not
+CREATE FUNCTION vexec_plan_lines(q text) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+	r record;
+BEGIN
+	PERFORM set_config('vexec.mode', 'force', true);
+	FOR r IN EXECUTE 'EXPLAIN (VERBOSE, COSTS OFF) ' || q LOOP
+		IF r."QUERY PLAN" ~ 'Vec Seq Scan|Kernel Steps|Hashed IN Lists|Prefilter' THEN
+			RETURN NEXT r."QUERY PLAN";
+		END IF;
+	END LOOP;
+END $$;
+SELECT vexec_plan_lines('SELECT id FROM vs WHERE i4 IN (1, 2, 3, 4, 5, 6, 7, 8, 9) AND t IN (''a'', ''b'')');
+SELECT vexec_plan_lines('SELECT id FROM vs WHERE i4 IN (1, 2, 3, 4, 5, 6, 7, 8) AND nf IN (1, 2, 3, 4, 5, 6, 7, 8, 9)');
+-- ints too far apart for a bitmap: compared one by one below 64 elements
+SELECT vexec_plan_lines(format('SELECT id FROM vs WHERE i8 = ANY (%L::int8[])',
+	(SELECT array_agg(g * 1000000007::int8)::text FROM generate_series(1, 63) g)));
+SELECT vexec_plan_lines(format('SELECT id FROM vs WHERE i8 = ANY (%L::int8[])',
+	(SELECT array_agg(g * 1000000007::int8)::text FROM generate_series(1, 64) g)));
+
 -- errors: inside a batch, at its edge, and PostgreSQL's own
 SELECT vexec_check('SELECT i2 * i2 * i2 * i2 FROM vs WHERE id < 5');
 SELECT vexec_check('SELECT i4 * 1000000 FROM vs');
@@ -158,6 +251,15 @@ SELECT vexec_check('SELECT x FROM vfl WHERE x = 0');
 SELECT vexec_check('SELECT x FROM vfl WHERE y >= x');
 SELECT vexec_check('SELECT x + 1, x * 2, -x FROM vfl');
 SELECT vexec_check('SELECT x - ''Infinity'' FROM vfl WHERE x = ''Infinity''');
+SELECT vexec_check('SELECT x, y FROM vfl WHERE x IN (''NaN'', ''-0'', 2, 3, 4, 5, 6, 7, 8)');
+SELECT vexec_check('SELECT x, y FROM vfl WHERE y = ANY (''{NaN,0,2,3,4,5,6,7,-Infinity}''::float4[])');
+SELECT vexec_check('SELECT x, y FROM vfl WHERE x NOT IN (''NaN'', 0, 2, 3, 4, 5, 6, 7, ''Infinity'')');
+SELECT vexec_check(format('SELECT x, y FROM vfl WHERE x = ANY (%L::float8[])',
+	'{NaN,-0,' || (SELECT string_agg(g::text, ',') FROM generate_series(2, 70) g) || '}'));
+SELECT vexec_check(format('SELECT x, y FROM vfl WHERE y = ANY (%L::float4[])',
+	'{NaN,0,-Infinity,' || (SELECT string_agg(g::text, ',') FROM generate_series(2, 70) g) || '}'));
+SELECT vexec_check(format('SELECT x, y FROM vfl WHERE x <> ALL (%L::float8[])',
+	'{NaN,0,Infinity,' || (SELECT string_agg(g::text, ',') FROM generate_series(2, 70) g) || '}'));
 
 -- collations: bytes, varstr_cmp, and a nondeterministic one left to fmgr
 CREATE COLLATION vexec_und (provider = icu, locale = 'und');
@@ -172,6 +274,10 @@ SELECT vexec_check('SELECT s FROM vco WHERE s = ''a'' COLLATE vexec_ci');
 SELECT vexec_check('SELECT s FROM vco WHERE s >= ''A'' COLLATE vexec_ci');
 SELECT vexec_check('SELECT s FROM vco WHERE s LIKE ''a%'' COLLATE vexec_und');
 SELECT vexec_check('SELECT s FROM vco WHERE s <> ''''');
+SELECT vexec_check('SELECT s FROM vco WHERE s COLLATE "C" IN (''a'', ''A'', ''ä'', ''x1'', ''x2'', ''x3'', ''x4'', ''x5'', ''x6'')');
+SELECT vexec_check('SELECT s FROM vco WHERE s COLLATE vexec_und IN (''a'', ''B'', ''ä'', '''', ''x2'', ''x3'', ''x4'', ''x5'', ''x6'')');
+SELECT vexec_check('SELECT s FROM vco WHERE s COLLATE vexec_ci IN (''a'', ''B'', ''x1'', ''x2'', ''x3'', ''x4'', ''x5'', ''x6'', ''x7'')');
+SELECT vexec_check('SELECT s FROM vco WHERE s COLLATE vexec_ci NOT IN (''a'', ''B'', ''x1'', ''x2'', ''x3'', ''x4'', ''x5'', ''x6'', ''x7'')');
 
 -- bpchar's trailing blanks
 CREATE TABLE vbp (c char(6), v varchar(6));
@@ -183,6 +289,10 @@ SELECT vexec_check('SELECT c, v FROM vbp WHERE c < ''ab c''');
 SELECT vexec_check('SELECT c, v FROM vbp WHERE c LIKE ''ab''');
 SELECT vexec_check('SELECT c, v FROM vbp WHERE c LIKE ''ab%''');
 SELECT vexec_check('SELECT c, v FROM vbp WHERE c LIKE ''%  ''');
+SELECT vexec_check('SELECT c, v FROM vbp WHERE c IN (''ab'', ''x1'', ''x2'', ''x3'', ''x4'', ''x5'', ''x6'', ''x7'', '''')');
+SELECT vexec_check('SELECT c, v FROM vbp WHERE c IN (''ab   '', ''ab c'', ''x2'', ''x3'', ''x4'', ''x5'', ''x6'', ''x7'', ''x8'')');
+SELECT vexec_check('SELECT c, v FROM vbp WHERE v IN (''ab'', ''x1'', ''x2'', ''x3'', ''x4'', ''x5'', ''x6'', ''x7'', ''x8'')');
+SELECT vexec_check('SELECT c, v FROM vbp WHERE c NOT IN (''ab'', ''x1'', ''x2'', ''x3'', ''x4'', ''x5'', ''x6'', ''x7'', ''x8'')');
 
 -- LIKE: literal, prefix, suffix, substring, the general pattern, escapes
 SELECT vexec_check('SELECT count(*) FROM vs WHERE t LIKE ''text 1''');
@@ -249,6 +359,14 @@ SELECT vexec_check('SELECT n * n FROM vnum');
 SELECT vexec_check('SELECT count(*) FROM vnum WHERE k = ''NaN'' OR k > 100');
 SELECT vexec_check('SELECT count(*) FROM vnum WHERE f > 1');
 SELECT vexec_check('SELECT n = 999999999999999999.0, k = 123456.78910 FROM vnum');
+SELECT vexec_check('SELECT n, k, f FROM vnum WHERE n IN (999999999999999999, 0.0, 1, 2, 3, 4, 5, 6, 7)');
+SELECT vexec_check('SELECT m FROM vnum WHERE m IN (999999999999999999999999999999999999.990, -1.00, 0.01, 1, 2, 3, 4, 5, 6)');
+SELECT vexec_check('SELECT k FROM vnum WHERE k IN (123456.78910, ''NaN'', 0, 1, 2, 3, 4, 5, 6)');
+SELECT vexec_check('SELECT f FROM vnum WHERE f IN (1.50, ''NaN'', ''-Infinity'', 1, 2, 3, 4, 5, 6)');
+SELECT vexec_check('SELECT f FROM vnum WHERE f NOT IN (1.50, ''NaN'', 1, 2, 3, 4, 5, 6, 7, NULL)');
+SET vexec.batch_numeric_layout = varlena;
+SELECT vexec_check('SELECT count(*) FROM vs WHERE n IN (0.143, 0.1430, 0.286, 1.000, 1.143, 2, 3.5, 140.143, 141.000)');
+RESET vexec.batch_numeric_layout;
 SELECT vexec_check('SELECT count(*) FROM vs WHERE n > 100.5 AND n <= 120.25');
 SELECT vexec_check('SELECT sum(n * 2), sum(nb - 10::numeric ^ 37), sum(nf + i4) FROM vs');
 SELECT vexec_check('SELECT i4::numeric, i8::numeric, i2::numeric FROM vs WHERE id < 3');
@@ -261,6 +379,15 @@ INSERT INTO vdt VALUES ('infinity', 'infinity'), ('-infinity', '-infinity'),
 	('1970-01-01', '1970-01-01'), (NULL, NULL);
 SELECT vexec_check('SELECT d, ts FROM vdt WHERE d > ''2000-01-01''');
 SELECT vexec_check('SELECT d, ts FROM vdt WHERE ts < ''1999-12-31''');
+SELECT vexec_check('SELECT d, ts FROM vdt WHERE d IN (''infinity'', ''-infinity'', ''2000-01-01'', ''5874897-12-31'', ''1970-01-01'', ''2001-01-01'', ''2002-01-01'', ''2003-01-01'', ''2004-01-01'')');
+SELECT vexec_check('SELECT d, ts FROM vdt WHERE ts IN (''infinity'', ''2000-01-01'', ''294276-12-31 23:59:59.999999'', ''4713-11-24 00:00:00 BC'', ''1970-01-01'', ''2001-01-01'', ''2002-01-01'', ''2003-01-01'', ''2004-01-01'')');
+SELECT vexec_check(format('SELECT d, ts FROM vdt WHERE d = ANY (%L::date[])',
+	(SELECT (array_agg(DATE '2001-01-01' + g) || '{infinity,-infinity,2000-01-01,5874897-12-31,1970-01-01}'::date[])::text
+	 FROM generate_series(1, 70) g)));
+SELECT vexec_check(format('SELECT d, ts FROM vdt WHERE ts = ANY (%L::timestamp[])',
+	(SELECT (array_agg(TIMESTAMP '2001-01-01' + g * interval '1 day') ||
+			 '{infinity,2000-01-01,"294276-12-31 23:59:59.999999","4713-11-24 00:00:00 BC",1970-01-01}'::timestamp[])::text
+	 FROM generate_series(1, 70) g)));
 SELECT vexec_check('SELECT d FROM vdt WHERE d < ts');
 SELECT vexec_check('SELECT d FROM vdt WHERE d = ''2000-01-01''::timestamp');
 SELECT vexec_check('SELECT d::timestamp FROM vdt');

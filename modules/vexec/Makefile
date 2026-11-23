@@ -56,6 +56,7 @@ OBJS = \
 	expr/k_text.o \
 	expr/k_regex.o \
 	expr/k_nested.o \
+	expr/inset.o \
 	expr/kernels.o \
 	expr/packs.o \
 	expr/strsearch.o \

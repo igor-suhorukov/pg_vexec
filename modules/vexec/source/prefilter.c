@@ -34,7 +34,9 @@
  *							text and bytea = and <>, under a deterministic
  *							collation, which compare their bytes
  *	column = ANY (array)	of those types' equalities, the array a
- *							constant
+ *							constant; its values a set (expr/inset.h)
+ *							where they are many enough for a lookup to
+ *							beat comparing them
  *	column LIKE constant	a literal, a prefix, a suffix or a substring,
  *							H7's kinds (expr/k_text.c), NOT LIKE too
  *	column IS [NOT] NULL
@@ -69,6 +71,7 @@
 
 #include "vexec.h"
 #include "expr/expr.h"
+#include "expr/inset.h"
 #include "source/source.h"
 
 #define DATETIME_BTREE_FAM_OID	434		/* datetime_ops, which has no symbol */
@@ -343,6 +346,13 @@ check_saop(ScalarArrayOpExpr *saop, Index scanrelid, Relation rel, VexecHeapChec
 			const_bytes(elems[i], &k->bytes[k->nvalues], &k->lens[k->nvalues]);
 			k->nvalues++;
 		}
+		if (k->nvalues >= VEXEC_INSET_MIN_READER_BYTES)
+		{
+			k->kind = VEXEC_CHECK_BYTES_SET;
+			k->set = vexec_inset_create(CurrentMemoryContext, VEXEC_INSET_BYTES, k->nvalues);
+			for (int i = 0; i < k->nvalues; i++)
+				vexec_inset_add_bytes(k->set, k->bytes[i], k->lens[i]);
+		}
 		return true;
 	}
 	if (int_type(att->atttypid, &k->is_unsigned) && att->attbyval &&
@@ -356,6 +366,17 @@ check_saop(ScalarArrayOpExpr *saop, Index scanrelid, Relation rel, VexecHeapChec
 		for (int i = 0; i < nelems; i++)
 			if (!nulls[i])
 				k->ints[k->nvalues++] = int_value(elems[i], elemtype);
+		if (k->nvalues >= VEXEC_INSET_MIN)
+		{
+			k->set = vexec_inset_create(CurrentMemoryContext, VEXEC_INSET_INTS, k->nvalues);
+			for (int i = 0; i < k->nvalues; i++)
+				vexec_inset_add_int(k->set, k->ints[i]);
+			vexec_inset_finish(k->set);
+			if (k->set->bits == NULL && k->nvalues < VEXEC_INSET_MIN_HASHED_INTS)
+				k->set = NULL;
+			else
+				k->kind = VEXEC_CHECK_INT_SET;
+		}
 		return true;
 	}
 	return false;

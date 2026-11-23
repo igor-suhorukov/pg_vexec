@@ -143,6 +143,7 @@
 #include "batch/batch.h"
 #include "exec/exec.h"
 #include "expr/expr.h"
+#include "expr/inset.h"
 #include "source/source.h"
 
 /* What a column's value is written as, per column. */
@@ -894,6 +895,14 @@ check_passes(const VexecHeapCheck *k, const char *p)
 				}
 				break;
 			}
+		case VEXEC_CHECK_INT_SET:
+			m = vexec_inset_has_int(k->set, check_int(k, p));
+			break;
+		case VEXEC_CHECK_BYTES_SET:
+			if (VARATT_IS_COMPRESSED(p) || VARATT_IS_EXTERNAL(p))
+				return true;	/* the node decides it */
+			m = vexec_inset_has_bytes(k->set, VARDATA_ANY(p), VARSIZE_ANY_EXHDR(p));
+			break;
 		case VEXEC_CHECK_BYTES:
 		case VEXEC_CHECK_LIKE:
 			{

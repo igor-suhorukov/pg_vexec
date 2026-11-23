@@ -321,6 +321,7 @@ vexec_node_compile(VexecNode *node, List *quals, List *tlist)
 	}
 	node->nkernels = cc.nkernels;
 	node->nfallbacks = cc.nfallbacks;
+	node->nhashed = cc.nhashed;
 	node->declared = list_concat(node->declared, cc.declared);
 	if (vexec_enable_shared_exprs)
 		share_subtrees(node);
@@ -1456,6 +1457,8 @@ vexec_node_explain_properties(VexecNode *node, List *ancestors, ExplainState *es
 								psprintf("%d of %d", eager, node->nquals), es);
 		ExplainPropertyInteger("Kernel Steps", NULL, node->nkernels, es);
 		ExplainPropertyInteger("Fallback Steps", NULL, node->nfallbacks, es);
+		if (node->nhashed > 0)
+			ExplainPropertyInteger("Hashed IN Lists", NULL, node->nhashed, es);
 		if (node->nshared > 0)
 			ExplainPropertyInteger("Shared Steps", NULL, node->nshared, es);
 		vexec_node_explain_declared(node, es);

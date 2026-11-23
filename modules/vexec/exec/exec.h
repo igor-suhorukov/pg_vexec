@@ -405,6 +405,7 @@ struct VexecNode
 								 * an aggregate's argument under a FILTER */
 	int			nkernels;		/* compiled */
 	int			nfallbacks;
+	int			nhashed;		/* IN lists looked up in a set (expr/inset.h) */
 	int			nshared;		/* X10: subtrees the targets share */
 	List	   *declared;		/* compiled calls bound to kernel packs'
 								 * declarations, VexecExpr *, for EXPLAIN */

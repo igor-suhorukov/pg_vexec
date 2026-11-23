@@ -41,6 +41,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/selfuncs.h"
 
 #include "vexec.h"
 #include "batch/batch.h"
@@ -92,6 +93,40 @@ oracle_call(OracleContext *ctx, Oid funcid, Node *node, List *args, Oid collatio
 		ctx->steps->declared++;
 	else
 		ctx->steps->fallback++;
+}
+
+/*
+ * An IN list's kernel share beyond the one comparison oracle_call() priced,
+ * as PostgreSQL prices the evaluation the node will make
+ * (PG19:src/backend/optimizer/path/costsize.c:5030-5071).  Where PostgreSQL
+ * hashed the array (hashfuncid), its price is one lookup a row, a hash and
+ * a comparison, whatever the elements: the node that looks its rows up in a
+ * set (expr/inset.h) adds the hash's call; one that compares the elements
+ * one by one adds what PostgreSQL's linear search costs, half the
+ * elements' comparisons, so that it is not chosen at a lookup's price -- a
+ * Vec Seq Scan comparing 16,000 elements a row was chosen over an index at
+ * that price.  Where PostgreSQL did not hash it, its price is already the
+ * linear search's.
+ */
+static void
+oracle_saop(OracleContext *ctx, ScalarArrayOpExpr *saop)
+{
+	QualCost	qc = {0, 0};
+
+	if (!OidIsValid(saop->hashfuncid))
+		return;
+	if (vexec_saop_key_of(saop) != VEXEC_SAOP_LINEAR)
+	{
+		add_function_cost(ctx->root, saop->hashfuncid, NULL, &qc);
+		ctx->steps->kernel_cost += qc.per_tuple;
+	}
+	else
+	{
+		double		nelems = estimate_array_length(ctx->root, lsecond(saop->args));
+
+		add_function_cost(ctx->root, saop->opfuncid, NULL, &qc);
+		ctx->steps->kernel_cost += qc.per_tuple * Max(nelems * 0.5 - 1, 0);
+	}
 }
 
 static bool
@@ -152,9 +187,12 @@ oracle_walker(Node *node, void *context)
 		case T_ScalarArrayOpExpr:
 			{
 				ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) node;
+				int			kernels = ctx->steps->kernel;
 
 				set_sa_opfuncid(saop);
 				oracle_call(ctx, saop->opfuncid, node, saop->args, saop->inputcollid);
+				if (ctx->steps->kernel > kernels && ctx->root != NULL)
+					oracle_saop(ctx, saop);
 				break;
 			}
 		case T_SubPlan:

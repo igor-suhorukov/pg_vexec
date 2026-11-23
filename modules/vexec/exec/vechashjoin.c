@@ -4439,6 +4439,7 @@ compile_over(HjState *s, VexecNode *helper, List *exprs, bool is_qual, VexecTop 
 		vexec_compile_top(&cc, lfirst(lc), is_qual, &tops[i++]);
 	helper->nkernels += cc.nkernels;
 	helper->nfallbacks += cc.nfallbacks;
+	helper->nhashed += cc.nhashed;
 	helper->declared = list_concat(helper->declared, cc.declared);
 }
 

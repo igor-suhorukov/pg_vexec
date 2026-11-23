@@ -202,6 +202,18 @@ SELECT heap_check($$SELECT id FROM hp WHERE t <> 'late9001' AND id > 9000$$);
 SELECT heap_check($$SELECT id, v FROM hp WHERE v = 'v12' AND c = '12'$$);
 SELECT heap_check('SELECT id FROM hp WHERE s = ANY (ARRAY[1, 5, NULL, 299])');
 SELECT heap_check($$SELECT id FROM hp WHERE t IN ('ccc', 'late9100', NULL)$$);
+-- = ANY of nine values and more, as many as PostgreSQL hashes: the reader
+-- looks a tuple's value up in a set of them (expr/inset.h), and so does the
+-- node after it
+SELECT heap_check('SELECT id FROM hp WHERE s = ANY (ARRAY[1, 5, NULL, 299, 250, 251, 252, 253, 254, 255])');
+SELECT heap_check(format('SELECT id, s FROM hp WHERE s = ANY (%L::int4[])',
+	(SELECT array_agg(g * 3 - 1)::text FROM generate_series(1, 16000) g)));
+SELECT heap_check($$SELECT id FROM hp WHERE d IN ('2020-01-01', '2020-01-02', '2020-01-03', '2020-01-04', '2020-01-05', '2020-02-01', '2020-03-01', '2021-01-01', '2022-06-01')$$);
+SELECT heap_check($$SELECT id, t FROM hp WHERE t IN ('ccc', 'late9100', NULL, 'late9101', 'late9102', 'b', 'bb', 'dflt', 'late9299', '')$$);
+SELECT heap_check(format('SELECT id FROM hp WHERE v = ANY (%L::text[])',
+	(SELECT array_agg('v' || g)::text FROM generate_series(1, 500, 2) g)));
+SELECT heap_explain($$SELECT id FROM hp WHERE s IN (1, 5, 299, 250, 251, 252, 253, 254, 255) AND t IN ('ccc', 'late9100')$$,
+	'Vec Seq Scan|Prefilter|Hashed IN Lists');
 SELECT heap_check($$SELECT id FROM hp WHERE t LIKE 'ddd%' AND t NOT LIKE '%dddddddddddddddd%'$$);
 SELECT heap_check($$SELECT id FROM hp WHERE t LIKE '%e' AND t LIKE 'eee'$$);
 SELECT heap_check('SELECT id FROM hp WHERE f IS NULL');
