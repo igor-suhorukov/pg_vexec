@@ -153,29 +153,30 @@ modules and packs built elsewhere find them too.
 
 `docker/simple/Dockerfile.base` builds those four extensions on vanilla
 PostgreSQL 19 as the PostgreSQL Global Development Group packages it for
-Debian trixie, `postgres:19rc1-trixie`, from this repository on GitHub. It
+Debian trixie, `postgres:19-trixie`, from this repository on GitHub. It
 takes no build context, and needs none of the images or checkouts of [the
 development environment](#the-development-environment); what the base lacks
-comes from Debian's and PGDG's packages.
+comes from Debian's and PGDG's packages. That tag follows PostgreSQL 19's
+minor releases; `--build-arg BASE_IMAGE=postgres:19.0-trixie` holds one.
 
 ```sh
-docker build -t pg_vexec:19rc1 - < docker/simple/Dockerfile.base
-docker build -t pg_vexec:19rc1 --build-arg REF=<branch or tag> --no-cache - < docker/simple/Dockerfile.base
-docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1 \
+docker build -t pg_vexec:19 - < docker/simple/Dockerfile.base
+docker build -t pg_vexec:19 --build-arg REF=<branch or tag> --no-cache - < docker/simple/Dockerfile.base
+docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19 \
     -c shared_preload_libraries=vexec -c vexec.mode=auto
 ```
 
 After a push, build with `--no-cache`: Docker otherwise keeps the clone it made
 before. The image says which commit it holds:
-`docker run --rm pg_vexec:19rc1 cat /usr/share/postgresql/19/pg_vexec.commit`.
+`docker run --rm pg_vexec:19 cat /usr/share/postgresql/19/pg_vexec.commit`.
 
 `docker/simple/Dockerfile.execparquet` adds `vexec_parquet` to that image, built
 from the commit the image holds, with Arrow C++ from Apache's own Debian
 packages, which neither Debian trixie nor PGDG packages:
 
 ```sh
-docker build -t pg_vexec:19rc1-parquet - < docker/simple/Dockerfile.execparquet
-docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1-parquet \
+docker build -t pg_vexec:19-parquet - < docker/simple/Dockerfile.execparquet
+docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19-parquet \
     -c shared_preload_libraries=vexec,vexec_parquet -c vexec.mode=auto
 ```
 
@@ -186,8 +187,8 @@ of the build: some 30 GB of disk, 44 GB of memory at its 16 jobs (`ENGINE_JOBS`)
 and hours.
 
 ```sh
-docker build -t pg_vexec:19rc1-mergetree - < docker/simple/Dockerfile.mergetree
-docker run -d --name vexec --shm-size 1g -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1-mergetree \
+docker build -t pg_vexec:19-mergetree - < docker/simple/Dockerfile.mergetree
+docker run -d --name vexec --shm-size 1g -e POSTGRES_PASSWORD=<password> pg_vexec:19-mergetree \
     -c shared_preload_libraries=vexec,ch_table_engines -c vexec.mode=auto
 ```
 

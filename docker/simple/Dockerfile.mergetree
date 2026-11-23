@@ -5,15 +5,15 @@
 # its engine library, the core of ClickHouse compiled from its sources.  It
 # takes no build context:
 #
-#   docker build -t pg_vexec:19rc1 - < docker/simple/Dockerfile.base
-#   docker build -t pg_vexec:19rc1-mergetree - < docker/simple/Dockerfile.mergetree
-#   docker run -d --name vexec --shm-size 1g -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1-mergetree \
+#   docker build -t pg_vexec:19 - < docker/simple/Dockerfile.base
+#   docker build -t pg_vexec:19-mergetree - < docker/simple/Dockerfile.mergetree
+#   docker run -d --name vexec --shm-size 1g -e POSTGRES_PASSWORD=<password> pg_vexec:19-mergetree \
 #       -c shared_preload_libraries=vexec,ch_table_engines -c vexec.mode=auto
 #
 #   CREATE EXTENSION ch_table_engines;
 #   CREATE TABLE t (...) USING mergetree WITH (order_by = '...');
 #
-#   BASE_IMAGE   Dockerfile.base's image: pg_vexec:19rc1
+#   BASE_IMAGE   Dockerfile.base's image: pg_vexec:19
 #   CHTE_REPO    ch_table_engines' repository: on this project's GitHub
 #   CHTE_REF     the branch or tag to build: main
 #   ENGINE_JOBS  the engine's compile jobs: 16, which ch_table_engines gives 44 GB
@@ -38,7 +38,7 @@
 # The stages engine and build (--target) have the compilers and the repository
 # at /src; the image it ends in is the base with the extension and the library.
 
-ARG BASE_IMAGE=pg_vexec:19rc1
+ARG BASE_IMAGE=pg_vexec:19
 
 FROM debian:trixie AS engine
 ARG CHTE_REPO=https://github.com/igor-suhorukov/pg_ch_table_engines.git

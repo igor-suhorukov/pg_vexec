@@ -6,15 +6,18 @@
 # it runs beside are of one commit whatever the branch has moved to since.  It
 # takes no build context:
 #
-#   docker build -t pg_vexec:19rc1 - < docker/simple/Dockerfile.base
-#   docker build -t pg_vexec:19rc1-parquet - < docker/simple/Dockerfile.execparquet
-#   docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1-parquet \
+#   docker build -t pg_vexec:19 - < docker/simple/Dockerfile.base
+#   docker build -t pg_vexec:19-parquet - < docker/simple/Dockerfile.execparquet
+#   docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19-parquet \
 #       -c shared_preload_libraries=vexec,vexec_parquet -c vexec.mode=auto
 #
-#   BASE_IMAGE     Dockerfile.base's image: pg_vexec:19rc1
+#   BASE_IMAGE     Dockerfile.base's image: pg_vexec:19
 #   REPO           the repository holding its commit: this project's on GitHub
 #   ARROW_VERSION  26.0.0-1, as docker/Dockerfile.parquet's; the packages'
-#                  names, libarrow2600 and the others, carry its major version
+#                  names, libarrow2600 and the others, carry its major version.
+#                  Each stage pins the libraries with it, not the -dev packages
+#                  alone: apt would take a later release's libarrow2600 (26.0.1
+#                  since November 2026), which libarrow-dev=26.0.0-1 refuses
 #
 # What the base lacks:
 #   build-essential, pkg-config, git, postgresql-server-dev-19   the build, the
@@ -38,7 +41,7 @@
 # repository at /src; the image it ends in is the base with vexec_parquet and
 # what it loads.
 
-ARG BASE_IMAGE=pg_vexec:19rc1
+ARG BASE_IMAGE=pg_vexec:19
 
 FROM ${BASE_IMAGE} AS build
 ARG REPO=https://github.com/igor-suhorukov/pg_vexec.git
@@ -53,7 +56,8 @@ RUN apt-get update \
  && rm /tmp/apache-arrow-apt-source.deb \
  && apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        "libarrow-dev=$ARROW_VERSION" "libparquet-dev=$ARROW_VERSION" "libarrow-s3-dev=$ARROW_VERSION"
+        "libarrow-dev=$ARROW_VERSION" "libparquet-dev=$ARROW_VERSION" "libarrow-s3-dev=$ARROW_VERSION" \
+        "libarrow2600=$ARROW_VERSION" "libparquet2600=$ARROW_VERSION" "libarrow-s3-2600=$ARROW_VERSION"
 RUN pg_config="/usr/lib/postgresql/$PG_MAJOR/bin/pg_config" \
  && commit="$(cat "$("$pg_config" --sharedir)/pg_vexec.commit")" \
  && git init -q /src \

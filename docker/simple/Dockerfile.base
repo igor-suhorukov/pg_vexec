@@ -6,12 +6,14 @@
 # so nothing of a checkout goes in, and needs none of vexec's dev images and
 # no checkout of the port or of PostgreSQL's fork:
 #
-#   docker build -t pg_vexec:19rc1 - < docker/simple/Dockerfile.base
-#   docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19rc1 \
+#   docker build -t pg_vexec:19 - < docker/simple/Dockerfile.base
+#   docker run -d --name vexec -e POSTGRES_PASSWORD=<password> pg_vexec:19 \
 #       -c shared_preload_libraries=vexec -c vexec.mode=auto
 #
-#   REF    the branch or tag to build: main
-#   REPO   its repository: this project's on GitHub
+#   REF         the branch or tag to build: main
+#   REPO        its repository: this project's on GitHub
+#   BASE_IMAGE  the server's image: postgres:19-trixie, PostgreSQL 19's latest
+#               minor release; postgres:19.0-trixie and the like hold one
 #
 # Docker keeps the clone's layer: after a push, build with --no-cache, or it
 # builds what it cloned before.  The image says which commit it holds, in
@@ -35,7 +37,7 @@
 # /src; the image it ends in is the base with the extensions and what
 # vexec_flight loads.
 
-ARG BASE_IMAGE=postgres:19rc1-trixie
+ARG BASE_IMAGE=postgres:19-trixie
 
 FROM ${BASE_IMAGE} AS build
 ARG REPO=https://github.com/igor-suhorukov/pg_vexec.git
