@@ -78,10 +78,10 @@ The plan's phases land here in order, each on a branch of its own:
   contract, `vexec/device_v1`, and its headers; VecAgg's, VecHashJoin's and
   VecSort's device strategies, each falling back to its CPU's; and the source
   contract's units, which a device reads itself from Parquet and Arrow files.
-  The provider that runs them on a GPU, `vexec_gpu`, is on the branch `vpqc`
-  and not on this one: without a provider no node takes a device, and nothing
-  here needs CUDA or libcudf.  V8's change to the port -- gp_core's settings --
-  is in a worktree of the port, under `pg19/` only.
+  The provider that runs them on a GPU, `vexec_gpu`, is on the branch
+  `gpu_acceleration` and not on this one: without a provider no node takes a
+  device, and nothing here needs CUDA or libcudf.  V8's change to the port --
+  gp_core's settings -- is in a worktree of the port, under `pg19/` only.
 
 ## Layout
 
