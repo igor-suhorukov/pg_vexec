@@ -1581,7 +1581,7 @@ saop_found(VexecEval *ev, const VexecSaopHash *h, const VexecVec *x, int i)
  * of `compute` whose value the set has into `found` -- ANY's true, ALL's
  * false -- and, where the array has a NULL, every row of `compute` into
  * `nulls`, which a found row's answer overrides: ExecEvalHashedScalarArrayOp()'s
- * answers, for a strict equality (execExprInterp.c:4426-4450).  False, with
+ * answers, for a strict equality (execExprInterp.c:4421-4478).  False, with
  * nothing written, where x's layout is none a key is read from here: the
  * elements are then compared one by one (saop_compare()).
  */

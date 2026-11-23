@@ -355,7 +355,7 @@ compile_var(VexecCompileContext *cc, Var *var)
  * function a kernel is bound to (k_compare.c, k_text.c, k_numeric.c), so
  * that its VE_SAOP is compiled at all.  x = ANY of an equality is true where
  * the set has x; x <> ALL of its negation is false there, as
- * ExecEvalHashedScalarArrayOp() answers NOT IN (execExprInterp.c:4426-4430).
+ * ExecEvalHashedScalarArrayOp() answers NOT IN (execExprInterp.c:4421-4428).
  * The pairs of integer widths and of float widths compare their values
  * widened, so their keys are too: PostgreSQL hashes none of them, since the
  * two sides' hash functions differ (clauses.c's condition 3), and prices

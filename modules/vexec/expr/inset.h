@@ -10,11 +10,11 @@
  * turn, and, where the array is a constant of MIN_ARRAY_SIZE_FOR_HASHED_SAOP
  * elements or more and the operator -- or, for <> ALL, its negator -- hashes
  * both sides by one function, by one lookup in a hash table of the elements
- * (PG19:src/backend/optimizer/util/clauses.c:2814-2905,
+ * (PG19:src/backend/optimizer/util/clauses.c:2612-2720,
  * convert_saop_to_hashed_saop(); src/backend/executor/execExprInterp.c:4257,
  * ExecEvalHashedScalarArrayOp()).  The planner prices it so: a hash and a
  * comparison a row, where the linear search is half the elements'
- * comparisons (src/backend/optimizer/path/costsize.c:5041-5071).
+ * comparisons (src/backend/optimizer/path/costsize.c:5026-5072).
  *
  * vexec compared x with each element, a kernel's pass over the batch an
  * element, where the planner had priced one lookup: 16,000 elements took
@@ -67,7 +67,7 @@
 
 #include "exec/keyhash.h"
 
-/* PostgreSQL's MIN_ARRAY_SIZE_FOR_HASHED_SAOP (clauses.c:2814) */
+/* PostgreSQL's MIN_ARRAY_SIZE_FOR_HASHED_SAOP (clauses.c:2612) */
 #define VEXEC_INSET_MIN		9
 /* a set of ints without a bitmap, and the heap reader's set of byte keys (above) */
 #define VEXEC_INSET_MIN_HASHED_INTS	64

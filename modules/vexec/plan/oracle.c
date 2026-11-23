@@ -98,7 +98,7 @@ oracle_call(OracleContext *ctx, Oid funcid, Node *node, List *args, Oid collatio
 /*
  * An IN list's kernel share beyond the one comparison oracle_call() priced,
  * as PostgreSQL prices the evaluation the node will make
- * (PG19:src/backend/optimizer/path/costsize.c:5030-5071).  Where PostgreSQL
+ * (PG19:src/backend/optimizer/path/costsize.c:5026-5072).  Where PostgreSQL
  * hashed the array (hashfuncid), its price is one lookup a row, a hash and
  * a comparison, whatever the elements: the node that looks its rows up in a
  * set (expr/inset.h) adds the hash's call; one that compares the elements
