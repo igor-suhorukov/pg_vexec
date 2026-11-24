@@ -18,7 +18,11 @@
 #     protobuf, which those tests do not use.
 #
 #   BASE_IMAGE      pg_accel/vexec-dev:vanilla-arrow
-#   ARROW_VERSION   26.0.0-1, the newest on 2026-10-26
+#   ARROW_VERSION   26.0.0-1, the newest on 2026-10-26; the packages' names,
+#                   libarrow2600 and the others, carry its major version.  The
+#                   libraries are pinned with it, not the -dev packages alone:
+#                   apt would take a later release's libarrow2600 (26.0.1 since
+#                   November 2026), which libarrow-dev=26.0.0-1 refuses
 #   MOTO_VERSION    5.2.4
 #   POSTGIS_TAG     3.7.0rc2, its commit checked as POSTGIS_COMMIT
 
@@ -35,6 +39,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && rm /tmp/apache-arrow-apt-source.deb \
     && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         libarrow-dev=${ARROW_VERSION} libparquet-dev=${ARROW_VERSION} libarrow-s3-dev=${ARROW_VERSION} \
+        libarrow2600=${ARROW_VERSION} libparquet2600=${ARROW_VERSION} libarrow-s3-2600=${ARROW_VERSION} \
     && rm -rf /var/lib/apt/lists/* \
     && grep -q '^#define ARROW_S3$' /usr/include/arrow/util/config.h \
     && pkg-config --exists arrow parquet arrow-s3
